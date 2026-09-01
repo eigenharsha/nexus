@@ -92,6 +92,12 @@ def main() -> int:
         # so catch it here first.
         if re.search(r"<https?://", raw):
             errors.append(f"{rel}: autolink <https://…> breaks MDX — use [text](url)")
+        # a nested " inside a JSX attribute terminates it early and the MDX
+        # parser then reads the rest of the title as attribute names
+        for m in re.finditer(r'<(\w+)\s+(?:title|caption|label)="([^"]*)"([^>]*)>', body):
+            if re.match(r'\s*[^\s=/>]', m.group(3) or "") and "=" not in (m.group(3) or ""):
+                errors.append(
+                    f"{rel}: nested quote in <{m.group(1)}> title — use “ ” inside the attribute")
 
         # a raw | inside an inline code span silently splits a table cell
         infence = False
