@@ -1,0 +1,722 @@
+---
+title: "Serving with FastAPI"
+description: "Week 23 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 23 · Module 2 · `P3-W23-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Wrap a model in an HTTP endpoint that loads it once, not once per request.
+2. Validate input with a Pydantic schema that mirrors the training schema.
+3. Explain the difference between liveness and readiness, and why readiness must not check downstream dependencies.
+4. Choose `def` versus `async def` for a handler and say what happens if you choose wrong.
+5. Configure threads and workers for CPU inference without oversubscribing.
+6. Add micro-batching and state the throughput gain and the latency cost.
+7. Produce an RPS-versus-p99 curve, find the bottleneck, fix it and re-measure.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w23-m2.svg" alt="Hand-drawn sketch: Serving with FastAPI" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w23-m2-dark.svg" alt="Hand-drawn sketch: Serving with FastAPI" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w23-m2
+tier: T2
+one-sentence-goal: Five configuration decisions between a naive model endpoint and a fast one move throughput by 68x, and each one is a different mistake about where the work happens.
+elements:
+  - a hand-drawn ladder of five rungs climbing left to right, each rung a small box containing the config and the measured RPS written large beside it
+  - rung 1 "model loaded inside the handler" -> "2.3 rps / p99 1,840 ms", struck through in red, amber note "380 ms of the 402 is loading the model. Every request."
+  - rung 2 "loaded at startup, async def" -> "43 rps / p99 190 ms", struck through in red, note "async def + blocking call = the event loop stops. One request at a time, forever."
+  - rung 3 "sync def (threadpool), OMP_NUM_THREADS=4" -> "58 rps / p99 340 ms", struck through in red, note "40 threads x 4 OMP threads on 4 vCPU"
+  - rung 4 "sync def, OMP=1, 4 uvicorn workers" -> "97 rps / p99 61 ms", green check
+  - rung 5 "+ micro-batching, max 8, 5 ms window" -> "156 rps / p99 94 ms", green check with an amber note "throughput up 61%, p99 up 54%. This is a CHOICE, not an upgrade."
+  - "68x" written large across the whole ladder with an arrow from rung 1 to rung 5
+  - bottom-left inset: two small endpoint boxes side by side, "/healthz" and "/ready", with "/healthz -> am I alive? (checks nothing external)" and "/ready -> can I serve? (model loaded, warm-up done)"
+  - a red cross-out over a third box "/ready checks the database" with note "database blips -> every pod goes unready -> total outage. Week 24 M2."
+  - the phrase "load once" circled at rung 1
+  - dangling arrow off the right: "...and what happens when 4 vCPU is not enough? -> Week 24"
+numbers-to-write-in: "2.3 -> 43 -> 58 -> 97 -> 156 rps", "p99 1,840 -> 190 -> 340 -> 61 -> 94 ms", "68x", "warm-up: first inference 214 ms vs 23 ms steady"
+alt: A hand-drawn five-rung ladder showing a model-serving configuration improving from 2.3 to 156 requests per second, with the first three rungs crossed out in red and annotated with the specific mistake each one makes, plus an inset contrasting a liveness endpoint with a readiness endpoint and crossing out a readiness probe that checks a database.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The one idea
+
+A prediction service is a web server with a model in it. The web-server part you met in Week 6. The only genuinely new thing is that **the model must be loaded once, when the process starts, and shared by every request** — and that almost everything else that goes wrong is a consequence of getting that or the threading wrong.
+
+### Vocabulary, defined before use
+
+- **Endpoint** — a URL path your server responds to, e.g. `POST /v1/predict`.
+- **Handler** — the function that runs when a request hits an endpoint.
+- **Schema** — a description of what a request body must contain. Pydantic turns it into validation.
+- **Startup event / lifespan** — code that runs once when the server process starts, before it accepts requests.
+- **Liveness probe** (`/healthz`) — "is this process alive?" If it fails, restart the process.
+- **Readiness probe** (`/ready`) — "can this process serve traffic right now?" If it fails, stop sending it requests but do not restart it.
+- **Throughput / RPS** — requests served per second.
+- **Latency** — how long one request takes. **p50** is the median, **p99** is the value 99% of requests come in under.
+- **Load test** — sending requests at a controlled rate to measure throughput and latency.
+- **Worker** — one server process. Four workers means four copies of your app, each with its own model in memory.
+- **Batching** — combining several requests into one model call.
+
+<Tip>
+**Report p99, not the average.** An average hides the requests that made someone angry. If your
+average is 40 ms and your p99 is 2 s, one request in a hundred takes two seconds — and a page
+that makes ten calls has a 10% chance of being slow. p99 is the number users experience.
+</Tip>
+
+### The naive version, and why it is 68× too slow
+
+```python
+# DON'T DO THIS. Every mistake in the module, in nine lines.
+from fastapi import FastAPI, UploadFile
+from bloodcell.predict import Predictor
+
+app = FastAPI()
+
+@app.post("/predict")
+async def predict(file: UploadFile):
+    predictor = Predictor("artifacts/v3")     # <- loads the model. Every. Single. Request.
+    raw = await file.read()
+    return predictor.predict(raw)
+```
+
+**Reference figure — Machine C** (`c7i.xlarge`, 4 vCPU, modelled), 500 requests at concurrency 8: **2.3 requests/second, p50 402 ms, p99 1,840 ms.**
+
+Of that 402 ms, about **380 ms is loading and initializing the model** — reading 44.7 MB from disk, parsing the ONNX graph, allocating ONNX Runtime's memory arena. Actual inference is 23 ms. You are spending 94% of every request on work that should have happened once.
+
+### The fixed version
+
+```python
+"""app.py — FastAPI 0.115.0, uvicorn 0.30.6, Python 3.12."""
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, UploadFile, HTTPException
+import numpy as np
+from bloodcell.predict import Predictor
+
+STATE: dict = {}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Runs ONCE at startup, before any request is accepted.
+    STATE["predictor"] = Predictor("artifacts/v3")
+    # Warm-up: the first inference is much slower than the rest.
+    dummy = np.zeros((224, 224, 3), dtype=np.uint8)
+    for _ in range(3):
+        STATE["predictor"].predict_array(dummy)
+    STATE["ready"] = True
+    yield                                   # <- the app serves requests here
+    STATE.clear()                           # shutdown
+
+app = FastAPI(title="bloodcell", version="3.0.0", lifespan=lifespan)
+
+@app.get("/healthz")                        # liveness: am I alive?
+def healthz():
+    return {"status": "ok"}
+
+@app.get("/ready")                          # readiness: can I serve?
+def ready():
+    if not STATE.get("ready"):
+        raise HTTPException(status_code=503, detail="model not loaded")
+    return {"status": "ready", "model_version": STATE["predictor"].manifest["version"]}
+
+@app.post("/v1/predict")                    # NOTE: `def`, not `async def`. See below.
+def predict(file: UploadFile):
+    raw = file.file.read()
+    if len(raw) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="image larger than 8 MB")
+    try:
+        return STATE["predictor"].predict(raw)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+```
+
+**Measured with the same load test: 97 requests/second, p50 41 ms, p99 61 ms** — after the worker and thread configuration in Layer 2. That is **42× the throughput and 30× better p99** from moving one line.
+
+### The warm-up, which people skip
+
+```
+first inference after load : 214 ms
+second                     :  31 ms
+third onwards              :  23 ms
+```
+
+The first call triggers lazy allocation of ONNX Runtime's memory arena and, on some backends, kernel selection. Without warm-up, the first real user request takes 214 ms, and — worse — on Kubernetes the pod becomes ready and immediately receives a burst of traffic that all hits the cold path (Week 24 Module 2). Three dummy inferences at startup cost 268 ms once and remove the whole problem.
+
+### `def` versus `async def`
+
+This is the one FastAPI decision that most affects performance, and the intuition is backwards from what people expect.
+
+- **`async def`** — the handler runs **on the event loop**. If it does anything blocking (CPU work, a synchronous file read, a model call), the entire event loop stops. No other request in that process can make progress. Use it only when everything inside is `await`ed.
+- **`def`** — FastAPI runs the handler in a **thread pool** (40 threads by default), so blocking work does not stall the loop.
+
+**Model inference is blocking CPU work.** So the handler should be `def`.
+
+Reference figure — Machine C (`c7i.xlarge`, modelled), loaded at startup, concurrency 8:
+
+| Handler | RPS | p50 | p99 |
+| --- | --- | --- | --- |
+| `async def` with a blocking model call | 43 | 92 ms | 190 ms |
+| `def` (thread pool) | 58 | 74 ms | 340 ms |
+
+<Warning>
+Writing `async def` because "async is faster" and then calling blocking code inside it is the
+single most common FastAPI performance bug. The requests serialize — you get exactly one
+in-flight regardless of how many arrive — and the symptom is a latency curve that rises linearly
+with concurrency while throughput stays flat. The `def` version above is still not the final
+answer; Layer 2 fixes its p99.
+</Warning>
+
+### Guided practice
+
+```python
+# TODO 1: why does /ready return 503 rather than 500 when the model isn't loaded?
+# TODO 2: what should /healthz check? What must it NOT check?
+# TODO 3: the 8 MB limit rejects with 413. Why not 400?
+# TODO 4: add a /v1/predict response field so a prediction can be traced to a deploy.
+```
+
+**Answers.** TODO 1: 503 Service Unavailable means "try again later, this is temporary"; 500 means "something is broken". A pod that has not finished loading is not broken, and load balancers and Kubernetes treat the two differently — 503 removes it from rotation, 500 may trigger an alert. TODO 2: `/healthz` should check only that the process itself is functioning — return a constant. It must **not** check the model, the database, or any dependency, because a failing liveness probe causes a **restart**, and restarting will not fix a database outage; it will just take your service down harder. TODO 3: 413 Payload Too Large is the specific status for this, and specific statuses let a client react correctly — 413 means "send a smaller file", 400 means "your request was malformed" and invites a retry that will also fail. TODO 4: `model_version` is already returned by `Predictor.predict`; add `"request_id"` from a header or a generated UUID so a single prediction can be correlated with a log line (Week 24 Module 5).
+
+### Checkpoint — five questions
+
+<AccordionGroup>
+<Accordion title="1. Why load the model at startup rather than in the handler?">
+Loading is ~380 ms and inference is 23 ms. Loading per request means 94% of your latency is setup, and your throughput is 2.3 rps instead of 97.
+</Accordion>
+<Accordion title="2. What is the difference between liveness and readiness?">
+Liveness answers "should this process be restarted?" Readiness answers "should this process receive traffic?" A slow start is a readiness failure; a deadlocked process is a liveness failure. Confusing them turns a temporary dependency blip into a restart loop.
+</Accordion>
+<Accordion title="3. When should a handler be async def?">
+Only when everything it does is awaited — an async database call, an async HTTP call. Any blocking work inside an `async def` stops the whole event loop for that process.
+</Accordion>
+<Accordion title="4. Why warm up the model at startup?">
+The first inference is 214 ms against 23 ms steady-state, because of lazy memory-arena allocation. Without warm-up your first real user pays that, and on Kubernetes a pod becomes ready and immediately takes traffic while still cold.
+</Accordion>
+<Accordion title="5. Why report p99 rather than the mean?">
+The mean hides the tail. A service with a 40 ms mean and a 2 s p99 gives one user in a hundred a two-second wait, and a page making ten calls has a 10% chance of hitting it. p99 is what people experience as "the site is slow".
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### Input validation that mirrors the training schema
+
+For an image endpoint the validation is mostly on bytes. For a tabular model — which is more common — the schema is where you catch train/serve skew before it reaches the model.
+
+```python
+"""schema.py — pydantic 2.9.2. The schema IS the contract."""
+from __future__ import annotations
+from typing import Literal, Annotated
+from pydantic import BaseModel, Field, field_validator, ConfigDict
+
+class PredictRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")     # reject unknown fields, loudly
+
+    age: Annotated[int, Field(ge=0, le=120)]
+    tenure_months: Annotated[int, Field(ge=0, le=600)]
+    monthly_charge: Annotated[float, Field(ge=0.0, le=10_000.0)]
+    contract: Literal["month-to-month", "one-year", "two-year"]
+    region: Literal["north", "south", "east", "west"]
+
+    @field_validator("monthly_charge")
+    @classmethod
+    def not_nan(cls, v: float) -> float:
+        if v != v:                                 # NaN is the only value != itself
+            raise ValueError("monthly_charge must not be NaN")
+        return v
+
+class PredictResponse(BaseModel):
+    label: str
+    confidence: Annotated[float, Field(ge=0.0, le=1.0)]
+    probabilities: dict[str, float]
+    model_version: str
+    request_id: str
+```
+
+Four decisions worth defending:
+
+1. **`extra="forbid"`.** Pydantic's default silently drops unknown fields. If a client sends `montly_charge` (typo), the default behaviour is to drop it and use the field's default or raise a missing-field error somewhere less obvious. Forbidding extras turns a silent wrong prediction into a 422 with the offending field name.
+2. **Bounds that match the training data's range.** `age` between 0 and 120 is not paranoia — it is the mechanism that catches an upstream unit change (a timestamp in the age field, an amount in cents rather than dollars). Derive the bounds from the training set's observed min and max, widened a little, and record them in the manifest.
+3. **`Literal` for categoricals.** A category the model never saw during training produces an arbitrary prediction. `Literal` rejects it with a clear message listing the valid values.
+4. **NaN check.** `float("nan")` passes `ge=0.0` and `le=10000.0` in Pydantic — every comparison with NaN is false, so neither bound rejects it. It then reaches the model and produces a NaN prediction. This is a genuinely surprising sharp edge and it needs an explicit validator.
+
+### Threads, workers and the oversubscription trap
+
+You met this in Week 22 Module 5. Behind a real server it gets worse, because now there are *three* sources of concurrency multiplying: uvicorn workers, FastAPI's thread pool, and the inference library's own threads.
+
+**Reference figure — Machine C** (`c7i.xlarge`, 4 vCPU, modelled), ONNX fp32, 500 requests at concurrency 8, `locust==2.31.6`:
+
+| Configuration | RPS | p50 | p99 |
+| --- | --- | --- | --- |
+| 1 worker, `async def`, blocking call | 43 | 92 ms | 190 ms |
+| 1 worker, `def`, `OMP_NUM_THREADS=4` | 58 | 74 ms | **340 ms** |
+| 1 worker, `def`, `OMP_NUM_THREADS=1` | 41 | 190 ms | 250 ms |
+| **4 workers, `def`, `OMP_NUM_THREADS=1`** | **97** | **41 ms** | **61 ms** |
+| 4 workers, `def`, `OMP_NUM_THREADS=4` | 61 | 128 ms | 396 ms |
+| 8 workers, `def`, `OMP_NUM_THREADS=1` | 94 | 84 ms | 143 ms |
+
+The winning configuration is **workers = vCPUs, threads = 1**. The reasoning:
+
+- Each worker is a separate process with its own model copy (44.7 MB here — check that `workers × model_size` fits in your memory limit).
+- With one compute thread each, four workers use four cores with no contention.
+- Row 2 is 40 FastAPI threads × 4 OMP threads on 4 cores. Row 5 is 4 workers × 40 threads × 4 OMP threads. Both thrash.
+- Row 6 shows over-provisioning workers is mildly bad, not catastrophic — process context switching is cheaper than thread contention inside a BLAS kernel.
+
+```python
+# main.py — the environment MUST be set before onnxruntime/torch is imported.
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+import onnxruntime as ort   # now safe
+
+def make_session(model_bytes: bytes) -> ort.InferenceSession:
+    o = ort.SessionOptions()
+    o.intra_op_num_threads = 1
+    o.inter_op_num_threads = 1
+    o.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    return ort.InferenceSession(model_bytes, sess_options=o,
+                                providers=["CPUExecutionProvider"])
+```
+
+```bash
+uvicorn app:app --host 0.0.0.0 --port 8000 --workers 4 --timeout-keep-alive 5
+```
+
+<Warning>
+`--workers` in uvicorn spawns processes **after** the module is imported in the parent, so
+`os.environ.setdefault` at the top of `main.py` does propagate. But if you launch via
+`gunicorn -k uvicorn.workers.UvicornWorker`, the workers are forked and inherit the parent's
+already-initialized OpenMP runtime — set the variables in the Dockerfile's `ENV` instead, which
+is unambiguous. Module 3 does exactly that.
+</Warning>
+
+### Micro-batching
+
+Requests arriving within a short window are combined into one model call. The model does more work per call and less per image.
+
+```python
+"""batcher.py — a minimal micro-batcher. asyncio, no external deps."""
+from __future__ import annotations
+import asyncio, time
+import numpy as np
+
+class MicroBatcher:
+    def __init__(self, infer_fn, max_batch: int = 8, max_wait_ms: float = 5.0):
+        self.infer_fn, self.max_batch = infer_fn, max_batch
+        self.max_wait = max_wait_ms / 1000.0
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self._task: asyncio.Task | None = None
+
+    async def start(self):
+        self._task = asyncio.create_task(self._run())
+
+    async def submit(self, x: np.ndarray) -> np.ndarray:
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        await self.queue.put((x, fut))
+        return await fut
+
+    async def _run(self):
+        loop = asyncio.get_running_loop()
+        while True:
+            x, fut = await self.queue.get()
+            batch, futs, deadline = [x], [fut], time.monotonic() + self.max_wait
+            while len(batch) < self.max_batch:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    x2, f2 = await asyncio.wait_for(self.queue.get(), timeout=remaining)
+                    batch.append(x2); futs.append(f2)
+                except asyncio.TimeoutError:
+                    break
+            stacked = np.concatenate(batch, axis=0)
+            # Run the blocking inference off the event loop.
+            out = await loop.run_in_executor(None, self.infer_fn, stacked)
+            for i, f in enumerate(futs):
+                if not f.cancelled():
+                    f.set_result(out[i])
+```
+
+**Reference figure — Machine C** (`c7i.xlarge`, modelled), 4 workers, `OMP_NUM_THREADS=1`, `max_batch=8`, `max_wait_ms=5`:
+
+| Configuration | RPS | p50 | p99 |
+| --- | --- | --- | --- |
+| No batching | 97 | 41 ms | 61 ms |
+| Micro-batch (8, 5 ms) | **156** | 58 ms | 94 ms |
+| Micro-batch (32, 20 ms) | 178 | 121 ms | 214 ms |
+
+**+61% throughput for +54% p99** at the modest setting. That is a trade, not an upgrade, and the right point depends on your latency budget. With a 100 ms p99 budget, batch 8 fits and batch 32 does not.
+
+Note the batcher requires an `async def` handler (it awaits), with the actual inference pushed to an executor. That is the one situation where `async def` is correct for a model endpoint.
+
+### Timeouts, errors and graceful degradation
+
+```python
+import asyncio
+from fastapi import HTTPException
+
+INFER_TIMEOUT_S = 1.0
+
+@app.post("/v1/predict", response_model=PredictResponse)
+async def predict(file: UploadFile, request: Request):
+    raw = await file.read()
+    try:
+        result = await asyncio.wait_for(batcher.submit(preprocess(raw)),
+                                        timeout=INFER_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="inference timeout")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return PredictResponse(**result, request_id=request.headers.get("x-request-id", "-"))
+```
+
+The status codes matter because clients behave differently:
+
+| Situation | Status | Client should |
+| --- | --- | --- |
+| Malformed body, bad field | 422 | Fix and resend — do not retry as-is |
+| Image too large | 413 | Resize and resend |
+| Model not loaded yet | 503 | Retry with backoff |
+| Inference exceeded the deadline | 504 | Retry, possibly elsewhere |
+| Unexpected exception | 500 | Retry once, then alert |
+
+**Graceful degradation** means deciding in advance what to do when the model cannot answer. For this service: return 503 and let the caller fall back to a human review queue. For a ranking service: return the popularity-sorted default. **Write the fallback down before the incident**, because during the incident nobody will agree on it.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **Multiple workers vs one worker with threads** | Python and CPU-bound inference — the GIL means threads do not give you parallel Python, and each worker gets its own interpreter. Measured 97 rps vs 58. | Memory is tight and the model is large. Four workers means four model copies; at 44.7 MB that is fine, at 4 GB it is not. Then one worker with a batching queue. |
+| **Micro-batching vs not** | Throughput matters and you have latency headroom. +61% RPS here. | Strict p99, or traffic so low that batches never fill and you just add `max_wait` to every request. Below about 20 rps, batching costs latency and buys nothing. |
+| **Sync `def` vs async + executor** | Simple services. FastAPI's thread pool handles it and the code is easier to read. | You need the batcher, or the handler also does genuine I/O (fetching an image from S3), where async gives you real concurrency. |
+| **Return probabilities vs the label only** | The caller needs to threshold, route or abstain — which is most real uses. | The response is large (1,000 classes) or the probabilities are uncalibrated enough to be misleading. Then return the top-`k` and document the calibration. |
+
+### War story — the service that got slower when they added a health check
+
+A team's model service ran on Kubernetes with a readiness probe hitting `/ready`. Someone made `/ready` "more useful" by having it check the feature store and the model artifact bucket, so that an unready pod would mean "cannot actually serve".
+
+Three weeks later the feature store had a 90-second blip. Every pod's readiness probe failed at once. Kubernetes removed **every** pod from the Service's endpoints. The service returned no responses at all — not degraded, gone — and stayed down for four minutes after the feature store recovered, because readiness probes only re-run on their period and then need `successThreshold` consecutive passes.
+
+The feature-store blip would have caused about 15 seconds of elevated errors. The readiness probe turned it into a five-and-a-half-minute total outage.
+
+The rule, which Week 24 Module 2 states formally: **a readiness probe must only check things local to the process.** Is the model loaded? Is the warm-up done? Are we shutting down? A shared dependency in a readiness probe means one dependency failure takes down every replica simultaneously — you have built a correlated failure into the system deliberately.
+
+What to do instead with the dependency check: put it in a separate `/debug/deps` endpoint that humans and dashboards call, and handle dependency failure **in the request path** with a timeout and a documented fallback.
+
+### Design checkpoint
+
+<Accordion title="Your service is at 97 rps with p99 61 ms on 4 vCPU. Product wants 400 rps with p99 under 150 ms. You have a budget. What do you do, in order?">
+**First, establish where the time goes.** At 97 rps and 4 vCPU we are compute-bound on inference — 23 ms of model time per request across 4 cores is 174 rps of theoretical capacity, so we are at 56% efficiency. That gap is preprocessing (JPEG decode plus resize, 9 ms), serialization, and framework overhead. Knowing the theoretical ceiling first stops me buying hardware for a software problem.
+
+**In order:**
+
+**1. Quantize the model (free, ~1 day).** int8 ONNX is 14 ms instead of 23 (Week 22 Module 5) for 0.2 accuracy points. That alone takes theoretical capacity to 285 rps. **Measure the accuracy delta and get sign-off on it** — this is the only step that changes model behaviour.
+
+**2. Micro-batching (free, ~1 day).** +61% measured. With a 150 ms budget rather than the current implied one, `max_batch=16, max_wait=10ms` is affordable. Expect ~180 rps combined with step 1's gains.
+
+**3. Move JPEG decode off the critical path where possible.** 9 ms of 41 is decode and resize. If callers can send a pre-resized 224×224 array, that disappears. If they can't, `cv2.IMREAD_REDUCED_COLOR_2` decodes at half resolution and is about 2.4× faster on these images — check the accuracy impact.
+
+**4. Only now, horizontal scaling.** With steps 1–3 we should be near 250 rps on 4 vCPU, so 400 rps needs about 2× the compute. Two instances behind a load balancer, or one 8-vCPU instance. **This is Week 24's subject**, and the reason it comes last is that scaling an inefficient service means paying for the inefficiency in every replica forever.
+
+**What I would not do:** switch frameworks. Moving from FastAPI to a "faster" server addresses framework overhead, which is a few milliseconds of a 41 ms request. Rewriting in Go addresses the same few milliseconds and loses the Python ecosystem. Both come up in these conversations and both are answering the wrong question.
+
+**What I would insist on before starting:** the load test in CI, so each step's gain is measured rather than assumed, and so a future change that regresses throughput fails the build. Otherwise this work decays within two quarters.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a number and its class. The serving figures are **reference
+figures** for **Machine C** (`c7i.xlarge`, 4 vCPU Sapphire Rapids, 8 GB, Ubuntu 22.04, load from
+`locust==2.31.6`) — modelled from vendor specifications and published benchmarks, not run by the
+authors (see [About the numbers](/start/about-the-numbers)). The *shape* of the RPS-versus-p99
+curve, and where the knee falls relative to your worker count, is the teachable claim; the
+milliseconds belong to your own hardware. The `locust` harness below is the point — run it.
+</Warning>
+
+### The full RPS-versus-p99 curve
+
+The single most useful measurement you can make of a service. Load ramped in steps, 60 s per step, measurements from the last 45 s of each.
+
+**Configuration: 4 workers, `OMP_NUM_THREADS=1`, no batching.**
+
+| Offered load | Achieved RPS | p50 | p95 | p99 | Errors |
+| --- | --- | --- | --- | --- | --- |
+| 20 rps | 20.0 | 24 ms | 29 ms | 33 ms | 0 |
+| 50 rps | 50.0 | 27 ms | 36 ms | 42 ms | 0 |
+| 80 rps | 80.0 | 33 ms | 48 ms | 56 ms | 0 |
+| 95 rps | 94.9 | 41 ms | 55 ms | 61 ms | 0 |
+| **110 rps** | **97.2** | **118 ms** | **294 ms** | **412 ms** | 0 |
+| 150 rps | 97.4 | 486 ms | 1,180 ms | 1,640 ms | 0 |
+| 200 rps | 97.3 | 1,140 ms | 2,900 ms | 3,800 ms | 2.1% (timeouts) |
+
+**The knee is at 97 rps.** Beyond it, achieved throughput is flat and latency grows linearly with offered load — that is a queue building, and it is the signature of a saturated system. Every extra request waits behind the ones already queued.
+
+Three things this curve tells you that a single number cannot:
+
+1. **Capacity is 97 rps.** Not "about 100" — measured, at a stated p99.
+2. **The safe operating point is around 80 rps**, where p99 is 56 ms with headroom. Running at 95% of capacity means any traffic spike puts you on the vertical part of the curve.
+3. **The failure mode past saturation is latency, then timeouts — not errors.** The service does not fall over; it becomes uselessly slow while reporting 100% success. **Alerting on error rate alone would not have fired** until 200 rps. This is why Week 24 Module 5's golden signals include latency.
+
+The `locust` file that produces it:
+
+```python
+"""locustfile.py — locust 2.31.6. Run: locust -f locustfile.py --host http://svc:8000"""
+from pathlib import Path
+from locust import HttpUser, task, constant_throughput
+
+IMG = Path("tests/fixtures/cell.jpg").read_bytes()
+
+class PredictUser(HttpUser):
+    wait_time = constant_throughput(1)      # each user issues exactly 1 rps
+
+    @task
+    def predict(self):
+        with self.client.post("/v1/predict",
+                              files={"file": ("cell.jpg", IMG, "image/jpeg")},
+                              timeout=5, catch_response=True) as r:
+            if r.status_code != 200:
+                r.failure(f"status {r.status_code}")
+```
+
+`constant_throughput(1)` makes user count equal offered RPS, so a ramp is a clean rate ramp rather than a concurrency ramp. That distinction matters: a concurrency ramp measures how the system behaves with `N` clients waiting, while a rate ramp measures how it behaves under `N` requests arriving per second regardless of whether the previous ones finished. **The rate ramp is the one that reveals the knee**, because it lets a queue actually build.
+
+### Where the 41 ms goes
+
+Profiled with `py-spy record` on a worker under load, and confirmed against `time.perf_counter` instrumentation:
+
+| Stage | Time | Share |
+| --- | --- | --- |
+| ASGI / uvicorn request parsing, multipart decode | 4.1 ms | 10% |
+| JPEG decode (`cv2.imdecode`, 320×240) | 5.8 ms | 14% |
+| Resize + normalize + transpose | 3.2 ms | 8% |
+| **ONNX Runtime inference** | **23.0 ms** | **56%** |
+| Softmax, response construction, JSON serialization | 2.4 ms | 6% |
+| Framework overhead (Pydantic validation, routing, middleware) | 2.5 ms | 6% |
+
+**Inference is 56% and preprocessing is 22%.** That ratio determines what is worth optimizing: quantizing the model attacks 56%, moving decode off the request attacks 22%, and rewriting the web framework attacks 6%. People consistently propose the third.
+
+<Tip>
+**Instrument the stages, not just the total.** Six `time.perf_counter()` calls and a histogram
+per stage turn "the service is slow" into "inference is 56%". Week 24 Module 5 exports these as
+Prometheus histograms; even without that, having the breakdown in your logs at debug level is
+worth an afternoon.
+</Tip>
+
+### Micro-batching: the latency/throughput frontier
+
+Measured, 4 workers, `OMP_NUM_THREADS=1`, offered load held at 90% of each configuration's capacity:
+
+| `max_batch` | `max_wait_ms` | RPS | p50 | p99 | Mean batch size |
+| --- | --- | --- | --- | --- | --- |
+| 1 (off) | — | 97 | 41 ms | 61 ms | 1.0 |
+| 4 | 5 | 131 | 49 ms | 78 ms | 3.1 |
+| 8 | 5 | 156 | 58 ms | 94 ms | 5.4 |
+| 8 | 20 | 162 | 74 ms | 131 ms | 7.2 |
+| 32 | 20 | 178 | 121 ms | 214 ms | 14.8 |
+| 32 | 50 | 181 | 196 ms | 341 ms | 24.1 |
+
+Two structural facts:
+
+- **`max_wait` sets a floor on p50 at low load.** At 20 rps with `max_wait=20ms`, batches never fill, so every request waits the full 20 ms for nothing. Measured: p50 goes from 24 ms (no batching) to 44 ms. **Batching is a load-dependent optimization** and should ideally be adaptive — many production servers disable it below a threshold.
+- **Mean batch size never reaches `max_batch`.** At `max_batch=32, max_wait=20ms` the mean is 14.8, because arrivals are Poisson-distributed and the window closes on the timer more often than on the count. Sizing your GPU memory for `max_batch` and your throughput for the *mean* is the correct way round.
+
+This is the same mechanism as TensorFlow Serving's dynamic batching (Week 24 Module 4) and as vLLM's continuous batching (Week 26). The difference in continuous batching is that requests can *join and leave a running batch* between token steps, which removes the head-of-line blocking that limits the table above — but the underlying trade is identical.
+
+### Memory per worker, and why it bites in containers
+
+```
+process RSS, 1 worker, idle after warm-up : 312 MB
+  ├─ Python interpreter + imports          :  84 MB
+  ├─ onnxruntime shared library            :  61 MB
+  ├─ model weights (44.7 MB ONNX)          :  45 MB
+  ├─ ORT memory arena (post warm-up)       :  98 MB
+  └─ opencv, numpy, fastapi                :  24 MB
+
+4 workers                                  : 1,248 MB
+```
+
+**Measured peak under load at 97 rps: 1,412 MB across four workers.** With a container memory limit of 1,024 MB the fourth worker is OOM-killed under load, the service silently drops to three workers and 73 rps, and the only signal is an `OOMKilled` in the pod's event history that nobody is looking at. Week 24 Module 3 makes this a first-class concern.
+
+Two mitigations worth knowing:
+
+- **ONNX Runtime's arena grows and does not shrink.** `arena_extend_strategy=kSameAsRequested` (instead of the default `kNextPowerOfTwo`) reduced peak arena from 98 MB to 61 MB per worker at a 3% latency cost. Worth it when memory-limited, not otherwise.
+- **`--preload` under gunicorn** loads the app before forking, so the model's pages are shared copy-on-write between workers. Measured: 4 workers went from 1,248 MB to **687 MB** RSS total. The catch is that the ORT session is not fork-safe in all configurations — verify predictions match after forking before relying on it.
+
+### Production failure modes
+
+<AccordionGroup>
+<Accordion title="async def wrapping a blocking model call">
+**Signature:** throughput flat regardless of concurrency; latency grows linearly with offered load from the very first step; CPU utilization stuck near 1 core per worker. **Cause:** the event loop is blocked, so exactly one request is in flight per worker. **Detection:** compare RPS at concurrency 1 and 8 — if they are the same, the loop is blocked. **Fix:** `def` handler, or `await loop.run_in_executor(...)`.
+</Accordion>
+<Accordion title="Readiness probe checking a shared dependency">
+**Signature:** a brief dependency outage becomes a total service outage lasting minutes longer than the dependency was down. **Cause:** every replica fails readiness simultaneously; Kubernetes empties the endpoint list. **Detection:** read your probe. If it makes a network call, that is the bug. **Fix:** readiness checks process-local state only. Week 24 Module 2 has the full treatment.
+</Accordion>
+<Accordion title="Thread oversubscription across three layers">
+**Signature:** p99 5–8× p50; CPU at 100% with poor throughput; adding workers makes it worse. **Cause:** `workers × threadpool × OMP_NUM_THREADS` far exceeding the CPU limit — and in a container the limit is the cgroup quota, not the host's core count, which most libraries do not detect. **Detection:** `ps -eLf | wc -l` in the container versus your CPU limit. **Fix:** `ENV OMP_NUM_THREADS=1` in the Dockerfile and workers matched to the CPU limit.
+</Accordion>
+<Accordion title="Worker OOM-killed under load, service silently degrades">
+**Signature:** throughput drops by a fraction matching one worker, no error logs from the application. **Cause:** `workers × per-worker RSS` exceeds the container limit under load. **Detection:** `dmesg` or the pod's event history; the process just vanishes. **Fix:** size the limit as `workers × measured_peak_RSS × 1.3`, or use `--preload` to share the model's pages.
+</Accordion>
+<Accordion title="No warm-up, so every new pod serves a slow burst">
+**Signature:** latency spikes correlated with deploys and with autoscaling events. **Cause:** the first inference is 214 ms against 23 ms steady state, and a new pod is marked ready immediately. **Detection:** plot p99 against pod age. **Fix:** warm-up in the lifespan handler *before* setting the ready flag, so the pod does not receive traffic until it is warm.
+</Accordion>
+<Accordion title="NaN sailing through numeric validation">
+**Signature:** a NaN prediction, or a confidence of NaN serialized as `null` in JSON. **Cause:** `float("nan")` satisfies both `ge` and `le` because every comparison with NaN is false. **Detection:** an explicit `v != v` check. **Fix:** the validator in Layer 2. JSON has no NaN literal, so the failure often surfaces downstream as a parse error in a client, far from the cause.
+</Accordion>
+</AccordionGroup>
+
+### Papers and specs
+
+- **Dean &amp; Barroso (2013), "The Tail at Scale," CACM 56(2).** *Takeaway:* in a service where one user request fans out to many backends, the p99 of the components becomes the p50 of the user experience — which is why tail latency, not average latency, is the number that matters, and why techniques like hedged requests and micro-partitioning exist.
+- **Crankshaw et al. (2017), "Clipper: A Low-Latency Online Prediction Serving System," NSDI.** *Takeaway:* adaptive batching that sizes each batch to a latency SLO, plus per-model caching and containerized model isolation, is the right architecture for prediction serving — the micro-batcher in Layer 2 is a simplified Clipper.
+- **Olston et al. (2017), "TensorFlow-Serving: Flexible, High-Performance ML Serving," NeurIPS ML Systems Workshop.** *Takeaway:* dynamic batching with a timeout window plus versioned model loading and atomic version switching; the design Week 24 Module 4 deploys and benchmarks.
+- **Fielding &amp; Reschke (2014), [RFC 7231 §6](https://www.rfc-editor.org/rfc/rfc7231#section-6).** *Takeaway:* the HTTP status codes have specific meanings that clients and infrastructure act on — 503 means retry, 500 means broken, 422 means do not resend unchanged — and using them correctly is what makes retry logic and load balancers behave.
+- **Google SRE Book, Chapter 4, "Service Level Objectives."** *Takeaway:* choose a small number of indicators that reflect user experience (latency, error rate, throughput, saturation), set targets from what users actually need rather than from what the system currently does, and use the error budget to arbitrate between reliability and feature work. Week 24 Module 5 applies this properly; the load-test curve in this module is where the latency SLI comes from.
+
+### Stretch challenge
+
+**Load-test the service, produce the RPS-versus-p99 curve, find the bottleneck, fix it, and re-measure.**
+
+Part one: reproduce the curve. Ramp offered load in at least seven steps through and past saturation, 60 s per step, discarding the first 15 s of each. Plot achieved RPS and p99 against offered RPS on the same axes. **Mark the knee.** Use `constant_throughput` so you are ramping rate, not concurrency — with a concurrency ramp you will not see the queue build and you will not find the knee.
+
+Part two: instrument the stages and produce the breakdown table. Six timers. Then pick the largest stage and attack it: quantize the model, or move decode off the request path, or add batching. **Re-measure the full curve** and report both.
+
+Part three, the open one: **decide what your service's SLO should be, and what capacity you should provision.**
+
+The curve gives you capacity at a given p99. The SLO question is harder and there is no formula. Consider: what does the caller do when a request is slow — does a human wait, or is this a batch pipeline? What is the cost of a timeout versus the cost of an extra instance? What headroom do you need for the traffic pattern's peak-to-mean ratio, which you should measure rather than assume? And what happens during a deploy, when you temporarily have fewer replicas (Week 24 Module 2)?
+
+Write the SLO as a sentence with two numbers ("99% of `/v1/predict` requests complete in under X ms, measured over a 30-day window"), state the provisioned capacity that supports it, and justify the headroom factor. Then compute the error budget: at 99%, you get 7.2 hours of "slow" per month. Is that the right number? Arguing about that, with the curve in front of you, is the exercise — and it is the conversation that most engineering teams never have explicitly.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Load-test the service. Produce an RPS-versus-p99 curve. Find the bottleneck, fix it, and re-measure.
+</Card>
+
+<Steps>
+<Step title="Build the naive version and measure it (20 min)">
+Model loaded inside the handler. Run the load test. You should get something near 2.3 rps and a p99 over a second. Keep the number — it is the baseline that makes everything after it meaningful.
+</Step>
+<Step title="Move the load to lifespan and re-measure (15 min)">
+One change. Expect roughly 43 rps with a single worker. Note that p99 got *worse* relative to p50 — that is the event loop, and it's the next step.
+</Step>
+<Step title="Fix the handler and the threads (25 min)">
+`def` instead of `async def`, `OMP_NUM_THREADS=1` set before the import, `--workers 4`. Expect about 97 rps at p99 61 ms. Try the wrong combinations too — 4 workers with `OMP_NUM_THREADS=4` should be visibly worse.
+</Step>
+<Step title="Add warm-up and prove it matters (15 min)">
+Time the first three inferences after load. Then remove the warm-up, restart, and send one request. You should see roughly 214 ms versus 23 ms.
+</Step>
+<Step title="Produce the full curve (45 min)">
+Seven load steps through saturation, 60 s each. Plot achieved RPS and p99 against offered RPS. Mark the knee. Note where errors start and how far past the knee that is.
+</Step>
+<Step title="Instrument the stages (30 min)">
+Six timers around parse, decode, preprocess, inference, postprocess, serialize. Produce the breakdown table. Confirm inference dominates.
+</Step>
+<Step title="Attack the biggest stage and re-measure (40 min)">
+Quantize to int8 (Week 22 Module 5), or add the micro-batcher, or both. Re-run the full curve. Report the before and after on one chart.
+</Step>
+<Step title="Write the SLO (15 min)">
+One sentence with two numbers, the provisioned capacity that supports it, and the headroom factor you chose. Put it in the README.
+</Step>
+</Steps>
+
+## The whiteboard
+
+The T2 build-up is the five-rung ladder, one rung at a time, with the RPS number and the specific mistake written in as each is revealed. The health-check inset comes last. The point of drawing it as a ladder is that each rung is a *different* misconception, not a refinement of the previous one.
+
+<Tip>
+**Draw it yourself.** Five rungs with their RPS numbers and the mistake at each, plus the
+`/healthz` versus `/ready` inset with the crossed-out dependency check. If you can write in the
+mistake for each rung you will not ship any of them — and the readiness-probe one has caused
+more total outage minutes than the rest combined.
+[Blank version](/assets/diagrams/p3-w23-m2-blank.svg) · [Editable source](/assets/diagrams/p3-w23-m2.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Took a model endpoint from 2.3 to 156 requests/second on 4 vCPU — 68× — through five measured changes: loading at startup, a sync handler, `OMP_NUM_THREADS=1` with worker-per-core, warm-up, and micro-batching; produced the RPS-versus-p99 curve and identified the saturation knee at 97 rps."
+
+**The interview question this earns you.** "How would you serve a model?" gets a shallow answer from most candidates. Yours: "Load once at startup with a warm-up, because the first inference is 214 ms against 23 ms steady. Sync handler, because inference is blocking CPU work and an `async def` around it stops the event loop. One compute thread per worker and workers equal to the CPU limit, because three layers of concurrency multiply and oversubscription took p99 from 61 to 340 ms. Then micro-batching if the latency budget allows — 61% more throughput for 54% more p99, which is a trade rather than an upgrade."
+
+The load-test curve is also the best answer to "how do you know it's fast enough?" — you show the knee.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Read your team's readiness probes today.** If any of them makes a network call to a shared dependency, you have a correlated failure built into the system: one dependency blip takes down every replica at once. The fix is deleting code.
+
+**2. Check `workers × OMP_NUM_THREADS` against your container's CPU limit.** Both default to "all cores" and nobody multiplies them. In a container, libraries typically see the host's core count rather than the cgroup quota, so the mismatch is usually much worse than it looks.
+
+**3. Get an RPS-versus-p99 curve for one service and put it in the README.** Most teams cannot answer "what is our capacity?" with a number. Producing the curve takes an afternoon and it changes every subsequent capacity conversation from an argument into arithmetic.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| ~2 rps and p99 over a second | Model loaded inside the handler | Load once in the `lifespan` handler |
+| Throughput flat as concurrency rises | `async def` wrapping a blocking model call — the event loop is stalled | Use `def`, or `run_in_executor` |
+| p99 5–8× p50 under load | Thread oversubscription across workers, threadpool and OMP | `OMP_NUM_THREADS=1` before import; workers = CPU limit |
+| Latency spikes on every deploy and scale-up | No warm-up; new pods serve cold | 3 dummy inferences in `lifespan` before setting ready |
+| Brief dependency blip becomes a multi-minute total outage | Readiness probe checks a shared dependency | Readiness checks process-local state only |
+| Throughput silently drops by a quarter | One worker OOM-killed; no application log | Size the memory limit as `workers × peak RSS × 1.3`, or `--preload` |
+| NaN prediction from a validated request | NaN passes `ge`/`le` because all NaN comparisons are false | Explicit `v != v` validator |
+| Client sends a typo'd field and gets a wrong prediction | Pydantic silently drops unknown fields by default | `model_config = ConfigDict(extra="forbid")` |
+| Batching made p50 worse and throughput no better | Low traffic: batches never fill, so every request waits `max_wait` for nothing | Disable batching below a traffic threshold, or make it adaptive |
+| Errors only start far past saturation | Past the knee the failure mode is latency, not errors | Alert on latency and saturation, not error rate alone |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [FastAPI — Concurrency and `async` / `await`](https://fastapi.tiangolo.com/async/) — read the "path operation functions" section, which states exactly when `def` runs in a thread pool. It is the authoritative answer to the module's most consequential decision.
+- [FastAPI — Lifespan events](https://fastapi.tiangolo.com/advanced/events/) — read this for the `asynccontextmanager` pattern; the older `@app.on_event("startup")` is deprecated.
+- [Pydantic 2.9 — Model config](https://docs.pydantic.dev/2.9/api/config/) — read `extra` and `strict`. The default `extra="ignore"` is the one that silently drops typo'd fields.
+- [Uvicorn — Deployment](https://www.uvicorn.org/deployment/) — read the section on workers and on running behind a process manager; it explains why `--workers` and gunicorn's forking differ in how environment variables reach the runtime.
+- [ONNX Runtime — Performance tuning](https://onnxruntime.ai/docs/performance/tune-performance/) — read the threading and the memory-arena sections; `arena_extend_strategy` is the knob behind the memory numbers in Layer 3.
+
+**Papers**
+
+- [Dean &amp; Barroso (2013)](https://doi.org/10.1145/2408776.2408794) — *component p99 becomes user-facing p50 when a request fans out; tail latency is the number that matters.*
+- [Crankshaw et al. (2017)](https://arxiv.org/abs/1612.03079) — *adaptive batching sized to a latency SLO, with model isolation; the architecture the micro-batcher simplifies.*
+- [Olston et al. (2017)](https://arxiv.org/abs/1712.06139) — *dynamic batching with a timeout window and atomic model version switching; deployed and benchmarked in Week 24 Module 4.*
+- [Google SRE Book, Ch. 4](https://sre.google/sre-book/service-level-objectives/) — *pick a few user-facing indicators, set targets from user need, and spend the error budget deliberately.*
+- [RFC 7231 §6](https://www.rfc-editor.org/rfc/rfc7231) — *status codes are instructions to clients and infrastructure; 503, 500 and 422 produce different retry behaviour.*
+
+**Go deeper**
+
+- Google SRE Book, [Chapter 4 "Service Level Objectives"](https://sre.google/sre-book/service-level-objectives/) — read this before writing your SLO in the stretch challenge. The distinction between SLI, SLO and SLA, and the error-budget framing, is the vocabulary the rest of Phase 3 uses.
+- Brendan Gregg, ["The USE Method"](https://www.brendangregg.com/usemethod.html) — read this for utilization, saturation and errors as a systematic checklist for any resource. The RPS-versus-p99 knee is saturation, made visible.
+- [`py-spy`](https://github.com/benfred/py-spy) — read the README and then run `py-spy top --pid <worker>` against your service under load. It samples a running process without modifying it, which means you can profile production, and it is the tool that produced the stage breakdown in Layer 3.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-23/p3-w23-m2">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

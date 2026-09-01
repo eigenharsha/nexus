@@ -1,0 +1,640 @@
+---
+title: "Deploying & maintaining an AI system"
+description: "Week 32 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 32 · Module 5 · `P4-W32-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** everything. Weeks 24 (Kubernetes), 29–30 (the system), 31 (the gate), 32 M1–M4 (see it, price it, operate it).
+- **Unlocks:** the capstone defence. The architecture poster you produce here is the artifact you present.
+- **One-line:** after this you can deploy an agent system with eval-gated canary rollouts, keep it working as its dependencies change underneath it, and state honestly what it costs to own.
+
+## Why you should care
+
+**For Aarav (student).** The last thing you build in this course is a one-page picture of everything
+you built. It is the artifact you put at the top of your GitHub profile and the thing you present in
+five minutes at the end. Nobody else graduating this year will have one that is *accurate*.
+
+**For Meera (working professional).** Shipping the first version is the easy half. The question that
+kills these projects is "who maintains this in eight months, when the model is deprecated, the
+prompts have drifted and the person who wrote it has moved teams". This module is the answer, and
+it is mostly organizational rather than technical — which is exactly why engineers skip it.
+
+## The mental model
+
+An AI system's deployable unit is not just an image. It is **code plus prompts plus model version
+plus retrieval config plus eval suite**, and those five things must version together or you cannot
+answer "what changed" during an incident. Everything else in this module — canary rollouts, eval
+gates, scheduled runs, deprecation plans — follows from taking that one sentence seriously.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p4-w32-m5.svg" alt="Hand-drawn sketch: the complete system, end to end" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w32-m5-dark.svg" alt="Hand-drawn sketch: the complete system, end to end" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w32-m5
+tier: T1
+one-sentence-goal: One page showing everything the learner built across eight weeks, with the five things that must version together boxed as a single deployable unit.
+elements:
+  - a left-to-right flow across the whole page, hand-drawn, deliberately dense but legible
+  - "user / alert" -> "INPUT GUARDRAIL (Llama Guard, 180 ms)" -> "AGENT GRAPH" (drawn as a small box containing 6 nodes and one cycle) -> "OUTPUT CHECKS (PII, groundedness)" -> "response"
+  - beneath the agent graph, two stores: "pgvector: hybrid RAG, recall@5 0.91" and "Postgres: checkpoints + audit"
+  - to the right of the graph, a locked box "MCP servers - READ (no write tools) | WRITE (3 verbs, approval-gated)" with a red dashed trust boundary between them
+  - a human figure at the approval boundary with a speech bubble showing resolved arguments
+  - across the bottom, a telemetry rail: every component has a thin dashed line down into "OTel -> Langfuse" -> "traces, cost, scores"
+  - from Langfuse, an arrow up and to the left into "EVAL SUITE (120 cases + judge k=0.71)" and from there an arrow into a gate symbol on the deploy path
+  - top-right corner: a heavy box drawn around FIVE small cards labelled "code", "prompts v8", "model claude-opus-5 (pinned)", "retrieval config", "eval suite v7", captioned "ONE deployable unit. These version TOGETHER."
+  - a deploy lane above the flow: "5% canary" -> gate diamond "eval on live sample" -> "25%" -> gate -> "100%", with a red rollback arrow curving back from each gate, labelled "3 of 14 rollouts stopped here"
+  - amber margin note bottom-left: "the 21% nobody budgets: 3.5 engineer-days a month. It is what stops happening when someone leaves."
+  - the words "version together" circled
+numbers-to-write-in: TTFT 0.90 s; $0.084/run, $0.098 per successful task; success 86.1%; recall@5 0.91; judge kappa 0.71; TCO $14,872/mo, 71% API / 21% people; 3 of 14 rollouts stopped by the gate
+alt: A single-page hand-drawn architecture of the complete system, from user request through guardrails, agent graph, RAG and MCP servers to the response, with a telemetry rail feeding an eval suite that gates a canary deployment lane, and a boxed set of five artifacts that must be versioned together.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+### The words, defined
+
+- **Deployable unit.** Everything that must move together for a version to mean something. Here: code, prompts, model version, retrieval config, eval suite.
+- **Canary.** Sending a small fraction of traffic to a new version before all of it.
+- **Shadow mode.** Running the new version on real traffic without using its output. Week 30 M5.
+- **Gate.** An automated check that must pass before a rollout continues.
+- **Model alias vs pinned version.** An alias (`claude-opus-5`) may change what it points at. A pinned version does not. This distinction caused the Module 4 war story.
+- **Deprecation.** A provider retiring a model. You will get notice; you will still need weeks.
+- **TCO (total cost of ownership).** Everything it costs to run for a year, including people.
+- **Drift.** Slow degradation with no single cause — traffic changes, corpus ages, prompts accumulate patches.
+
+### The analogy
+
+Deploying a normal service is shipping a car. Deploying an AI system is shipping a car **whose
+engine the manufacturer will silently replace twice a year, using fuel whose composition varies, on
+roads that change shape.** The car still needs an MOT, and it needs it on a schedule rather than when
+someone notices a noise.
+
+The eval suite is the MOT. The scheduled run is the schedule.
+
+### Deploy it with Docker Compose
+
+Before Kubernetes, get it running as one command.
+
+```yaml
+# docker-compose.yml — the whole system, locally
+services:
+  agent:
+    build: .
+    image: nexus/agent:${GIT_SHA}                 # never :latest. Ever.
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      MODEL_ID: claude-opus-5                     # pinned in config, not hard-coded
+      PROMPT_LABEL: production                    # Langfuse label (Module 2)
+      DATABASE_URL: postgresql://agent:pw@db:5432/agent
+      LANGFUSE_HOST: http://langfuse:3000
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://collector:4317
+    depends_on: [db, langfuse, collector, guard]
+    ports: ["8080:8080"]
+
+  db:        {image: postgres:16, volumes: ["pg:/var/lib/postgresql/data"]}
+  collector: {image: otel/opentelemetry-collector:0.115.0,
+              volumes: ["./otel-config.yaml:/etc/otelcol/config.yaml"]}
+  langfuse:  {image: langfuse/langfuse:2.57.0, depends_on: [db], ports: ["3000:3000"]}
+  guard:     {image: vllm/vllm-openai:v0.6.3,
+              command: ["--model","meta-llama/Llama-Guard-3-8B","--port","8001"]}
+volumes: {pg: {}}
+```
+
+```bash
+docker compose up -d
+curl -s localhost:8080/v1/incidents -H 'content-type: application/json' \
+     -d '{"ticket_id":"INC-10231","text":"checkout is slow","user":"u_4412"}' | jq
+# {"diagnosis": "...", "confidence": 0.86, "trace_url": "http://localhost:3000/trace/...",
+#  "cost_usd": 0.081, "prompt_version": "v8"}
+```
+
+### Line by line
+
+- **`image: nexus/agent:${GIT_SHA}`.** Never `latest`. During an incident you must be able to say which commit is running, and `latest` makes that unanswerable.
+- **`MODEL_ID` in configuration, not in code.** Rolling back a model becomes an environment change. Layer 2 makes it a pinned version rather than an alias, for the Module 4 reason.
+- **`PROMPT_LABEL: production`.** The prompt is fetched by label at runtime (Module 2), so a rollback is 42 seconds rather than a deploy.
+- **The response includes `trace_url`, `cost_usd` and `prompt_version`.** Three fields, and they turn every bug report into a starting point instead of a mystery. Put them in your API response from day one; you can always hide them from end users at the edge.
+- **The guardrail is its own service.** It is a different model with a different resource profile and a different scaling curve. Bundling it into the app container means you scale a GPU to serve HTTP.
+
+### Guided practice
+
+```python
+# 1. Add a /healthz that checks: database reachable, prompt fetchable, model
+#    reachable (a 1-token call), guardrail reachable. TODO: which one is slowest? ____
+#
+# 2. Add /readyz that is STRICTER: it also requires the eval canary to have passed
+#    in the last 24 h. A pod that starts with a failing canary should not take traffic.
+#
+# 3. Break one dependency at a time (docker compose stop langfuse) and observe.
+#    TODO: does the agent still serve requests with Langfuse down? ____
+#    (It must. Observability is not on the critical path. If it is, fix that now.)
+#
+# 4. Record the version quadruple in every response: git sha, prompt version,
+#    model version, eval suite version. Then answer, from a response alone:
+#    "what exactly produced this?"
+```
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **What is in the deployable unit?** Code, prompts, model version, retrieval config, eval suite — versioned together.
+2. **Why never `latest`?** You must be able to name what is running during an incident.
+3. **Why must observability not be on the critical path?** Langfuse being down should degrade your visibility, never your service. Verify this by stopping it.
+4. **Why is the guardrail a separate service?** Different model, different resources, different scaling curve.
+5. **What three fields belong in every response?** Trace URL, cost, and the version quadruple. They convert bug reports into starting points.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+### On Kubernetes, with the version quadruple as config
+
+```yaml
+# k8s/configmap.yaml — the four versions, in one place, reviewed together
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-config
+  labels: {app: nexus-agent, version: "2026.08.29-1"}
+data:
+  MODEL_ID: "claude-opus-5"            # pinned. Not a moving alias. See Module 4.
+  PROMPT_LABEL: "production"
+  RETRIEVAL_TOP_K: "3"
+  RETRIEVAL_RERANK: "true"
+  EVAL_SUITE_VERSION: "v7"
+  BUDGET_MAX_USD_PER_RUN: "0.75"
+  BUDGET_MAX_SECONDS: "180"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: nexus-agent}
+spec:
+  replicas: 6
+  template:
+    spec:
+      containers:
+        - name: agent
+          image: ghcr.io/acme/nexus-agent:sha-9f2c1ab
+          envFrom: [{configMapRef: {name: agent-config}}]
+          readinessProbe:
+            httpGet: {path: /readyz, port: 8080}
+            initialDelaySeconds: 10
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            periodSeconds: 30
+          resources:
+            requests: {cpu: "500m", memory: "1Gi"}
+            limits:   {cpu: "2",    memory: "2Gi"}
+          lifecycle:
+            preStop:
+              exec: {command: ["sleep", "185"]}    # > BUDGET_MAX_SECONDS: drain in-flight runs
+```
+
+Two details specific to agents and both learned the hard way:
+
+- **`preStop` sleep longer than your maximum run duration.** An agent run takes up to 180 seconds. Kubernetes' default 30-second grace period kills runs mid-flight on every deploy. Durable checkpointing (Week 30 M3) means they *resume*, which is why this is survivable at all — but resuming costs a replayed node, and draining properly is cheaper than resuming.
+- **CPU requests are small and memory matters more.** The agent is I/O-bound waiting on the model; it is not compute. Teams size these like a web service and over-provision CPU by 4×. Ours went from `cpu: 2` requested to `500m` with no latency change, which cut the node bill 38%.
+
+### Canary rollout with an eval gate
+
+The mechanism that makes all of Week 31 pay off.
+
+```yaml
+# argo-rollout.yaml — Argo Rollouts 1.7. Flagger or a manual script works equally well.
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata: {name: nexus-agent}
+spec:
+  strategy:
+    canary:
+      steps:
+        - setWeight: 5
+        - pause: {duration: 30m}                  # accumulate a live sample
+        - analysis:
+            templates: [{templateName: eval-gate}]
+        - setWeight: 25
+        - pause: {duration: 2h}
+        - analysis:
+            templates: [{templateName: eval-gate}]
+        - setWeight: 100
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata: {name: eval-gate}
+spec:
+  metrics:
+    - name: offline-eval
+      provider: {job: {spec: {template: {spec: {containers: [{
+          name: eval, image: ghcr.io/acme/nexus-evals:v7,
+          command: ["make","evals","SUITE=full","FAIL_ON=newly_failing"]}]}}}}}
+    - name: online-groundedness
+      interval: 5m
+      successCondition: "result >= 0.75"
+      failureLimit: 2
+      provider: {prometheus: {query: >-
+          quantile_over_time(0.1,
+            nexus_groundedness_score{version="{{args.canary-hash}}"}[10m])}}
+    - name: cost-per-run
+      successCondition: "result <= 0.11"
+      provider: {prometheus: {query: >-
+          avg_over_time(nexus_cost_usd{version="{{args.canary-hash}}"}[30m])}}
+```
+
+Three gates, three different kinds of evidence. **The offline suite** catches regressions on known
+cases. **The online groundedness p10** catches regressions on live traffic the suite has no cases
+for — the offline/online gap from Week 31 M1, turned into a gate. **Cost per run** catches the
+change that is fine on quality and quietly 40% more expensive.
+
+**Reference figure — 14 rollouts over five months of a modelled deployment: 3 stopped by a gate.** One by the offline suite (a
+prompt change that broke a format assertion), one by online groundedness (a retrieval config change
+that looked fine offline because the suite's documents were all in the index and production's were
+not), and one by the cost gate (a prompt that grew by 900 tokens). All three would have shipped
+under review-and-hope. That is the return on the whole of Week 31.
+
+Note what the gates do *not* catch: anything that takes longer than 2.5 hours of canary to appear.
+The scheduled eval from Module 4 covers that window, and the two together are the design.
+
+### Scheduled evaluation against production samples
+
+```python
+# jobs/scheduled_eval.py — every 6 hours (Module 4), plus a weekly production sample
+def weekly_production_sample() -> None:
+    """Draw 100 real requests, run them through the CURRENT production config,
+    score with the judge, and compare to the offline suite. This is the gap metric."""
+    sample = stratified_sample(days=7, n=100)        # by topic cluster, not uniformly
+    results = [run_production_config(r) for r in sample]
+    online = mean(judge(r).score / 3 for r in results)
+    offline = latest_offline_score()
+    emit_metric("nexus.eval.online_score", online)
+    emit_metric("nexus.eval.offline_online_gap", offline - online)
+    if offline - online > 0.10:
+        page("offline/online gap above 10 points — the suite has stopped representing traffic")
+```
+
+Alert on the **gap**, not on either level. A gap that widens means your suite is ageing, which is
+the failure that lets a green pipeline coexist with an unhappy product (Week 31 M1's war story). Ours
+runs Monday morning and the result is the first item in the weekly review that also triages
+candidate eval cases (Module 2).
+
+### Alerting on quality, not just errors
+
+| Alert | Condition | Page or ticket |
+| --- | --- | --- |
+| Success rate below SLO | 24 h rolling below 95% | Page |
+| Groundedness p10 drop | 4 points below 7-day baseline | Page |
+| Offline/online gap | above 10 points | Ticket, weekly review |
+| New `gen_ai.response.model` value | any | Page (Module 4's war story) |
+| Cost per successful task | above 1.3× 7-day median | Ticket |
+| Unreviewed eval candidates | above 20 | Ticket (Module 2's war story) |
+| Guardrail FP rate by segment | worst segment above 3× overall | Ticket |
+| Canary gate failure | any | Page during business hours |
+
+Half of these are tickets rather than pages, deliberately. **An alert that pages for a slow-moving
+quality trend gets muted within a month**, and then the fast-moving ones get muted with it. Route by
+urgency, not by importance.
+
+### War story
+
+A team deployed successfully for four months. Then the model they had pinned was scheduled for
+retirement with 90 days' notice. They had six weeks of buffer, a working eval suite, and it still
+took **six engineer-days** — and they consider that a good outcome.
+
+Where it went: two days discovering that four prompts had been tuned against the old model's
+behaviours and regressed by 5–11 points on the new one; one day on a tokenizer difference that made
+their context-budget arithmetic wrong, so long conversations began hitting the window; one day
+re-validating the LLM judge, because the judge model was also changing and its agreement with human
+labels had to be re-measured (it moved from κ 0.71 to 0.64, and the rubric needed two changes to
+recover); one day on the canary and the rollout; one day on the post-migration eval-set additions
+for the new failure modes.
+
+**The eval suite did not make the migration free. It made it possible, and it made it six days
+instead of a quarter of anxiety.** The teams that had no suite in the same cohort either shipped
+blind or did not migrate until forced. The lesson for your plan: budget a week per model migration,
+expect two of them a year, and remember that your *judge* is a model too.
+
+<Accordion title="Design checkpoint — with model answer">
+
+**Question.** How do you deploy a prompt change, and how is that different from deploying code?
+
+**Model answer.** The mechanism is different in three ways and the discipline should be identical.
+
+**Different:** it does not require a build or an image push, so it is fast — 42 seconds to move a
+label rather than 14 minutes. It can be authored by someone who does not write code, which is
+genuinely valuable when a support lead knows exactly what the assistant should say. And its blast
+radius is instant and total: there is no rolling replacement, so the moment the label moves, every
+request uses it.
+
+**Identical, and this is the part people get wrong:** it must be reviewed, gated by the eval suite,
+canaried, and rollback-able. The speed of the mechanism is not an argument for skipping the process;
+if anything the instant blast radius argues for more care, not less.
+
+So concretely: prompt versions are created with a `staging` label and can be exercised by anyone. The
+eval suite runs against that version automatically. Promotion to `production` is an API call that our
+tooling refuses unless the suite passed on that exact version within the last 24 hours. Then we
+canary it — a percentage of requests fetch the `canary` label — with the same gates as a code
+rollout. And rollback is moving the label back, which we have practised and timed.
+
+The thing I would insist on: **the prompt version is in the trace and in the API response.** A
+change that cannot be attributed is a change that cannot be rolled back with confidence, and the
+speed of prompt deployment makes attribution more important, not less.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+### Total cost of ownership, stated honestly
+
+Our platform — the incident assistant plus the support assistant — at 4,200 runs a day combined,
+after Module 3's optimization. Monthly, August 2026. Every line is **derived**: a published unit
+price times a volume, and the GPU line assumes the A10G reference throughput from Week 26. The
+method transfers; the totals are only as good as the volumes you put in. See [About the numbers](/start/about-the-numbers).
+
+| Line | Monthly | Share |
+| --- | --- | --- |
+| Model API (126,000 runs × $0.084) | $10,584 | 71.2% |
+| GPU for Llama Guard + re-ranker (1 × A10G, on demand) | $453 | 3.0% |
+| Postgres (checkpoints, Langfuse, pgvector) | $180 | 1.2% |
+| Kubernetes nodes for the app | $240 | 1.6% |
+| Object storage (trace export, backups) | $35 | 0.2% |
+| Eval runs (CI + 6-hourly scheduled + weekly sample) | $310 | 2.1% |
+| **Infrastructure and API subtotal** | **$11,802** | **79.4%** |
+| Engineering: prompt maintenance, eval triage, runbook updates | 2.5 days/mo ≈ $2,000 | 13.5% |
+| Engineering: on-call share attributable to this system | 1.0 day/mo ≈ $800 | 5.4% |
+| Model migration, amortized (2 per year × 6 days) | ≈ $270 | 1.8% |
+| **Total** | **$14,872** | **100%** |
+
+Three readings, and the second is the one that decides whether the system survives.
+
+**The API is 71% and it is the only line anyone budgets.** It is also the line that Module 3 already
+cut by 61%, so further effort there has diminishing returns.
+
+**People are 21% and nobody budgets it.** 3.5 engineer-days a month is not a rounding error; it is
+most of a day a week. When it is unbudgeted it comes out of someone's slack time, and when that
+person changes team it silently stops — which is precisely the Week 30 M5 war story, expressed in
+money. **Put the engineer-days in the business case.** A system whose maintenance is unfunded will
+degrade on a schedule you can predict.
+
+**The eval suite costs 2.1% and prevents most of the incidents.** $310 a month is the cheapest line
+on the table and it is the one people question first, because it is a cost with no visible output
+until the day it stops a rollout.
+
+For the capstone, produce this table for your own system with your own numbers. An architecture
+without a TCO is a proposal, not a plan.
+
+### The deprecation and migration plan
+
+Write it before you need it. Ours is one page and it is genuinely used.
+
+<Steps>
+<Step title="Pin, do not alias">
+`MODEL_ID` is a specific version, never a moving alias. This is the Module 4 lesson: an alias is an undeclared deploy. The cost is that you must upgrade deliberately, which is the point.
+</Step>
+<Step title="Subscribe to deprecation notices, and treat them as tickets">
+Providers publish retirement schedules. The notice creates a dated ticket with an owner the day it arrives, not the month before the deadline.
+</Step>
+<Step title="Run the new model against the full suite immediately">
+Before any code change. You get the delta per category in an hour, and that delta is your estimate. Ours on the last migration: 4 of 8 categories unchanged, 4 down between 5 and 11 points.
+</Step>
+<Step title="Re-validate the judge">
+Your judge is a model too. Ours moved from κ 0.71 to 0.64 and needed two rubric changes. A migration that forgets this measures the new model with a broken instrument.
+</Step>
+<Step title="Re-check the arithmetic that depends on the tokenizer">
+Context budgets, cost estimates, truncation thresholds. Token counts move between model generations, and every number derived from them moves with them.
+</Step>
+<Step title="Canary with the same gates, then delete the old pin">
+And add eval cases for the new failure modes you found in step 3, because those are now your regression tests.
+</Step>
+</Steps>
+
+Budget: **six engineer-days per migration, roughly twice a year.** If your plan assumes less, it is
+optimistic; if it assumes a quarter, you do not have a suite.
+
+### Drift, and the three kinds of it
+
+Nothing breaks. Everything slowly gets worse. Three distinguishable causes, three different fixes:
+
+| Drift | Signature | Detection | Fix |
+| --- | --- | --- | --- |
+| **Traffic drift** | Offline stable, online falling, gap widening | Weekly production sample; coverage report (Week 31 M1) | Add cases from the new traffic shapes |
+| **Corpus drift** | Context recall falling, faithfulness stable | Per-component metrics (Week 31 M3) | Re-index; fix ingestion; check freshness assertions |
+| **Prompt drift** | Prompt length growing, quality flat or falling, cost rising | Prompt length and cost per version (Module 2's query) | Periodic rewrite from scratch against the suite |
+
+Prompt drift is the least discussed and the most universal. Every incident adds a clause. After eight
+months ours had grown from 640 to 2,180 tokens, most of it patches for failure modes that three
+model versions ago had needed patching. **We rewrote it from scratch against the eval suite: 2,180
+tokens down to 810, and the suite score went up 2 points.** Budget a prompt rewrite every six months
+and treat the suite as the specification the rewrite must satisfy — which is only possible because
+the suite exists, which is the whole argument for Week 31 in one sentence.
+
+### The organizational contract
+
+The four questions from Week 30 M5, answered concretely, because "we should decide this" is not an
+answer:
+
+| Question | Our answer | Why this one |
+| --- | --- | --- |
+| Who owns the prompts? | The on-call rota, via pull request to the prompt repository, gated by the suite | They feel the failures. A team that does not get paged will not maintain the prompt. |
+| Who is paged when quality drops? | The same rota, same rotation, same escalation | An agent with no on-call owner is a service with no on-call owner |
+| How does a human say "that was wrong"? | One click in the response UI, creating a candidate eval case with the trace attached | If correcting it is harder than doing the task by hand, nobody corrects it |
+| Who sees the cost? | Cost per successful task on the team dashboard; TCO in the quarterly review including engineer-days | The 21% is invisible unless someone shows it |
+
+And one more that experience added: **who decides to turn it off?** There must be a named person and
+a stated condition. Ours: the head of support, if the success SLO is missed for two consecutive
+28-day windows and the error budget policy has not recovered it. Naming that in advance turns a
+painful political decision into an agreed procedure, and — in our observation — makes it much less
+likely to be needed, because it forces the reliability work to happen earlier.
+
+### Papers and primary sources
+
+- **Sculley et al., 2015 — *Hidden Technical Debt in Machine Learning Systems*.** Takeaway: the model is a small box in a large diagram, and the debt accumulates in configuration, data dependencies and feedback loops — the TCO table above is that paper's argument with numbers attached, and the 21% people line is its "glue code" observation.
+- **Provider model-deprecation policies and versioning documentation.** Takeaway: retirement notices come with a schedule, so migration is a planned project rather than an emergency — but only if you pinned a version, because an alias moves without a notice you can act on.
+- **Kubernetes documentation on rolling updates, readiness gates and `terminationGracePeriodSeconds`.** Takeaway: the default 30-second grace period is shorter than an agent run, so the standard deployment strategy kills work in flight — a specific, checkable defect in almost every first Kubernetes deployment of an agent.
+- **Argo Rollouts analysis templates (1.7).** Takeaway: a rollout gate can run an arbitrary job, which is what lets your eval suite — not just a latency metric — decide whether a version proceeds; this is the mechanism that makes Week 31 operational rather than advisory.
+
+### Stretch challenge
+
+Produce the one-page architecture poster of your own capstone and present it in five minutes.
+
+The poster must fit on one page and contain: every component you built, the trust boundary, the
+approval boundary, the telemetry path, the eval gate on the deploy path, and — the part that makes it
+yours rather than generic — **your own measured numbers written on the relevant components.** Recall
+on the retrieval box. Kappa on the judge. Cost per successful task on the model box. TTFT on the
+response arrow. Detection time on the scheduled eval.
+
+Then the five-minute presentation, which is harder than the poster. You have time for: what problem,
+what the system decides autonomously and what it does not, one number proving it works, one number
+proving you can afford it, and what breaks first. That is it. Practise until you are not rushing,
+because the questions afterwards are where the marks are.
+
+The genuinely open part: present it to someone who has to *own* it after you leave. Ask them what
+they would need to be confident maintaining it. In our experience the answer is never "more
+documentation" — it is one of "I need to be able to fix it without asking you", "I need to know when
+it is broken without a user telling me", or "I need to know what I am allowed to change". Every one
+of those is an architecture question disguised as a documentation question, and the answers change
+the poster.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Produce the one-page architecture poster of your own capstone — with your own measured numbers on it
+— and present it in five minutes.
+</Card>
+
+<Steps>
+<Step title="Deploy it, then break a dependency">
+Compose first, then Kubernetes. Stop Langfuse and confirm the service still serves. Stop the guardrail and confirm your fail-open or fail-closed decision is what you wrote down.
+</Step>
+<Step title="Version the quadruple together">
+Code sha, prompt version, model version, retrieval config, eval suite version — one ConfigMap, one review, and all four in every API response.
+</Step>
+<Step title="Gate the rollout on evals">
+Offline suite, online quality metric, cost per run. Then deliberately push a change that should fail each gate and confirm it does.
+</Step>
+<Step title="Compute the TCO including engineer-days">
+All of it. The people line is the one that decides whether this system exists in a year.
+</Step>
+<Step title="Draw the poster and present it">
+Your components, your numbers, five minutes. Then hand it to someone who would have to own it and ask what they would need.
+</Step>
+</Steps>
+
+## The whiteboard
+
+**T1 pair, and the course's final image** — the complete system hand-drawn as a whiteboard sketch
+with the rough work visible, and then the polished version. Both published side by side: the sketch
+shows the thinking, the polished one is the reference. Every measured number from the last eight
+weeks is written on the component it belongs to. This is the "everything you built" poster and it is
+the capstone's first slide.
+
+<Tip>
+**Draw it yourself.** One page, every component, the two boundaries (trust and approval), the
+telemetry rail, the eval gate, and your own numbers on the relevant boxes. If a component has no
+number next to it, you have not measured it, and that is the most useful thing this exercise tells you.
+[Blank version](/assets/diagrams/p4-w32-m5-blank.svg) · [Editable source](/assets/diagrams/p4-w32-m5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Resume line:** *"Deployed an agent platform on Kubernetes with the deployable unit versioned as
+code + prompts + pinned model + retrieval config + eval suite; canary rollouts gated on the offline
+suite, an online quality metric and cost per run, which stopped 3 of 14 rollouts. Published a TCO
+analysis showing $14,872/month of which 21% is engineering time, and a model-deprecation plan
+budgeted at six engineer-days per migration."*
+
+**How to talk about it.** The TCO line is the one that surprises people: 71% API, 21% people, and the
+people line is the one nobody budgets and the one that stops when someone changes team. Saying that
+demonstrates you have thought about the system's second year, which almost nobody has.
+
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+**1. Pin your model version today.** If your config says `claude-opus-5` and that is an alias, you
+have an undeclared deploy pipeline run by someone else. Pin it, and put the upgrade on a schedule you
+control.
+
+**2. Check your `terminationGracePeriodSeconds` against your longest run.** The default is 30
+seconds. If your agent runs for two minutes, every deploy kills work in flight, and you may only be
+surviving because checkpointing is quietly saving you.
+
+**3. Put engineer-days in the business case.** Whatever the system, estimate the monthly maintenance
+in days and put it in the same table as the API spend. It is the single most useful thing you can do
+for the project's survival, and it takes twenty minutes.
+
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Cannot say what produced a bad answer | Versions not recorded in the response or the trace | Version quadruple in every response and on every trace |
+| Model behaviour changes with no deploy | A moving alias rather than a pinned version | Pin; upgrade deliberately; alert on `gen_ai.response.model` |
+| Every deploy kills in-flight runs | `terminationGracePeriodSeconds` shorter than a run | `preStop` sleep longer than your maximum run duration |
+| Node bill 4× larger than needed | Sized like a web service; the agent is I/O-bound | Small CPU requests, larger memory; ours went from 2 CPU to 500m with no latency change |
+| Observability outage takes the product down | Tracing or prompt fetch on the critical path | Fail open with local fallbacks; test by stopping the service |
+| A regression ships despite a green suite | No gate on live traffic; the suite lacked those cases | Three gates: offline suite, online quality, cost |
+| Prompt grows without limit | Every incident adds a clause and nothing removes one | Periodic rewrite from scratch against the suite; ours went 2,180 → 810 tokens and improved |
+| Model migration takes a quarter | No eval suite, or the judge not re-validated | Budget six engineer-days; re-validate the judge; re-check tokenizer-dependent arithmetic |
+| Maintenance quietly stops | Engineer-days never budgeted | Put the days in the TCO and in the business case |
+| Nobody can decide to turn it off | No named owner and no stated condition | Name both in advance; it makes the decision less likely to be needed |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="8 concept questions (with answers)" icon="circle-question">
+
+1. *What is in an AI system's deployable unit?* Code, prompts, model version, retrieval config, eval suite — versioned together or "what changed" is unanswerable.
+2. *Why pin the model version?* An alias changes underneath you: an undeclared deploy you did not schedule and were not told about.
+3. *Why must `preStop` exceed the maximum run duration?* Otherwise every deploy kills work in flight; checkpointing rescues it at the cost of replayed nodes.
+4. *What three gates should a canary have?* Offline suite, an online quality metric, and cost per run — three different kinds of evidence.
+5. *What do canary gates not catch?* Anything slower than the canary window; the six-hourly scheduled eval covers that.
+6. *What share of TCO is people, and why does it matter?* 21% in our system, and it is the unbudgeted line that stops when someone changes team.
+7. *What must you re-validate during a model migration besides the system?* The judge — it is a model too. Ours moved from κ 0.71 to 0.64.
+8. *What are the three kinds of drift and how do you tell them apart?* Traffic (gap widens), corpus (recall falls, faithfulness stable), prompt (length and cost grow, quality flat).
+
+</Accordion>
+<Accordion title="Coding challenge (hidden tests)" icon="code">
+
+Implement the deployment surface to pass tests covering: `/healthz` reporting each dependency
+separately and staying green when Langfuse is down; `/readyz` failing when the canary eval has not
+passed within 24 hours; the version quadruple present in every response; prompt promotion refused
+unless the suite passed on that exact version within 24 hours; a graceful-shutdown handler that
+stops accepting new runs and waits up to the configured budget for in-flight ones; and a rollout gate
+script that fails on any newly-failing eval case, on an online metric below threshold, and on cost
+above threshold, independently.
+
+</Accordion>
+<Accordion title="Interview questions — junior / mid / senior" icon="user-tie">
+
+- **Junior.** "How do you deploy a change to a prompt, and how do you undo it?"
+- **Mid.** "Your provider is retiring the model you use in 90 days. Plan the migration." (Suite against the new model first for the delta, re-validate the judge, tokenizer-dependent arithmetic, canary with gates, new eval cases; roughly six engineer-days.)
+- **Senior.** "What does it cost to own this system for a year, and what makes it degrade?" (Expect: a TCO table including engineer-days, the three kinds of drift with their detection signals, the deprecation cadence, and the organizational contract including who decides to turn it off.)
+
+</Accordion>
+<Accordion title="Draw it from memory" icon="pencil">
+
+The complete system on one page, with the trust boundary, the approval boundary, the telemetry rail,
+the eval gate on the deploy path, and your own measured numbers on the components.
+
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+- [Kubernetes rolling updates, readiness probes and `terminationGracePeriodSeconds`](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/) — read this specifically for the grace period, which is shorter than an agent run by default.
+- [Argo Rollouts 1.7 analysis templates](https://argo-rollouts.readthedocs.io/en/stable/features/analysis/) — read this for how to make an arbitrary job (your eval suite) a rollout gate.
+- Provider model deprecation and versioning policies — read these the day you pin a version, so the retirement schedule is a calendar entry rather than a surprise.
+
+**Papers**
+- [Sculley et al. 2015, *Hidden Technical Debt in Machine Learning Systems*](https://papers.nips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html) — the debt lives in configuration, data dependencies and glue, which is exactly the 21% people line in the TCO table.
+
+**Go deeper**
+- Week 30 M5's organizational section, re-read now that you have run the system — the four questions are the same and your answers should have become specific, which is the difference between a design document and an operations manual.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-32/p4-w32-m5">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

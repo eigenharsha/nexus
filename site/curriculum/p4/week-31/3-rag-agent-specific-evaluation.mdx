@@ -1,0 +1,619 @@
+---
+title: "RAG & agent-specific evaluation"
+description: "Week 31 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 31 · Module 3 · `P4-W31-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Modules 1–2 (the suite and a validated judge), Weeks 27–28 (chunking, embeddings, hybrid retrieval, re-ranking), Week 30 (the graph whose nodes you are about to attribute failures to).
+- **Unlocks:** Week 32 M2 (per-component scores on production traces), the capstone's measured-retrieval requirement.
+- **One-line:** after this you can take a failing multi-step system and say *which component* caused the failure, with a number, instead of guessing at the prompt.
+
+## Why you should care
+
+**For Aarav (student).** "End to end it is 78%" is where most projects stop. "End to end it is 78%;
+retrieval recall@5 is 0.91, context precision 0.62, faithfulness 0.88 — so the bottleneck is that
+we retrieve five documents of which three are noise" is a diagnosis. The second sentence is a
+fifteen-minute measurement and it is the difference between tinkering and engineering.
+
+**For Meera (working professional).** When quality drops, the meeting will be about the prompt,
+because the prompt is the thing everyone can see. Per-component metrics are how you say "retrieval
+recall fell from 0.91 to 0.74 when we changed the chunker on Tuesday" and end the meeting in four
+minutes. Attribution is the whole value here.
+
+## The mental model
+
+A RAG or agent failure is a **chain of components**, and end-to-end score is their product. Measure
+only the product and you can never tell which factor moved. So instrument each stage separately —
+*did we retrieve the right thing, was the retrieved set clean, did the answer stick to it, did the
+answer address the question* — and you convert a mystery into a diagnosis.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p4-w31-m3.svg" alt="Hand-drawn sketch: which component failed?" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w31-m3-dark.svg" alt="Hand-drawn sketch: which component failed?" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w31-m3
+tier: T2
+one-sentence-goal: Turn "the answer was wrong" into a decision tree that lands on exactly one component, each branch carrying the metric that decides it.
+elements:
+  - a hand-drawn decision tree, root at the top: a box "the answer was wrong"
+  - first question diamond: "was the right document retrieved at all?" with the metric written beside it "context RECALL"
+  - no branch -> red leaf "RETRIEVAL. Look at: chunking, embedding model, hybrid weights, k"
+  - yes branch -> second diamond: "was most of what we retrieved relevant?" metric "context PRECISION"
+  - no branch -> amber leaf "RE-RANKING / k too high. The signal is there, buried in noise."
+  - yes branch -> third diamond: "is every claim in the answer supported by the context?" metric "FAITHFULNESS"
+  - no branch -> red leaf "GENERATION - hallucination. Prompt, or model."
+  - yes branch -> fourth diamond: "does the answer address the question asked?" metric "ANSWER RELEVANCY"
+  - no branch -> amber leaf "the model answered a different question. Usually query transformation."
+  - yes branch -> green leaf "the answer is right. If a human disagreed, your acceptance criterion is wrong."
+  - to the right, a separate small sketch: a chain of 5 node boxes with node 1 circled in red and node 3 marked with a big red X, an arrow from 1 to 3 labelled "step 3 failed BECAUSE of step 1" and an amber note "end-state evaluation blames node 3. Trajectory evaluation finds node 1."
+  - amber margin note: "9% of our SUCCESSFUL runs had a wrong trajectory. Right by luck. They regress 3x more often."
+  - the words "context precision" circled
+numbers-to-write-in: end-to-end 78%; recall@5 0.91; precision 0.62; faithfulness 0.88; relevancy 0.84; attribution 5/5 vs 1/5
+alt: A hand-drawn diagnostic decision tree for a wrong RAG answer, with four questions each labelled by the metric that answers it and each no-branch naming the responsible component, plus a side sketch showing a five-node agent trajectory where a late failure is caused by an early node.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+### The words, defined
+
+- **RAG.** Retrieval-Augmented Generation: find relevant documents, put them in the prompt, answer from them. Weeks 27 and 28.
+- **Context.** The documents you retrieved and put in the prompt. The model's evidence.
+- **Grounded / faithful.** Every claim in the answer is supported by the context. The opposite is a **hallucination** — a claim that is not in the evidence, whether or not it happens to be true.
+- **Context recall.** Of the information needed to answer, how much did retrieval actually find? Measures the retriever's completeness.
+- **Context precision.** Of what retrieval returned, how much was relevant? Measures noise.
+- **Answer relevancy.** Does the answer address the question that was asked, or a nearby one?
+- **Trajectory.** The path an agent took — which tools, in what order. Distinct from the final answer.
+- **End-state evaluation.** Scoring only the final answer.
+- **Trajectory evaluation.** Scoring the path. Both are needed, for the reason in Layer 3.
+
+### The analogy
+
+A student gets a question wrong. There are four different problems and four different fixes.
+They never found the right chapter (**recall**). They found it, buried in forty pages of irrelevant
+material, and could not see it (**precision**). They read the right page and then wrote something the
+page does not say (**faithfulness**). Or they wrote something true and well-supported that answers a
+different question (**relevancy**).
+
+"You got it wrong, try harder" helps with none of these. Knowing which one it is tells you exactly
+what to change.
+
+### Detect an answer that is not in the sources
+
+The cheapest useful groundedness check is fifteen lines and needs no judge.
+
+```python
+# grounded.py — split the answer into claims, check each against the context
+import re, anthropic
+client = anthropic.Anthropic()
+
+def split_claims(answer: str) -> list[str]:
+    """One sentence, one claim. Crude, and good enough to start."""
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", answer) if len(s.strip()) > 20]
+
+CHECK = ("Does the CONTEXT support the CLAIM? Answer exactly one word: "
+         "SUPPORTED if the context states or directly implies it; "
+         "UNSUPPORTED if the context does not, even if the claim is true in general.")
+
+def is_supported(claim: str, context: str) -> bool:
+    r = client.messages.create(
+        model="claude-haiku-4-5", max_tokens=10, system=CHECK,
+        messages=[{"role": "user",
+                   "content": f"CONTEXT:\n{context}\n\nCLAIM:\n{claim}"}])
+    return "SUPPORTED" in "".join(b.text for b in r.content if b.type == "text").upper()
+
+def faithfulness(answer: str, context: str) -> tuple[float, list[str]]:
+    claims = split_claims(answer)
+    if not claims:
+        return 1.0, []
+    bad = [c for c in claims if not is_supported(c, context)]
+    return 1 - len(bad) / len(claims), bad
+```
+
+Run it on an answer you already believe:
+
+```
+faithfulness = 0.80
+unsupported:
+  - "This typically resolves within 15 minutes once the pool is resized."
+```
+
+That sentence is true, helpful, and nowhere in the retrieved runbook. The model added it from
+general knowledge. Depending on your product that is fine or it is a compliance incident — but you
+should know it is happening, and until you ran this you did not.
+
+### Line by line
+
+- **One sentence, one claim** is crude. Sentences with two claims are scored as one, and a sentence that is half-supported counts as unsupported. Fine for a first pass; Layer 2 does it properly.
+- **`claude-haiku-4-5` for the check.** This is the narrow, mechanical criterion from Module 2, where the cheap model measured κ 0.69 against the strong model's 0.74. Ten output tokens per claim, so a 6-claim answer costs about $0.0004.
+- **"even if the claim is true in general"** is the load-bearing phrase. Without it the checker scores world knowledge as supported, and faithfulness becomes meaningless — this is the most common way people accidentally build a groundedness metric that measures nothing.
+- **Return the unsupported claims, not just the score.** The list is what you act on; the number is what you plot.
+- **A score of 1.0 with zero claims is a bug**, not a pass. An empty or evasive answer should not score perfectly on faithfulness; pair it with answer relevancy, which will be near zero.
+
+### Guided practice
+
+```python
+# 1. Run faithfulness over 20 of your own answers. TODO: mean score ____
+#    Read every unsupported claim. Categorise them: world knowledge, invented
+#    specifics, over-generalisation, or a genuine checker error.
+#
+# 2. Break retrieval on purpose: pass the WRONG document as context and re-run.
+#    Faithfulness should collapse. TODO: did it? ____
+#    If it stayed high, your checker is scoring world knowledge as supported.
+#
+# 3. The complementary failure: write an answer that quotes the context perfectly
+#    and does not answer the question. Faithfulness = 1.0.
+#    This is why you need answer relevancy too. Never report faithfulness alone.
+```
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **What is the difference between "wrong" and "unfaithful"?** Unfaithful means not supported by the context — a claim can be true and unfaithful, and that is still a defect in a RAG system.
+2. **Why must the checker be told "even if true in general"?** Otherwise it scores world knowledge as supported and the metric measures nothing.
+3. **Why is faithfulness alone insufficient?** An answer that quotes the context and ignores the question scores 1.0. Pair it with relevancy.
+4. **What does context recall measure, and what does precision measure?** Recall: did we find what we needed. Precision: how much of what we found was relevant.
+5. **Why report the unsupported claims, not just the score?** The list is actionable; the score is only trackable.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+### The four RAG metrics, implemented
+
+RAGAS formalized these. Implement them yourself once — they are short, and understanding what each
+one can and cannot see is the point.
+
+```python
+# evals/rag_metrics.py — ragas==0.2.10 has these; this is what they do
+from dataclasses import dataclass
+
+@dataclass
+class RagCase:
+    question: str
+    contexts: list[str]              # what retrieval returned, in rank order
+    answer: str
+    ground_truth: str | None = None  # a reference answer, if you have one
+    required_facts: list[str] | None = None   # cheaper than a full reference
+
+def context_recall(case: RagCase) -> float:
+    """Of the facts needed to answer, what fraction appear in the retrieved context?
+    Needs ground truth. This is the RETRIEVER's score and nothing else's."""
+    facts = case.required_facts or decompose(case.ground_truth)
+    joined = "\n".join(case.contexts)
+    return sum(is_supported(f, joined) for f in facts) / len(facts)
+
+def context_precision(case: RagCase) -> float:
+    """Rank-weighted: of the retrieved chunks, how many are relevant, and are the
+    relevant ones near the top? Mean of precision@k over the ranks of relevant hits."""
+    rel = [is_relevant(c, case.question) for c in case.contexts]
+    if not any(rel):
+        return 0.0
+    hits, total = 0, 0.0
+    for k, r in enumerate(rel, start=1):
+        if r:
+            hits += 1
+            total += hits / k
+    return total / hits
+
+def faithfulness(case: RagCase) -> float:
+    """Of the claims in the answer, what fraction are supported by the context?
+    This is the GENERATOR's score. Retrieval quality does not affect it."""
+    claims = decompose(case.answer)
+    joined = "\n".join(case.contexts)
+    return sum(is_supported(c, joined) for c in claims) / max(len(claims), 1)
+
+def answer_relevancy(case: RagCase, n: int = 3) -> float:
+    """Generate n questions the answer would be a good answer TO, then measure
+    their similarity to the real question. Catches answers that address something else."""
+    qs = generate_questions_for(case.answer, n)
+    return sum(cosine(embed(q), embed(case.question)) for q in qs) / n
+```
+
+The property that makes this set worth the effort: **each metric isolates one component.**
+
+| Metric | Scores | Unaffected by |
+| --- | --- | --- |
+| Context recall | Chunking, embedding model, hybrid weights, `k` | The generator entirely |
+| Context precision | Re-ranking, `k`, chunk size | The generator entirely |
+| Faithfulness | The generation prompt and model | Whether retrieval found the right thing |
+| Answer relevancy | Query understanding, generation prompt | Retrieval quality |
+
+So a table of four numbers over time tells you which subsystem moved. That is the deliverable.
+
+### Our measured baseline
+
+Week-28 hybrid RAG over the runbook corpus, 120 labelled cases, judge validated at κ 0.71
+(Module 2), mechanical criteria on `claude-haiku-4-5`:
+
+| Metric | Score | Reading |
+| --- | --- | --- |
+| End-to-end acceptance | 0.78 | The number people quote |
+| Context recall@5 | **0.91** | Retrieval finds it. Not the bottleneck. |
+| Context precision@5 | **0.62** | Of 5 retrieved chunks, roughly 2 are noise |
+| Faithfulness | 0.88 | 12% of claims unsupported |
+| Answer relevancy | 0.84 | Some answers drift off the question |
+
+The diagnosis takes ten seconds once you have the table: **retrieval finds the answer and buries it**.
+The fix is not the prompt and not the embedding model — it is `k` and re-ranking. We dropped `k` from
+5 to 3 after re-ranking; precision went 0.62 to 0.81, faithfulness 0.88 to 0.93 (fewer distractor
+chunks to hallucinate from), end-to-end 0.78 to 0.86. Prompt untouched.
+
+### Trajectory evaluation
+
+For an agent, the answer is not the only thing that can be wrong. A run can reach the right answer
+by a route you would never sanction.
+
+```python
+# evals/trajectory.py
+from dataclasses import dataclass
+
+@dataclass
+class Trajectory:
+    node_trail: list[str]
+    tool_calls: list[tuple[str, dict]]
+    evidence_ids: list[str]
+
+def tool_call_correctness(traj: Trajectory, expected: set[str]) -> float:
+    """Of the tools that should have been called, how many were? (recall over tools)"""
+    called = {name for name, _ in traj.tool_calls}
+    return len(called & expected) / len(expected) if expected else 1.0
+
+def trajectory_precision(traj: Trajectory, expected: set[str]) -> float:
+    """How much of what it did was necessary? Catches expensive wandering."""
+    called = {name for name, _ in traj.tool_calls}
+    return len(called & expected) / len(called) if called else 0.0
+
+def forbidden_tools_used(traj: Trajectory, forbidden: set[str]) -> list[str]:
+    """A SAFETY property. Must be empty. Non-negotiable, regardless of the answer."""
+    return [n for n, _ in traj.tool_calls if n in forbidden]
+
+def evidence_actually_used(traj: Trajectory, answer: str) -> float:
+    """Did the answer cite what the agent fetched, or answer despite it?"""
+    cited = extract_citations(answer)
+    return len(set(cited) & set(traj.evidence_ids)) / max(len(cited), 1)
+```
+
+**`forbidden_tools_used` is an assertion, not a metric.** It belongs in tier one of Module 1's
+pyramid, it is free, and it should fail the build. Everything else here is a graded score.
+
+### Trade-offs
+
+| Decision | Choose A | Choose B |
+| --- | --- | --- |
+| **Full reference answers (A) vs required-facts lists (B)** | You have a canonical answer and the domain tolerates one — FAQ, policy lookup. Enables exact-match and recall directly. | Almost always. `required_facts` is a list of three to six things a correct answer must contain; it is far cheaper to author, more robust to rewording, and it is what makes context recall computable at all. |
+| **End-state only (A) vs end-state + trajectory (B)** | A one-shot RAG pipeline with no agency. There is no trajectory to evaluate. | Any agent. Layer 3 has the number: 9% of our *successful* runs had a wrong trajectory, and those regressed three times more often on the next change. |
+| **Judge for `is_supported` (A) vs string containment (B)** | Default. Paraphrase is normal; containment misses it and under-reports faithfulness by ~14 points on our data. | As a free pre-filter: exact containment means supported, skip the judge call. This cut our judge calls 41% at identical scores. |
+| **Per-case metrics (A) vs corpus aggregate (B)** | Both, but store per-case. The aggregate is for the dashboard; the per-case values are what you sort by to find the twelve worst cases. | Never aggregate-only. A mean of 0.88 with a bimodal distribution is two different systems. |
+
+### War story
+
+A team's RAG quality dropped from 84% to 71% over a weekend. Nothing shipped on Friday. Three days
+of investigation focused on the prompt and the model, because those were the visible parts, and the
+model provider had in fact released an update that week — which made it the obvious culprit and
+absorbed two of the three days.
+
+The per-component metrics, computed after the fact, made it obvious in one table: **context recall
+had fallen from 0.90 to 0.61 while faithfulness was unchanged at 0.89.** The generator was fine; it
+was faithfully answering from documents that no longer contained the answer. The cause was a
+document-ingestion job that had silently started failing on Friday evening, so ~8% of the corpus was
+stale and the newest runbooks were missing entirely.
+
+The fix took twenty minutes. The three days were spent because the only instrument was one
+end-to-end number. **Component metrics are not for improving quality; they are for locating a
+regression in minutes rather than days**, and that is a different and much larger benefit.
+
+<Accordion title="Design checkpoint — with model answer">
+
+**Question.** Your RAG system scores faithfulness 0.94 and end-to-end acceptance 0.61. What is
+happening and what do you measure next?
+
+**Model answer.** High faithfulness with low acceptance means the system is answering *faithfully
+from the wrong material*, or answering faithfully and irrelevantly. Faithfulness is only a
+constraint relative to the context — it says nothing about whether the context was right.
+
+Next measurement, in this order. **Context recall**, which needs ground truth or a required-facts
+list; if it is low, the answer was never retrievable and everything downstream is irrelevant. Then
+**answer relevancy**; a faithful answer to a different question scores 0.94 faithfulness and fails
+acceptance, and this is common when query transformation is over-eager. Then **context precision**;
+if recall is high and precision is low, the answer is present but buried, and reducing `k` or adding
+a re-ranker usually recovers most of it.
+
+There is a fourth possibility people miss and I would check it early because it is cheap: the
+acceptance criteria themselves. If a human is rejecting answers that are correct, retrievable and
+relevant, then the criterion is measuring something the metrics do not — usually format or tone.
+Read ten rejected cases before running anything. In our own case that was the answer twice out of
+the five times we have run this diagnosis.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+### Attribution: the experiment that proves the suite works
+
+An eval suite that cannot locate a fault is a smoke alarm with no address. Test it the way you test
+any detector: plant known faults and see whether it finds them.
+
+We planted five, one at a time, in the Week-30 system, and asked: does the suite attribute this to
+the right component?
+
+| Planted fault | End-to-end | Which metric moved | Attributed correctly? |
+| --- | --- | --- | --- |
+| Chunk size 512 → 2,048 (splits mid-procedure) | 0.78 → 0.66 | context recall 0.91 → 0.72 | **Yes** — retrieval |
+| Re-ranker disabled | 0.78 → 0.70 | context precision 0.62 → 0.38 | **Yes** — ranking |
+| Generation prompt loses "answer only from the context" | 0.78 → 0.69 | faithfulness 0.88 → 0.61 | **Yes** — generation |
+| Query rewriter over-expands the query | 0.78 → 0.71 | answer relevancy 0.84 → 0.59, recall unchanged | **Yes** — query understanding |
+| Tool returns stale data (a 3-day-old cache) | 0.78 → 0.64 | **all four unchanged** | **No** — see below |
+
+**Four of five attributed correctly. One did not, and that one is the interesting row.** Stale tool
+data is invisible to every RAG metric: retrieval found the right document, the context was clean,
+the answer was faithful to it, and it addressed the question. The answer was simply out of date. No
+metric that compares the answer to the context can see this, because the context itself is wrong.
+
+The detector we added for it is not a RAG metric at all — it is a **freshness assertion** on tool
+results: every evidence item carries the timestamp of the data it came from, and a case fails if the
+answer relies on evidence older than the case's staleness tolerance. Four lines, tier one of the
+pyramid. The general lesson: **the metrics evaluate the pipeline relative to its inputs; you need
+separate checks on whether the inputs are true.**
+
+With end-to-end score alone, we correctly identified the cause of **1 of the 5** planted faults —
+and that one was the prompt change, which we guessed because a prompt change is what people guess.
+
+### End-state versus trajectory, and why you need both
+
+Over 400 agent runs, hand-labelled on both the final answer and the trajectory:
+
+| | Trajectory correct | Trajectory wrong |
+| --- | --- | --- |
+| **Answer correct** | 289 (72.3%) | **35 (8.8%)** |
+| **Answer wrong** | 21 (5.3%) | 55 (13.8%) |
+
+Two off-diagonal cells, two different lessons.
+
+**35 runs (8.8%) were right by luck** — the agent skipped a check, guessed, and happened to be
+correct. End-state evaluation scores these as successes and they are landmines. We followed them
+through the next model change: of those 35, **11 (31%) failed after the change**, against 9.7% of
+the correctly-reached successes. **A right-by-luck run is roughly three times more likely to regress**,
+which is the empirical argument for trajectory evaluation and the reason a rising end-state score
+with a falling trajectory score is a warning, not a win.
+
+**21 runs (5.3%) did everything right and produced a wrong answer.** These are the highest-value
+cases in the whole suite: the process is sound and the failure is localized to the final generation
+step. In our set, 17 of the 21 were the same thing — the correct evidence retrieved, and a
+conclusion that did not follow from it — which became a single prompt fix worth 4 points end-to-end.
+
+### When step 3 fails because of step 1
+
+The hardest attribution problem in multi-step systems. The agent triages a ticket as P3, therefore
+gathers only logs and not metrics, therefore diagnoses from incomplete evidence at step 5. Every
+node after step 1 behaved correctly *given its inputs*. Blaming node 5 is wrong and is exactly what
+end-state evaluation does.
+
+The technique that works is **counterfactual replay**, and durable checkpointing (Week 30 M3) is
+what makes it cheap:
+
+```python
+# evals/attribute.py — replay from each checkpoint with that node's output corrected
+def first_divergent_node(thread_id: str, gold: dict) -> str | None:
+    """Walk the checkpoint history; at each node, substitute the gold output and
+    replay forward. The EARLIEST node whose correction fixes the run is the cause."""
+    history = list(app.get_state_history({"configurable": {"thread_id": thread_id}}))
+    for snap in reversed(history):                      # earliest first
+        node = snap.next[0] if snap.next else None
+        if node is None or node not in gold:
+            continue
+        app.update_state(snap.config, gold[node], as_node=node)
+        result = app.invoke(None, snap.config)
+        if accepted(result):
+            return node                                  # correcting HERE fixed it
+    return None
+```
+
+Cost: one replay per node, so a 7-node graph is up to 7 partial re-runs — about $0.42 and 90 seconds
+per failing case at our sizes. You do not run this on every case. You run it on the twelve worst
+cases each week, and it is how we discovered that 6 of 12 failures in one week originated at
+**triage**, three nodes upstream of where they surfaced. Nobody had suspected triage; the errors all
+*appeared* in diagnosis.
+
+The cheap approximation, for when you cannot afford replay: log each node's confidence and each
+node's inputs, and flag the earliest node whose confidence is below its historical p10. It agreed
+with counterfactual replay on 68% of cases in our comparison — not good enough to trust alone, good
+enough to rank the queue.
+
+### Metric pathologies worth knowing
+
+Every one of these has bitten us:
+
+- **Faithfulness rewards saying nothing.** An answer of "I cannot determine this from the provided context" is perfectly faithful. Always report relevancy alongside, and track refusal rate as its own number — ours crept from 3% to 11% after a faithfulness-focused prompt change, and the eval score improved while the product got worse.
+- **Context precision punishes correct retrieval of related material.** If your re-ranker returns the right chunk plus two genuinely useful neighbours, precision falls and quality rises. Precision is a diagnostic, not an objective.
+- **Answer relevancy via generated-question similarity is noisy** — ours had a run-to-run standard deviation of 0.04 on the same data, so a 0.03 movement means nothing. Run it three times or do not report small changes.
+- **Aggregates hide bimodality.** Our faithfulness mean of 0.88 was 71% of cases at 1.0 and 21% below 0.5. There is no case at 0.88. Plot the histogram; the mean is for the dashboard, the histogram is for understanding.
+
+### Papers and primary sources
+
+- **Es et al., 2023 — *RAGAS: Automated Evaluation of Retrieval Augmented Generation*.** Takeaway: decomposing RAG quality into faithfulness, answer relevance and context relevance gives reference-free metrics that isolate components — the isolation is the point, and it is what makes a regression attributable.
+- **Saad-Falcon et al., 2024 — *ARES: An Automated Evaluation Framework for RAG Systems*.** Takeaway: lightweight judges fine-tuned on synthetic data plus prediction-powered inference give confidence intervals on RAG metrics — a reminder that these scores are estimates with error bars, which almost nobody reports.
+- **TruLens documentation (the "RAG triad").** Takeaway: context relevance, groundedness and answer relevance form a closed diagnostic set — if all three are high and the user is unhappy, the problem is your acceptance criteria, which is a genuinely useful terminating condition.
+- **LangSmith evaluation documentation on trajectory evaluators.** Takeaway: agent correctness has to be scored on the path as well as the destination, because a right answer reached by the wrong route is a latent regression — which our 3× figure quantifies.
+
+### Stretch challenge
+
+Plant five faults of your own and prove your suite attributes each to the right component.
+
+Choose faults across the whole pipeline: one in ingestion (a document type that silently fails to
+parse), one in chunking, one in retrieval configuration, one in the generation prompt, and one that
+is *not visible to any RAG metric* — stale data, a wrong unit, a tool returning a different currency.
+For each, record: end-to-end delta, which metrics moved and by how much, and whether the suite named
+the right component without your knowing the answer in advance. Get someone else to plant them if
+you can; knowing the fault contaminates the diagnosis badly.
+
+Then the open part. The fifth fault is the interesting one, because it exposes the boundary of this
+whole family of metrics: everything here evaluates the answer *relative to the context*, and nothing
+evaluates whether the context is true. What would? Cross-source agreement (does an independent
+source say the same thing) is the obvious candidate and it is expensive and often unavailable.
+Freshness assertions are cheap and catch only staleness. Design a check that would have caught a
+tool returning a plausible wrong number, state what it costs, and be honest about what it still
+misses.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Plant five different failure causes in your Week-30 system and verify your eval suite attributes each
+to the right component. The deliverable is the attribution table, including the fault it failed to
+catch.
+</Card>
+
+<Steps>
+<Step title="Get the baseline table">
+Four RAG metrics plus end-to-end, on at least 100 cases, with per-case values stored, not just means.
+</Step>
+<Step title="Add required-facts lists">
+Three to six facts a correct answer must contain, per case. Cheaper to write than references and it is what makes context recall computable.
+</Step>
+<Step title="Add trajectory scoring">
+Tool-call correctness, trajectory precision, and a forbidden-tools assertion that fails the build.
+</Step>
+<Step title="Plant faults and diagnose blind">
+Have someone else plant them if possible. Record which metric moved for each.
+</Step>
+<Step title="Find the one you cannot see">
+Include a fault invisible to all four RAG metrics. Then design the check that catches it and add it to tier one.
+</Step>
+</Steps>
+
+## The whiteboard
+
+**T2** — the "which component failed?" decision tree, revealed one question at a time, each branch
+labelled with the metric that decides it. **T1** — a per-component score dashboard mock with the
+four metrics as sparklines over eight weeks, and the week where context recall drops circled in red.
+
+<Tip>
+**Draw it yourself.** The four-question tree with the metric on each branch, and the side sketch of a
+five-node trajectory where node 3's failure is caused by node 1.
+[Blank version](/assets/diagrams/p4-w31-m3-blank.svg) · [Editable source](/assets/diagrams/p4-w31-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Resume line:** *"Instrumented a RAG agent with per-component metrics (context recall 0.91,
+precision 0.62, faithfulness 0.88, answer relevancy 0.84 against 0.78 end-to-end); diagnosed the
+bottleneck as retrieval noise rather than generation and reached 0.86 end-to-end by cutting k from 5
+to 3 after re-ranking, with no prompt change. Validated the suite by planting five faults: 5 of 5
+attributed correctly against 1 of 5 using end-to-end score alone."*
+
+**How to talk about it.** Lead with the fault-planting experiment — it is unusual, it demonstrates
+you tested your instrument rather than trusting it, and it gives you the honest story about the
+fifth fault, the one no RAG metric can see. That honesty is what makes the rest credible.
+
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+**1. Compute the four metrics on your existing RAG system this week.** It is a day's work and it
+almost always shows the bottleneck is not where the team believes. Ours was precision; every team we
+have shown this to assumed it was the prompt.
+
+**2. Add the freshness assertion.** Every piece of evidence carries the timestamp of the data it came
+from, and answers relying on stale evidence fail. Four lines, tier one, and it catches the failure
+class that is invisible to everything else.
+
+**3. Start scoring trajectories on your worst twelve cases weekly.** You do not need full
+counterfactual replay to begin — tool-call correctness and a forbidden-tools assertion are free, and
+the forbidden-tools check is a safety property that should have been there anyway.
+
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Faithfulness high, users unhappy | Faithful to the wrong context, or answering a different question | Report recall, precision and relevancy alongside; never faithfulness alone |
+| Faithfulness improves, product worsens | Refusal rate rising — "I cannot determine that" is perfectly faithful | Track refusal rate as its own metric next to faithfulness |
+| Groundedness checker passes world knowledge | Prompt does not say "even if true in general" | Add the clause; then break retrieval deliberately and confirm the score collapses |
+| Three days spent on the prompt for a retrieval bug | Only one end-to-end number | Per-component metrics; the war story's table took ten seconds to read |
+| Mean of 0.88 with no case near 0.88 | Bimodal distribution hidden by the aggregate | Plot the histogram; store per-case values |
+| A 0.03 change in answer relevancy reported as an improvement | Metric noise (σ ≈ 0.04 run to run) | Three runs; report the spread |
+| Agent scores well, regresses on the next model change | Right-by-luck runs counted as successes | Trajectory evaluation; those runs regress ~3× more often |
+| Regression cannot be attributed at all | Fault is invisible to RAG metrics (stale or wrong tool data) | Freshness assertions and input validation — separate from the pipeline metrics |
+| Attribution blames the last node | Errors originate upstream and surface late | Counterfactual replay from checkpoints on your worst twelve cases |
+| Precision fell and quality rose | Precision punishes retrieving useful neighbours | Treat precision as a diagnostic, never as an objective |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="8 concept questions (with answers)" icon="circle-question">
+
+1. *A claim is true but not in the context. Faithful?* No. Faithfulness is relative to the evidence, and this is a defect in a RAG system.
+2. *Recall 0.91, precision 0.62 — what do you change?* `k` and re-ranking. The answer is being found and buried; the generator is not the problem.
+3. *Faithfulness 0.94, acceptance 0.61 — diagnose.* Faithful to the wrong context, or faithfully answering a different question. Check recall, then relevancy, then the acceptance criteria themselves.
+4. *Why is faithfulness alone a dangerous objective?* Refusing to answer scores 1.0.
+5. *What fraction of successful runs had a wrong trajectory, and why does it matter?* 8.8%, and they regressed 3× more often on the next change.
+6. *What kind of fault is invisible to all four RAG metrics?* One where the context itself is wrong — stale data, a bad unit, a tool returning a plausible wrong number.
+7. *How do you attribute a late failure to an early node?* Counterfactual replay from checkpoints, correcting one node at a time; the earliest correction that fixes the run is the cause.
+8. *Why store per-case metric values?* To sort by them, find the worst twelve, and see bimodality that the mean conceals.
+
+</Accordion>
+<Accordion title="Coding challenge (hidden tests)" icon="code">
+
+Implement the four RAG metrics and the trajectory scorers to pass tests covering: `context_precision`
+matching hand-computed rank-weighted values on a fixed relevance vector; `faithfulness` returning 1.0
+for a fully-quoting answer and dropping proportionally as unsupported claims are added; a
+world-knowledge claim scored unsupported; `answer_relevancy` scoring a topically-adjacent answer
+below a direct one; `forbidden_tools_used` failing the run for a read-only case that calls a write
+tool; and the exact-containment pre-filter skipping the judge call without changing any score.
+
+</Accordion>
+<Accordion title="Interview questions — junior / mid / senior" icon="user-tie">
+
+- **Junior.** "The answer sounds right but is not in the sources. How would you detect that automatically?"
+- **Mid.** "RAG quality dropped 13 points over a weekend with no deploy. What do you measure, in what order?" (Per-component metrics; recall versus faithfulness separates ingestion from generation immediately.)
+- **Senior.** "Your agent gets the right answer 78% of the time. Why is that number insufficient, and what would you add?" (Expect: component decomposition, trajectory evaluation with the right-by-luck argument, counterfactual attribution, and the class of fault no answer-versus-context metric can see.)
+
+</Accordion>
+<Accordion title="Draw it from memory" icon="pencil">
+
+The four-question diagnostic tree with the metric on each branch and the responsible component on
+each leaf.
+
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+- [RAGAS 0.2.10 documentation](https://docs.ragas.io/) — read the metric definitions and then read the source; the implementations are short and knowing exactly what each prompt asks is the difference between using a metric and quoting one.
+- [LangSmith evaluation documentation, trajectory evaluators](https://docs.smith.langchain.com/) — read this for the vocabulary of scoring a path rather than a destination.
+- [LangGraph `get_state_history` and `update_state`](https://langchain-ai.github.io/langgraph/) — read this for the mechanics that make counterfactual replay cheap.
+
+**Papers**
+- [Es et al. 2023, *RAGAS*](https://arxiv.org/abs/2309.15217) — reference-free metrics that isolate retrieval from generation, which is what makes a regression attributable.
+- [Saad-Falcon et al. 2024, *ARES*](https://arxiv.org/abs/2311.09476) — RAG metrics are estimates and deserve confidence intervals, which almost nobody reports.
+
+**Go deeper**
+- [TruLens's "RAG triad" writing](https://www.trulens.org/) — read it for the closed diagnostic set and the terminating condition: if all three are high and users are unhappy, your acceptance criteria are what is wrong.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-31/p4-w31-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

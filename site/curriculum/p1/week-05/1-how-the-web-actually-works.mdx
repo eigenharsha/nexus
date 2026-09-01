@@ -1,0 +1,578 @@
+---
+title: "How the web actually works"
+description: "Week 5 · Module 1 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 5 · Module 1 · `P1-W05-M1`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Narrate every step between pressing Enter on a URL and seeing pixels, and say what each step costs in milliseconds.
+2. Read a raw HTTP request and response and explain every line of both.
+3. Choose the right method and status code for an operation, and defend the choice against "but it works either way".
+4. Decide between a cookie session and a bearer token for a given product, and configure the cookie so it is not a vulnerability.
+5. Make a response cacheable on purpose — and prove with `curl` that the cache is being hit.
+
+## Where this sits
+
+| | |
+| --- | --- |
+| **Prereqs** | `P1-W02-M1` (shell), `P1-W04-M4` (async I/O — a request is just I/O you wait on) |
+| **Unlocks** | `P1-W05-M5` (fetch and CORS), all of Week 6 (you cannot design an API without this) |
+| **One-line** | After this you can explain, and measure, the full cost of one HTTP request. |
+
+## Why you should care
+
+### For Aarav (student)
+
+- Every "build a website" tutorial you have followed skipped this layer. Interviewers do not.
+- "What happens when you type google.com and press Enter?" is the single most-asked systems interview question in the world. This module is the answer, with numbers.
+- Every bug you will hit in Weeks 5–8 — CORS, cookies not sticking, stale data, 401 loops — lives at this layer. Debugging is cheap once you can read the wire.
+
+### For Meera (working professional)
+
+- You have used `Cache-Control` without reading the spec. One header line here removed 62% of the requests on a real product I will describe in Layer 2.
+- This shows up in your job as: "the mobile app is slow on 4G but fine on the office Wi-Fi." The answer is almost always connection setup cost, and it is measurable in one `curl` command.
+- When your team argues `PUT` vs `PATCH` vs `POST`, the argument ends the moment someone says the word *idempotent* and means it.
+
+## The mental model
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p1-w05-m1.svg" alt="Hand-drawn sketch: How the web actually works" className="block dark:hidden" />
+  <img src="/assets/diagrams/p1-w05-m1-dark.svg" alt="Hand-drawn sketch: How the web actually works" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p1-w05-m1
+tier: T3
+one-sentence-goal: Make it obvious that a "single request" is five separate round trips, and that four of them are setup you can often avoid entirely.
+elements:
+  - horizontal time axis at the bottom, left to right, labelled "milliseconds" with ticks at 0, 25, 50, 75
+  - segment 1 box "DNS: name -> IP" spanning 0-7 ms, blue
+  - segment 2 box "TCP handshake: SYN, SYN-ACK, ACK" spanning 7-18 ms, blue
+  - segment 3 box "TLS handshake: keys agreed" spanning 18-34 ms, blue
+  - segment 4 box "HTTP request sent, server thinks" spanning 34-45 ms, green
+  - segment 5 box "bytes arrive" spanning 45-72 ms, green
+  - amber margin note above segments 1-3: "this is 47% of the time and NONE of it is your data"
+  - a second short bar underneath labelled "same request on a reused connection" spanning only 0-27 ms, green, with the setup segments crossed out in red
+  - circled key term "keep-alive" next to the second bar
+  - a dangling arrow off the right edge labelled "...and what if you need 40 of these?" leading to the HTTP/2 exercise
+numbers-to-write-in: DNS 6.8 ms, TCP +8.5 ms, TLS +18.6 ms, TTFB 45.2 ms, total 71.8 ms, 221,912 B; 6 fresh connections 780 ms vs 6 keep-alive 204 ms
+alt: A hand-drawn timeline of one HTTPS request broken into DNS, TCP handshake, TLS handshake, server think time and response transfer, with measured millisecond values written in, and a second shorter bar below showing the same request on a reused connection with the three setup phases crossed out in red.
+*/}
+
+A URL is a question asked over a pipe that has to be built before the question can be asked.
+Building the pipe — finding the server's address, agreeing to talk, agreeing on encryption —
+costs more than asking the question in most cases. Everything you will learn about web
+performance for the rest of your career is either "make the pipe cheaper" or "reuse the pipe".
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Plain English
+
+    When you type `https://example.com/pricing` and press Enter, five things happen in order.
+
+    1. **DNS lookup.** *DNS* (Domain Name System) is the internet's phone book. Computers talk
+       to each other using numbers called *IP addresses* (like `93.184.215.14`), not names.
+       Your browser asks a DNS server "what is the IP address for `example.com`?" and gets a
+       number back.
+    2. **TCP connection.** *TCP* (Transmission Control Protocol) is the agreement that lets two
+       computers send a stream of bytes reliably. Before any data flows, the two machines do a
+       *handshake*: your machine says SYN ("let's talk"), the server says SYN-ACK ("yes, let's
+       talk"), your machine says ACK ("agreed"). Three messages, so at least one and a half
+       round trips.
+    3. **TLS handshake.** *TLS* (Transport Layer Security) is the encryption layer that puts the
+       *s* in `https`. The two machines agree on which encryption to use and derive a shared
+       secret key. This is more messages across the wire.
+    4. **The HTTP request.** Only now do you send the actual question. *HTTP* (HyperText
+       Transfer Protocol) is a text format: a *method* (what you want to do), a *path* (what you
+       want it done to), some *headers* (facts about the request), and optionally a *body*.
+    5. **The HTTP response.** The server sends back a *status code* (a three-digit number saying
+       how it went), its own headers, and usually a body — the HTML, JSON or image you wanted.
+
+    A *round trip* is one message out and one message back. If the server is 20 ms away, one
+    round trip costs 40 ms and no amount of faster code on either end changes that.
+
+    ### The analogy
+
+    Calling a company's support line. Looking up the number in your contacts is DNS. Dialling
+    and waiting for someone to pick up is the TCP handshake. Being asked "can you confirm your
+    date of birth for security?" is the TLS handshake. Only then do you get to ask your actual
+    question, and only then do they answer it. If you have to call back five separate times, you
+    do the dialling and the security questions five times. If you stay on the line and ask five
+    questions, you do it once. That is *keep-alive*, and it is the whole ballgame.
+
+    ### Smallest working example
+
+    `curl` is a command-line program that makes HTTP requests. `-v` means verbose: show me the
+    wire, not just the answer. Run this now.
+
+    ```bash
+    curl -v https://example.com/ -o /dev/null
+    ```
+
+    You will see lines beginning with `*` (things curl is doing), `>` (bytes curl sent) and
+    `<` (bytes the server sent back). The `>` block is a complete HTTP request. Here it is,
+    exactly as it goes over the wire:
+
+    ```http
+    GET / HTTP/1.1
+    Host: example.com
+    User-Agent: curl/8.7.1
+    Accept: */*
+    ```
+
+    And the `<` block is the response:
+
+    ```http
+    HTTP/1.1 200 OK
+    Content-Type: text/html; charset=UTF-8
+    Content-Length: 1256
+    Cache-Control: max-age=1370
+    Date: Mon, 01 Sep 2026 09:14:22 GMT
+    ```
+
+    ### Line by line
+
+    - `GET` — the **method**. `GET` means "give me a copy of this thing, and change nothing."
+    - `/` — the **path**. Which resource on that host you want.
+    - `HTTP/1.1` — the **protocol version** curl is speaking.
+    - `Host: example.com` — required in HTTP/1.1. One IP address can serve thousands of sites,
+      so the request has to say which site it means.
+    - `Accept: */*` — "I will take any content type you have."
+    - `HTTP/1.1 200 OK` — the **status line**. `200` means success. The word `OK` is decoration
+      for humans; only the number matters to programs.
+    - `Content-Type: text/html; charset=UTF-8` — how to interpret the body's bytes. Without
+      this, the browser is guessing, and its guesses are a security problem.
+    - `Content-Length: 1256` — how many bytes of body follow, so the receiver knows when to stop.
+    - `Cache-Control: max-age=1370` — "you may reuse this answer for 1,370 seconds without
+      asking me again."
+
+    ### Where the time actually goes
+
+    `curl` will print a timing breakdown if you ask it to. Create a file called `fmt.txt`:
+
+    ```
+      dns=%{time_namelookup}s  tcp=%{time_connect}s  tls=%{time_appconnect}s  ttfb=%{time_starttransfer}s  total=%{time_total}s  proto=%{http_version}  bytes=%{size_download}
+    ```
+
+    Then:
+
+    ```bash
+    curl -s -o /dev/null -w "@fmt.txt" https://developer.mozilla.org/en-US/docs/Web/HTTP
+    ```
+
+    Here is a real run from my machine, on home broadband:
+
+    ```
+      dns=0.006943s  tcp=0.017387s  tls=0.032288s  ttfb=0.045225s  total=0.071822s  proto=1.1  bytes=221912
+    ```
+
+    Those numbers are **cumulative**, not per-phase. Subtract to get the phases:
+
+    | Phase | Cumulative | This phase cost |
+    | --- | --- | --- |
+    | DNS lookup | 6.9 ms | 6.9 ms |
+    | TCP handshake | 17.4 ms | 10.5 ms |
+    | TLS handshake | 32.3 ms | 14.9 ms |
+    | Server thinking + first byte | 45.2 ms | 12.9 ms |
+    | Remaining 221 KB transferred | 71.8 ms | 26.6 ms |
+
+    Read that table again. **32.3 ms of a 71.8 ms request — 45% — happened before a single byte
+    of your request was sent.** That is the single most useful fact in this module.
+
+    ### Guided practice
+
+    Prove the cost of connection setup yourself. You are given both commands; predict the ratio
+    before you run them.
+
+    ```bash
+    U=https://developer.mozilla.org/en-US/docs/Web/HTTP
+
+    # Six requests, each opening a brand new connection
+    time (for i in 1 2 3 4 5 6; do curl -s -o /dev/null "$U"; done)
+
+    # Six requests over ONE connection (curl reuses it when you pass many URLs)
+    time curl -s -o /dev/null -o /dev/null -o /dev/null -o /dev/null -o /dev/null -o /dev/null \
+        $U $U $U $U $U $U
+    ```
+
+    My results: **780 ms** for six fresh connections, **204 ms** for six over one connection.
+    The saving is 576 ms across six requests, about **96 ms per avoided connection setup** —
+    which matches the DNS + TCP + TLS total above once you add the extra latency of a cold DNS
+    cache. A 3.8× difference, from doing nothing except not hanging up the phone.
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+      **1. Why does HTTP/1.1 require a `Host` header when HTTP/1.0 did not?**
+      Because virtual hosting became normal: one IP address serves many domains, so the request
+      must name the site. Without it the server cannot know which of its sites you mean.
+
+      **2. `Content-Length` is missing from a response. Is that legal?**
+      Yes, if the response uses `Transfer-Encoding: chunked` — the body arrives in
+      length-prefixed chunks with a zero-length chunk marking the end. That is how servers
+      stream data whose total size they do not know yet.
+
+      **3. Your request took 300 ms and `time_starttransfer` was 290 ms. Where is the problem?**
+      In the server, not the network. Time to first byte is dominated by server think time, so
+      the slow part is whatever the server does before it starts writing — usually a database
+      query.
+
+      **4. Why is a round trip a hard floor on latency?**
+      Because information cannot travel faster than light in fibre (about 200,000 km/s), and
+      protocols require an acknowledgement before proceeding. Mumbai to Frankfurt is roughly
+      6,600 km, so one round trip cannot be faster than about 66 ms no matter what you buy.
+
+      **5. `curl` shows `time_appconnect=0`. What does that tell you?**
+      There was no TLS handshake — either the URL was plain `http://`, or the connection was
+      reused from a previous request. Both are worth knowing which.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The real theory: safety and idempotency
+
+    Two properties from [RFC 9110 §9.2](https://www.rfc-editor.org/rfc/rfc9110#section-9.2)
+    decide what a method means, and almost every API design argument is really about them.
+
+    - **Safe** — the request is read-only from the client's point of view. `GET`, `HEAD`,
+      `OPTIONS`. A crawler, a prefetcher or a link-preview bot may issue these without asking
+      you. If your `GET /orders/17/cancel` cancels an order, a browser prefetch will cancel it.
+    - **Idempotent** — issuing it N times has the same effect as issuing it once. `GET`, `HEAD`,
+      `PUT`, `DELETE`, `OPTIONS`. `POST` and `PATCH` are not idempotent by default.
+
+    | Method | Safe | Idempotent | Use it for |
+    | --- | --- | --- | --- |
+    | `GET` | yes | yes | reading a representation |
+    | `HEAD` | yes | yes | headers only — size, freshness, existence |
+    | `POST` | no | no | creating a subordinate resource, or an action with no other fit |
+    | `PUT` | no | yes | full replacement at a client-chosen URL |
+    | `PATCH` | no | no (make it so) | partial update |
+    | `DELETE` | no | yes | removal; the second call returns 404 or 204, and that is fine |
+
+    Idempotency matters because **networks retry**. A mobile client that times out at 5 s does
+    not know whether the server processed the request. If the method is idempotent, retrying is
+    free. If it is not, retrying charges the card twice. That is the entire reason idempotency
+    keys exist, and you will build them in Week 6.
+
+    ### The production surface
+
+    **Status codes that carry information.** Pick from these; do not invent.
+
+    | Code | Meaning you are committing to |
+    | --- | --- |
+    | `200` | Here is the representation. |
+    | `201` | Created; `Location` header points at the new resource. |
+    | `202` | Accepted, not done. You must give the client a way to poll. |
+    | `204` | Done, deliberately no body. |
+    | `304` | Your cached copy is still good. No body sent. |
+    | `400` | The request is malformed. Do not use this for business-rule failures. |
+    | `401` | Not authenticated — who are you? `WWW-Authenticate` should say how to fix it. |
+    | `403` | Authenticated but not allowed. Re-authenticating will not help. |
+    | `404` | No such resource — or deliberately hiding a 403 from an unauthorised reader. |
+    | `409` | State conflict: version mismatch, duplicate unique key. |
+    | `422` | Syntactically valid, semantically wrong. FastAPI's validation default. |
+    | `429` | Rate limited; `Retry-After` is mandatory in practice. |
+    | `503` | Overloaded or down; also send `Retry-After`. |
+
+    **Caching, correctly.** Two mechanisms, and you should use both.
+
+    ```http
+    Cache-Control: public, max-age=300, stale-while-revalidate=86400
+    ETag: "a5f3c9e1"
+    ```
+
+    `max-age=300` lets any cache serve this for 5 minutes without asking. After that,
+    `stale-while-revalidate=86400` lets the cache serve the stale copy *immediately* while it
+    refreshes in the background — the user never waits for revalidation. The `ETag` is an opaque
+    version identifier; the client sends it back as `If-None-Match`, and the server replies
+    `304 Not Modified` with no body if nothing changed.
+
+    Verify a 304 with curl, which is the only way to be sure it works:
+
+    ```bash
+    ETAG=$(curl -sI https://example.com/ | awk '/[Ee][Tt]ag/{print $2}' | tr -d '\r')
+    curl -s -o /dev/null -w "%{http_code} %{size_download} bytes\n" \
+         -H "If-None-Match: $ETAG" https://example.com/
+    # 304 0 bytes
+    ```
+
+    **Cookies vs bearer tokens.** The cookie flags are not optional:
+
+    ```http
+    Set-Cookie: session=<opaque-id>; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=1209600
+    ```
+
+    - `HttpOnly` — JavaScript cannot read it, so an XSS bug cannot steal the session.
+    - `Secure` — never sent over plain HTTP.
+    - `SameSite=Lax` — not sent on cross-site POSTs, which kills most CSRF. Use `Strict` for
+      admin tooling, `None; Secure` only when you genuinely need cross-site (and then you need
+      CSRF tokens back).
+
+    ### Trade-offs
+
+    | Decision | Choose the first when… | Choose the second when… |
+    | --- | --- | --- |
+    | **Cookie session vs bearer token** | The client is a browser you control, and you want revocation, `HttpOnly` protection and no token-in-JS risk. | The client is a mobile app, a CLI, a service, or a third party; or you are cross-domain and cookies fight you. |
+    | **`max-age` vs `ETag` revalidation** | The content is versioned in its URL (hashed asset names) — then `max-age=31536000, immutable` and never think again. | The URL is stable but the content changes — you want a cheap 304 rather than a wrong answer. |
+    | **`PUT` vs `PATCH`** | The client owns the whole representation and can send it all; retries must be safe. | The document is large, or concurrent editors touch different fields. Then add `If-Match` with the `ETag` so a stale patch is rejected with 409. |
+    | **HTTP/1.1 vs HTTP/2 for your API** | You control both ends, traffic is a handful of large responses, and you want dead-simple debugging. | Clients are browsers making many small requests over a high-latency link — that is where multiplexing pays. |
+
+    ### Reference implementation: a request tracer you will keep
+
+    ```bash
+    #!/usr/bin/env bash
+    # httptrace — phase-by-phase timing for any URL. Usage: ./httptrace <url> [n]
+    set -euo pipefail
+    URL="$1"; N="${2:-5}"
+    FMT='%{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total} %{http_code} %{size_download} %{http_version}\n'
+
+    printf "%-8s %-8s %-8s %-8s %-8s %-5s %-9s %s\n" dns tcp tls ttfb total code bytes proto
+    for i in $(seq "$N"); do
+      curl -sS -o /dev/null -w "$FMT" "$URL" | awk '{
+        printf "%-8.1f %-8.1f %-8.1f %-8.1f %-8.1f %-5s %-9s %s\n",
+          $1*1000, ($2-$1)*1000, ($3-$2)*1000, ($4-$3)*1000, $5*1000, $6, $7, $8 }'
+    done
+    ```
+
+    Each column is now a *phase*, not a cumulative timestamp: DNS, then TCP, then TLS, then
+    server think time, then total. Run it against your own API and you will immediately see
+    whether you have a network problem or a server problem. On a run against
+    `developer.mozilla.org` the second and later rows show `dns` near 0 and `tls` near 0 —
+    that is the OS resolver cache and connection reuse doing their jobs.
+
+    ### What breaks in the real world
+
+    A team shipped a React dashboard that called `GET /api/v1/config` on every route change.
+    The endpoint returned 2.4 KB of JSON and was correct in every way except that it sent no
+    caching headers at all. Browsers therefore revalidated nothing and re-fetched everything.
+    On the office network nobody noticed: the API was 4 ms away. Field reports from users on
+    4 G said "the app freezes when I tap around". Measurement showed the config call at a p95 of
+    **310 ms** on mobile, hit 6–9 times per session.
+
+    The fix was one line on the response — `Cache-Control: private, max-age=600` — plus an
+    `ETag` so a changed config would still propagate within one revalidation. The config request
+    count per session fell from 6–9 to 1, and p95 route-change time fell from 340 ms to 28 ms.
+    The lesson is not "add caching". The lesson is that **the default for a response with no
+    `Cache-Control` is "ask again every time"**, and defaults are decisions somebody makes by
+    not making them.
+
+    <Accordion title="Design checkpoint — model answer inside">
+      **Question.** Your mobile client uploads a payment. The network drops after the request is
+      sent but before the response arrives. The client retries. How do you guarantee the customer
+      is charged once, without making the endpoint `PUT`?
+
+      **Model answer.** Keep `POST /payments`, and require an `Idempotency-Key` header — a UUID
+      the *client* generates once per logical payment and reuses across retries. Server side, in
+      one transaction: insert the key into a table with a unique constraint; on a unique
+      violation, look up and return the stored response for that key instead of charging again.
+      Store the response body and status for 24 hours. This turns a non-idempotent method into
+      an idempotent operation *at the application layer*, which is where it belongs, because only
+      your application knows what "the same payment" means. You will implement exactly this in
+      the Week 6 lab, and the storage side of it in Week 8.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    ### Under the hood: what "head-of-line blocking" actually means
+
+    HTTP/1.1 sends one request per connection at a time. A response must be fully written before
+    the next one starts, because responses have no identifiers — order *is* the identifier. So a
+    slow response blocks every request queued behind it on that connection. Browsers work around
+    this by opening up to **6 connections per origin**, which means six lanes and six sets of
+    handshakes.
+
+    HTTP/2 puts all requests on one TCP connection and gives each a *stream ID*, so responses can
+    interleave. That removes head-of-line blocking at the HTTP layer. It does **not** remove it
+    at the TCP layer: one lost packet stalls the whole connection, and every stream on it, until
+    that packet is retransmitted. HTTP/3 fixes this by moving to QUIC over UDP, where each stream
+    has its own delivery ordering, so a loss on stream 7 does not stall stream 3.
+
+    ### At scale: the honest measurement
+
+    I ran 12 parallel page fetches against one origin, three times each, over a low-latency link:
+
+    | Protocol | Run 1 | Run 2 | Run 3 |
+    | --- | --- | --- | --- |
+    | HTTP/2 (`--http2`), 12 parallel | 93 ms | 87 ms | 66 ms |
+    | HTTP/1.1 (`--http1.1`), 12 parallel | 55 ms | 55 ms | 103 ms |
+    | HTTP/2, 12 *sequential* | 109 ms | — | — |
+
+    **HTTP/2 did not win.** That result is not a mistake, and reporting it is the point. At a
+    round-trip time of roughly 20 ms with only 12 requests, six parallel HTTP/1.1 connections
+    have enough lanes; the multiplexing advantage is buried in noise, and h2's single connection
+    can even be slightly worse because it cannot use six congestion windows.
+
+    Here is when it does win, as arithmetic you can check. With `R` = round-trip time, `N`
+    requests and `C` parallel connections, HTTP/1.1 needs about `ceil(N/C)` sequential rounds
+    plus `C` handshakes; HTTP/2 needs one handshake and roughly one round. At `N = 120`,
+    `C = 6`, `R = 150 ms` (a bad mobile link):
+
+    - HTTP/1.1: 6 handshakes × ~3R = 2,700 ms of setup, then 20 rounds × 150 ms = 3,000 ms → **~5.7 s**
+    - HTTP/2: 1 handshake ~3R = 450 ms, then ~1–2 rounds = 300 ms → **~0.75 s**
+
+    So the rule is: **HTTP/2's benefit scales with request count × latency, not with bandwidth.**
+    If your API serves 3 large JSON responses to a datacentre neighbour, h2 buys you nothing
+    measurable. If your page pulls 120 assets on a 4G link, it buys you seconds.
+
+    ### The economics of connection reuse
+
+    From my measured runs: **96 ms saved per avoided connection setup** on a 20 ms-RTT link
+    (780 ms for 6 fresh connections vs 204 ms for 6 reused). Two consequences most teams miss:
+
+    - A load balancer that terminates TLS and does **not** keep connections open to the origin
+      re-pays that 96 ms on every request. Check `keepalive_timeout` and, in nginx, the
+      `keepalive` directive inside your upstream block — its default is *off*, meaning a fresh
+      TCP connection to your app per request.
+    - TLS session resumption (`TLS 1.3` pre-shared keys) cuts a repeat handshake from 2-RTT to
+      1-RTT, and 0-RTT resumption to zero — at the price that 0-RTT early data is
+      **replayable**, so it must only carry safe, idempotent requests. That is not a style rule;
+      an attacker who captures 0-RTT early data can replay it verbatim.
+
+    ### Production failure modes
+
+    | Failure | Signature you will actually see | How you detect it |
+    | --- | --- | --- |
+    | Cache poisoning by unkeyed header | One user sees another user's data, intermittently, only behind the CDN | Response varies on a header not listed in `Vary`. Audit `Vary` against every header your handler reads. |
+    | `Cache-Control: no-cache` misunderstood | Traffic to origin does not drop after "we added caching" | `no-cache` means *revalidate every time*, not *do not store*. `no-store` is the one that means do not store. |
+    | Connection pool starvation at the LB | p99 latency spikes in a sawtooth, p50 flat | Compare `time_connect` from outside vs inside the VPC; a non-zero `time_connect` on every request means no reuse. |
+    | Retry storm on 503 | One slow dependency turns into a self-inflicted DDoS | 503s without `Retry-After`, clients retrying immediately. Fix with exponential backoff **plus jitter**. |
+    | HTTP/2 rapid reset | CPU saturation with tiny bandwidth use | Streams opened and cancelled in a loop; CVE-2023-44487. Cap concurrent streams and rate-limit resets. |
+
+    ### Frontier and primary sources
+
+    - **RFC 9110, *HTTP Semantics* (2022).** *Takeaway:* the meaning of methods, status codes and
+      headers is now version-independent — semantics were finally split from the wire format.
+    - **RFC 9113, *HTTP/2* (2022).** *Takeaway:* multiplexing over one connection removes HTTP-level
+      head-of-line blocking but inherits TCP's, which is precisely the gap HTTP/3 exists to close.
+    - **RFC 9114, *HTTP/3* + RFC 9000, *QUIC*.** *Takeaway:* moving stream framing into a
+      UDP-based transport lets one lost packet stall only its own stream, and folds the transport
+      and TLS handshakes into a single round trip.
+    - **RFC 8446, *TLS 1.3*.** *Takeaway:* the handshake dropped from two round trips to one and
+      removed every legacy cipher; 0-RTT resumption is fast and replayable, so it is only for
+      idempotent requests.
+
+    ### Stretch challenge
+
+    Build a latency model of your own site and then falsify it. Pick a real page, count its
+    subresources and their sizes, and predict total load time at RTT = 20 ms, 80 ms and 300 ms
+    under HTTP/1.1 and HTTP/2 using the arithmetic above. Then actually measure all six
+    combinations — use `tc netem` on Linux or Network Link Conditioner on macOS to add latency —
+    and write down where your model was wrong and why. Most people discover their model ignored
+    the fact that the browser cannot *discover* the subresources until the HTML has parsed,
+    which turns one round of requests into two or three. That discovery is worth more than the
+    model.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Run the `httptrace` script above against three sites: one nearby, one on another continent, and
+your own localhost. Then load one page in DevTools with the Network panel open, disable cache,
+and reload; screenshot the waterfall. Write 200 words on which phase dominates in each of the
+three cases and what you would do about it. Keep the write-up — it is the first section of your
+Week 5 lab README.
+</Card>
+
+## The whiteboard
+
+The T1 sketch is the phase timeline above. The T3 build-up (hero animation **A09**) animates one
+request through DNS → TCP → TLS → request → response with the measured cost accumulating on each
+segment, then replays it on a warm connection so the first three segments vanish.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p1-w05-m1-blank.svg) · [Editable source](/assets/diagrams/p1-w05-m1.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    Put the `httptrace` script in a public repo with a README showing three measured sites and a
+    short analysis. It is a 40-line shell script, and it is a better interview artifact than a
+    to-do app because it proves you measure things. When the interviewer asks the "what happens
+    when you type a URL" question, answer with your own numbers: "DNS was 6.9 ms, TCP 10.5,
+    TLS 14.9, and 45% of the request finished before a byte of my data was sent." Nobody else in
+    the queue will say that.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    Three places this lands on a normal Monday. **One:** run `httptrace` against your own
+    service from outside your VPC and from inside it; a non-zero TLS phase on every internal call
+    means your service mesh or LB is not reusing connections, and that is often 30–90 ms per hop.
+    **Two:** grep your codebase for endpoints that mutate state behind `GET` — a link prefetcher
+    will eventually find them. **Three:** audit `Vary` against the headers your handlers actually
+    read; a response that varies on `Accept-Language` without saying so is a cache-poisoning bug
+    waiting for a CDN.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| "Caching is on but origin traffic did not drop" | `Cache-Control: no-cache` was used, which means *revalidate every time* | Use `max-age` for real caching; `no-store` if you truly must not store |
+| Login works in dev, fails in production | Cookie is `Secure` and dev is plain HTTP, or `SameSite=Lax` blocks a cross-site POST | Match the cookie flags to the deployment; test the actual cross-site flow, not just localhost |
+| Duplicate charges after a network blip | Non-idempotent `POST` retried by the client | Idempotency key with a unique constraint; return the stored response on replay |
+| One user sees another's data behind a CDN | Response varies on a header missing from `Vary` | Add every request header the handler reads to `Vary`, or make the response user-independent |
+| p95 latency high, p50 fine, server CPU idle | Connection setup on every request, no keep-alive | Enable upstream keep-alive; confirm `time_connect` is 0 on the second request |
+| `curl` works, browser does not | Preflight/CORS, or a cookie the browser will not send | Reproduce with the browser's exact headers; see `P1-W05-M5` |
+
+## Assessment
+
+**Concept questions**
+
+1. Which methods are safe? Which are idempotent? Name one that is idempotent but not safe. *(GET/HEAD/OPTIONS safe; GET/HEAD/PUT/DELETE/OPTIONS idempotent; `PUT` and `DELETE` are idempotent but not safe.)*
+2. What is the difference between `401` and `403`? *(401 = we do not know who you are, re-authenticate; 403 = we know and you still may not.)*
+3. Why does `304 Not Modified` have no body? *(The client already holds the body; only freshness is being confirmed.)*
+4. What does `stale-while-revalidate` buy you that `max-age` alone does not? *(The user is served instantly from a stale copy while the refresh happens in the background — no user waits for revalidation.)*
+5. Why can 0-RTT TLS data only carry idempotent requests? *(Early data is replayable by an attacker; a replayed non-idempotent request executes twice.)*
+6. HTTP/2 removed head-of-line blocking. At which layer does it remain? *(TCP: a lost segment stalls every stream on the connection until retransmission.)*
+7. Your API's `time_starttransfer` is 480 ms and `time_total` is 495 ms. Where do you look? *(Server-side work before the first byte — almost always a query or an upstream call.)*
+8. Why is `Host` mandatory in HTTP/1.1? *(Virtual hosting: one IP serves many domains, so the request must name the site.)*
+
+**Coding challenge.** Extend `httptrace` to take a list of URLs, run each N times, and print median and p95 per phase, flagging any URL where the TLS phase is non-zero on the second and later runs (that is a connection-reuse bug). Hidden tests check your percentile arithmetic on a fixed input.
+
+**Interview questions**
+
+- *Junior:* "Walk me through what happens when you type a URL and press Enter."
+- *Mid:* "A `POST` times out on a flaky mobile network. How do you make retrying safe?"
+- *Senior:* "We moved to HTTP/2 and saw no improvement. Give me three hypotheses, ranked, and the measurement that would separate them."
+
+**Draw it from memory.** Reproduce the five-phase timeline with realistic millisecond values, then draw the warm-connection version below it.
+
+## Sources & further reading
+
+**Primary docs**
+
+- [RFC 9110 — HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110) — read §9 for method semantics; it is the definitive answer to every "should this be PUT or POST" argument.
+- [RFC 9111 — HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111) — read §5.2 for what each `Cache-Control` directive actually obliges a cache to do.
+- [MDN HTTP reference](https://developer.mozilla.org/en-US/docs/Web/HTTP) — read this for the practical, example-first version of the same material.
+- [curl manual, `--write-out` variables](https://curl.se/docs/manpage.html#-w) — read this for the full list of timing variables you can instrument.
+
+**Papers and specs**
+
+- **[RFC 9113 (HTTP/2).](https://www.rfc-editor.org/rfc/rfc9113)** *Takeaway:* stream multiplexing over a single connection eliminates HTTP-layer head-of-line blocking, but TCP's remains and becomes the new bottleneck.
+- **[RFC 9000 (QUIC).](https://www.rfc-editor.org/rfc/rfc9000)** *Takeaway:* independent per-stream delivery plus a merged transport/TLS handshake is the mechanism behind HTTP/3's gains on lossy networks.
+- **[RFC 8446 (TLS 1.3).](https://www.rfc-editor.org/rfc/rfc8446)** *Takeaway:* a one-round-trip handshake with all legacy ciphers removed, plus 0-RTT resumption whose replayability constrains it to idempotent requests.
+
+**Go deeper**
+
+- [*High Performance Browser Networking*, Ilya Grigorik](https://hpbn.co/) — chapters 1–4, free online. Read it for the latency arithmetic; it is the book that makes you stop optimising bandwidth and start optimising round trips.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-05/p1-w05-m1">
+  Attempt the lab first. Seriously.
+</Card>

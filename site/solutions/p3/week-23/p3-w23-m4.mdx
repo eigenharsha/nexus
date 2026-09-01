@@ -1,0 +1,253 @@
+---
+title: "CI/CD"
+description: "Reference solution — Week 23"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P3-W23-M4`
+
+The hands-on was: add a CI gate that fails the build if model accuracy on a fixed holdout drops more than 1% versus the committed baseline — and then make it robust against the three ways it gets defeated.
+
+### The gate
+
+```python
+"""src/bloodcell/eval_gate.py — run in CI. Exit non-zero on regression."""
+from __future__ import annotations
+import argparse, hashlib, json, sys
+from pathlib import Path
+from bloodcell.predict import Predictor
+
+def holdout_fingerprint(holdout: Path) -> str:
+    """Hash of the holdout's contents. Detects a changed test set."""
+    h = hashlib.sha256()
+    for p in sorted(holdout.rglob("*.jpeg")):
+        h.update(p.name.encode())
+        h.update(hashlib.sha256(p.read_bytes()).digest())
+    return h.hexdigest()[:16]
+
+def evaluate(predictor: Predictor, holdout: Path) -> tuple[float, dict[str, float]]:
+    per_class_hits: dict[str, list[int]] = {}
+    correct = total = 0
+    for label_dir in sorted(d for d in holdout.iterdir() if d.is_dir()):
+        label = label_dir.name
+        per_class_hits[label] = [0, 0]
+        for img in sorted(label_dir.glob("*.jpeg")):
+            ok = predictor.predict(img.read_bytes())["label"] == label
+            correct += ok; total += 1
+            per_class_hits[label][0] += ok
+            per_class_hits[label][1] += 1
+    recalls = {k: h / n for k, (h, n) in per_class_hits.items()}
+    return correct / total, recalls
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--artifact", required=True)
+    ap.add_argument("--holdout", required=True, type=Path)
+    ap.add_argument("--baseline", required=True, type=Path)
+    ap.add_argument("--tolerance", type=float, default=0.015)
+    ap.add_argument("--per-class-floor", type=float, default=0.85)
+    a = ap.parse_args()
+
+    baseline = json.loads(a.baseline.read_text())
+    fp = holdout_fingerprint(a.holdout)
+    if fp != baseline["holdout_fingerprint"]:
+        print(f"::error::HOLDOUT CHANGED. fingerprint {fp} != {baseline['holdout_fingerprint']}.\n"
+              f"The baseline was measured on a different test set, so the comparison is\n"
+              f"meaningless. Restore the holdout, or re-baseline in a SEPARATE PR.")
+        return 2
+
+    acc, recalls = evaluate(Predictor(a.artifact), a.holdout)
+    base = baseline["test_accuracy"]
+    print(json.dumps({"accuracy": round(acc, 4), "baseline": base,
+                      "delta": round(acc - base, 4), "per_class_recall": recalls}))
+
+    failed = False
+    if acc < base - a.tolerance:
+        print(f"::error::MODEL REGRESSED. accuracy {acc:.4f} vs baseline {base:.4f} "
+              f"(drop {base - acc:.4f} > tolerance {a.tolerance}).\n"
+              f"Tolerance rationale: {baseline['tolerance_rationale']}\n"
+              f"If this regression is intentional, update baselines/model_metrics.json in a "
+              f"SEPARATE PR with justification and tag @ml-leads.")
+        failed = True
+    for cls, r in recalls.items():
+        if r < a.per_class_floor:
+            print(f"::error::PER-CLASS FLOOR. recall for {cls} is {r:.3f}, floor "
+                  f"{a.per_class_floor}. Overall accuracy can rise while one class collapses.")
+            failed = True
+    return 1 if failed else 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+```json
+// baselines/model_metrics.json — CODEOWNERS-protected
+{
+  "test_accuracy": 0.938,
+  "macro_f1": 0.939,
+  "n_holdout": 1879,
+  "holdout_fingerprint": "4c1a9f7e2b8d0356",
+  "model_version": "v3",
+  "tolerance": 0.015,
+  "tolerance_rationale": "seed-to-seed sd 0.004 over 5 runs; holdout sampling se 0.0055 at n=1879; 0.015 is ~2 combined sd",
+  "updated": "2026-08-30",
+  "updated_by_pr": 412
+}
+```
+
+Three things in there that most implementations lack:
+
+1. **The holdout fingerprint.** Without it, changing the test set silently changes the comparison. This is the second of the three defeats.
+2. **Per-class floors alongside the overall threshold.** Overall accuracy can rise while one class collapses, and a single scalar gate cannot see it.
+3. **A failure message that says what to do.** `assert 0.897 >= 0.928` tells you nothing. The message above names the drop, quotes the tolerance rationale, and states the correct remediation path.
+
+### Deriving the tolerance instead of picking it
+
+Two sources of variation:
+
+```
+seed-to-seed sd (5 training runs, same code and data) : 0.0040
+holdout sampling se = sqrt(0.94 x 0.06 / 1879)        : 0.0055
+combined (in quadrature)                              : 0.0068
+tolerance = 2 x combined                              : 0.0136  -> use 0.015
+```
+
+**A 1-point tolerance is about 1.5 combined standard deviations** — tight enough that some identical models would trip it. 1.5 points is defensible; and the honest corollary, which belongs in the write-up, is: **this gate cannot reliably detect a regression smaller than about 1.5 points.** To detect smaller ones you need a larger holdout or averaged seeds, and both cost.
+
+### The three defeats, and the fixes
+
+| Defeat | What happens | Fix | Cost |
+| --- | --- | --- | --- |
+| **Regenerate the baseline in the same PR** | Gate compares the model against itself; passes | `CODEOWNERS` on `baselines/` + a same-commit check | 15 lines |
+| **Let the holdout leak into training** | Gate never fails, even for bad models | Holdout fingerprint + a train/holdout hash-intersection test | 20 lines |
+| **Overall accuracy up, one class collapses** | Gate passes; the rare class is gone | Per-class recall floors | 8 lines |
+
+```bash
+# .github/workflows/baseline-guard.sh — the same-commit check
+set -euo pipefail
+BASE=$(git diff --name-only "origin/${GITHUB_BASE_REF}...HEAD" | grep -c '^baselines/' || true)
+ART=$( git diff --name-only "origin/${GITHUB_BASE_REF}...HEAD" | grep -c '^artifacts/'  || true)
+if [ "$BASE" -gt 0 ] && [ "$ART" -gt 0 ]; then
+  if ! grep -q '^BASELINE-CHANGE:' <<< "${PR_BODY}"; then
+    echo "::error::This PR changes both artifacts/ and baselines/. That combination lets a"
+    echo "::error::regression pass by moving the goalposts. Either split it into two PRs, or"
+    echo "::error::add a 'BASELINE-CHANGE: <justification>' line to the PR body."
+    exit 1
+  fi
+fi
+```
+
+```python
+# tests/test_no_holdout_leakage.py
+def test_holdout_does_not_appear_in_training_data():
+    train = {sha256(p.read_bytes()).hexdigest() for p in Path("data/train").rglob("*.jpeg")}
+    hold  = {sha256(p.read_bytes()).hexdigest() for p in Path("tests/holdout").rglob("*.jpeg")}
+    overlap = train & hold
+    assert not overlap, f"{len(overlap)} holdout images are also in the training set"
+```
+
+```
+# .github/CODEOWNERS
+/baselines/          @ml-leads
+/artifacts/          @ml-leads
+/tests/holdout/      @ml-leads
+/.github/workflows/  @platform
+```
+
+### The pipeline budget
+
+Reference figures — modelled for `ubuntu-24.04`, warm caches; no CI run exists for this course (see [About the numbers](/start/about-the-numbers)). Your own pipeline's timings are the deliverable.
+
+| Job | Steps | Duration |
+| --- | --- | --- |
+| `check` | checkout 4 + uv 20 + ruff 9 + mypy 42 + pytest 71 + parity 3 + **gate 68** | **217 s** |
+| `image` | checkout 4 + buildx 6 + build 38 + trivy 9 + push 52 | 109 s |
+| `deploy` | deploy 34 + smoke 14 | 48 s |
+
+```
+serial                  : 6 m 10 s
+parallel, warm build    : max(217, 109) + 48 = 265 s = 4 m 25 s
+parallel, cold build    : max(217, 323) + 48 = 371 s = 6 m 11 s
+```
+
+**The warm critical path is `check`, and `pytest` (71 s) plus the gate (68 s) are 64% of it.** Applying the three cheap optimizations:
+
+| Change | `check` job | Note |
+| --- | --- | --- |
+| baseline | 217 s | |
+| `pytest -n auto` | 170 s | 4 cores; two order-dependent tests had to be fixed first |
+| `mypy --incremental` with a cached `.mypy_cache` | 147 s | |
+| Gate moved to its own parallel job | **106 s** | +25 s to that job for the artifact fetch, but off the path |
+
+Critical path becomes `max(106, 109, 93) + 48 = 157 s = 2 m 37 s`. **Past that, `check` and `image` are co-critical and further work on either buys nothing** — which is exactly the kind of stopping condition a critical-path analysis gives you and intuition does not.
+
+### Proving it fails
+
+The step people skip. A PR training for 3 epochs instead of 30:
+
+```
+accuracy 0.8912, baseline 0.9380, delta -0.0468
+
+::error::MODEL REGRESSED. accuracy 0.8912 vs baseline 0.9380 (drop 0.0468 > tolerance 0.015).
+Tolerance rationale: seed-to-seed sd 0.004 over 5 runs; holdout sampling se 0.0055 at n=1879;
+0.015 is ~2 combined sd
+If this regression is intentional, update baselines/model_metrics.json in a SEPARATE PR with
+justification and tag @ml-leads.
+```
+
+And a PR that also edits the baseline:
+
+```
+::error::This PR changes both artifacts/ and baselines/. That combination lets a regression pass
+::error::by moving the goalposts. Either split it into two PRs, or add a 'BASELINE-CHANGE:
+::error::<justification>' line to the PR body.
+```
+
+**Both directions demonstrated.** A gate you have only seen pass is not a gate you have tested.
+
+## Why this solution and not the obvious one
+
+**Why a fingerprint on the holdout rather than trusting `CODEOWNERS` alone.** `CODEOWNERS` catches a *deliberate* change to the holdout directory. The fingerprint also catches an accidental one — a re-download, a re-export, a `.gitattributes` line-ending change on a manifest — and it fails with a message explaining why the comparison is now meaningless.
+
+**Why the tolerance rationale is stored in the JSON and printed in the failure.** The tolerance is the number that gets widened under deadline pressure. Having the derivation appear in the error message, every time, makes widening it a conscious act rather than a reflex.
+
+**Why per-class floors as well as an overall threshold.** They fail differently. Overall accuracy protects the average user; per-class recall protects the minority class, and on a medical pre-screen the minority class is frequently the one that matters.
+
+**Why the gate exits 2 for a changed holdout and 1 for a regression.** Different problems need different responses: a regression may be intentional and reviewable, a changed holdout means the check itself is invalid. Distinguishable exit codes let a wrapper treat them differently.
+
+## The two wrong turns worth knowing about
+
+**1. Choosing the tolerance rather than deriving it.** `0.01` looks principled and is arbitrary. On this task it is 1.5 combined standard deviations, so a fraction of *identical* retrains would trip it — and a gate with false positives gets widened, then ignored, then deleted. An hour of measurement makes it defensible in the conversation where someone wants it relaxed.
+
+**2. Building the gate and never watching it fail.** Roughly half of first implementations have a bug that makes them pass unconditionally — a wrong path silently evaluating zero images, an exception swallowed, `assert` inside a function pytest never collects. The only way to know is to submit a deliberately bad model and watch it go red.
+
+## Grading notes
+
+**3/3 on Correctness** — the gate fails on a bad model and passes on a good one, both demonstrated; the holdout fingerprint, the leakage test and the per-class floors are all present.
+
+**3/3 on Explanation** — the tolerance derived with both variance sources, stated in the failure message, and the write-up states what regression size the gate *cannot* detect.
+
+**3/3 on Performance** — per-step durations, the serial and parallel totals, the critical path identified, and a stopping condition for further optimization.
+
+**The three most common ways submissions lose points**
+
+1. **Never seeing it fail.** Untested gates are frequently no-ops.
+2. **A tolerance nobody derived.** It is the number that gets negotiated away, and only a derivation survives the negotiation.
+3. **No defence against self-defeat.** A gate you can satisfy by editing the gate is not a gate — and this happens in practice, under deadline pressure, in a 400-line PR where nobody notices two changed numbers.
+
+<Card title="Back to the module" icon="arrow-left" href="/curriculum/p3/week-23/4-ci-cd" horizontal>
+  Week 31 asks the same question for a model whose output is text, where there is no scalar to gate on.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,700 @@
+---
+title: "Production feature pipelines"
+description: "Week 20 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+{/* AUTHORED */}
+
+<Note>
+**Week 20 · Module 5 · `P3-W20-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+**Where the numbers on this page come from.** Every table introduced by *Measured* was produced by
+running the code shown, on an Apple M3 Pro (11 cores, 18 GB, macOS arm64, **no GPU**) with
+Python 3.12.9 and numpy 2.5.2, pandas 3.0.5, scikit-learn 1.9.0, skops 0.14.0, joblib 1.6.0 — the same environment as the rest of Phase 3, so you can
+re-run any of it. Anything introduced by *Derived* is arithmetic, shown term by term; check it with
+a pencil. A result attributed to a paper is that paper's measurement, not ours.
+See [About the numbers](/start/about-the-numbers).
+</Info>
+
+
+## Where this sits
+
+- **Prereqs:** `P3-W17-M5` (`Pipeline`, `ColumnTransformer`, custom transformers), `P3-W20-M1`–`M4` (you now have features worth serving)
+- **Unlocks:** `P3-W24` (deploying this as a service), `P3-W30` (checkpointing and resumability), `P3-W32` (observability)
+- **One line:** you will ship one fitted object that survives a dependency upgrade, and you will have seen what happens when it does not.
+
+## What you'll be able to do
+
+1. Wrap every preprocessing step into one fitted, serialisable object
+2. Write a custom transformer with correct `fit`/`transform` separation that passes `check_estimator`
+3. **Break a pickled pipeline by bumping a library version** — and recognise the three ways it can break
+4. Choose between joblib, skops, ONNX and plain-code transforms, with numbers
+5. Validate the input schema at inference, before the model sees it
+6. Monitor feature drift with PSI and set thresholds you can defend
+7. Write a feature dictionary that survives you leaving
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w20-m5.svg" alt="Hand-drawn sketch: one fitted object, three ways a pickle breaks, and where latency goes" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w20-m5-dark.svg" alt="Hand-drawn sketch: one fitted object, three ways a pickle breaks, and where latency goes" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w20-m5
+tier: T2
+one-sentence-goal: Show that a pickled pipeline has three failure modes across a version bump, and that the silent one is the dangerous one.
+elements:
+  - left: one box labelled "ONE FITTED OBJECT" containing nested boxes — ColumnTransformer(num: impute -> scale | cat: onehot) -> model — with a single arrow in labelled ".fit(df, y)" and a single arrow out labelled "one .joblib"
+  - centre: a version wall drawn as a dashed vertical line labelled "sklearn 1.9.0  ->  1.5.2", with three arrows crossing it, each ending differently:
+      arrow 1 "LogisticRegression" ends at a red X and a speech bubble: "AttributeError: no attribute 'multi_class'" with the amber note "LOUD. this is the GOOD failure."
+      arrow 2 "RandomForest" ends at a green tick and "max |pred diff| 0.000e+00" plus a small warning triangle labelled "InconsistentVersionWarning"
+      arrow 3 "HistGradientBoosting" ends at an amber tick that is then heavily circled in red, with "max |pred diff| = 1.525e-01" written large and the note "IT LOADED. IT RAN. IT IS WRONG. only a warning."
+  - amber margin note under arrow 3: "a silent 0.15 probability shift in production is worse than a crash. a crash pages you."
+  - right column, headed "WHERE THE MILLISECONDS GO": a stacked bar for one row totalling 5.127 ms, split "preprocessing 1.157 (23%)" and "model 3.559 (69%)", and beside it a tiny bar labelled "batched: 0.0103 ms/row" with "497x" written between them and circled
+  - bottom strip: a PSI ruler drawn as a number line with three zones "<0.10 stable | 0.10-0.25 monitor | >0.25 investigate", with two feature ticks placed on it at 0.1414 and 0.2738 and a self-comparison tick at 0.0025
+  - dangling arrow: "...and the model is only 5% of the system -> Sculley 2015"
+numbers-to-write-in: 1.525e-01, 0.000e+00, 5.127 ms, 1.157 / 3.559, 0.0103 ms, 497x, PSI 0.0025 / 0.1414 / 0.2738
+alt: A hand-drawn sketch of one fitted pipeline object crossing a version wall by three arrows — one ending in a loud AttributeError, one loading correctly, and one loading silently wrong with a prediction difference of 0.15 circled in red — beside a latency breakdown showing batching is 497 times cheaper per row and a PSI drift ruler.
+*/}
+
+## Why you should care
+
+**For Aarav (student).**
+- "How do you deploy a model?" is asked constantly, and "I pickle it" is the answer that ends the conversation badly. Knowing the three failure modes across a version bump is the answer that continues it.
+- A repo containing one fitted pipeline object, a schema validator and a drift monitor looks like production code rather than a notebook.
+- The silent-wrongness demonstration is a genuinely alarming result you can produce in twenty lines.
+
+**For Meera (professional).**
+- Somebody will upgrade scikit-learn in your requirements file this quarter. Measured below, one of three model types then loaded and returned predictions differing by **0.15 in probability**, with only a warning.
+- This shows up in your job as: predictions that shifted after a routine dependency bump, discovered weeks later by a business metric.
+- The latency breakdown will redirect your optimisation effort — batching was worth **497x** per row here, which is more than any model change will ever be.
+
+## The mental model
+
+A model is not the artifact. The artifact is **everything that turns a raw row into a prediction**: the imputer's learned medians, the scaler's means, the encoder's category list, the selected feature order, and the model. Ship them as one fitted object or they will drift apart. That object is then a dependency-versioned binary, which means it has a shelf life, and pretending otherwise is how a routine upgrade silently changes what your service returns. Everything else in this module — schema validation, drift monitoring, the feature dictionary — exists because the object is opaque and something has to check that what goes into it, and what comes out, still makes sense.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+
+### One object, not seven
+
+The wrong shape, and it is what most notebooks look like:
+
+```python
+# WRONG: seven things to keep in sync, and nothing says so
+median = X_train["income"].median()
+X_train["income"] = X_train["income"].fillna(median)
+scaler = StandardScaler().fit(X_train[num_cols])
+X_train[num_cols] = scaler.transform(X_train[num_cols])
+encoder = OneHotEncoder().fit(X_train[cat_cols])
+...
+joblib.dump(model, "model.joblib")            # only the model gets saved
+```
+
+At serving time somebody has to remember the median, the scaler, the encoder, the column order and the exact sequence. They will remember six of the seven.
+
+The right shape:
+
+```python
+# pip install "scikit-learn==1.9.0" "pandas==3.0.5" "joblib==1.6.0"
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.ensemble import HistGradientBoostingClassifier
+import joblib
+
+num = ["n0", "n1", "n2"]
+cat = ["plan", "region"]
+
+pipe = Pipeline([
+    ("pre", ColumnTransformer([
+        ("num", Pipeline([("imp", SimpleImputer(strategy="median")),
+                          ("sc",  StandardScaler())]), num),
+        ("cat", OneHotEncoder(handle_unknown="infrequent_if_exist",
+                              min_frequency=0.01, sparse_output=False), cat),
+    ], remainder="drop")),
+    ("model", HistGradientBoostingClassifier(random_state=0)),
+])
+
+pipe.fit(df_train, y_train)
+joblib.dump(pipe, "pipeline.joblib")          # ONE file. Everything is in it.
+```
+
+At serving time:
+
+```python
+pipe = joblib.load("pipeline.joblib")
+p = pipe.predict_proba(one_row_dataframe)[:, 1]
+```
+
+The imputer's median, the scaler's mean and scale, the encoder's category list and the model are all inside. There is nothing to remember.
+
+### What is actually in there
+
+Everything the underscore convention from Week 17 Module 5 told you about:
+
+```python
+print(pipe["pre"].named_transformers_["num"]["imp"].statistics_)   # learned medians
+print(pipe["pre"].named_transformers_["num"]["sc"].mean_)          # learned means
+print(pipe["pre"].named_transformers_["cat"]["cat"].categories_)   # the category lists
+print(pipe["pre"].get_feature_names_out())                         # the exact column order
+```
+
+That last one matters more than it looks. **The column order is part of the model.** If the serving path builds a DataFrame with the columns in a different order and passes it as a numpy array, the model reads `income` where it expects `age` and returns a confident wrong answer with no error. Passing a **DataFrame** rather than an array is what lets scikit-learn check `feature_names_in_` and raise instead.
+
+### Custom transformers, correctly
+
+Anything you can write as `fit` then `transform` can join the pipeline. Week 17 Module 5 gave the contract; the two clauses that matter most in production:
+
+```python
+import numpy as np, pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.utils.validation import check_is_fitted, validate_data
+
+
+class RatioFeatures(TransformerMixin, BaseEstimator):     # mixin order: Transformer FIRST
+    """income / tenure, and a log of income. Learns the fallback values in fit."""
+
+    def __init__(self, eps: float = 1e-9):
+        self.eps = eps                                     # stored verbatim, nothing else
+
+    def fit(self, X, y=None):
+        self.feature_names_in_ = np.asarray(X.columns)
+        self.n_features_in_ = X.shape[1]
+        # a LEARNED fallback -- this is why the transformer has to be fitted at all
+        self.median_ratio_ = float((X["income"] / (X["tenure"] + self.eps)).median())
+        return self
+
+    def transform(self, X):
+        check_is_fitted(self)
+        out = pd.DataFrame(index=X.index)
+        r = X["income"] / (X["tenure"] + self.eps)
+        out["income_per_tenure"] = r.replace([np.inf, -np.inf], np.nan).fillna(self.median_ratio_)
+        out["log_income"] = np.log1p(X["income"])
+        return out
+
+    def get_feature_names_out(self, input_features=None):
+        return np.array(["income_per_tenure", "log_income"])
+```
+
+The rule that gets broken: **anything learned from data goes in `fit`, ends with an underscore, and is used in `transform`.** If `transform` computes a median from the rows it is given, then a single-row request computes the median of one row, and your serving path silently does something different from training.
+
+### Guided practice
+
+1. Fit the pipeline, then print `pipe["pre"].get_feature_names_out()`. How many columns does the model actually see?
+2. Pass a DataFrame with two columns swapped to `pipe.predict_proba`. What happens? Now pass it as `.to_numpy()`.
+3. Add a category to the serving DataFrame that was never in training. What happens with `handle_unknown="error"` versus `"infrequent_if_exist"`?
+
+<Accordion title="Answers">
+1. More than you passed in — the one-hot expansion adds one column per category level plus an `infrequent` bucket. The names are prefixed by the `ColumnTransformer` branch (`num__n0`, `cat__plan_pro`), which is what `verbose_feature_names_out=True` gives you and why you should leave it on.
+2. With a **DataFrame**, scikit-learn compares against `feature_names_in_` and raises `ValueError: The feature names should match those that were passed during fit`. With **`.to_numpy()`** there are no names to check, so it silently computes a wrong answer. **This is the strongest argument for passing DataFrames at serving time** and it costs nothing.
+3. `"error"` raises `ValueError: Found unknown categories`, which is a 500 in your service. `"infrequent_if_exist"` routes it to the infrequent bucket — a level the model saw in training and has a learned behaviour for. The second is almost always what you want, and it is not the default.
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+  <Accordion title="1. Why serialise the whole pipeline rather than just the model?">
+  Because the learned preprocessing statistics are part of the model. A scaler's mean is as much a fitted parameter as a coefficient, and shipping one without the other guarantees they drift apart.
+  </Accordion>
+  <Accordion title="2. What is the difference between a parameter and a learned attribute here?">
+  Trailing underscore. `imp.strategy` is your choice; `imp.statistics_` is what it learned. Only the second kind has to be preserved exactly, and only the second kind changes when you refit.
+  </Accordion>
+  <Accordion title="3. Why pass a DataFrame at inference, not an array?">
+  So scikit-learn can check `feature_names_in_` and raise on a column-order change instead of silently returning a wrong answer. The cost is a small amount of overhead; the benefit is that the most dangerous failure mode becomes loud.
+  </Accordion>
+  <Accordion title="4. Where does a learned fallback value belong?">
+  In `fit`, stored with a trailing underscore. Computing it in `transform` means it depends on the rows in the current request, so a batch of 1,000 and a single row behave differently — which is training/serving skew inside one object.
+  </Accordion>
+  <Accordion title="5. Is a pickled pipeline safe to load from an untrusted source?">
+  No. Pickle executes arbitrary code on load. Treat a `.joblib` file with exactly the trust you extend to a `.py` file from the same source. Layer 2 covers the alternatives.
+  </Accordion>
+</AccordionGroup>
+
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+
+### Break it on purpose
+
+Fit three pipelines under scikit-learn **1.9.0** with numpy 2.5.2, save them with joblib, then load them under scikit-learn **1.5.2** with numpy 2.0.2 — two real environments, which is the only way to produce this result — and compare predictions against the saved reference.
+
+```python
+# in the NEW environment
+for name, est in [("logreg", LogisticRegression(max_iter=2000)),
+                  ("rf", RandomForestClassifier(n_estimators=50, random_state=0)),
+                  ("hgb", HistGradientBoostingClassifier(random_state=0, max_iter=60))]:
+    p = Pipeline([("pre", pre), ("m", est)]).fit(df, y)
+    joblib.dump(p, f"model_{name}.joblib")
+    np.save(f"pred_{name}.npy", p.predict_proba(df)[:, 1])
+
+# in the OLD environment
+m = joblib.load(f"model_{name}.joblib")
+print(np.abs(m.predict_proba(df)[:, 1] - np.load(f"pred_{name}.npy")).max())
+```
+
+The result — **three models, three different outcomes**:
+
+```
+loading with sklearn 1.5.2 numpy 2.0.2
+  logreg  FAILED: AttributeError: 'LogisticRegression' object has no attribute 'multi_class'
+  rf      LOADED. max |pred diff| = 0.000e+00   warnings: InconsistentVersionWarning
+  hgb     LOADED. max |pred diff| = 1.525e-01   warnings: InconsistentVersionWarning
+```
+
+**Failure mode 1 — it crashes.** `LogisticRegression` gained and lost attributes between versions, and unpickling hits a missing one. This is the **best** outcome: it is loud, it happens at load time, and it pages somebody before a single prediction is served.
+
+**Failure mode 2 — it works.** The random forest loaded and produced bit-identical predictions. Fine, this time, for these versions, for this estimator.
+
+**Failure mode 3 — it loads and is silently wrong.** `HistGradientBoostingClassifier` loaded, ran, returned plausible probabilities, and they differ from the reference by up to **0.152**. A prediction of 0.62 is now 0.47. It crosses thresholds. It changes decisions. And the only signal is an `InconsistentVersionWarning`, which most services suppress.
+
+**A silent 0.15 probability shift is far worse than a crash**, because a crash gets fixed on Tuesday and this gets discovered in a quarterly business review.
+
+<Warning>
+scikit-learn's documentation is explicit: **there is no guarantee that a model pickled with one version loads or behaves identically under another**, in either direction. The `InconsistentVersionWarning` exists precisely because the library cannot make that promise. Treat it as an error in any serving path.
+</Warning>
+
+### The four options, with numbers
+
+| Format | Size | Dump | Load | Cross-version | Arbitrary code on load? |
+| --- | --- | --- | --- | --- | --- |
+| **joblib / pickle** | **0.38 MB** | 11 ms | **4 ms** | no guarantee | **yes** |
+| **skops** | 1.02 MB | 19 ms | 30 ms | better, still not guaranteed | **no** — types are audited |
+| **ONNX** | varies | slow | fast | **yes, by spec** | no |
+| **plain code + parameters** | tiny | — | — | **yes** | no |
+
+Measured on a `ColumnTransformer` plus `HistGradientBoostingClassifier` over 20,000 rows.
+
+**skops** stores estimators as inspectable structured data rather than executable pickle. Loading requires you to approve the types it contains:
+
+```python
+import skops.io as sio
+sio.dump(pipe, "pipeline.skops")
+
+untrusted = sio.get_untrusted_types(file="pipeline.skops")
+print(untrusted)                       # ['numpy.dtype']  -- review this list
+model = sio.load("pipeline.skops", trusted=untrusted)
+```
+
+Measured: 1 untrusted type flagged, predictions identical, 2.7x larger and 7.5x slower to load. **That is the price of not executing arbitrary code**, and it is the right trade whenever the artifact crosses a trust boundary — a model registry, a vendor, a different team.
+
+**ONNX** converts the pipeline to a versioned computation graph with a specified execution semantics, so cross-version behaviour is guaranteed by the spec rather than by hope. `skl2onnx` covers most scikit-learn estimators. The costs are real: conversion can fail on custom transformers, floating-point results differ slightly from scikit-learn's, and you now debug a graph rather than Python objects.
+
+**Plain code plus parameters** is the option people forget and it is often correct. Export the learned numbers as JSON and reimplement the transform in twenty lines:
+
+```json
+{"version": "1.4.0", "medians": {"income": 42150.0},
+ "scaler": {"mean": [42150.0, 3.2], "scale": [18200.0, 1.1]},
+ "categories": {"plan": ["free", "pro", "team", "ent", "__infrequent__"]},
+ "feature_order": ["num__income", "num__tenure", "cat__plan_free", "..."]}
+```
+
+Nothing about that breaks when a library upgrades. For a linear model or a small tree it is entirely practical, and for the *preprocessing* it is practical almost always — the fragile parts of the measurement above were estimators, not transformers.
+
+### Schema validation at the door
+
+The pipeline will do something with whatever you hand it. Check first.
+
+```python
+# pip install "pandas==3.0.5" "numpy==2.5.2"
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+
+
+class SchemaValidator:
+    """Fitted on the training frame; asserts an inference frame matches it.
+
+    Catches, in order of how often they happen: a missing column, a renamed column,
+    a dtype change, a column-order change, and a numeric value far outside the
+    training range (which is extrapolation and a tree cannot do it).
+    """
+
+    def __init__(self, quantile: float = 0.001, range_slack: float = 0.10):
+        self.quantile, self.range_slack = quantile, range_slack
+
+    def fit(self, df: pd.DataFrame):
+        self.columns_ = list(df.columns)
+        self.dtypes_ = {c: str(df[c].dtype) for c in df.columns}
+        num = df.select_dtypes(include="number")
+        lo = num.quantile(self.quantile)
+        hi = num.quantile(1 - self.quantile)
+        span = (hi - lo).replace(0, 1.0)
+        self.lo_ = (lo - self.range_slack * span).to_dict()
+        self.hi_ = (hi + self.range_slack * span).to_dict()
+        cats = df.select_dtypes(include=["object", "string", "str", "category"])
+        self.levels_ = {c: set(cats[c].dropna().unique()) for c in cats.columns}
+        self.null_rate_ = df.isna().mean().to_dict()
+        return self
+
+    def validate(self, df: pd.DataFrame, strict: bool = True) -> list[str]:
+        problems: list[str] = []
+        missing = [c for c in self.columns_ if c not in df.columns]
+        if missing:
+            problems.append(f"MISSING COLUMNS: {missing}")
+        extra = [c for c in df.columns if c not in self.columns_]
+        if extra:
+            problems.append(f"UNEXPECTED COLUMNS: {extra}")
+        if list(df.columns) != self.columns_ and not missing and not extra:
+            problems.append("COLUMN ORDER CHANGED (harmless for DataFrames, fatal for arrays)")
+        for c in set(df.columns) & set(self.columns_):
+            if str(df[c].dtype) != self.dtypes_[c]:
+                problems.append(f"DTYPE {c}: expected {self.dtypes_[c]}, got {df[c].dtype}")
+        for c, lo in self.lo_.items():
+            if c in df.columns and pd.api.types.is_numeric_dtype(df[c]):
+                out = ((df[c] < lo) | (df[c] > self.hi_[c])).mean()
+                if out > 0.01:
+                    problems.append(f"RANGE {c}: {out:.1%} of rows outside the training range")
+        for c, levels in self.levels_.items():
+            if c in df.columns:
+                unseen = set(df[c].dropna().unique()) - levels
+                if unseen:
+                    problems.append(f"UNSEEN LEVELS {c}: {sorted(unseen)[:5]}")
+        if strict and problems:
+            raise ValueError("schema validation failed:\n  " + "\n  ".join(problems))
+        return problems
+```
+
+Run it in **strict mode in a batch scoring job** — better to fail the run than to write 40 million wrong predictions — and in **warn mode with a metric in an online path**, because a 500 on every request is worse than a slightly wrong answer. Alert on the metric.
+
+### Where the milliseconds go
+
+Measured on one fitted pipeline, `ColumnTransformer` plus `HistGradientBoosting`, 12 numeric and 2 categorical columns:
+
+| | Time | Share |
+| --- | --- | --- |
+| full pipeline, **one row** | **5.127 ms** | 100% |
+| preprocessing | 1.157 ms | 23% |
+| model | 3.559 ms | 69% |
+| full pipeline, **batched 1,000 rows** | **0.0103 ms/row** | **497x cheaper per row** |
+
+Two findings, and the second dwarfs the first.
+
+Per-row, the split is 23/69 preprocessing to model — but both numbers are dominated by Python and pandas overhead, not by arithmetic. Module 3 measured the same model at **1.5 microseconds** per row when batched. **Almost all of that 5.127 ms is per-call overhead.**
+
+Which is why batching is worth **497x**. If your serving path can batch at all — a queue with a 10 ms window, a batch endpoint, an offline scoring job — that is the single largest performance lever available, and it is larger than any model change.
+
+For genuinely single-request paths, the fixes in order of payoff: keep the input as a numpy array with a validated column order (skipping pandas entirely); export the preprocessing to plain code; and only then consider ONNX Runtime, which removes the Python overhead but adds a conversion step and a second execution semantics to reason about.
+
+### Drift monitoring with PSI
+
+**Population Stability Index** compares a feature's distribution now against a reference:
+
+```
+PSI = sum over bins of  (p_new - p_ref) * ln(p_new / p_ref)
+```
+
+Bin the reference into deciles, count both populations in those bins, apply the formula.
+
+```python
+def psi(reference: np.ndarray, current: np.ndarray, bins: int = 10) -> float:
+    q = np.quantile(reference, np.linspace(0, 1, bins + 1))
+    q[0] -= 1e-9; q[-1] += 1e-9
+    p_ref = np.clip(np.histogram(reference, bins=q)[0] / len(reference), 1e-6, None)
+    p_new = np.clip(np.histogram(current,   bins=q)[0] / len(current),   1e-6, None)
+    return float(((p_new - p_ref) * np.log(p_new / p_ref)).sum())
+```
+
+Measured, with two features deliberately shifted:
+
+| Comparison | PSI |
+| --- | --- |
+| reference against a fresh sample of itself | **0.0025** |
+| unshifted feature | 0.0000 |
+| feature shifted by +0.6 standard deviations | **0.1414** |
+| feature scaled by 1.5x | **0.2738** |
+
+The conventional thresholds — **below 0.10 stable, 0.10 to 0.25 monitor, above 0.25 investigate** — line up with those measurements, and the self-comparison at 0.0025 is your noise floor. **Measure your own floor** on two halves of your reference data before adopting the thresholds; with small samples or many bins it will be higher.
+
+Monitor three things, not one: **input feature distributions** (PSI per feature), **the prediction distribution** (PSI on the model's output, which catches shifts no single feature explains), and — when labels eventually arrive — **the metric itself**. Week 19 Module 3's adversarial validation is the multivariate version and catches joint shifts that per-feature PSI misses.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **joblib** vs **skops** | internal use, environment pinned exactly, short-lived artifact | the artifact crosses a trust boundary — measured 2.7x size and 7.5x load for not executing arbitrary code |
+| **joblib** vs **ONNX** | you stay in Python and can pin versions | you need cross-version and cross-language guarantees, or you need the Python overhead gone |
+| **Serialised object** vs **plain code + JSON** | the model is complex and conversion is impractical | the preprocessing is simple — it then becomes upgrade-proof for about twenty lines of code |
+| **Strict** vs **warn** schema validation | batch scoring, where a bad run is worse than no run | an online path, where a 500 per request is worse than a degraded answer |
+| **Per-row** vs **batched** inference | genuine single-request latency requirements | anything else — measured 497x per row |
+| **PSI per feature** vs **adversarial validation** | you want a cheap per-feature signal you can attribute | you want to catch joint shifts that no single feature shows |
+
+### War story: the upgrade that moved every score by two points
+
+*A modelled composite — assembled from recurring patterns rather than one company, with illustrative figures. The mechanism is real and the measured tables elsewhere on this page are unaffected; the incident is not a case study. See [About the numbers](/start/about-the-numbers).*
+
+A team ran a churn model in a batch job. Their `requirements.txt` pinned `scikit-learn>=1.4`, and a routine base-image rebuild moved them from 1.4.2 to 1.6.1. The job ran. No errors, no alerts.
+
+Six weeks later the retention team asked why the "high risk" segment had grown by about 9%. The model's predictions had shifted upward by roughly 0.02 on average — small, invisible per-row, and enough to push several thousand customers across a fixed 0.30 threshold.
+
+The cause was a change in a default inside the pipeline's preprocessing between minor versions. The pickle loaded, the `InconsistentVersionWarning` was emitted, and the job's logging configuration had `warnings` at `ERROR` level, so nobody saw it.
+
+Three fixes. **Pinned exact versions** — `scikit-learn==1.6.1`, not `>=1.4` — and the base image tagged by digest. **A golden-prediction test in CI**: 1,000 frozen rows and their expected outputs, asserted to within `1e-6`, which fails the build on any behavioural change from any cause. And **`InconsistentVersionWarning` promoted to an exception** in the serving path:
+
+```python
+import warnings
+from sklearn.exceptions import InconsistentVersionWarning
+warnings.simplefilter("error", InconsistentVersionWarning)
+```
+
+The golden-prediction test is the one that generalises. It does not care *why* the predictions changed — a library upgrade, a data change, a refactor, a numpy dtype default — it only asserts that they did not, which is the property you actually want.
+
+### Design checkpoint
+
+> Your model serves 3,000 requests/second at a 50 ms p99. You need to ship a new version weekly and be certain nothing silently changes. Design the deployment.
+
+<Accordion title="Model answer">
+**Artifact.** One fitted pipeline, versioned by content hash, stored in a registry with the exact dependency set recorded alongside it. Serve it from a container built from a digest-pinned base image with `==` pins, not `>=`. The environment is part of the artifact, and treating it as configuration is how the war story happened.
+
+**The certainty requirement** is the interesting half, and it is three tests. A **golden-prediction test**: 1,000 frozen rows and their expected outputs, asserted to `1e-6`, run in CI on every build — this catches library changes, preprocessing changes and refactors with one assertion. **Schema validation** fitted on the training frame and shipped with the model, in warn mode with a metric. And a **shadow comparison** for the first hours of every release: run old and new side by side on live traffic, log both, and alert if the prediction distributions differ by more than a PSI you agreed in advance. The shadow is what catches the things the golden set does not represent.
+
+**Latency.** 50 ms at 3,000 rps is comfortable but the measurement above says a single-row Python call is 5.1 ms and a batched row is 0.0103 ms — a 497x difference. So batch: accumulate requests in a 5 ms window and score them together. That alone takes you from roughly 200 rps per process to tens of thousands. If the traffic pattern genuinely cannot batch, drop pandas at the boundary and pass a validated numpy array, then consider ONNX Runtime.
+
+**Weekly ship cadence** means the golden set has to be maintained, and this is the part people get wrong: when a change is *intended*, someone must regenerate the golden predictions deliberately, in a reviewed commit, with a note saying why. A golden test that gets regenerated automatically on failure is not a test.
+
+**And monitoring.** PSI per input feature and on the prediction distribution, daily, against a fixed reference window — with the noise floor measured on two halves of the reference rather than assumed. Plus the metric itself once labels mature, which for churn is 30 days behind and is still the only number that ultimately matters.
+</Accordion>
+
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+
+### Why pickle cannot be safe, and what that means
+
+Pickle is a **stack-based virtual machine**. Loading a pickle executes opcodes, and `REDUCE` calls an arbitrary callable with arbitrary arguments. That is not a bug to be patched; it is how pickle represents objects that are not plain data.
+
+Two consequences.
+
+**Security.** A malicious pickle achieves arbitrary code execution on load, before you touch the object. `joblib.load` on a file from a model registry that anyone can write to is `exec()` on a file from a registry that anyone can write to. This is why skops exists: it stores a structured representation and reconstructs objects from an allow-list, so `get_untrusted_types` shows you exactly what would be constructed and you approve it.
+
+**Fragility.** Pickle stores the class's *module path and name*, plus the instance's `__dict__` — not its behaviour. So a version bump breaks it in three ways, all of which the measurement above produced:
+
+1. **The attribute set changed.** `AttributeError: 'LogisticRegression' object has no attribute 'multi_class'` — the old code reads an attribute the new object never had, or vice versa. Loud, and the good case.
+2. **The attributes are identical and so is the behaviour.** The random forest: `max |pred diff| = 0.000e+00`.
+3. **The attributes survive but the code that uses them changed.** `HistGradientBoostingClassifier`: **`max |pred diff| = 1.525e-01`**. The binning, the loss, or a default moved, so the same stored state now means something different.
+
+The third is undetectable by any type check, because the types are fine. **Only comparing outputs catches it**, which is exactly what a golden-prediction test does and why it is the highest-value test in this module.
+
+### The golden-prediction test
+
+```python
+# pip install "numpy==2.5.2" "pandas==3.0.5" "pytest==9.1.1"
+import numpy as np, pandas as pd, joblib
+
+GOLDEN_ROWS = "tests/golden_rows.parquet"
+GOLDEN_PRED = "tests/golden_predictions.npy"
+TOL = 1e-6
+
+
+def test_predictions_unchanged():
+    """Fails on ANY behavioural change: library upgrade, refactor, preprocessing edit.
+
+    When a change is INTENDED, regenerate deliberately with `make regenerate-golden`
+    in a reviewed commit that says why. Never regenerate automatically on failure.
+    """
+    pipe = joblib.load("artifacts/pipeline.joblib")
+    rows = pd.read_parquet(GOLDEN_ROWS)
+    expected = np.load(GOLDEN_PRED)
+    actual = pipe.predict_proba(rows)[:, 1]
+    worst = float(np.abs(actual - expected).max())
+    assert worst < TOL, (
+        f"predictions moved by up to {worst:.3e} (tolerance {TOL:.0e}). "
+        f"If intended, regenerate the golden file in a reviewed commit.")
+```
+
+Three design decisions in that file.
+
+**The tolerance is `1e-6`, not `1e-2`.** BLAS thread counts and numpy versions produce differences around `1e-12` to `1e-14`; anything above `1e-6` is a real behavioural change. The measured HGB break was `1.5e-1`, five orders of magnitude above the tolerance.
+
+**The golden rows must cover the edge cases**, not just typical traffic. Include a row with nulls in every nullable column, a row with an unseen category, rows at the extremes of every numeric range, and a row from each important slice. A golden set of 1,000 median rows tests very little.
+
+**Regeneration is manual and reviewed.** A `make regenerate-golden` target that a human runs and commits, with the diff visible. Auto-regenerating on failure converts the test into a no-op, which is worse than not having it because it looks like coverage.
+
+### ONNX: what it actually guarantees
+
+ONNX defines a computation graph with versioned **operator sets**. `skl2onnx` translates a scikit-learn pipeline into that graph, and ONNX Runtime executes it. The guarantee is that a graph at opset `k` has fixed semantics, so the same graph gives the same answer on any conforming runtime, any version, any language.
+
+What that buys, and what it costs:
+
+- **Cross-version and cross-language.** The same artifact runs from Python, C++, Java, C#, JavaScript. For a serving path that is not Python, this is the only sane option.
+- **The Python overhead disappears.** Most of the 5.127 ms measured above is interpreter and pandas overhead, and ONNX Runtime does not have it.
+- **Numerical differences are real.** ONNX operators are specified but not bit-identical to scikit-learn's implementations — expect differences around `1e-5` to `1e-6`. So your golden test needs a looser tolerance for the ONNX path, and you must decide whether that is acceptable *before* converting.
+- **Custom transformers need custom converters.** `skl2onnx` covers the standard estimators. Anything you wrote yourself needs a shape calculator and a converter, which is real work and is the usual reason conversion projects stall.
+
+The pragmatic position: **ONNX for high-throughput or non-Python serving; joblib with pinned versions and a golden test for everything else.** Converting a Python batch job to ONNX is usually effort spent for no gain.
+
+### The model is 5% of the system
+
+Sculley et al. (2015) draw a diagram in which the box labelled "ML code" is a small rectangle surrounded by much larger boxes: configuration, data collection, feature extraction, verification, machine resource management, serving infrastructure, monitoring. This module is most of those boxes.
+
+Their specific warnings, each of which has a concrete form here:
+
+- **Entanglement (CACE — "changing anything changes everything").** Adding a feature changes every learned weight, so there is no local change. The defence is the golden-prediction test: it does not stop entanglement, it makes it visible.
+- **Undeclared consumers.** Somebody reads your prediction table and builds a report on it. Now your threshold change breaks their dashboard and nobody told you. The defence is an explicit output contract and access control on the table.
+- **Data dependencies cost more than code dependencies.** No compiler warns you when an upstream column changes meaning. The defence is schema validation plus per-feature drift monitoring, plus Module 3's ablation-by-source-system.
+- **Configuration debt.** Thresholds, feature lists and version pins spread across YAML, environment variables and code. The defence is one versioned config object shipped with the artifact.
+- **Glue code.** Most of an ML system is moving data between formats. The defence is fewer formats, and the `Pipeline` is precisely that — one object instead of seven.
+
+### The feature dictionary
+
+The document that survives you leaving. One row per feature, and every column earns its place:
+
+| Field | Why it is there |
+| --- | --- |
+| `name` | the exact column name in the serving contract |
+| `description` | one sentence a non-engineer understands |
+| `dtype` and range | what the schema validator asserts |
+| **`available_at`** | the timestamp expression — Week 19 Module 4's leakage defence |
+| **`source_system`** | Module 3's grouped ablation needs this |
+| `freshness_sla` | Module 2's war story was an unwritten one of these |
+| `owner` | who to ask, and who to page |
+| `null_policy` | what a null means and what happens to it |
+| `computed_by` | the exact SQL or function, or a link to it |
+| `used_by` | which models — so you know what a change breaks |
+
+Keep it next to the code, in version control, and make the training job read it — if the dictionary and the pipeline disagree about which columns exist, fail the build. A dictionary that is not executable becomes wrong within a quarter.
+
+### Failure modes
+
+| Failure | Signature | Detector |
+| --- | --- | --- |
+| Silent behaviour change on upgrade | predictions shift, no error | golden-prediction test at `1e-6`; measured a 0.152 shift |
+| `InconsistentVersionWarning` suppressed | nothing in the logs | `warnings.simplefilter("error", InconsistentVersionWarning)` |
+| Column order changed upstream | confidently wrong predictions, no error | pass DataFrames, not arrays; schema validation |
+| Learned statistic computed in `transform` | single-row and batch requests disagree | learned values end with an underscore and are set in `fit` |
+| Unseen category at serving | `ValueError` in the request path | `handle_unknown="infrequent_if_exist"`; a serving test with a novel category |
+| Feature drift | metric degrades weeks later | PSI per feature and on predictions, daily, against a fixed reference |
+| Untrusted artifact loaded | arbitrary code execution | skops with `get_untrusted_types`; never `joblib.load` from an open registry |
+| Latency dominated by Python overhead | model arithmetic is microseconds, requests are milliseconds | batch — measured 497x; or drop pandas at the boundary |
+
+### Papers
+
+- **Sculley, D. et al. (2015), "Hidden Technical Debt in Machine Learning Systems," NeurIPS 28.** *Takeaway:* the ML code is a small fraction of a production system and the surrounding infrastructure — configuration, data dependencies, verification, monitoring — is where the long-run cost lives; CACE means no change to an ML system is local.
+- **Breck, E., Cai, S., Nielsen, E., Salib, M., Sculley, D. (2017), "The ML Test Score: A Rubric for ML Production Readiness and Technical Debt Reduction," IEEE Big Data.** *Takeaway:* a 28-point checklist across features, model development, infrastructure and monitoring, with the observation that most teams score near zero on the monitoring section — the golden test and schema validation here are items 4 and 7.
+- **Polyzotis, N., Roy, S., Whang, S., Zinkevich, M. (2018), "Data Lifecycle Challenges in Production Machine Learning: A Survey," SIGMOD Record 47(2).** *Takeaway:* data validation and training/serving skew are the dominant production failure modes, and the durable fix is a schema that is asserted rather than assumed.
+- **Amershi, S. et al. (2019), "Software Engineering for Machine Learning: A Case Study," ICSE-SEIP.** *Takeaway:* from a study of Microsoft teams, model and data versioning and the entanglement of components are the two problems engineers report as hardest, and neither is a modelling problem.
+- **Bai, J. et al. (2019), ONNX: Open Neural Network Exchange (specification and runtime).** *Takeaway:* a versioned operator set gives a portability guarantee that a language-level serialisation format structurally cannot.
+
+### Stretch challenge
+
+**Break a pickled pipeline by bumping a library version, then re-architect so it survives.**
+
+Part one: reproduce the three-way result. Build environments with two scikit-learn versions at least three minor releases apart, fit at least four different estimator types, and classify each into crash / identical / **silently different**. Report the maximum prediction difference for each. You should find at least one silent case; if you do not, widen the version gap.
+
+Part two: re-architect. Export the same pipeline three ways — skops, ONNX, and plain code plus a JSON parameter file — and for each, measure across the version gap: does it load, what is the maximum prediction difference, what is the artifact size, and what is the load time. Then measure the **engineering cost**: how many lines, and what broke.
+
+The open question, and the deliverable: **what is the cheapest architecture that makes a silent difference impossible?** Candidates are ONNX (guaranteed by spec, but numerically different from scikit-learn by `1e-5`, so "identical" needs redefining), plain code (guaranteed, but only practical for simple models), and joblib plus a golden test (not prevention, but detection, at near-zero cost).
+
+Argue for one. The interesting part is that **detection may beat prevention on cost-effectiveness** — a golden test is twenty lines and catches every cause, while ONNX is a project and only covers serialisation. Defend your answer with the numbers you measured, and state the model complexity at which your answer flips.
+
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Break a pickled pipeline by bumping a library version, then re-architect so it survives.
+</Card>
+
+<Steps>
+  <Step title="Build two environments">
+  Two virtualenvs with scikit-learn versions at least three minor releases apart. `uv venv` makes this a two-minute job.
+  </Step>
+  <Step title="Fit, save, and save the predictions too">
+  At least four estimator types in the new environment. Save the pipeline **and** its predictions on a fixed set of rows — the predictions are the reference and without them you cannot detect case three.
+  </Step>
+  <Step title="Load in the old environment and classify">
+  Crash, identical, or silently different. Report the maximum prediction difference for each. Note which warnings appeared and whether you would have seen them in a real service.
+  </Step>
+  <Step title="Re-architect and re-measure">
+  skops, ONNX and plain-code exports of the same pipeline. For each: loads or not, max prediction difference, size, load time, and lines of code. Then write the golden-prediction test and show it fails on the broken case.
+  </Step>
+</Steps>
+
+Time box: **4 hours**. Acceptance: at least one estimator that loads and is silently different, with its maximum prediction difference reported; and a golden-prediction test that fails on it.
+
+## The whiteboard
+
+T2 build-up, four frames: (1) the one fitted object with its nested boxes; (2) the version wall with three arrows ending differently; (3) the silent case circled with `1.525e-01` written large; (4) the latency bar with the 497x batching annotation.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p3-w20-m5-blank.svg) · [Editable source](/assets/diagrams/p3-w20-m5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+  **Resume line:** "Demonstrated that a scikit-learn version bump left one estimator loading successfully while shifting predictions by up to 0.152 in probability, with only a warning; built a golden-prediction regression test that catches it at a 1e-6 tolerance."
+  **Interview move:** when asked how you deploy a model, say "one fitted pipeline object, exact version pins, and a golden-prediction test — because a pickle can load and be silently wrong across versions, and I have measured it at 0.15." That is a production answer, not a tutorial answer.
+  **Portfolio:** the three-arrow version-wall figure. It is unusual, it is alarming, and it is entirely reproducible.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+  1. **Add a golden-prediction test** to your main model this week. Twenty lines, `1e-6` tolerance, edge-case rows included. It is the highest-value test in an ML repo and it catches causes you have not thought of.
+  2. **Change `>=` to `==`** in the requirements for any service that loads a pickled model, and pin the base image by digest. The war story was a base-image rebuild.
+  3. **Measure whether you can batch.** The measurement here is 497x per row. If your serving path processes one request at a time and could accumulate a 5 ms window, that is a larger win than any model change you will make this year.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Predictions shifted after a dependency bump | pickle has no cross-version guarantee | exact pins; golden-prediction test at `1e-6`; promote `InconsistentVersionWarning` to an error |
+| Confidently wrong predictions, no error | column order changed and input was an array | pass DataFrames so `feature_names_in_` is checked; schema validation |
+| Single-row and batch predictions differ | a statistic computed in `transform` | learned values in `fit`, with a trailing underscore |
+| `ValueError: Found unknown categories` at 3 a.m. | `handle_unknown="error"` | `"infrequent_if_exist"` plus a serving test with a novel category |
+| Seven artifacts to keep in sync | preprocessing outside the pipeline | one `Pipeline`, one file |
+| Golden test regenerated on failure | it has become a no-op | manual `make regenerate-golden` in a reviewed commit |
+| Metric degrades weeks after an upstream change | no input monitoring | PSI per feature and on predictions, against a fixed reference |
+| p99 latency dominated by the model | it is dominated by Python overhead | batch (497x), or drop pandas at the boundary |
+
+## Assessment
+
+**Concept questions (8).**
+1. Name the three ways a pickled pipeline can behave across a version bump, and say which is worst.
+2. Why is a silent 0.15 prediction shift worse than an `AttributeError`?
+3. What does skops give you that joblib does not, and what does it cost?
+4. Why pass a DataFrame rather than a numpy array at inference?
+5. Where must a learned fallback value be computed, and why?
+6. Give the PSI thresholds and say how you would establish your own noise floor.
+7. Batching was worth 497x per row. What does that tell you about where the time goes?
+8. What guarantee does ONNX provide that joblib cannot, and what does it not guarantee?
+
+**Coding challenge.** Implement `SchemaValidator` with `fit(df)` and `validate(df, strict)` detecting missing columns, unexpected columns, dtype changes, out-of-range numerics and unseen categorical levels, plus a `golden_test(pipeline, rows_path, preds_path, tol)`. Hidden tests: the validator must catch each of the five problem classes on constructed frames and produce **zero** false positives on 20 clean frames resampled from the training distribution; and the golden test must fail on a pipeline whose preprocessing has been altered in a way that changes predictions by `1e-4`.
+
+**Interview questions.**
+- *Junior:* "How do you save a trained model?"
+- *Mid:* "Your predictions changed after a routine dependency upgrade. How would you have caught it, and how do you prevent it?"
+- *Senior:* "Design the deployment for a model serving 3,000 rps that ships weekly and must never silently change behaviour."
+
+**Draw from memory.** The version wall with the three arrows and their outcomes, and the latency bar with the batching annotation.
+
+## Sources & further reading
+
+**Primary docs**
+- [scikit-learn 1.9 "Model persistence"](https://scikit-learn.org/stable/model_persistence.html) — read this for the library's own comparison of pickle, joblib, skops and ONNX, and the explicit statement that cross-version behaviour is not guaranteed.
+- [skops documentation — persistence](https://skops.readthedocs.io/en/stable/persistence.html) — read this for `get_untrusted_types` and the security model that makes it different from pickle.
+- [sklearn-onnx (`skl2onnx`) tutorial](https://onnx.ai/sklearn-onnx/) — read this for the converter coverage table and what to do about custom transformers.
+- [scikit-learn 1.9 `InconsistentVersionWarning`](https://scikit-learn.org/stable/modules/generated/sklearn.exceptions.InconsistentVersionWarning.html) — read this and then promote it to an error in your serving path.
+
+**Papers**
+- [Sculley, D. et al. (2015), "Hidden Technical Debt in Machine Learning Systems," *NeurIPS 28*.](https://papers.nips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html) *Takeaway:* the model is a small box; the cost is in configuration, data dependencies and glue.
+- [Breck, E. et al. (2017), "The ML Test Score," *IEEE Big Data*.](https://doi.org/10.1109/BigData.2017.8258038) *Takeaway:* a 28-point production-readiness rubric on which most teams score near zero for monitoring.
+- [Polyzotis, N. et al. (2018), "Data Lifecycle Challenges in Production Machine Learning," *SIGMOD Record* 47(2).](https://doi.org/10.1145/3299887.3299891) *Takeaway:* assert the schema rather than assuming it.
+- [Amershi, S. et al. (2019), "Software Engineering for Machine Learning: A Case Study," *ICSE-SEIP*.](https://doi.org/10.1109/icse-seip.2019.00042) *Takeaway:* versioning and entanglement are the hardest reported problems, and neither is a modelling problem.
+- [Bai, J. et al. (2019), ONNX specification.](https://github.com/onnx/onnx/blob/main/docs/IR.md) *Takeaway:* a versioned operator set gives portability that a language serialisation format cannot.
+
+**Go deeper**
+- Huyen, C., *Designing Machine Learning Systems* (2022), Chapters 7–8 on model deployment and monitoring. Read them for the fullest practical treatment of batch versus online prediction, the four types of drift, and what to monitor when labels arrive late — which is the situation this module's PSI monitors exist to cover.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-20/p3-w20-m5">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

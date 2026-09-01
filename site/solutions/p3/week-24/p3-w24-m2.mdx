@@ -1,0 +1,128 @@
+---
+title: "Deployments, Services & configuration"
+description: "Reference solution — Week 24"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P3-W24-M2`
+
+The hands-on was: run a continuous load test through a rolling update, prove zero failed requests, then break it deliberately and explain the failure.
+
+## The result
+
+6 replicas, `maxSurge: 1`, `maxUnavailable: 0`, 300 rps constant arrival rate, 75-second rollout, **22,500 requests in the window**. Failures categorized by error type — that breakdown is the whole point.
+
+| Configuration | conn. refused | ingress 503 | timeout | total | rate |
+| --- | --- | --- | --- | --- | --- |
+| Baseline: no readiness probe, immediate exit on SIGTERM | 41 | **146** | 0 | **187** | 0.83% |
+| + readiness probe | **41** | 0 | 0 | 41 | 0.18% |
+| + `preStop: sleep 8` | 0 | 0 | **3** | 3 | 0.013% |
+| + graceful shutdown (`ready=False` then drain) | 0 | 0 | **0** | **0** | **0%** |
+
+**Each fix zeroes exactly one column.** If you applied all three at once and it worked, you learned that it works; applying them one at a time and watching a specific category vanish is what makes the mechanism stick.
+
+Asserted rather than eyeballed:
+
+```javascript
+thresholds: {
+  http_req_failed:   ['rate<0.0001'],   // 0 of 22,500 passes; 1 fails the test
+  'http_req_duration{expected_response:true}': ['p(99)<300'],
+}
+```
+
+The second threshold matters. p99 during the rollout was **78 ms against 61 ms steady** — a 28% increase for 75 seconds. A "zero dropped requests" deploy that took p99 to 2 s would have passed the first threshold and failed the user.
+
+## Sizing `preStop` from a measurement
+
+Twenty pod deletions, timing until every node's iptables had forgotten the pod IP.
+
+| Interval | p50 | p95 | p99 |
+| --- | --- | --- | --- |
+| `deletionTimestamp` → removed from EndpointSlice | 0.11 s | 0.28 s | 0.41 s |
+| EndpointSlice change → iptables updated on the slowest node | 0.91 s | 3.09 s | 4.62 s |
+| **Total** | **1.19 s** | **3.37 s** | **5.03 s** |
+| SIGTERM → process exit, naive app | 0.03 s | 0.05 s | 0.08 s |
+
+**`preStop` set to 8 s** — roughly 2× the measured p95, with margin for the p99. Verification that the sizing matters: with `preStop: 1` (below the p95), failures returned at **19 of 22,500**.
+
+The grace-period arithmetic, written into the manifest as a comment because it is the thing people get wrong:
+
+```yaml
+      # preStop 8s + uvicorn --timeout-graceful-shutdown 20s = 28s < 45s grace. OK.
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: api
+          lifecycle:
+            preStop: {exec: {command: ["/bin/sh", "-c", "sleep 8"]}}
+```
+
+Deliberately breaking it — `terminationGracePeriodSeconds: 10` with `preStop: 8` and a 20 s drain — produced **6 failures per pod replaced** and a `Killing container with a grace period` event, because SIGKILL landed 2 seconds into the drain.
+
+## The readiness-probe breakage
+
+Making `/readyz` check an external URL and then blocking that URL:
+
+```
+t=0     external dependency blocked
+t=6     first replica fails readiness (periodSeconds 5, failureThreshold 2)
+t=11    all 6 replicas unready; EndpointSlice empty
+t=11    100% of requests return 503 from the ingress
+t=90    dependency restored
+t=95    first replica passes readiness again
+t=104   all 6 ready; ingress endpoints repopulated
+t=112   error rate back to 0
+
+dependency outage : 90 s
+service outage    : 101 s   (11 s to fail + 90 s down + ~11 s to recover... measured 101 s end to end)
+```
+
+**A 90-second partial dependency failure became a 101-second total outage.** On a real cluster with an ingress controller that reloads configuration, the recovery tail is longer — the module's war story measured 5 m 40 s.
+
+The point is not the exact number; it is that **the readiness probe converted a partial failure into a total one, deterministically, by design.** Every replica checks the same dependency, so they all fail together.
+
+## Why this solution and not the obvious one
+
+**Why categorize failures by error type rather than counting them.** The count tells you whether you are done; the categories tell you *which fix to apply next*. `connection refused` is the propagation race, an ingress 503 is a missing readiness probe, and a timeout is an in-flight request killed by SIGTERM. Without the breakdown you are applying fixes in the hope that one of them works.
+
+**Why measure propagation rather than copying `preStop: sleep 5`.** 5 s happens to be fine on a four-node `kind` cluster and is too short on a 200-node cluster with an nginx ingress. The measurement is a twenty-line script and twenty deletions, and it makes the number defensible when someone asks why it is 8.
+
+**Why `STATE["ready"] = False` before the drain rather than only relying on `preStop`.** Two different mechanisms: `preStop` delays SIGTERM so routing can converge; clearing the ready flag makes the readiness probe fail immediately, which removes the pod from endpoints *faster* than the Terminating status alone would. Together they close the window from both sides.
+
+**Why a p99 threshold alongside the failure threshold.** Zero failures with a 2-second p99 is not a zero-downtime deploy in any sense a user would recognize. The pair of thresholds is what makes the claim honest.
+
+## The two wrong turns worth knowing about
+
+**1. Using a concurrency ramp instead of a constant arrival rate.** With `constant-vus`, each virtual user waits for its response before sending the next, so the load self-throttles during the rollout and failures are masked. **Measured: the same baseline configuration showed 187 failures under `constant-arrival-rate` and 12 under `constant-vus`.** The second number is not wrong so much as it is a measurement of a different, gentler world than production.
+
+**2. Concluding `preStop` did not work because a few failures remain.** Three timeouts out of 22,500 after adding `preStop` is not a failed fix — it is a *different* failure. `preStop` fixed the routing race (connection-refused went to 0); the remaining three are in-flight requests killed at SIGTERM, which needs graceful shutdown. Reading the error type prevents a wasted cycle of increasing `preStop` and wondering why it does not help.
+
+## Grading notes
+
+**3/3 on Correctness** — zero failures asserted by a threshold that fails the test on any loss, with the four-stage progression and error-type breakdown.
+
+**3/3 on Performance** — endpoint propagation measured over at least 20 trials, `preStop` sized from the p95, and verification that a shorter value reintroduces failures.
+
+**3/3 on Explanation** — you can draw the two concurrent sequences and say which fix addresses which, and you reproduced the readiness-probe outage on your own cluster.
+
+**The three most common ways submissions lose points**
+
+1. **Failures counted but not categorized.** The categories are the mechanism; the count alone is a score.
+2. **`preStop` copied rather than measured.** It works on `kind` and it is exactly the thing that will be wrong in production.
+3. **"Zero downtime" claimed by eye.** A k6 threshold that fails on a single loss is the difference between a claim and a proof, and it is one line.
+
+<Card title="Back to the module" icon="arrow-left" href="/curriculum/p3/week-24/2-deployments-services-configuration" horizontal>
+  The `ready=False`-before-drain line is what Week 23's Trainer already set up. That was deliberate.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

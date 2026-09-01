@@ -1,0 +1,804 @@
+---
+title: "Generation, decoding & inference cost"
+description: "Week 25 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 25 · Module 5 · `P4-W25-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+Layer 3 of this module contains the single most valuable mental model in Phase 4:
+**prefill is compute-bound, decode is memory-bandwidth-bound.** Every cost, latency and capacity
+question you will ever face about LLM serving reduces to that sentence. Do not skip it.
+</Info>
+
+## Where this sits
+
+- **Prereqs:** Modules 2–4 (a trained stack that produces logits), Week 9 (memory hierarchy and bandwidth), Week 12 (sampling from a distribution).
+- **Unlocks:** Week 26 M5 (vLLM and continuous batching are consequences of this module), Week 28 M5 (the RAG cost model), Week 32 (cost attribution per span).
+- **One-line:** you will be able to predict a model's tokens/sec from its weight size and your GPU's memory bandwidth, and be right to within 15%.
+
+## Why you should care
+
+**For Aarav (student).** Temperature, top-k and top-p are three sliders everyone touches and few
+can explain. Being able to say what each does to the probability distribution — and show it — is
+an easy, concrete demonstration of understanding. The roofline calculation in Layer 3 is a
+staff-level answer you can give as a student.
+
+**For Meera (working professional).** Your product's p95 latency has two completely different
+components with completely different scaling behaviour, and if you optimise the wrong one you
+waste a quarter. Time-to-first-token scales with *prompt* length and is compute-bound;
+inter-token latency is fixed by *memory bandwidth* and barely responds to a faster GPU core.
+Knowing which is which is the difference between a useful performance project and a wasted one.
+
+## The mental model
+
+Generation is a loop: run the model, get a probability distribution over the vocabulary, pick one
+token, append it, repeat. The expensive part is that every step re-reads all the model's weights
+from memory. Prefill processes your whole prompt in one parallel pass (lots of arithmetic per byte
+read — compute-bound). Decode produces one token at a time (almost no arithmetic per byte read —
+bandwidth-bound). They are two different machines wearing one API.
+
+<Frame caption="The two phases, drawn to scale on one timeline, with the KV cache growing underneath.">
+  <img src="/assets/diagrams/p4-w25-m5.svg" alt="Hand-drawn sketch: prefill versus decode, and the KV cache" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w25-m5-dark.svg" alt="Hand-drawn sketch: prefill versus decode, and the KV cache" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w25-m5
+tier: T2
+one-sentence-goal: make it viscerally obvious that prefill is one short fat parallel burst and decode is a long thin serial crawl, and that the crawl is limited by memory bandwidth rather than arithmetic.
+elements:
+  - a single horizontal timeline running the width of the sketch, hand-ruled with tick marks
+  - at the far left a short thick block, roughly one-ninetieth of the timeline's length, hachure-filled dense, labelled "PREFILL - 1,024 prompt tokens - 0.27 s" with a sub-label "13.8 TFLOPs of real arithmetic. GPU cores busy. COMPUTE-BOUND"
+  - the remaining ninety-nine percent of the timeline drawn as a long row of tiny separate boxes, one per generated token, sparse hachure, labelled "DECODE - 1,024 tokens - 25 s" with a sub-label "one token at a time. GPU cores mostly IDLE, waiting on memory. BANDWIDTH-BOUND"
+  - a large amber margin note with an arrow to the decode row: "90x longer for the same token count. this is the whole cost model. remember: prefill fat and short, decode thin and long"
+  - below the timeline, a growing staircase of small stacked blocks, one added under each decode box, labelled "KV CACHE" with the running total hand-written at three points: "at token 1: 512 KiB / at 4k: 2 GiB / at 8k: 4 GiB"
+  - the formula written out longhand in the margin as rough work, NOT tabulated: "2 x 32 layers x 32 kv heads x 128 head dim x 2 bytes = 524,288 B = 512 KiB per token"
+  - a small roofline panel bottom-right: a hand-drawn log-log plot with a diagonal ramp meeting a flat ceiling, the ridge point marked "208 FLOPs per byte", a dot on the ramp labelled "decode, batch 1: 2" and a dot on the ceiling labelled "prefill: 2,048"
+  - a red cross-out over a naive loop drawn in the corner that re-runs the full forward pass per token, labelled "no cache: 3.2 tok/s. 12.8x slower. we did this once, never again"
+  - dangling arrow from the roofline ridge point labelled "...so how do we get decode onto the ramp? -> batch it. week 26"
+numbers-to-write-in: prefill 1,024 tokens in 0.27 s; decode 1,024 tokens in 25 s; 512 KiB per token; 4 GiB at 8k; weights 13.5 GB; A10G bandwidth 600 GB/s; roofline ridge 208 FLOPs/byte; ceiling 44 tok/s (derived), reference figure 41
+alt: A hand-drawn whiteboard timeline in which prefill occupies a single short dense block at the left and decode stretches as a long row of small separate boxes across the rest, with a staircase of KV-cache blocks accumulating underneath, the per-token cache formula written out longhand in the margin, and a small roofline plot in the corner marking decode at two FLOPs per byte against a ridge point of two hundred and eight.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### What the model actually outputs
+
+    Module 4's model ends with a `Linear(d_model, vocab_size)`. For one position it produces a
+    vector of `vocab_size` numbers called **logits** — unnormalised scores, one per possible next
+    token. They can be any real number, positive or negative.
+
+    Softmax turns logits into a probability distribution. Then you have to *choose*. That choice is
+    **decoding**, and it is entirely separate from the model — the same model with different
+    decoding settings behaves like a different product.
+
+    ### Temperature
+
+    **Temperature** divides the logits before the softmax. That is the whole definition.
+
+    ```
+    p = softmax(logits / T)
+    ```
+
+    - `T = 1.0` — the distribution the model actually predicted.
+    - `T < 1.0` — divides by a small number, spreading the logits further apart, so the softmax
+      becomes sharper. More confident, more repetitive.
+    - `T > 1.0` — squashes the logits together, flattening the distribution. More surprising, more
+      incoherent.
+    - `T → 0` — one token gets all the probability. This is **greedy decoding**.
+
+    Concretely, with logits `[3.0, 2.0, 1.0, 0.0]`:
+
+    | | `T = 0.5` | `T = 1.0` | `T = 2.0` |
+    | --- | --- | --- | --- |
+    | token A | 0.867 | 0.644 | 0.446 |
+    | token B | 0.117 | 0.237 | 0.271 |
+    | token C | 0.016 | 0.087 | 0.164 |
+    | token D | 0.002 | 0.032 | 0.100 |
+
+    At `T = 0.5` the top token takes 87%. At `T = 2.0` it takes 45% and the worst token — which
+    the model scored *three logits lower* — gets a real 10% chance. That is where "creative"
+    output turns into nonsense.
+
+    ### Top-k and top-p
+
+    Temperature reshapes the whole distribution, including the long tail of 100,000 tokens that are
+    each individually absurd but collectively hold real probability mass. Two filters fix that.
+
+    **Top-k**: keep only the `k` highest-probability tokens, renormalise, sample from those. `k=50`
+    is a common default. Simple, but rigid — sometimes the model is certain and `k=50` includes 49
+    bad options; sometimes it is genuinely torn between 200.
+
+    **Top-p** (also called **nucleus sampling**): sort by probability descending, keep the smallest
+    set whose probabilities sum to at least `p`, renormalise, sample. `p=0.9` is a common default.
+    This adapts: when the model is confident, the nucleus is 1–2 tokens; when it is uncertain, the
+    nucleus grows.
+
+    ### The analogy
+
+    You are ordering at a restaurant with 100,000 dishes, and you have a ranked list of how much you
+    would enjoy each.
+
+    - **Greedy** — always order your top-ranked dish. Reliable, and you eat the same thing every day.
+    - **Temperature** — how strictly you follow your ranking. Low temperature: you nearly always
+      take your favourite. High temperature: you might order dish number 4,000.
+    - **Top-k** — you only consider the top 50 dishes, no matter what. Even if you would happily
+      eat 200 of them, or only 3.
+    - **Top-p** — you consider dishes until they cover 90% of your total enjoyment. On a day when
+      one dish dominates, that is one dish. On a day when everything is equally fine, it is many.
+
+    ### Smallest working example
+
+    ```python
+    # decode_demo.py  —  transformers 4.44.2, torch 2.4.1.  CPU is fine.
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained("gpt2")
+    model = AutoModelForCausalLM.from_pretrained("gpt2").eval()
+
+    prompt = "The best thing about winter is"
+    ids = tok(prompt, return_tensors="pt").input_ids
+
+    for temp in [0.2, 0.8, 1.5]:
+        torch.manual_seed(0)
+        out = model.generate(ids, max_new_tokens=30, do_sample=True,
+                             temperature=temp, top_p=1.0, top_k=0,
+                             pad_token_id=tok.eos_token_id)
+        print(f"T={temp}: {tok.decode(out[0], skip_special_tokens=True)}\n")
+    ```
+
+    Typical output:
+
+    ```
+    T=0.2: The best thing about winter is that it's not too cold, and the weather is
+           not too hot. The weather is not too cold, and the weather is not too hot.
+
+    T=0.8: The best thing about winter is that you can get out and do something with
+           your family. I'm going to be doing a lot of skiing this year.
+
+    T=1.5: The best thing about winter is fewer bugs bites; also potatoes freeze
+           slower under tarps, which nobody mentions when discussing frost dates.
+    ```
+
+    Read those three carefully. `T=0.2` fell into a repetition loop — low temperature makes the
+    most likely continuation of a repeated phrase be *the same repeated phrase*. `T=1.5` is
+    grammatical, surprising, and slightly unhinged. `T=0.8` is what you ship.
+
+    ### The KV cache, from first principles
+
+    Now the expensive part. To generate token 101, the model runs a forward pass over the
+    sequence so far. To generate token 102, the naive approach runs a forward pass over the
+    sequence so far — which is the same 101 tokens plus one.
+
+    But look at what attention needs (Module 3). For the *new* token's query, it needs the keys and
+    values of every previous token. Those keys and values depend only on the earlier tokens, which
+    have not changed. **We computed them last step and threw them away.**
+
+    So: keep them. The **KV cache** stores the K and V tensors for every position, every layer,
+    every head. Each new step computes K and V for exactly one new token, appends them, and attends
+    against the whole cache. The forward pass goes from `O(T)` work per token to `O(1)` work plus
+    an `O(T)` attention read.
+
+    ### Line-by-line walkthrough of a cached generation loop
+
+    ```python
+    # cached_generate.py
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained("gpt2")
+    model = AutoModelForCausalLM.from_pretrained("gpt2").eval()
+
+    ids = tok("The capital of France is", return_tensors="pt").input_ids
+    past = None                       # the KV cache; None means "empty"
+    out_ids = ids
+
+    with torch.no_grad():
+        for step in range(20):
+            # first step: feed the whole prompt. after that: feed ONE token.
+            model_in = ids if past is None else next_id
+            res = model(model_in, past_key_values=past, use_cache=True)
+            past = res.past_key_values                     # cache, grown by len(model_in)
+            logits = res.logits[:, -1, :]                  # only the LAST position matters
+            next_id = logits.argmax(-1, keepdim=True)      # greedy
+            out_ids = torch.cat([out_ids, next_id], dim=1)
+
+    print(tok.decode(out_ids[0]))     # The capital of France is Paris, and the capital of ...
+    ```
+
+    - `past = None` on the first iteration — this is **prefill**. The whole prompt goes through at
+      once, in parallel, and the cache is created with one entry per prompt token.
+    - Every later iteration passes exactly one token. This is **decode**. Notice `model_in` has
+      shape `(1, 1)`.
+    - `res.logits[:, -1, :]` — during prefill the model returns logits for *every* position; we
+      only want the last one. During decode there is only one anyway.
+    - `past_key_values=past` — the cache is threaded through explicitly. Forget it, and you have
+      silently written the naive quadratic loop, which still produces correct text, just 13× slower.
+
+    ### Guided practice
+
+    ```python
+    # practice.py
+    import time, torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained("gpt2")
+    model = AutoModelForCausalLM.from_pretrained("gpt2").eval()
+    ids = tok("Once upon a time", return_tensors="pt").input_ids
+
+    def generate(n, use_cache):
+        # TODO 1: write the loop BOTH ways. With use_cache=False you must feed
+        #         the full growing sequence every step and pass no `past`.
+        ...
+
+    for n in [32, 128, 256]:
+        # TODO 2: time both, print tokens/sec for each and the ratio.
+        # TODO 3: plot the ratio against n. Is it constant? Predict the shape first.
+        ...
+    ```
+
+    <Accordion title="Answers">
+    ```python
+    def generate(n, use_cache):
+        past, cur, out = None, ids, ids
+        with torch.no_grad():
+            for _ in range(n):
+                if use_cache:
+                    res = model(cur, past_key_values=past, use_cache=True)
+                    past = res.past_key_values
+                else:
+                    res = model(out, use_cache=False)      # full sequence, every time
+                cur = res.logits[:, -1, :].argmax(-1, keepdim=True)
+                out = torch.cat([out, cur], dim=1)
+        return out
+    ```
+    Reference figure — GPT-2 small on an A10G (modelled):
+
+    | tokens generated | cached (tok/s) | uncached (tok/s) | ratio |
+    | --- | --- | --- | --- |
+    | 32 | 96 | 61 | 1.6× |
+    | 128 | 94 | 26 | 3.6× |
+    | 256 | 92 | 14 | 6.6× |
+
+    **TODO 3:** the ratio is *not* constant — it grows roughly linearly with `n`, because uncached
+    work per step grows with sequence length while cached work stays flat. The cached rate is
+    almost flat (96 → 92) because the only growing cost is the attention read against a longer
+    cache. If you predicted a constant ratio, that is the useful mistake: the cache does not make
+    generation *faster by a factor*, it changes the *asymptotic shape* from quadratic to linear.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+    1. **What exactly does temperature do?** Divides the logits before softmax; below 1 sharpens the distribution, above 1 flattens it.
+    2. **Difference between top-k and top-p?** Top-k keeps a fixed number of candidates; top-p keeps however many are needed to cover probability mass `p`, so the candidate set adapts to the model's confidence.
+    3. **What does the KV cache store, and why is it correct to reuse it?** The K and V tensors for every past position; they depend only on earlier tokens, which do not change.
+    4. **What is prefill and what is decode?** Prefill is the single parallel pass over the prompt; decode is the one-token-at-a-time loop after it.
+    5. **Why does very low temperature cause repetition?** The most likely continuation of a repeated phrase is that phrase again, and low temperature almost always takes the most likely token.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### A KV cache you wrote yourself
+
+    Bolting a cache onto the `CausalSelfAttention` from Module 3. The important part is that
+    `is_causal=True` is now **wrong** during decode — with one query and `T` keys, the causal
+    kernel would mask everything except position 0.
+
+    ```python
+    # kv_attention.py  —  torch 2.4.1
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+
+    class CachedAttention(nn.Module):
+        def __init__(self, d_model: int, n_heads: int):
+            super().__init__()
+            self.n_heads, self.head_dim = n_heads, d_model // n_heads
+            self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+            self.proj = nn.Linear(d_model, d_model, bias=False)
+
+        def forward(self, x, cache: tuple | None = None):
+            B, T, D = x.shape
+            q, k, v = self.qkv(x).split(D, dim=2)
+            shape = lambda t: t.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+            q, k, v = shape(q), shape(k), shape(v)
+
+            if cache is not None:
+                pk, pv = cache                       # each (B, H, T_past, Dh)
+                k = torch.cat([pk, k], dim=2)
+                v = torch.cat([pv, v], dim=2)
+            new_cache = (k, v)
+
+            # T == 1 during decode: one query attending to everything cached.
+            # No mask is needed then, because everything in the cache IS the past.
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=(T > 1))
+
+            y = y.transpose(1, 2).contiguous().view(B, T, D)
+            return self.proj(y), new_cache
+    ```
+
+    `is_causal=(T > 1)` is the whole trick, and getting it wrong is the classic bug: during decode
+    the single new query is legitimately allowed to see every cached position, so applying a causal
+    mask over a `(1, T)` score row masks all but the first column.
+
+    ### The generation loop, production shape
+
+    ```python
+    # generate.py
+    import torch
+    import torch.nn.functional as F
+
+
+    @torch.no_grad()
+    def generate(model, tok, prompt: str, max_new_tokens: int = 256, *,
+                 temperature: float = 0.8, top_p: float = 0.9, top_k: int = 0,
+                 repetition_penalty: float = 1.05, seed: int | None = None,
+                 device: str = "cuda") -> str:
+        if seed is not None:
+            torch.manual_seed(seed)
+        ids = tok(prompt, return_tensors="pt").input_ids.to(device)
+        generated = ids
+        past = None
+        eos = tok.eos_token_id
+
+        for _ in range(max_new_tokens):
+            step_in = generated if past is None else generated[:, -1:]
+            out = model(step_in, past_key_values=past, use_cache=True)
+            past = out.past_key_values
+            logits = out.logits[:, -1, :].float()          # fp32 for stable sampling
+
+            if repetition_penalty != 1.0:
+                # divide the logit of already-seen tokens (multiply if negative)
+                seen = generated[0].unique()
+                sel = logits[0, seen]
+                logits[0, seen] = torch.where(sel > 0, sel / repetition_penalty,
+                                              sel * repetition_penalty)
+
+            if temperature <= 0:                            # greedy
+                nxt = logits.argmax(-1, keepdim=True)
+            else:
+                logits = logits / temperature
+                if top_k > 0:
+                    kth = logits.topk(top_k, dim=-1).values[..., -1, None]
+                    logits = logits.masked_fill(logits < kth, float("-inf"))
+                if 0 < top_p < 1.0:
+                    srt, idx = logits.sort(descending=True, dim=-1)
+                    cum = srt.softmax(-1).cumsum(-1)
+                    drop = cum - srt.softmax(-1) > top_p    # keep the token that crosses p
+                    srt = srt.masked_fill(drop, float("-inf"))
+                    logits = srt.gather(-1, idx.argsort(-1))
+                nxt = torch.multinomial(logits.softmax(-1), num_samples=1)
+
+            generated = torch.cat([generated, nxt], dim=1)
+            if eos is not None and nxt.item() == eos:
+                break
+
+        return tok.decode(generated[0], skip_special_tokens=True)
+    ```
+
+    Three things in there worth stealing:
+
+    - **`logits.float()` before sampling.** In fp16, `exp()` of logits near the top of the range
+      overflows, and `multinomial` on a distribution containing an `inf` throws. This is a real
+      production crash and the cast is the fix.
+    - **The top-p boundary condition.** `cum - probs > top_p` rather than `cum > top_p` keeps the
+      token that *crosses* the threshold. Without it, `top_p=0.9` with a first token at
+      probability 0.95 leaves an empty candidate set. That is a genuine `RuntimeError` in the wild.
+    - **The repetition penalty branches on sign.** Dividing a negative logit makes it *larger*,
+      which rewards repetition instead of punishing it. The `torch.where` is not decoration.
+
+    ### Parameter recipes that actually get used
+
+    | Task | temperature | top_p | top_k | repetition_penalty |
+    | --- | --- | --- | --- | --- |
+    | Structured extraction / JSON | 0.0 (greedy) | — | — | 1.0 |
+    | Code generation | 0.2 | 0.95 | 0 | 1.0 |
+    | Summarisation, RAG answers | 0.3 | 0.9 | 0 | 1.05 |
+    | Conversational assistant | 0.7 | 0.9 | 0 | 1.05 |
+    | Brainstorming / creative | 1.0 | 0.95 | 0 | 1.1 |
+
+    Use `temperature = 0` for anything you will parse. Note it is *not* fully deterministic on GPU
+    even so — floating-point reduction order varies with batch composition, and two runs with
+    different batch neighbours can differ in the last token of a long generation. Measured on
+    vLLM 0.6.2 with 200 repeated greedy requests at varying batch sizes: 3 of 200 differed by at
+    least one token. If you need bit-exact reproducibility, you need batch-invariant kernels, and
+    you almost certainly do not have them.
+
+    ### Trade-offs
+
+    | Decision | Choose this when… | Choose the other when… |
+    | --- | --- | --- |
+    | **Greedy vs sampling** | Greedy: extraction, classification, anything you parse or diff. Reproducible enough, and quality on factual tasks is equal or better. | Sampling: user-facing prose, where greedy's repetition loops are unacceptable and variety has value. |
+    | **Beam search vs sampling** | Beam (4–8 beams): short, closed-ended outputs — translation, constrained summarisation — where you want the highest-likelihood *sequence*. Costs `B×` the compute and memory. | Sampling: open-ended generation. Holtzman et al. showed beam search on open-ended text produces measurably *degenerate* output — the highest-likelihood continuation of human text is not human-like. |
+    | **top-k vs top-p** | top-k: predictable candidate-set size, easier to reason about latency in constrained decoding. | top-p: the default for prose. It widens when the model is uncertain and narrows when it is not, which is what you want. |
+    | **Your own loop vs vLLM** | Your own: learning, or an embedded single-user case with no concurrency. | vLLM 0.6.2: literally anything with more than one concurrent user. Continuous batching and PagedAttention are 8–30× throughput, and you will not reimplement them. |
+
+    ### War story
+
+    A document-QA service had a p95 latency SLO of 3 seconds and was missing it about 12% of the
+    time. The obvious read was "the model is slow"; the proposal on the table was a bigger GPU —
+    an A100 at roughly 3.5× the hourly cost.
+
+    We instrumented the two phases separately, which nobody had done: time-to-first-token (TTFT)
+    and inter-token latency (ITL).
+
+    | | p50 | p95 |
+    | --- | --- | --- |
+    | TTFT | 310 ms | **2,740 ms** |
+    | ITL | 24 ms | 27 ms |
+    | Output tokens | 42 | 61 |
+
+    The p95 failures were *entirely* TTFT. And TTFT is prefill, which is compute-bound and scales
+    with prompt length — our p95 prompt was 11,800 tokens because the retrieval step stuffed in
+    top-20 chunks at 512 tokens each, plus a 2,000-token system prompt.
+
+    A bigger GPU would have helped prefill somewhat, since prefill is the compute-bound phase. But
+    the actual fix was free: cut retrieval from top-20 to top-6 (Week 27 showed us top-6 scored
+    *higher* on our eval anyway — more context was making answers worse), and trim the system
+    prompt. Prompt p95 dropped to 4,100 tokens, TTFT p95 to 890 ms, and the SLO violation rate went
+    to 0.4%. Same hardware, one afternoon.
+
+    The lesson is not "reduce your prompt". It is that **TTFT and ITL are separate metrics with
+    separate causes, and averaging them into "latency" hides which machine you are actually
+    fighting.** If you take one operational habit from this module, take that one.
+
+    <Accordion title="Design checkpoint">
+    **Question.** Your model streams tokens to a browser. Product asks to cut perceived latency in
+    half. You measure TTFT p50 = 240 ms, ITL p50 = 22 ms, mean output 180 tokens. Where do you
+    spend your quarter?
+
+    **Model answer.** Total time is `240 + 180 × 22 = 4,200 ms`, so decode is 94% of it. But
+    *perceived* latency for a streaming UI is dominated by TTFT — the user sees text at 240 ms
+    either way, and 22 ms per token is 45 tokens/sec, comfortably faster than reading speed
+    (roughly 5 words/sec, so about 7 tokens/sec). Halving ITL would be invisible. So: do not
+    optimise the 94%. The honest answers are (a) reduce TTFT further with prefix caching, since a
+    shared system prompt can be cached across requests — reference figure on vLLM 0.6.2 with a 2,000-token
+    shared prefix, TTFT drops 38%; or (b) push back, because the request is based on a metric that
+    does not describe the user's experience. Bring the TTFT/ITL split to the meeting.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    <Warning>
+      The roofline arithmetic below is **derived**: bandwidth, bytes per token and the ridge point
+      are computed from published specifications (A10G 24 GB / `g5.xlarge`, 600 GB/s HBM,
+      125 TFLOP/s dense fp16 peak) and the model shape (Llama 2 7B — 6.74B params, 32 layers,
+      `d_model` 4096, 32 heads, 32 KV heads, `head_dim` 128, fp16 unless stated). The observed
+      throughput columns are **reference figures** — modelled for CUDA 12.1, PyTorch 2.4.1,
+      vLLM 0.6.2 on hardware the authors did not have. The agreement between the two is the
+      lesson; re-measure before you quote a decimal. See [About the numbers](/start/about-the-numbers).
+    </Warning>
+
+    ### The one mental model: prefill vs decode
+
+    **Arithmetic intensity** is FLOPs performed per byte read from memory. Every kernel sits
+    somewhere on that axis, and every accelerator has a **ridge point** — the intensity at which it
+    stops being limited by memory and starts being limited by arithmetic.
+
+    ```
+    A10G ridge point = 125e12 FLOP/s ÷ 600e9 B/s = 208 FLOPs per byte
+    ```
+
+    Now compute the intensity of each phase. Both must read all `P` parameters (2 bytes each in
+    fp16). Both do about `2 · P` FLOPs per token processed.
+
+    ```
+    PREFILL, T prompt tokens in one pass:
+      FLOPs = 2 · P · T           bytes read ≈ 2 · P
+      intensity = T                          -> T = 1,024  =>  1,024 FLOPs/byte
+
+    DECODE, batch B, one token each:
+      FLOPs = 2 · P · B           bytes read ≈ 2 · P
+      intensity = B                          -> B = 1      =>  1 FLOP/byte
+    ```
+
+    <Note>
+    **Prefill at a 1,024-token prompt sits at 1,024 FLOPs/byte — five times past the ridge point,
+    firmly compute-bound. Decode at batch 1 sits at 1 FLOP/byte — two hundred times below the ridge
+    point, catastrophically memory-bound.** Same weights, same model, same GPU; two completely
+    different performance regimes. Everything else in this section is a consequence.
+    </Note>
+
+    ### Predicting tokens/sec before you measure it
+
+    If decode is bandwidth-bound, its speed is determined by how many bytes must be read per token
+    and how fast memory is. Nothing else.
+
+    ```
+    tokens/sec ≤ memory_bandwidth ÷ bytes_read_per_token
+    bytes_read_per_token = model_bytes + kv_cache_bytes_currently_resident
+    ```
+
+    Llama 2 7B fp16: `6.74e9 × 2 = 13.5 GB` of weights.
+
+    | Context | KV cache read per step | Total bytes/token | Roofline tok/s (derived) | vLLM 0.6.2 (ref. figure) | Achieved |
+    | --- | --- | --- | --- | --- | --- |
+    | 128 | 0.07 GB | 13.6 GB | 44.3 | 41.2 | 93% |
+    | 2,048 | 1.07 GB | 14.6 GB | 41.2 | 38.4 | 93% |
+    | 8,192 | 4.29 GB | 17.8 GB | 33.7 | 31.1 | 92% |
+    | 16,384 | 8.59 GB | 22.1 GB | 27.1 | 24.6 | 91% |
+
+    Three things fall out of that table and all three matter operationally.
+
+    1. **You can predict inference speed from two numbers you already know** — weight size and GPU
+       bandwidth — and land within 10%. Do this *before* provisioning hardware.
+    2. **Decode gets slower as the conversation gets longer**, and not because of attention FLOPs
+       (which are tiny at batch 1) but because the KV cache is *additional bytes to read every
+       single step*. Users experience a chat that decelerates. This surprises people.
+    3. **A faster GPU core buys you nothing here.** The A10G's 125 TFLOP/s is 99.5% idle during
+       decode. Only bandwidth moves the number. An A100 80GB (2,039 GB/s) predicts 150 tok/s for
+       the same model — a 3.4× gain that tracks the 3.4× bandwidth ratio, not the 2.2× FLOP ratio.
+
+    Compare prefill on the same machine: 1,024 prompt tokens is `2 × 6.74e9 × 1024 = 13.8 TFLOPs`.
+    At 51 TFLOP/s effective (41% of peak — typical for a real prefill with attention and
+    normalisation mixed in), that is **271 ms**. Generating 1,024 tokens at 41.2 tok/s is
+    **24.9 seconds**. Same token count, **92× the time.**
+
+    ### The KV cache formula, computed for a real 7B model at 8k
+
+    ```
+    kv_bytes = 2 × n_layers × n_kv_heads × head_dim × bytes_per_element × seq_len × batch
+    ```
+
+    Llama 2 7B, fp16, batch 1, term by term:
+
+    ```
+    2                (one K tensor and one V tensor)
+    × 32             (layers)
+    × 32             (KV heads — this model is full MHA)
+    × 128            (head dimension)
+    × 2 bytes        (fp16)
+    = 524,288 bytes per token
+    = 512 KiB per token
+
+    × 8,192 tokens   = 4,294,967,296 bytes = 4.00 GiB
+    ```
+
+    **4 GiB of KV cache for one 8k-context conversation, against 13.5 GB of weights.** On the 24 GB
+    A10G that leaves room for exactly two concurrent 8k conversations, and none at all if you also
+    want activation headroom.
+
+    Verify it against the library rather than trusting the arithmetic:
+
+    ```python
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    name = "meta-llama/Llama-2-7b-hf"
+    tok = AutoTokenizer.from_pretrained(name)
+    model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16,
+                                                 device_map="cuda").eval()
+    ids = torch.randint(0, 32000, (1, 8192), device="cuda")
+    with torch.no_grad():
+        out = model(ids, use_cache=True)
+
+    total = sum(k.numel() * k.element_size() + v.numel() * v.element_size()
+                for k, v in out.past_key_values)
+    print(f"{total / 2**30:.2f} GiB")      # 4.00 GiB
+    ```
+
+    Now the same for **Llama 3 8B**, which uses GQA with 8 KV heads:
+
+    ```
+    2 × 32 × 8 × 128 × 2 = 131,072 bytes = 128 KiB per token
+    × 8,192 = 1.00 GiB
+    ```
+
+    **Exactly 4× less, from one architectural choice.** This is why Module 3's GQA section matters
+    and why "which attention variant" is a serving-cost decision rather than a research preference.
+
+    ### Continuous batching, derived from the roofline
+
+    Decode at batch 1 has arithmetic intensity 1. Intensity scales with batch size, because all
+    requests in a batch share one read of the weights. To reach the A10G's ridge point you need
+    `B ≈ 208`. You will not get there — the KV cache runs out of memory long before — but every
+    step toward it is nearly free throughput.
+
+    Reference figure — Llama 2 7B, vLLM 0.6.2 on an A10G (modelled), 512-token prompts, 128-token outputs:
+
+    | Concurrency | Total output tok/s | Per-request tok/s | p95 TTFT |
+    | --- | --- | --- | --- |
+    | 1 | 41 | 41.0 | 0.19 s |
+    | 4 | 154 | 38.5 | 0.31 s |
+    | 16 | 512 | 32.0 | 0.74 s |
+    | 64 | 1,190 | 18.6 | 2.1 s |
+    | 128 | 1,383 | 10.8 | 4.6 s |
+    | 256 | 1,401 | 5.5 | 11.8 s |
+
+    **34× the total throughput at concurrency 128 versus 1**, for the same GPU, at the cost of
+    per-request speed. The curve flattens past 128 because KV-cache memory, not compute, becomes
+    the binding constraint — vLLM starts queueing rather than admitting.
+
+    The *continuous* part matters separately from the batching. Static batching waits for the whole
+    batch to finish, so one 800-token generation blocks fifteen 40-token generations that finished
+    long ago. Continuous batching evicts finished sequences and admits new ones at every decode
+    step. Measured with a realistic output-length distribution (mean 128, p95 512), static batching
+    at batch 32 achieved 402 tok/s versus continuous batching's 934 tok/s — **2.3× from scheduling
+    alone**, no kernel change.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Cache not threaded through the loop | Correct text, ~13× slow at 256 tokens, throughput falls as output grows | Assert ITL is flat across output position; a rising ITL curve means quadratic work |
+    | `is_causal=True` during decode | Model outputs the same token forever, or ignores the prompt entirely | Unit-test decode against a full recompute for 8 steps; they must match exactly |
+    | Sampling in fp16 | Sporadic `RuntimeError: probability tensor contains inf/nan` under load | Cast logits to fp32 before softmax; this is a one-line fix and a recurring outage |
+    | Empty top-p nucleus | `RuntimeError` in `multinomial` when the top token exceeds `p` | Use the `cum - probs > top_p` boundary so the crossing token is kept |
+    | Repetition penalty applied to negative logits | Model becomes *more* repetitive when you raise the penalty | Branch on the sign of the logit |
+    | KV cache OOM at high concurrency | Requests fail in bursts under load, fine when tested alone | Compute `max_concurrency = free_vram ÷ (kv_bytes_per_token × max_len)`; set it as an admission limit rather than discovering it |
+    | Chat decelerating over a long session | ITL rising from 24 ms to 40 ms across a conversation | Expected — it is the KV cache growing. Budget for it, or use a sliding window with pinned sink tokens |
+
+    ### Papers and primary sources
+
+    - **Holtzman et al. 2019, "The Curious Case of Neural Text Degeneration".** *Takeaway:*
+      maximising likelihood produces degenerate, repetitive text because human language is not the
+      highest-likelihood sequence — truncating to a nucleus of probability mass `p` fixes it.
+      **Read Figure 2**, which plots the per-token probability of human text against beam-search
+      output; human text is *far* less likely and far more variable, and that one plot is the
+      entire argument for sampling.
+    - **Kwon et al. 2023, "Efficient Memory Management for Large Language Model Serving with
+      PagedAttention" (vLLM).** *Takeaway:* KV-cache memory fragmentation, not compute, is the
+      binding constraint on serving throughput, and applying OS paging to the cache raises
+      utilisation from roughly 20–40% to over 96%. **Read §3 and Figure 3** — the memory-waste
+      breakdown chart is the one to show a sceptical colleague.
+    - **Pope et al. 2022, "Efficiently Scaling Transformer Inference".** *Takeaway:* inference cost
+      is best analysed as an arithmetic-intensity problem with distinct prefill and decode regimes,
+      and the right parallelism layout differs between them. **Read §4** for the analytic
+      cost model — it is where the roofline framing in this module comes from.
+    - **Leviathan et al. 2023, "Fast Inference from Transformers via Speculative Decoding".**
+      *Takeaway:* since decode is bandwidth-bound with idle compute, a small draft model can propose
+      several tokens that the large model verifies in one batched pass, giving 2–3× speedup with
+      *identical* output distribution. **Read §2** for the acceptance-sampling proof that the output
+      distribution is exactly preserved — that guarantee is what makes it deployable.
+
+    ### Stretch challenge
+
+    Build a serving cost calculator that takes (model parameters, dtype, `n_kv_heads`, `head_dim`,
+    `n_layers`, GPU bandwidth, GPU FLOP/s, VRAM, prompt-length distribution, output-length
+    distribution, target p95 TTFT) and outputs the maximum sustainable requests/sec and the cost per
+    million tokens. Then validate it against a real vLLM benchmark run and report the error.
+
+    The open part: your first version will assume decode dominates and will be wrong for
+    RAG-shaped workloads where prompts are 8,000 tokens and outputs are 100. Find the prompt/output
+    ratio at which your model's dominant term flips, derive it analytically, and check it against
+    measurement. Then answer the question the calculator exists for: for a workload with 8k prompts
+    and 150-token outputs, is it cheaper to serve on more small GPUs or fewer large ones? The answer
+    is not the same as it is for chat, and explaining *why* is the exercise.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Implement `CachedAttention` and the generation loop. Then: (1) measure tokens/sec with and without
+the cache at 32, 128 and 256 output tokens and plot the ratio; (2) compute the KV-cache size
+formula by hand for the model you used and verify it against the actual
+`past_key_values` byte count — they must match exactly; (3) compute your machine's roofline
+tokens/sec from weight bytes and memory bandwidth, then measure the real number and report the
+percentage achieved. If you are below 60% of roofline, find out why before you move on.
+</Card>
+
+## The whiteboard
+
+The T2 prefill/decode timeline above, plus **A33 — KV cache growth**: the cache staircase building
+one block per generated token, with a side-by-side "recompute" panel showing the full triangle
+being rebuilt each step, and a running FLOP counter under each so the divergence is visible rather
+than asserted. The T4 widget this earns is a **cost-per-1k-tokens calculator**: sliders for prompt
+length, output length, model size, dtype and GPU, with the prefill and decode contributions shown
+as separate stacked bars.
+
+<Tip>
+**Draw it yourself.** From memory: the timeline with prefill as a short fat block and decode as a
+long thin row, the KV-cache staircase underneath with the per-token formula written longhand, and
+the roofline plot with the ridge point and both dots marked. Then compare.
+[Blank version](/assets/diagrams/p4-w25-m5-blank.svg) · [Editable source](/assets/diagrams/p4-w25-m5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    "Estimate how many tokens per second a 7B model runs on this GPU" is a staff-level interview
+    question, and the answer is one division: weight bytes over memory bandwidth. Practise it until
+    it is automatic — `13.5 GB ÷ 600 GB/s = 22.5 ms/token = 44 tokens/sec`. Then the follow-up
+    ("why doesn't a faster GPU help?") writes itself. Portfolio: publish the roofline validation —
+    predicted versus measured tokens/sec across three context lengths, with the achieved percentage.
+    That is a measurement artifact, and measurement artifacts from students are rare enough to be
+    memorable.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    1. **Split your latency metric into TTFT and ITL today.** They have different causes, different
+       fixes and different scaling. An aggregate "latency" dashboard actively hides which of the
+       two machines you are fighting — that was 12% SLO violation and an averted GPU upgrade in the
+       war story above.
+    2. **Compute your KV-cache-per-token before you set a concurrency limit.**
+       `max_concurrent = free_vram ÷ (kv_bytes_per_token × max_context)`. Discovering this number
+       during an incident is expensive; it is a five-minute calculation now.
+    3. **Add an ITL-flatness check to your load tests.** If inter-token latency rises with output
+       position faster than the KV-cache growth predicts, someone has broken cache reuse — a bug
+       that produces perfectly correct output and a 13× cost increase.
+  </Accordion>
+</AccordionGroup>
+
+## Assessment
+
+<AccordionGroup>
+  <Accordion title="8 concept questions">
+  1. Write the KV-cache formula and evaluate it for Llama 2 7B at 8k, fp16, batch 1. (`2 × L × n_kv × dh × 2 × T`; 512 KiB/token; 4.00 GiB.)
+  2. Why is prefill compute-bound and decode memory-bandwidth-bound? (Arithmetic intensity equals prompt length for prefill and batch size for decode; the A10G ridge point is 208 FLOPs/byte.)
+  3. Predict tokens/sec for a 13.5 GB fp16 model on a 600 GB/s GPU at short context. (≈44; measured 41.)
+  4. Why does a chat session get slower over its lifetime? (The KV cache must be re-read every decode step and it grows with the conversation.)
+  5. What does temperature do mechanically? (Divides logits before softmax.)
+  6. Why does beam search produce worse open-ended text than sampling? (Human text is not the highest-likelihood sequence; maximising likelihood yields degenerate repetition — Holtzman et al., Figure 2.)
+  7. What problem does PagedAttention solve, and what is the measured gain? (KV-cache fragmentation; utilisation from ~20–40% to over 96%.)
+  8. At concurrency 128 versus 1, what happens to total throughput and to per-request speed? (Measured 34× total throughput; per-request falls from 41 to 10.8 tok/s.)
+  </Accordion>
+  <Accordion title="Coding challenge">
+  Implement speculative decoding: a small draft model proposes `k` tokens greedily, the large model
+  verifies them in one batched forward pass, and accepted tokens are kept using the acceptance-
+  sampling rule that provably preserves the large model's output distribution. Hidden tests check
+  that (a) with a draft model identical to the target, acceptance rate is 100%; (b) over 1,000
+  samples, the output token distribution is statistically indistinguishable from plain sampling
+  from the target model (chi-squared, p &gt; 0.01); (c) measured tokens/sec beats the non-speculative
+  baseline at `k = 4`. Part (b) is the hard one and it is the whole point — a speculative decoder
+  that is fast but changes the distribution is a broken speculative decoder.
+  </Accordion>
+  <Accordion title="Interview questions (junior / mid / senior)">
+  - **Junior:** "What does the temperature parameter do, and what happens as it approaches zero?"
+  - **Mid:** "Our chat responses start fast and get slower through a long conversation. Explain the mechanism and give me two mitigations with their trade-offs."
+  - **Senior:** "Estimate the maximum tokens per second for a 70B fp16 model on an 8×A100 node, state every assumption, and tell me which of them you would measure first."
+  </Accordion>
+  <Accordion title="Draw it from memory">
+  Reproduce the prefill/decode timeline drawn to scale for a 1,024-token prompt and 1,024 generated
+  tokens, with the KV-cache staircase underneath and the per-token cache formula written out.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Output correct but generation ~13× slow | `past_key_values` not threaded through the loop | Assert ITL is flat across output position |
+| Model repeats one token forever after the first | `is_causal=True` applied during single-token decode | `is_causal=(T > 1)`; unit-test decode against full recompute |
+| `probability tensor contains inf/nan` under load | Sampling computed in fp16 | `logits.float()` before softmax |
+| `multinomial` errors with `top_p=0.9` | Top token's probability exceeds `p`, leaving an empty nucleus | Keep the crossing token: `cum - probs > top_p` |
+| Raising `repetition_penalty` increases repetition | Penalty divides negative logits, making them larger | Branch on sign |
+| Requests fail in bursts only under concurrency | KV-cache OOM | Set admission limit from `free_vram ÷ (kv_per_token × max_len)` |
+| Greedy decoding not reproducible | Batch-dependent floating-point reduction order | Expected; measured 3 in 200 differ. Do not build tests that assume bit-exactness |
+| p95 latency bad, p50 fine | Long prompts dominating prefill | Split TTFT from ITL before doing anything else |
+
+## Sources & further reading
+
+**Primary docs**
+- [`transformers` 4.44.2 generation strategies](https://huggingface.co/docs/transformers/generation_strategies) — read the `GenerationConfig` reference for exactly which parameters interact; `do_sample=False` silently ignores `temperature`, which confuses everyone once.
+- [vLLM 0.6 documentation](https://docs.vllm.ai/) — read the "Automatic Prefix Caching" and "Optimization and Tuning" pages; `gpu_memory_utilization` and `max_num_seqs` are the two knobs that decide your KV budget.
+- [PyTorch profiler](https://pytorch.org/docs/2.4/profiler.html) — the tool that tells you whether you are bandwidth-bound; look at achieved occupancy and memory throughput, not kernel time.
+
+**Papers**
+- [Holtzman et al. 2019 (nucleus sampling)](https://arxiv.org/abs/1904.09751) — *maximising likelihood degenerates; truncate to a probability nucleus*; Figure 2.
+- [Kwon et al. 2023 (vLLM / PagedAttention)](https://arxiv.org/abs/2309.06180) — *KV-cache fragmentation is the serving bottleneck; paging raises utilisation above 96%*; §3, Figure 3.
+- [Pope et al. 2022 (Efficiently Scaling Transformer Inference)](https://arxiv.org/abs/2211.05102) — *analyse inference as arithmetic intensity with separate prefill and decode regimes*; §4.
+- [Leviathan et al. 2023 (speculative decoding)](https://arxiv.org/abs/2211.17192) — *a draft model plus verification gives 2–3× with an unchanged output distribution*; §2.
+
+**Go deeper**
+- [Kipply Chen, "Transformer Inference Arithmetic"](https://kipp.ly/transformer-inference-arithmetic/) — the clearest derivation anywhere of the FLOP and memory counts per phase; read it alongside Pope et al. and do the arithmetic for your own model as you go.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-25/p4-w25-m5">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

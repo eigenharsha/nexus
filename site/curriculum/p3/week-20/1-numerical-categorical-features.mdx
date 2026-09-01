@@ -1,0 +1,660 @@
+---
+title: "Numerical & categorical features"
+description: "Week 20 · Module 1 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+{/* AUTHORED */}
+
+<Note>
+**Week 20 · Module 1 · `P3-W20-M1`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+**Where the numbers on this page come from.** Every table introduced by *Measured* was produced by
+running the code shown, on an Apple M3 Pro (11 cores, 18 GB, macOS arm64, **no GPU**) with
+Python 3.12.9 and numpy 2.5.2, pandas 3.0.5, scikit-learn 1.9.0 — the same environment as the rest of Phase 3, so you can
+re-run any of it. Anything introduced by *Derived* is arithmetic, shown term by term; check it with
+a pencil. A result attributed to a paper is that paper's measurement, not ours.
+See [About the numbers](/start/about-the-numbers).
+</Info>
+
+
+## Where this sits
+
+- **Prereqs:** `P3-W17-M5` (`Pipeline`, `ColumnTransformer`), `P3-W19-M4` (leakage — target encoding is its worst case)
+- **Unlocks:** `P3-W20-M3` (selecting among the features you just made), `P3-W20-M5` (serving them), `P3-W26` (entity embeddings are the deep-learning version of this)
+- **One line:** you will choose an encoder from the model family rather than from habit, and implement out-of-fold target encoding that gains 1 AUC point instead of faking 10.
+
+## What you'll be able to do
+
+1. Say which model families need scaling and which are provably indifferent — with numbers
+2. Explain why a monotone transform cannot change AUC for a single feature, and when it does change everything
+3. Choose one-hot, ordinal or target encoding from the model family and the cardinality
+4. Implement out-of-fold target encoding from scratch, with smoothing
+5. Quantify the inflation of the naive version — and show that smoothing does not fix it
+6. Compute the collision rate of the hashing trick before you use it
+7. Handle unseen and rare categories at inference without a 3 a.m. page
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w20-m1.svg" alt="Hand-drawn sketch: encoder choice by model family, and the target-encoding leak" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w20-m1-dark.svg" alt="Hand-drawn sketch: encoder choice by model family, and the target-encoding leak" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w20-m1
+tier: T2
+one-sentence-goal: Show that the right encoder is a function of the model family, and that target encoding has three versions of which only one is both honest and useful.
+elements:
+  - left column, headed "DOES SCALING MATTER?": four rows drawn as small paired bars, before/after standardising — "KNN 0.5973 -> 0.9566" with a fat green arrow and "+35.9", "SVC-rbf 0.6353 -> 0.9650  +33.0", "LogisticRegression 0.9038 -> 0.9038  +0.00" with an amber note "but lbfgs: 404 iterations -> 9", "HistGB 0.9743 -> 0.9743  +0.00" with a green tick
+  - amber margin note: "distance-based? scale. gradient-based? scale for SPEED. tree-based? never."
+  - centre column, headed "WHICH ENCODER?": a 40-level category feeding three arrows — to "one-hot 43 cols", "ordinal 4 cols", "target 4 cols". Beside them two model icons with numbers: "logreg: one-hot 0.7183 | ordinal 0.6206  -> +9.77" and "HistGB: 0.6985 | 0.6962 -> +0.23", the +9.77 circled in red
+  - right column, headed "TARGET ENCODING, THREE WAYS": three stacked boxes with the measured AUCs
+      "encode on the FULL dataset      0.7471"  crossed out in heavy red, labelled "a LIE"
+      "encode on the train fold, reuse 0.6234"  crossed out in red, labelled "WORSE than no feature (0.6318)"
+      "OUT-OF-FOLD                     0.6423"  ticked green, labelled "+1.05 AUC pts of real signal"
+  - under them the smoothing formula hand-written: "w = (count*mean + m*prior) / (count + m)" with "m" circled and the amber note "smoothing controls VARIANCE. it does not fix a LEAK: 0.7471 -> 0.7438 at m=200."
+  - bottom strip: a small table of hashing collisions, "cardinality 10,000 into 2^12 buckets = 62.6% collide; into 2^16 = 7.3%"
+  - dangling arrow: "...and features built from TIME? -> M2"
+numbers-to-write-in: +35.9 / +33.0 / +0.00, 404 -> 9 iterations, +9.77 vs +0.23, 0.7471 / 0.6234 / 0.6423 / 0.6318, 62.6% and 7.3%
+alt: A hand-drawn three-column sketch showing which model families gain from scaling, how one-hot versus ordinal encoding changes logistic regression by ten AUC points but a boosted tree by nothing, and three ways to target-encode of which two are crossed out in red and only out-of-fold is ticked.
+*/}
+
+## Why you should care
+
+**For Aarav (student).**
+- "How would you encode a 5,000-level categorical?" is a standard interview question, and the good answer has a cardinality threshold and a collision calculation in it.
+- Out-of-fold target encoding is a genuinely tricky implementation with an exact right answer. Getting it right in a portfolio repo is a strong signal.
+- The scaling table is a two-minute experiment that settles an argument people have constantly.
+
+**For Meera (professional).**
+- Somebody on your team is one-hot encoding a high-cardinality column into a linear model and wondering why the matrix is 40 GB. Somebody else is target encoding without out-of-fold and reporting a number that is 10 AUC points fictional.
+- This shows up in your job as: a `ValueError: Found unknown categories` at 3 a.m. because a new country code appeared.
+- Feature engineering moves metrics further than hyperparameter tuning does — Week 18 measured the whole XGBoost hyperparameter space at about 0.01 AUC on one dataset. Encoding choices here move 0.10.
+
+## The mental model
+
+Every feature has to become a number the model can use, and the right way to do that depends entirely on what the model does with numbers. A **distance-based** model (k-NN, SVM with an RBF kernel, K-Means) compares magnitudes, so scale is everything. A **gradient-based linear** model is mathematically indifferent to scale but numerically dependent on it, so scaling buys convergence speed rather than accuracy. A **tree** only compares values to thresholds, so it is invariant to any monotone transform and cares only about *order*. Categorical encoding follows the same logic: a linear model needs one column per level because it has no way to express "category 7 is not between 6 and 8"; a tree can carve out integer ranges and barely notices.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+
+### Scaling: who actually cares
+
+Take a dataset and deliberately wreck the scales — multiply one feature by 100,000 and another by 0.0001 — then fit five model families with and without `StandardScaler`.
+
+```python
+# pip install "scikit-learn==1.9.0" "numpy==2.5.2"
+import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+
+X, y = make_classification(n_samples=6000, n_features=12, n_informative=6,
+                           class_sep=0.9, random_state=0)
+X[:, 0] *= 1e5
+X[:, 1] *= 1e-4
+cv = StratifiedKFold(5, shuffle=True, random_state=0)
+
+for name, make in [("KNeighbors(k=15)",   lambda: KNeighborsClassifier(15)),
+                   ("SVC(rbf)",           lambda: SVC()),
+                   ("LogisticRegression", lambda: LogisticRegression(max_iter=5000)),
+                   ("HistGradientBoosting", lambda: HistGradientBoostingClassifier(random_state=0))]:
+    raw = cross_val_score(make(), X, y, cv=cv, scoring="roc_auc").mean()
+    scl = cross_val_score(make_pipeline(StandardScaler(), make()), X, y, cv=cv, scoring="roc_auc").mean()
+    print(f"{name:<22} raw {raw:.4f}   scaled {scl:.4f}   delta {(scl-raw)*100:+6.2f} AUC pts")
+```
+
+```
+KNeighbors(k=15)       raw 0.5973   scaled 0.9566   delta +35.93 AUC pts
+SVC(rbf)               raw 0.6353   scaled 0.9650   delta +32.96 AUC pts
+LogisticRegression     raw 0.9038   scaled 0.9038   delta  -0.00 AUC pts
+HistGradientBoosting   raw 0.9743   scaled 0.9743   delta  +0.00 AUC pts
+```
+
+**Three completely different answers**, and each follows from what the model does:
+
+- **k-NN and RBF-SVM: 33 to 36 AUC points.** Both compute Euclidean distance. The feature multiplied by `1e5` dominates every distance, so the model is effectively using one column. This is the same failure as the customer-segmentation war story in Week 18 Module 4.
+- **Logistic regression: exactly nothing.** The coefficient simply absorbs the scale — multiply a feature by `1e5` and its weight divides by `1e5`. But look at what *did* change:
+
+```
+lbfgs iterations: raw 404   standardised 9
+```
+
+**A 45x reduction in iterations.** With `max_iter` at its default of 100 the raw version would not have converged at all, and you would have shipped whatever lbfgs had reached — which is Week 17 Module 5's war story. So for linear models scaling buys **convergence, not accuracy**, and that is still a reason to do it.
+
+- **Trees: exactly nothing, and no caveat.** A tree only asks `x_j <= t`, so multiplying by `1e5` multiplies the thresholds by `1e5` and changes nothing else.
+
+| Family | Needs scaling? | Why |
+| --- | --- | --- |
+| k-NN, RBF-SVM, K-Means, PCA | **yes, critically** | they compute distances or variances |
+| Linear, logistic, neural nets | **yes, for convergence** | the loss surface is a ravine otherwise (Week 17 Module 2) |
+| Regularized linear models | **yes, for correctness** | the L1/L2 penalty is applied to raw coefficients, so scale changes the effective penalty per feature |
+| Trees, forests, boosting | **no** | invariant to any monotone per-feature transform |
+
+### Which scaler
+
+- **`StandardScaler`** — subtract the mean, divide by the standard deviation. The default. Sensitive to outliers, because both statistics are.
+- **`MinMaxScaler`** — squash to [0, 1]. Use when you need a bounded range (image pixels, some neural net inputs). One outlier compresses everything else into a sliver.
+- **`RobustScaler`** — subtract the median, divide by the interquartile range. Use when outliers are real and you do not want them setting the scale.
+- **`MaxAbsScaler`** — divide by the largest absolute value. The one to use on **sparse** data, because it does not subtract a mean and therefore does not destroy sparsity.
+
+### Transformations, and a fact about AUC that surprises people
+
+Take a heavily skewed feature — income, with a skew of 4.53 and a max 37x its median — and fit a single-feature logistic regression, raw and log-transformed:
+
+```
+single feature, raw     AUC 0.7618   log-loss 0.6067
+single feature, log1p   AUC 0.7618   log-loss 0.5806
+```
+
+**The AUC is identical to four decimal places.** It has to be: `log1p` is monotone increasing, so it cannot change the *order* of any two rows, and AUC depends only on order (Week 19 Module 1 proved that). Log-loss, which depends on the actual probabilities, improved by 4.3%.
+
+So when does transforming a feature help? When the model has to **combine** it with others linearly:
+
+```
+raw income             logreg AUC 0.8127
+log1p(income)          logreg AUC 0.8284      <- +1.57 AUC points
+QuantileTransformer    logreg AUC 0.8285
+PowerTransformer       logreg AUC 0.8284
+
+raw income             HistGB AUC 0.8116      <- trees are invariant
+log1p(income)          HistGB AUC 0.8116
+```
+
+**+1.57 AUC points for a linear model, exactly 0.0000 for a tree.** The linear model's `w * income` term assumes the effect is linear in pounds; the truth was linear in *log* pounds, and the transform supplied that. The tree found the same shape by itself with a staircase of splits.
+
+`QuantileTransformer` and `PowerTransformer` (Yeo-Johnson) get you to the same place without you having to guess `log`; use them when you have many skewed features and no domain reason to prefer a particular shape.
+
+### Encoding a category
+
+A category is not a number. If `plan` takes values `free`, `pro`, `team`, `enterprise` and you encode them as 0, 1, 2, 3, you have told a linear model that `enterprise` is four times `pro` and that `team` sits exactly between them.
+
+- **One-hot** — one binary column per level. Correct for linear models; explodes with cardinality.
+- **Ordinal** — one integer column. Correct when the category genuinely has an order (`small` &lt; `medium` &lt; `large`). For trees, often fine even when it does not.
+- **Target encoding** — replace the level with the mean of the target for that level. Powerful, compact, and the most dangerous transformation in this course.
+
+Measured on a 40-level category with a genuinely non-monotone effect:
+
+| Model | One-hot (43 cols) | Ordinal (4 cols) | Difference |
+| --- | --- | --- | --- |
+| LogisticRegression | 0.7183 | 0.6206 | **+9.77 AUC pts** |
+| HistGradientBoosting | 0.6985 | 0.6962 | **+0.23 AUC pts** |
+
+**The same choice is worth ten AUC points to one model and nothing to the other.** The linear model cannot express "levels 3, 17 and 29 are the risky ones" from a single integer column; a tree can, by splitting that column repeatedly.
+
+### Guided practice
+
+1. Add `MinMaxScaler` to the k-NN comparison. Does it recover the same 35 points?
+2. Apply `np.log1p` to a feature that contains zeros and one that contains negatives. What happens?
+3. One-hot encode a 3-level category with `drop="first"`. Why would you, and when must you not?
+
+<Accordion title="Answers">
+1. Yes, essentially — k-NN needs *comparable* ranges, and both scalers deliver that. The difference shows up with outliers: `MinMaxScaler` maps the outlier to 1.0 and squashes everything else into a narrow band near 0, which quietly recreates the problem. `RobustScaler` is the safer default when you have not looked at the distributions.
+2. `log1p(0) = 0`, which is fine and is exactly why `log1p` exists rather than `log`. On negatives it returns `nan` (with a runtime warning) for values below −1. For features that can be negative use `PowerTransformer(method="yeo-johnson")`, which is defined on the whole real line.
+3. `drop="first"` removes one column to avoid perfect collinearity — with all three columns present, their sum is always 1, which is exactly the intercept, so `X'X` is singular (Week 17 Module 2's duplicate-column demonstration). Do it for an **unregularized** linear model. Do **not** do it when you are regularizing, because the penalty then treats the dropped level as the reference and shrinks the others toward it asymmetrically; and never do it for a tree, which does not care and now has less information.
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+  <Accordion title="1. Why does scaling not change a logistic regression's AUC?">
+  Because the coefficient absorbs the scale exactly: scaling feature `j` by `c` divides `w_j` by `c`, leaving `w . x` unchanged. What changes is how hard it is for the optimiser to find those coefficients — 404 iterations versus 9 in the measurement above.
+  </Accordion>
+  <Accordion title="2. When can log-transforming a feature not possibly help?">
+  For a single-feature model scored on a rank-based metric like AUC, and for any tree-based model. In both cases only the order matters, and a monotone transform preserves order.
+  </Accordion>
+  <Accordion title="3. You have a 5,000-level category and a linear model. What do you do?">
+  Not one-hot — that is 5,000 columns of almost-empty sparse data. Options in order: group rare levels together (`min_frequency`), out-of-fold target encoding, the hashing trick with a collision budget you computed, or an entity embedding if you are already using a neural net.
+  </Accordion>
+  <Accordion title="4. Does a tree need one-hot encoding?">
+  Not conceptually — the algorithm needs an order, not a meaning. scikit-learn's `DecisionTreeClassifier` requires numbers so you must encode somehow, but `HistGradientBoosting`, LightGBM and CatBoost handle categories natively and do it better at high cardinality (Week 18 Module 3 measured +7.6 AUC points at cardinality 5,000).
+  </Accordion>
+  <Accordion title="5. What is the safest thing to do with a category you have never seen at inference?">
+  Map it to a dedicated "unseen" bucket that existed during training — which is what `OneHotEncoder(handle_unknown="infrequent_if_exist", min_frequency=...)` gives you. The dangerous options are raising (an outage) and silently mapping to zero (a wrong answer that looks like a right one).
+  </Accordion>
+</AccordionGroup>
+
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+
+### Target encoding, and the three ways to do it
+
+Target encoding replaces a category with the mean of the target for that category. On high-cardinality features it is often the single strongest transformation available — one column instead of 5,000, and it carries the signal directly.
+
+It is also the most leak-prone thing in this course, and there are exactly three ways to implement it. Measured on 12,000 rows with a 1,200-level category (10 rows per category) and a genuinely weak category effect:
+
+| Implementation | Accuracy | ROC-AUC | Verdict |
+| --- | --- | --- | --- |
+| no category feature at all | 0.5965 | 0.6318 | the floor |
+| **encode on the FULL dataset**, then cross-validate | **0.6798** | **0.7471** | **a lie: +11.53 AUC pts of fiction** |
+| encode on the training fold, apply to the training fold | 0.5927 | 0.6234 | **worse than omitting the feature** |
+| **out-of-fold encoding** | 0.5995 | **0.6423** | **+1.05 AUC pts of real signal** |
+
+Three distinct outcomes and each teaches something different.
+
+**The full-dataset version inflates by 11.5 AUC points.** With 10 rows per category, a category's target mean is dominated by the row's own label. The model reads the answer off the feature. This is Week 19 Module 4's Leak 1.
+
+**The naive in-fold version makes the model *worse than not having the feature*.** This surprises people. The encoding is computed correctly from training data only, so the cross-validation estimate is honest — but the *training rows* see an encoding that includes their own labels, while the *test rows* see one that does not. The model learns to trust a feature that behaves differently at prediction time. **The two mistakes have opposite signatures: full-dataset encoding inflates your score; in-fold encoding quietly degrades your model.**
+
+**Out-of-fold is the only version that is both honest and useful**, and its gain is +1.05 AUC points — real, modest, and roughly a tenth of what the leaky version claimed.
+
+### Out-of-fold target encoding, implemented
+
+The rule: **a row's encoding must never be computed from that row's label.** Split the training data into inner folds; encode each inner fold using the *other* inner folds.
+
+```python
+# pip install "numpy==2.5.2" "pandas==3.0.5" "scikit-learn==1.9.0"
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.model_selection import KFold
+from sklearn.utils.validation import check_is_fitted
+
+
+class OutOfFoldTargetEncoder(TransformerMixin, BaseEstimator):
+    """Target encoding with out-of-fold statistics and additive smoothing.
+
+    Mixin order matters: TransformerMixin FIRST (scikit-learn 1.9 asserts it).
+
+    Training rows are encoded with statistics computed from OTHER inner folds, so no
+    row ever sees its own label. New rows are encoded with the full-training-set map,
+    which is correct because their labels were never used to build it.
+
+    Smoothing:  w = (count * category_mean + m * prior) / (count + m)
+    Larger m pulls small categories toward the global prior.
+    """
+
+    def __init__(self, cols: list[str] | None = None, n_splits: int = 5,
+                 smoothing: float = 20.0, random_state: int = 0):
+        self.cols = cols
+        self.n_splits = n_splits
+        self.smoothing = smoothing
+        self.random_state = random_state
+
+    def _fit_map(self, s: pd.Series, y: np.ndarray, prior: float) -> dict:
+        d = pd.DataFrame({"c": s.to_numpy(), "y": y}).groupby("c")["y"].agg(["mean", "count"])
+        w = (d["mean"] * d["count"] + prior * self.smoothing) / (d["count"] + self.smoothing)
+        return w.to_dict()
+
+    def fit(self, X: pd.DataFrame, y):
+        y = np.asarray(y, dtype=float)
+        self.cols_ = list(self.cols) if self.cols is not None else \
+            list(X.select_dtypes(include=["object", "string", "str", "category"]).columns)
+        self.prior_ = float(y.mean())
+        # the map used for UNSEEN rows (validation, test, production)
+        self.maps_ = {c: self._fit_map(X[c], y, self.prior_) for c in self.cols_}
+        # the out-of-fold encoding of the TRAINING rows, cached for fit_transform
+        kf = KFold(self.n_splits, shuffle=True, random_state=self.random_state)
+        self.oof_ = {c: np.empty(len(X), dtype=float) for c in self.cols_}
+        for tr, va in kf.split(X):
+            prior_in = float(y[tr].mean())
+            for c in self.cols_:
+                m = self._fit_map(X[c].iloc[tr], y[tr], prior_in)
+                self.oof_[c][va] = X[c].iloc[va].map(m).fillna(prior_in).to_numpy()
+        self._fit_index = np.asarray(X.index)
+        self.feature_names_out_ = [f"{c}_te" for c in self.cols_]
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        check_is_fitted(self)
+        same = (len(X) == len(self._fit_index)) and np.array_equal(np.asarray(X.index), self._fit_index)
+        out = pd.DataFrame(index=X.index)
+        for c in self.cols_:
+            if same:                                    # the training rows -> out-of-fold values
+                out[f"{c}_te"] = self.oof_[c]
+            else:                                       # anything else -> the full-training map
+                out[f"{c}_te"] = X[c].map(self.maps_[c]).fillna(self.prior_).to_numpy()
+        return out
+
+    def get_feature_names_out(self, input_features=None):
+        return np.asarray(self.feature_names_out_)
+```
+
+Two implementation points that are easy to get wrong.
+
+**`transform` must behave differently on training rows than on new rows.** That is unusual and it is why `fit_transform` exists as a distinct concept. The index check above is one way; passing `y` to `fit_transform` and caching is another. What you must *not* do is apply the full-training map to the training rows — that is the naive version, measured at 0.6234, worse than omitting the feature.
+
+**Unseen categories fall back to the prior**, not to zero and not to a `NaN`. A `NaN` will be imputed by something downstream and you will not know what.
+
+### Smoothing, derived
+
+A category seen twice has a target mean estimated from two rows. That estimate is nearly worthless, and using it raw hands the model noise. Smoothing pulls small categories toward the global prior:
+
+```
+encoded(c) = ( n_c * mean_c  +  m * prior ) / ( n_c + m )
+```
+
+Read it as a weighted average of the category mean (weight `n_c`) and the global prior (weight `m`). It is the posterior mean under a Beta prior with `m` pseudo-observations at the base rate — so `m` is literally "how many rows of evidence I demand before I believe a category". At `n_c = m` the encoding is exactly halfway between the two.
+
+Measured, out-of-fold, sweeping `m`:
+
+| `m` | Accuracy | ROC-AUC |
+| --- | --- | --- |
+| 0 | 0.5995 | 0.6423 |
+| 1 | 0.6003 | 0.6416 |
+| 5 | 0.6012 | 0.6389 |
+| 20 | 0.6007 | 0.6426 |
+| 50 | 0.6008 | 0.6418 |
+| 200 | 0.6021 | 0.6423 |
+
+**Almost flat.** On this dataset smoothing is not the lever — out-of-fold-ness is. That is worth knowing, because the two are constantly confused.
+
+<Warning>
+**Smoothing does not fix a leak.** Applying the same smoothing to the full-dataset encoding: AUC 0.7471 at `m=0`, 0.7436 at `m=20`, 0.7438 at `m=200`. The inflation is essentially untouched. Smoothing is a **variance** control; out-of-fold is the **leakage** control. Doing one and calling it the other is a common and expensive confusion.
+</Warning>
+
+<Info>
+scikit-learn 1.3 added `sklearn.preprocessing.TargetEncoder`, which does the out-of-fold work for you and is the right production choice. Implement it once by hand anyway — the failure mode is invisible from the API, and having written the inner-fold loop is what makes you able to spot it in someone else's code.
+</Info>
+
+### High cardinality: the hashing trick, with the arithmetic
+
+The **hashing trick** maps a category through a hash function into one of `2^b` buckets. No vocabulary to store, no unseen-category problem, fixed memory — at the cost of **collisions**, where two unrelated categories land in the same bucket and their signals mix.
+
+The expected number of occupied buckets when hashing `k` categories into `m` is `m * (1 - (1 - 1/m)^k)`, so the collision rate is `1 - occupied/k`:
+
+| Cardinality | 2^8 = 256 | 2^10 = 1,024 | 2^12 = 4,096 | 2^14 = 16,384 | 2^16 = 65,536 |
+| --- | --- | --- | --- | --- | --- |
+| 1,000 | 74.91% | 36.15% | 11.26% | 2.99% | **0.76%** |
+| 10,000 | 97.44% | 89.76% | 62.60% | 25.15% | **7.26%** |
+
+**Compute this before you choose `n_features`, not after.** The rule of thumb that falls out: you need roughly `10x` to `100x` more buckets than categories to keep collisions under 10%, and the memory cost of doing so is usually trivial because the matrix is sparse.
+
+Collisions are not always fatal — a collision between two rare categories affects few rows, and the model can often route around it using other features. But they are unrecoverable and undiagnosable: you cannot inspect a hashed feature, and you cannot tell a collision from a real effect.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **One-hot** vs **ordinal** | linear or distance-based model, or a genuinely unordered category — measured +9.77 AUC pts for logistic regression | the category is genuinely ordered, or the model is a tree (measured +0.23, i.e. nothing) |
+| **One-hot** vs **target encoding** | cardinality under ~50 and you want interpretable coefficients | cardinality in the hundreds or thousands, and you can implement out-of-fold correctly |
+| **Target encoding** vs **native categorical** | you are using a linear model or an estimator without native support | you are on `HistGradientBoosting`, LightGBM or CatBoost — measured +7.6 AUC pts at cardinality 5,000 in Week 18 Module 3 |
+| **Target encoding** vs **hashing** | the categories carry real per-level signal and you can afford the fold machinery | you need fixed memory, streaming, or no vocabulary at serving time — and you have computed the collision rate |
+| **`StandardScaler`** vs **`RobustScaler`** | the feature is roughly symmetric and outliers are errors | outliers are real and you do not want them setting the scale |
+| **`StandardScaler`** vs **`MaxAbsScaler`** | dense data | sparse data — `with_mean=True` densifies and will exhaust memory |
+
+### Rare and unseen categories
+
+Two different problems that people conflate.
+
+**Rare** categories exist in training but with too few rows to estimate anything. Group them:
+
+```python
+OneHotEncoder(min_frequency=0.01, handle_unknown="infrequent_if_exist", sparse_output=False)
+```
+
+`min_frequency` folds every level below 1% of rows into a single `infrequent` column. This is free variance reduction and it shrinks the matrix.
+
+**Unseen** categories do not exist in training at all — a new country code, a new plan, a new device type. `handle_unknown` decides what happens:
+
+- `"error"` (the default) raises. Your endpoint returns a 500.
+- `"ignore"` produces an all-zeros row for that feature. Silent, and the model has no idea it is guessing.
+- `"infrequent_if_exist"` routes it into the same bucket as the rare categories — which is a level the model **saw during training** and has a learned behaviour for. This is the right default.
+
+### War story: the encoder that added 40 GB
+
+*A modelled composite — assembled from recurring patterns rather than one company, with illustrative figures. The mechanism is real and the measured tables elsewhere on this page are unaffected; the incident is not a case study. See [About the numbers](/start/about-the-numbers).*
+
+A retail team was building a basket-value model with a `product_id` feature at about 180,000 levels. Someone put a `OneHotEncoder` in front of a `Ridge` regression, and the training job — which had run in four minutes — started dying on a 64 GB machine.
+
+The arithmetic nobody had done: 2.4 million rows by 180,000 columns is 4.3e11 cells. Sparse, that is fine — about 2.4 million non-zeros, roughly 40 MB. But `StandardScaler` was in the pipeline ahead of the regression with its default `with_mean=True`, and subtracting a mean from a sparse matrix **densifies it**. 4.3e11 float64 cells is 3.5 terabytes; the allocation failed after filling memory.
+
+The first fix was `StandardScaler(with_mean=False)`, which kept the matrix sparse and got the job running again in eleven minutes. But the model was poor — a 180,000-column one-hot of product ids on 2.4 million rows means an average of 13 rows per product, and Ridge was estimating 180,000 coefficients from that.
+
+The second fix was the real one: out-of-fold target encoding of `product_id` into a single column, plus a small set of product attributes (category, price band, brand) one-hot encoded at low cardinality. Feature count went from 180,000 to 47, training time to 40 seconds, and held-out R-squared from 0.31 to 0.44.
+
+Two lessons. **`with_mean=True` on sparse data is a memory bomb** and the error message does not tell you that. And **a one-hot column with 13 rows behind it is not a feature, it is noise with a name** — the cardinality threshold is not about memory, it is about rows-per-level.
+
+### Design checkpoint
+
+> A fraud model has: `merchant_id` (85,000 levels), `country` (140), `device_type` (12), `hour_of_day`, and `amount` (log-normal, ranging from £0.50 to £42,000). The model is XGBoost. How do you encode each?
+
+<Accordion title="Model answer">
+Go feature by feature, and note that the model family answers half the questions immediately.
+
+**`amount`**: leave it alone. XGBoost is invariant to monotone transforms, so `log(amount)` would be a no-op — the measurement above showed HistGB at 0.8116 either way. If you later add a linear model to the ensemble, transform it *for that model only*, inside its own pipeline branch. What *is* worth adding is `amount / customer_median_amount`, which is a **ratio** — trees cannot construct ratios (Week 18 Module 1's axis-alignment result), so you have to hand it over explicitly.
+
+**`hour_of_day`**: for XGBoost, leave it as an integer. The wraparound at 23-to-0 that a linear model needs sin/cos for is something a tree handles with two splits. Module 2 measures this.
+
+**`device_type` (12 levels)**: one-hot, or native categorical. At this cardinality it makes no measurable difference; pick whichever keeps the pipeline simpler.
+
+**`country` (140 levels)**: `min_frequency=0.005` to fold the long tail into an `infrequent` bucket, then one-hot or native. 140 levels over a large fraud dataset is fine either way, and grouping the tail is free variance reduction.
+
+**`merchant_id` (85,000 levels)**: this is the real question and one-hot is not an option. In order of preference: (1) `enable_categorical=True` and let XGBoost partition the levels — measured at +7.6 AUC points over one-hot at cardinality 5,000; (2) out-of-fold target encoding into one column, with smoothing around `m=20`, if you also need the feature for a linear model or a downstream consumer; (3) **replace the id with what you actually mean** — merchant category code, merchant age in days, merchant's trailing 30-day chargeback rate (point-in-time correct, Module 2). Option 3 usually wins outright, because `merchant_id` is a key, not a feature, and Week 18 Module 2 measured what happens when a model latches onto an identifier: the ID took 81.8% of impurity importance while being pure noise.
+
+One thing to settle before any of it: is `merchant_id` stable? If merchants get new ids on re-registration, target encoding a fresh merchant gives you the prior and nothing else — which is exactly the population you most need to score.
+</Accordion>
+
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+
+### The leakage arithmetic of target encoding
+
+Why is target encoding so much more dangerous than any other transformation? Because the leaked quantity is a direct function of the row's own label, and the amount leaked is exactly `1/n_c`.
+
+For a category with `n_c` rows, the naive encoding for row `i` is
+
+```
+e_i = (1/n_c) * sum_{j in category} y_j
+    = (1/n_c) * y_i  +  ((n_c - 1)/n_c) * mean of the OTHER rows
+```
+
+The first term is the leak. **The encoding contains `1/n_c` of the row's own label**, and a boosted tree with enough depth can invert that.
+
+That gives you a precise risk model:
+
+| Rows per category `n_c` | Fraction of the row's own label in its encoding |
+| --- | --- |
+| 2 | **50%** |
+| 5 | 20% |
+| 10 | 10% |
+| 100 | 1% |
+| 1,000 | 0.1% |
+
+At 1,000 rows per category the naive version is nearly harmless. At 10 — which is the measured setup above — it is worth 11.5 AUC points of fiction. **Compute `n/cardinality` before you decide how careful to be**, and remember it is the *minimum* category size that matters, not the mean: a long-tailed category distribution has thousands of levels with two or three rows regardless of the average.
+
+Smoothing changes the leaked fraction to `1/(n_c + m)`, which is why it helps a little — and why it never helps enough. At `n_c = 10` and `m = 20`, the row still contributes `1/30 = 3.3%` of its own encoding. Measured: the leak went from 0.7471 to 0.7438 AUC. **You cannot smooth your way out of it; you have to not look at the label.**
+
+### CatBoost's ordered target statistics
+
+Out-of-fold encoding is not the last word. It has a subtler defect: the encoding for a training row is computed from `k-1` inner folds, and *different* rows get encodings computed from *different* subsets, so the feature's distribution differs between training and serving in a way that is hard to characterise. Prokhorenkova et al. (2018) call this **prediction shift**.
+
+CatBoost's fix is **ordered target statistics**: draw a random permutation of the rows, and encode each row using only the rows *before* it in that permutation.
+
+```
+e_i = ( sum_{j: perm(j) < perm(i)} [c_j = c_i] * y_j  +  m * prior )
+      / ( count_{j: perm(j) < perm(i)} [c_j = c_i]  +  m )
+```
+
+Every row's encoding is computed from a strict prefix, exactly as it would be in a streaming setting, so there is no leak of any size — not `1/n_c`, not `1/(n_c + m)`, zero. The cost is that early rows in the permutation have almost no history and get very noisy encodings, which CatBoost handles by averaging over several permutations.
+
+The pattern generalises and it is worth carrying: **an expanding-window statistic over a random permutation is the general recipe for a leak-free aggregate feature.** Module 2 uses exactly the same trick over *time* instead of over a permutation.
+
+### Hashing collisions: what actually breaks
+
+The collision table in Layer 2 gives the rate. The consequence depends on what collides.
+
+Two **rare** categories colliding affects few rows and is usually invisible. A rare category colliding with a **common** one is worse: the common category's statistics swamp the rare one, which now behaves as though it were the common one. And two **common** categories colliding merges two genuinely different populations, which the model then cannot separate at all using that feature.
+
+The birthday-problem intuition applies: with `k` categories and `m` buckets, the probability that *some* pair collides passes 50% at about `k = 1.18 * sqrt(m)`. For `m = 65,536` that is 302 categories — so with only 300 categories you are already more likely than not to have at least one collision. What saves you is that most collisions do not matter; what you are actually managing is the collision rate *weighted by category frequency*.
+
+Two mitigations worth knowing. **Signed hashing** (`alternate_sign=True`, scikit-learn's default for `FeatureHasher`) gives colliding features a random sign, so their contributions cancel in expectation rather than adding — this makes the inner product an unbiased estimator (Weinberger et al., 2009). And **multiple hash functions** into separate blocks means a pair colliding in one block probably does not collide in another, at a linear cost in memory.
+
+Measured on text (Module 2's comparison): `HashingVectorizer(n_features=2**18)` reached 0.7417 accuracy against TF-IDF's 0.8453 — **10.4 accuracy points**, which is what you pay for having no vocabulary. In exchange you get a stateless transformer that needs no `fit`, cannot fail on an unseen token, and streams.
+
+### Entity embeddings: the bridge to Phase 4
+
+For very high cardinality inside a neural network there is a fourth option. Instead of one-hot or hashing, learn a dense vector per category — an **embedding** — jointly with the rest of the model (Guo & Berkhahn, 2016).
+
+```
+merchant_id (85,000 levels)  ->  embedding table 85,000 x 16  ->  16 dense features
+```
+
+Parameter cost: `cardinality x dimension`. At 85,000 x 16 that is 1.36M parameters, roughly 5.4 MB in float32 — compared with 85,000 one-hot columns. And unlike hashing, the representation is *learned*: two merchants with similar fraud behaviour end up with nearby vectors, so the model can generalise across them.
+
+The usual dimension heuristic is `min(50, round(cardinality ** 0.25))` or `round(1.6 * cardinality ** 0.56)`; both give roughly 16–20 for 85,000 levels, and neither is principled — tune it.
+
+**This is the same mechanism as the token embeddings in Week 25.** A vocabulary of 50,000 subword tokens mapped to 768-dimensional vectors is an entity embedding with a different name. Understanding it here, on a `merchant_id` column, means the transformer's embedding layer is not a new idea when you meet it.
+
+The catch that keeps entity embeddings out of most tabular pipelines: they require a neural network, and Week 18 Module 3's measurement (Grinsztajn et al., 2022) says the neural network will probably lose to the boosted tree on your tabular data anyway. The honest position is that entity embeddings are the right answer *when you are already using a neural net for another reason*.
+
+### Memory arithmetic you should do before you type
+
+| Encoding | Columns | Memory for `n` rows |
+| --- | --- | --- |
+| One-hot, dense | `k` | `8nk` bytes — **at n=2.4M, k=180,000 this is 3.5 TB** |
+| One-hot, sparse (CSR) | `k` | roughly `12n` bytes (one non-zero per row) — about 29 MB |
+| Hashing, sparse | `2^b` | same as sparse one-hot; the `2^b` never materialises |
+| Target encoding | 1 | `8n` bytes, plus a `k`-entry map |
+| Entity embedding | `d` | `8nd` for the output, plus `4kd` for the table |
+
+The row that causes outages is the first one, and it is reached accidentally: any operation that densifies a sparse matrix — `StandardScaler(with_mean=True)`, `PCA` (as opposed to `TruncatedSVD`), `.toarray()`, or passing a sparse matrix to an estimator that does not support it — turns 29 MB into 3.5 TB with no warning.
+
+### Failure modes
+
+| Failure | Signature | Detector |
+| --- | --- | --- |
+| Target encoding without out-of-fold | CV score inflated in proportion to `1/n_c` | compare against the OOF version; check `n/cardinality` |
+| In-fold encoding applied to training rows | model *worse* than omitting the feature | measured 0.6234 vs 0.6318; compare against dropping the column |
+| Smoothing mistaken for leakage control | inflation persists at every `m` | measured 0.7471 to 0.7438; the two are different problems |
+| `MemoryError` on one-hot | `with_mean=True` densified a sparse matrix | `StandardScaler(with_mean=False)` or `MaxAbsScaler` |
+| `ValueError: Found unknown categories` in production | `handle_unknown="error"` | `"infrequent_if_exist"`, plus a serving test with a novel category |
+| Silent all-zero rows | `handle_unknown="ignore"` | count how often the infrequent bucket fires in production; alert on a spike |
+| Hashing collisions destroying a feature | accuracy well below a one-hot baseline | compute the collision rate; measured −10.4 accuracy points on text at 2^18 |
+| Scaling "made no difference" so it was removed | true for trees and for AUC on linear models, false for convergence | check `n_iter_` — 404 versus 9 in the measurement above |
+
+### Papers
+
+- **Micci-Barreca, D. (2001), "A preprocessing scheme for high-cardinality categorical attributes in classification and prediction problems," SIGKDD Explorations 3(1).** *Takeaway:* the original target-encoding paper, including the empirical-Bayes smoothing formula `(n*mean + m*prior)/(n+m)` that everything since uses.
+- **Prokhorenkova, L. et al. (2018), "CatBoost: unbiased boosting with categorical features," NeurIPS 31.** *Takeaway:* even out-of-fold target statistics induce a prediction shift, and computing each row's statistic from a strict prefix of a random permutation removes it entirely.
+- **Weinberger, K., Dasgupta, A., Langford, J., Smola, A., Attenberg, J. (2009), "Feature Hashing for Large Scale Multitask Learning," ICML.** *Takeaway:* hashing with a random sign makes the inner product an unbiased estimator of the true one, so collisions add variance rather than bias.
+- **Guo, C. & Berkhahn, F. (2016), "Entity Embeddings of Categorical Variables," arXiv:1604.06737.** *Takeaway:* learning a dense vector per category inside a neural net beats one-hot on high-cardinality tabular data and produces a representation in which similar categories are geometrically close — the same mechanism as a token embedding.
+- **Pargent, F., Pfisterer, F., Thomas, J., Bischl, B. (2022), "Regularized target encoding outperforms traditional methods in supervised machine learning with high cardinality features," Computational Statistics 37.** *Takeaway:* across 24 datasets, properly regularized target encoding beats one-hot and hashing at high cardinality — and the unregularized version is worse than both, which is the measured 0.6234 above.
+
+### Stretch challenge
+
+Build the **leak-free aggregate encoder** that generalises target encoding, and measure where each variant stops working.
+
+Implement three encoders behind one interface: (a) K-fold out-of-fold, (b) CatBoost-style ordered statistics over a random permutation, averaged over `p` permutations, and (c) leave-one-out (encode each row from every *other* row in its category — the tightest possible use of the data, and a notorious trap).
+
+Then sweep `n/cardinality` from 2 to 1,000 and measure, for each encoder: held-out AUC, and the gap between the CV estimate and a forward hold-out. You should find (c) is catastrophic at small `n_c` despite looking like the most data-efficient option — work out why, and show it algebraically as well as empirically.
+
+The open question: **at what `n/cardinality` does the choice of encoder stop mattering**, and does that threshold depend on the model family? A boosted tree can invert a leak that a linear model cannot exploit, so the answer may differ by a factor of several. Measure it for logistic regression and XGBoost, and produce one plot that tells a practitioner which encoder to reach for given their `n`, their cardinality and their model.
+
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Implement out-of-fold target encoding from scratch, and show the accuracy inflation of the naive version.
+</Card>
+
+<Steps>
+  <Step title="Build a dataset where it matters">
+  High cardinality relative to `n` — aim for about 10 rows per category — and a genuinely weak category effect. If the effect is strong, the leak is hidden by real signal and the demonstration fails.
+  </Step>
+  <Step title="Implement all three versions">
+  Full-dataset, naive in-fold, and out-of-fold. Plus a fourth arm: **no category feature at all**, which is the floor and which most submissions omit.
+  </Step>
+  <Step title="Measure all four">
+  Accuracy and AUC under the same cross-validation. You should find the leak far above the floor, the naive version *below* it, and out-of-fold slightly above.
+  </Step>
+  <Step title="Show smoothing is not the fix">
+  Sweep `m` for both the out-of-fold and the full-dataset versions. The leak should persist at every `m`.
+  </Step>
+</Steps>
+
+Time box: **3 hours**. Acceptance: four arms measured; the naive in-fold version scores below the no-feature floor; and the write-up states that smoothing controls variance while out-of-fold controls leakage.
+
+## The whiteboard
+
+T2 build-up, four frames: (1) the scaling table with the four model families; (2) the one-hot-versus-ordinal comparison with the two model icons; (3) the three target-encoding boxes with two crossed out in red; (4) the smoothing formula with the leak-persists numbers written beside it.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p3-w20-m1-blank.svg) · [Editable source](/assets/diagrams/p3-w20-m1.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+  **Resume line:** "Implemented out-of-fold target encoding with empirical-Bayes smoothing; demonstrated that the naive variant inflates AUC by 11.5 points while the in-fold variant performs worse than omitting the feature entirely."
+  **Interview move:** when asked how to encode a high-cardinality categorical, give the cardinality threshold and the `1/n_c` leakage arithmetic. "At 10 rows per category the naive encoding contains 10% of the row's own label, and I measured that at 11.5 AUC points." Almost nobody quantifies it.
+  **Portfolio:** the four-arm bar chart — no feature, leak, naive, out-of-fold — with the floor drawn as a line. It shows two failure modes in opposite directions, which is unusual and memorable.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+  1. **Grep for target encoding** in your repo. If it is not `sklearn.preprocessing.TargetEncoder` or an inner-fold loop, compute `n/cardinality` and estimate the inflation as `1/n_c`.
+  2. **Check every `StandardScaler` that sits in front of sparse data.** `with_mean=True` densifies; the war story above turned 29 MB into an attempted 3.5 TB allocation.
+  3. **Audit `handle_unknown`.** Any `OneHotEncoder` left at the default `"error"` in a serving path is an outage waiting for a new category. `"infrequent_if_exist"` plus `min_frequency` fixes it and improves the model slightly.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| CV great, production poor, high-cardinality feature present | target encoding without out-of-fold | out-of-fold, or `sklearn.preprocessing.TargetEncoder` |
+| Model worse than without the category feature | in-fold encoding applied to training rows | encode training rows out-of-fold; new rows with the full map |
+| Inflation persists after adding smoothing | smoothing is a variance control, not a leakage control | the two are different problems; you need both |
+| `MemoryError` on a wide one-hot | `with_mean=True` densified a sparse matrix | `with_mean=False`, or `MaxAbsScaler` |
+| `ValueError: Found unknown categories` in production | `handle_unknown="error"` | `"infrequent_if_exist"` plus a serving test |
+| Hashed features perform far worse than one-hot | collision rate never computed | the `m(1-(1-1/m)^k)` table; budget 10–100x buckets |
+| Scaling removed because "it made no difference" | true for AUC on a converged linear model, false for convergence | check `n_iter_`; 404 versus 9 in the measurement |
+| One-hot with 13 rows per level | cardinality far too high for one-hot | target-encode, use native categorical, or replace the id with attributes |
+
+## Assessment
+
+**Concept questions (8).**
+1. Why does scaling change k-NN by 36 AUC points and logistic regression by zero?
+2. Prove that a monotone transform of a single feature cannot change ROC-AUC.
+3. Give the fraction of its own label a row's naive target encoding contains, in terms of `n_c`.
+4. Why does the in-fold encoding make the model worse than omitting the feature?
+5. Write the smoothing formula and say what `m` means in words.
+6. Compute the expected collision rate for 4,000 categories in 2^12 buckets.
+7. When is one-hot encoding worth ten AUC points, and when is it worth nothing?
+8. What does `StandardScaler(with_mean=True)` do to a sparse matrix, and why?
+
+**Coding challenge.** Implement `OutOfFoldTargetEncoder` with `n_splits`, `smoothing`, unseen-category fallback and `get_feature_names_out`. Hidden tests: `check_estimator` passes; on a dataset with 10 rows per category the out-of-fold version must score within 0.02 AUC of the no-feature baseline plus the true effect, while the naive version must exceed it by more than 0.08; and `transform` must return different values for the fitting rows than for a copy of the same rows with a different index.
+
+**Interview questions.**
+- *Junior:* "Why do you scale features?"
+- *Mid:* "How would you encode a 5,000-level categorical for a linear model, and for XGBoost?"
+- *Senior:* "Explain why target encoding leaks, quantify it, and tell me why smoothing does not fix it."
+
+**Draw from memory.** The three target-encoding boxes with their AUCs and the no-feature floor line.
+
+## Sources & further reading
+
+**Primary docs**
+- [scikit-learn 1.9 "Preprocessing data"](https://scikit-learn.org/stable/modules/preprocessing.html) — read this for the scaler comparison, and for the note that `with_mean=False` is required on sparse input.
+- [scikit-learn 1.9 `TargetEncoder`](https://scikit-learn.org/stable/modules/generated/sklearn.preprocessing.TargetEncoder.html) — read this for the built-in out-of-fold implementation and its `cv`, `smooth` and `target_type` parameters.
+- [scikit-learn 1.9 `OneHotEncoder` — `min_frequency`, `handle_unknown`](https://scikit-learn.org/stable/modules/generated/sklearn.preprocessing.OneHotEncoder.html) — read this for rare-category grouping and the four unseen-category behaviours.
+- [scikit-learn 1.9 "Compare the effect of different scalers on data with outliers"](https://scikit-learn.org/stable/auto_examples/preprocessing/plot_all_scaling.html) — read this for the visual that explains why `RobustScaler` exists.
+
+**Papers**
+- [Micci-Barreca, D. (2001), "A preprocessing scheme for high-cardinality categorical attributes…," *SIGKDD Explorations* 3(1).](https://doi.org/10.1145/507533.507538) *Takeaway:* the empirical-Bayes smoothing formula every implementation uses.
+- [Prokhorenkova, L. et al. (2018), "CatBoost: unbiased boosting with categorical features," *NeurIPS 31*.](https://arxiv.org/abs/1706.09516) *Takeaway:* ordered target statistics over a random permutation remove the residual shift that out-of-fold encoding leaves.
+- [Weinberger, K. et al. (2009), "Feature Hashing for Large Scale Multitask Learning," *ICML*.](https://doi.org/10.1145/1553374.1553516) *Takeaway:* signed hashing makes collisions add variance rather than bias.
+- [Guo, C. & Berkhahn, F. (2016), "Entity Embeddings of Categorical Variables," *arXiv:1604.06737*. *Takeaway:* a learned dense vector per category generalises across similar levels](https://arxiv.org/abs/1604.06737) — the same mechanism as a token embedding.
+- [Pargent, F. et al. (2022), "Regularized target encoding outperforms traditional methods…," *Computational Statistics* 37.](https://doi.org/10.1007/s00180-022-01207-6) *Takeaway:* across 24 datasets, regularized target encoding wins at high cardinality and the unregularized version loses to everything.
+
+**Go deeper**
+- [Kuhn, M. & Johnson, K., *Feature Engineering and Selection* (2019), Chapters 5–6. Read it for the most careful treatment of encoding strategies and their interaction with resampling, including the point](http://www.feat.engineering/) — central to this module — that any encoding using the outcome must be inside the resampling loop.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-20/p3-w20-m1">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

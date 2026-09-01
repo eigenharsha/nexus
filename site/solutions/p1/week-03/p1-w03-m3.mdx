@@ -1,0 +1,182 @@
+---
+title: "Functions, errors, and the standard library"
+description: "Reference solution — Week 3"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W03-M3`
+
+Convert a `print`-debugged script into structured JSON logs with correlation IDs, and measure the cost.
+
+```python
+"""obs.py — structured logging with request correlation, and a non-blocking sink."""
+from __future__ import annotations
+
+import atexit
+import json
+import logging
+import logging.handlers
+import queue
+import sys
+import uuid
+from contextvars import ContextVar
+
+# ContextVar, not threading.local: correct across asyncio tasks too (Week 4).
+request_id: ContextVar[str] = ContextVar("request_id", default="-")
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, object] = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),          # lazy %-formatting happens HERE
+            "request_id": request_id.get(),
+        }
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        payload.update(getattr(record, "extra_fields", {}))
+        return json.dumps(payload, separators=(",", ":"), default=str)
+
+
+def configure(level: int = logging.INFO, async_sink: bool = True) -> None:
+    sink = logging.StreamHandler(sys.stderr)
+    sink.setFormatter(JsonFormatter())
+    if async_sink:
+        # Formatting and I/O move to a background thread; the request path only
+        # does a queue.put, so a stalled log collector cannot block a request.
+        q: queue.Queue[logging.LogRecord] = queue.Queue(maxsize=10_000)
+        listener = logging.handlers.QueueListener(q, sink, respect_handler_level=True)
+        listener.start()
+        atexit.register(listener.stop)
+        handlers: list[logging.Handler] = [logging.handlers.QueueHandler(q)]
+    else:
+        handlers = [sink]
+    logging.basicConfig(level=level, handlers=handlers, force=True)
+
+
+log = logging.getLogger("nexus")
+
+
+def handle(path: str) -> None:
+    request_id.set(str(uuid.uuid4()))
+    log.info("request started", extra={"extra_fields": {"path": path}})
+    try:
+        if path == "/boom":
+            raise RuntimeError("upstream refused")
+        log.debug("cache lookup for %s", path)        # %s: formatted only if emitted
+    except RuntimeError:
+        log.exception("request failed")               # message + full traceback
+    finally:
+        log.info("request finished")
+```
+
+Measuring it:
+
+```python
+import timeit
+
+SETUP = """
+import io, logging
+h = logging.StreamHandler(io.StringIO())
+log = logging.getLogger('bench'); log.handlers=[h]; log.propagate=False
+log.setLevel(logging.INFO)
+n = 42
+"""
+for label, stmt in [
+    ("emitted, %s",       'log.info("processed %s items", n)'),
+    ("filtered, %s",      'log.debug("processed %s items", n)'),
+    ("filtered, f-string", 'log.debug(f"processed {n} items")'),
+]:
+    t = timeit.timeit(stmt, setup=SETUP, number=200_000) / 200_000 * 1e6
+    print(f"{label:22s} {t:7.3f} us")
+```
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: f-strings in logging calls.**
+
+```python
+log.debug(f"processed {n} items for user {user.id} in {ms:.1f}ms")
+```
+
+This reads better and it costs you every time the line does *not* log. The f-string is evaluated before `debug()` is called, so the string is built, the attributes are accessed, the float is formatted — and then `debug()` checks the level and discards all of it.
+
+Measured: **0.149 µs for the f-string version versus 0.068 µs for `%s` placeholders**, both filtered out. **2.2×**, paid on every call in every hot path, for work that is thrown away.
+
+There is a second, larger reason. With `%s` placeholders, the raw values reach the handler as `record.args`, so a structured formatter can emit them as **typed JSON fields** rather than as text embedded in a message string. `"user_id": 1042` is queryable; `"msg": "processed 42 items for user 1042"` is a regex away from being queryable. Ruff's `G004` flags this.
+
+**Wrong turn 2: a synchronous handler in a service.**
+
+`logging.StreamHandler` calls `write` on the calling thread, and `logging` takes a module-level lock around handler dispatch. Two consequences under load:
+
+- If stderr is a pipe to a log collector and that collector stalls, `write` **blocks** once the pipe's 64 KB buffer fills (Week 2, Module 1). Your request threads are now blocked on your logging infrastructure, which is exactly backwards.
+- The handler lock serialises all logging across all threads, so at high concurrency logging becomes a contention point rather than a fixed per-call cost.
+
+`QueueHandler` + `QueueListener` reduces the request path to a `queue.put` and moves formatting and I/O to one background thread. The trade you accept is explicit: with `maxsize` set, a full queue blocks (back-pressure) or drops, and you must decide which. With `maxsize=0` it grows without bound and turns a log-sink outage into an OOM. **Set `maxsize` and decide.** The reference uses 10,000, roughly 3 seconds of buffer at the measured throughput.
+
+The arithmetic that makes this a real concern: an emitted line costs **3.469 µs**, so about **285,000 lines/second/core**. A service at 5,000 requests/second emitting 10 lines each is 50,000 lines/second — **17.5% of one core** on logging alone, before anything ships anywhere.
+
+**A third thing worth knowing: `ContextVar`, not `threading.local`.**
+
+A thread-local correlation ID works with a thread-per-request server and silently breaks under `asyncio`, where thousands of tasks share one thread — every task would read and overwrite the same slot. `ContextVar` is copied into each task's context at creation, so each task gets its own value and concurrent requests cannot see each other's IDs. Week 4 covers why.
+
+## The measured numbers this solution produces
+
+CPython 3.13.2, Apple M3 Pro, macOS 15:
+
+| Call | Cost per call |
+|---|---|
+| `log.info("processed %s items", n)` — **emitted** | **3.469 µs** |
+| `log.debug("processed %s items", n)` — filtered by level | **0.068 µs** |
+| `log.debug(f"processed &#123;n&#125; items")` — filtered by level | **0.149 µs** (**2.2×**) |
+| `print("processed", n, file=stream)` | 0.233 µs |
+
+Derived: **~285,000 emitted lines/second/core**; a filtered `log.debug` in a 10-million-iteration loop costs **0.68 s** total, which is why debug logging can stay in permanently.
+
+Exception costs, from Module 3's benchmark:
+
+| Operation | Cost |
+|---|---|
+| `try:` with nothing raised | **4.1 ns** |
+| `raise ValueError` + catch | **61.0 ns** (14.9×) |
+| `d.get("missing")` | 11.4 ns |
+| `d["missing"]` + catch `KeyError` | **64.4 ns** (5.6×) |
+
+The DST demonstration, `America/New_York`, 2025-03-09:
+
+```
+datetime(2025,3,9,1,30, tz=NY) + timedelta(hours=1)  ->  2025-03-09T02:30:00-05:00
+                                                          ^ a wall-clock time that did not exist
+via UTC:                                              ->  2025-03-09T03:30:00-04:00   correct
+naive < aware                                         ->  TypeError
+```
+
+## Grading notes
+
+**3/3 on correctness** means every record is one JSON object on one line with timestamp, level, logger, message and correlation ID; diagnostics on stderr and program output on stdout; and three concurrent workloads can be separated from the log file alone.
+
+**3/3 on code quality** means `%s` placeholders throughout (ruff `G004` clean), `log.exception` inside handlers rather than `log.error`, and a `QueueHandler` with an explicit `maxsize`.
+
+**3/3 on explanation** means the write-up reports your measured per-call costs and the 17.5%-of-a-core arithmetic for your own service's rate.
+
+The four most common ways submissions lose points:
+
+1. **f-strings in log calls.** 2.2× cost when filtered, and it destroys structured fields. Ruff catches every instance.
+2. **`log.error` instead of `log.exception` in an `except` block.** You lose the traceback, which is the entire diagnostic value.
+3. **`QueueHandler` with an unbounded queue.** A stalled sink then becomes an OOM instead of back-pressure. Set `maxsize` and state what happens when it fills.
+4. **A correlation ID stored in a global or a thread-local.** Works in the test, fails under concurrency. `ContextVar`.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

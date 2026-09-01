@@ -1,0 +1,987 @@
+---
+title: "Optimization"
+description: "Week 11 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 11 · Module 5 · `P2-W11-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Warning>
+Last module of the maths wall. You made it. This one closes two loops: it turns Module 4's gradients
+into actual learning, and **Layer 3 produces the exact number that governs Week 26** — why full
+fine-tuning of Llama-2-7B needs 107.84 GB while QLoRA needs 3.50 GB. Adam's memory cost is not a
+detail; it is the reason the whole parameter-efficient-fine-tuning field exists.
+</Warning>
+
+## Where this sits
+
+- **Prereqs:** `P2-W11-M4` (gradients, the chain rule), `P2-W11-M3` (eigenvalues — curvature is an
+  eigenvalue problem), `P2-W11-M2` (matrices).
+- **Unlocks:** Week 17 (training any model), **Week 21** (training a neural network for real), and
+  **Week 26** (the VRAM arithmetic that decides what you can fine-tune).
+- **One-line:** after this you can implement five optimizers from scratch, say why Adam is the default,
+  and compute the memory a training run will need before you start it.
+
+## What you'll be able to do
+
+1. Explain gradient descent as rolling downhill, and predict when it will diverge.
+2. Derive the stability threshold `lr < 2/L` and verify it experimentally.
+3. Implement GD, SGD, momentum, RMSProp and Adam from scratch and race them.
+4. Explain warmup and cosine decay, and why LLM training uses them.
+5. Compute training memory from parameter count — the number that decides your hardware.
+
+## Why you should care
+
+**Aarav (student).** "Why Adam?" is asked constantly and usually answered with "it works better". After
+this module you can say: it adapts a per-parameter step size from the ratio of the gradient's mean to
+its root-mean-square, which makes it insensitive to bad scaling — and it costs 2 extra floats per
+parameter, which is why a 7 B model needs 108 GB to fine-tune. That is a complete answer with a
+consequence attached.
+
+**Meera (working professional).** The learning rate is the hyperparameter that matters most and the one
+most often chosen by folklore. Knowing that stability requires `lr < 2/L`, where `L` is the largest
+curvature, converts "try 3e-4" into a diagnosis. And the memory table in Layer 3 is the calculation
+that tells you, before you provision anything, whether a fine-tune fits on the GPU you have.
+
+## The mental model
+
+You are standing somewhere on a hilly landscape in fog. You want to reach the lowest point. You can
+feel the slope under your feet — that is the gradient. So: **take a step downhill, and repeat.**
+
+```
+new_position = old_position − learning_rate × gradient
+```
+
+That is gradient descent, complete. Everything else in this module is a refinement of one of three
+problems with that sentence:
+
+1. **How big a step?** Too small and you take forever. Too big and you overshoot and fly apart. This
+   is the learning rate, and the threshold is computable.
+2. **The landscape is not a bowl.** It has long narrow valleys where the steepest direction points at
+   the *wall*, not along the valley floor. Momentum and adaptive methods fix this.
+3. **You cannot feel the true slope.** You measure it on a small sample of data, so it is noisy. That
+   is stochastic gradient descent, and the noise turns out to be useful.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p2-w11-m5.svg" alt="Hand-drawn sketch: optimization" className="block dark:hidden" />
+  <img src="/assets/diagrams/p2-w11-m5-dark.svg" alt="Hand-drawn sketch: optimization" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p2-w11-m5
+tier: T4
+one-sentence-goal: The learning rate has a hard stability threshold set by curvature, and everything above plain gradient descent is a way of dealing with a valley that is narrow in one direction and flat in another.
+elements:
+  - top strip: the same 1-D parabola drawn four times with a ball on it and the step sequence marked - lr well below 2/L (slow crawl), lr near 1/L (lands in a few steps), lr = 2/L (bouncing between the same two points forever, drawn as a loop), lr above 2/L (steps flying outward, crossed in red)
+  - the threshold "lr < 2/L" circled in blue with "L = biggest curvature = biggest eigenvalue of the Hessian" written under it
+  - middle: a contour map of a long narrow valley (Rosenbrock), with two trajectories overlaid - plain GD zig-zagging across the valley walls in red, Adam going almost straight down the floor in green - and "GD: never reached f<1e-3 in 5000 steps. Adam: 3051 steps." hand-written
+  - lower-left: a small table drawn as if on the board, optimizer vs final f, with Adam's 4.7e-10 circled
+  - lower-right, the payoff panel: four stacked bars for a 7B model - weights 13.5, master 27.0, Adam m+v 53.9, grads 13.5 GB - totalling 107.84 GB, beside a single tiny bar labelled "QLoRA 3.50 GB" with "31x" written between them in amber
+  - amber margin note by the Adam bar: "8 bytes per parameter, just to remember. THIS is why LoRA exists."
+  - dangling arrow off the QLoRA bar: "-> week 26"
+numbers-to-write-in: stability lr < 2/L, verified: 1.99/L converges, 2.0/L oscillates forever, 2.01/L diverges; Rosenbrock condition number 2508 at the optimum so lr < 2.0e-3; Adam reaches f<1e-3 at step 3051 while GD/momentum/Nesterov/RMSProp never do in 5000; 7B full fine-tune 107.84 GB vs QLoRA 3.50 GB
+alt: A whiteboard sketch showing a ball on a parabola at four learning rates from crawling to diverging with the stability threshold circled, a contour map of a narrow valley with gradient descent zig-zagging and Adam going straight down, a small results table, and a stacked bar chart of training memory for a seven-billion-parameter model beside a much smaller QLoRA bar.
+*/}
+
+<Tabs>
+
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions beyond Module 4. Every term defined where it appears.
+
+### Rolling a ball down a curve
+
+Take the simplest possible landscape: `f(x) = x²`. It is a bowl with its lowest point at `x = 0`.
+
+From Module 4, the derivative is `f'(x) = 2x`. At `x = 3` the slope is 6 — positive, meaning the curve
+goes *up* as `x` increases. So to go down, move `x` in the negative direction. That is why gradient
+descent has a minus sign:
+
+```
+x_new = x − lr × f'(x)
+```
+
+`lr` (the **learning rate**) is how big a step you take, as a fraction of the slope.
+
+```python
+def descend(f_prime, x, lr, steps):
+    history = [x]
+    for _ in range(steps):
+        x = x - lr * f_prime(x)
+        history.append(x)
+    return history
+
+f_prime = lambda x: 2 * x
+print([round(v, 4) for v in descend(f_prime, 3.0, lr=0.1, steps=8)])
+# [3.0, 2.4, 1.92, 1.536, 1.2288, 0.983, 0.7864, 0.6291, 0.5033]
+```
+
+It is walking towards zero, each step 80% of the previous position. It will get there.
+
+### Now break it
+
+Turn the learning rate up.
+
+```python
+for lr in (0.1, 0.5, 0.9, 1.0, 1.1, 1.5):
+    h = descend(f_prime, 3.0, lr=lr, steps=20)
+    print(f"lr={lr:<5} after 20 steps: x = {h[-1]:.6g}")
+```
+
+```
+lr=0.1   after 20 steps: x = 0.0345876
+lr=0.5   after 20 steps: x = 0
+lr=0.9   after 20 steps: x = 0.0345876
+lr=1.0   after 20 steps: x = 3
+lr=1.1   after 20 steps: x = 115.013
+lr=1.5   after 20 steps: x = 3.14573e+06
+```
+
+Five regimes, and each is worth naming:
+
+- **`lr = 0.1`** — converging, slowly. Each step multiplies `x` by `1 − 0.1×2 = 0.8`.
+- **`lr = 0.5`** — lands exactly on zero in one step. `x − 0.5 × 2x = 0`. Perfect.
+- **`lr = 0.9`** — the multiplier is `1 − 1.8 = −0.8`: it **overshoots past zero every step** and comes
+  back smaller. Same magnitude as `lr = 0.1`, opposite behaviour — oscillating but shrinking.
+- **`lr = 1.0`** — multiplier is exactly `−1`. Bounces between +3 and −3 forever. Never converges,
+  never diverges.
+- **`lr ≥ 1.1`** — multiplier magnitude exceeds 1. Each bounce is bigger than the last. **Diverges**,
+  reaching 3.1 million by step 20 at `lr = 1.5`.
+
+### The threshold is exactly `2/L`
+
+That is not a coincidence and it is not a rule of thumb. For `f(x) = ½Lx²`, the derivative is `Lx`, so
+one step gives:
+
+```
+x_new = x − lr·Lx = x(1 − lr·L)
+```
+
+Each step multiplies `x` by `(1 − lr·L)`. That shrinks towards zero if and only if
+`|1 − lr·L| < 1`, which means:
+
+```
+0 < lr < 2/L
+```
+
+`L` here is the **curvature** — how sharply the function bends. Bigger curvature means you must take
+smaller steps.
+
+Verified experimentally on `f(x) = ½Lx²` for two values of `L`:
+
+| lr | lr × L | x after 50 steps | verdict |
+|---|---|---|---|
+| 0.1/L | 0.10 | 0.00515 | converging slowly |
+| 0.5/L | 0.50 | 8.9e-16 | converges |
+| 1.0/L | 1.00 | 0 | converges (exactly, in one step) |
+| 1.5/L | 1.50 | 8.9e-16 | converges |
+| 1.99/L | 1.99 | 0.605 | converging slowly |
+| **2.0/L** | **2.00** | **1** | **oscillates forever** |
+| **2.01/L** | **2.01** | **1.645** | **DIVERGES** |
+| 2.5/L | 2.50 | 6.4e+08 | DIVERGES |
+
+The results are **identical for `L = 1` and `L = 10`** once you express the learning rate as a
+fraction of `2/L`. The threshold is exact, it is sharp, and 1% past it is the difference between
+converging and exploding.
+
+**This is what "the learning rate is too high" actually means.** Your loss did not "get unstable" —
+`lr × L` crossed 2.
+
+### Two dimensions, and the problem with them
+
+Real problems have many parameters. Consider
+
+```
+f(x, y) = x² + 100y²
+```
+
+The gradient is `[2x, 200y]`. The curvature is 2 in the `x` direction and 200 in the `y` direction —
+a **100× difference**. Draw the contours: they are long thin ellipses, stretched along `x`.
+
+The stability threshold is set by the *largest* curvature: `lr < 2/200 = 0.01`. But with `lr = 0.01`,
+the `x` direction moves by `0.01 × 2x = 0.02x` per step — 2% of the way. It takes hundreds of steps to
+cross the valley floor while the `y` direction was solved in one.
+
+**You are forced to take steps sized for the steepest direction, in a landscape whose interesting
+direction is the shallowest.** That ratio — largest curvature over smallest — is the **condition
+number** from Module 2, and it is the single number that determines how hard an optimisation problem
+is for plain gradient descent.
+
+### Momentum: remember where you were going
+
+Fix: instead of stepping in the direction of the current gradient, step in a running average of recent
+gradients.
+
+```python
+def momentum_descent(grad, x, lr, beta=0.9, steps=100):
+    v = [0.0] * len(x)
+    for _ in range(steps):
+        g = grad(x)
+        v = [beta * vi + gi for vi, gi in zip(v, g)]     # accumulate
+        x = [xi - lr * vi for xi, vi in zip(x, v)]
+    return x
+```
+
+`v` is the "velocity". Why it helps, in the narrow valley:
+
+- Across the valley, the gradient **alternates sign** each step (you overshoot one wall, then the
+  other). Averaging alternating values cancels them out.
+- Along the valley floor, the gradient **points consistently the same way**, so the average builds up.
+
+Momentum therefore damps the oscillation and accelerates the useful direction. The physical analogy is
+exact: a ball with mass rolls through small bumps instead of following every wiggle.
+
+With `beta = 0.9`, the velocity is roughly the sum of the last 10 gradients, so effective steps can be
+up to about `1/(1−β) = 10×` larger along a consistent direction.
+
+### Stochastic gradient descent
+
+Computing the gradient over a million training examples to take one step is wasteful. Instead compute
+it on a small random **batch**, and step.
+
+- **Batch GD** — all data per step. Exact gradient, expensive, one step per epoch.
+- **SGD** — one example per step. Very noisy, very cheap.
+- **Mini-batch SGD** — 32 to 512 examples. The universal default.
+
+The noise is not purely a cost. It helps you escape narrow bad regions, and there is good evidence it
+biases training towards flatter minima that generalise better (Layer 3 has the references). "SGD" in
+modern usage almost always means mini-batch.
+
+### Adam, in words
+
+Adam combines two ideas:
+
+1. **Momentum** — keep a running average of the gradient (called `m`, for the first moment).
+2. **Per-parameter scaling** — keep a running average of the *squared* gradient (called `v`, the second
+   moment), and divide the step by its square root.
+
+The second idea is the important one. Parameters whose gradients are consistently large get divided by
+a large number, so they take small steps; parameters with tiny gradients get divided by a small number
+and take relatively larger steps. **Adam automatically equalises the step size across parameters with
+wildly different scales** — which is exactly the narrow-valley problem, solved per parameter.
+
+```python
+def adam_step(x, g, t, m, v, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8):
+    m = [b1 * mi + (1 - b1) * gi for mi, gi in zip(m, g)]           # gradient average
+    v = [b2 * vi + (1 - b2) * gi * gi for vi, gi in zip(v, g)]      # squared-gradient average
+    mh = [mi / (1 - b1 ** t) for mi in m]                            # bias correction
+    vh = [vi / (1 - b2 ** t) for vi in v]
+    x = [xi - lr * mhi / (vhi ** 0.5 + eps) for xi, mhi, vhi in zip(x, mh, vh)]
+    return x, m, v
+```
+
+The **bias correction** (`/(1 − β^t)`) exists because `m` and `v` start at zero, which biases them
+towards zero for the first several steps. Dividing by `1 − β^t` — which is small early and approaches
+1 later — corrects it. Without it, Adam's first steps are far too small.
+
+Notice the cost: **`m` and `v` are the same size as the parameters.** Two extra copies. Layer 3 turns
+that into gigabytes.
+
+### Guided practice
+
+```python
+def gd(x, g, lr):        return x - lr * g
+
+# f(x) = x^2, so f'(x) = 2x. Find the largest lr that still converges.
+for lr in (0.4, 0.6, 0.8, 0.99, 1.0, 1.01):
+    x = 3.0
+    for _ in range(100):
+        x = gd(x, 2 * x, lr)
+    print(f"lr={lr:<6} x={x:.6g}")
+
+# TODO: f(x) = 0.5 * L * x^2 has curvature L. What is L here, and what is 2/L?
+```
+
+<Accordion title="Answer">
+
+`f(x) = x²` is `½Lx²` with **`L = 2`**, so the stability threshold is `2/L = 1.0`.
+
+Output:
+
+```
+lr=0.4    x=3.80295e-70
+lr=0.6    x=3.80295e-70
+lr=0.8    x=1.95996e-22
+lr=0.99   x=0.397859
+lr=1.0    x=3
+lr=1.01   x=21.7339
+```
+
+Exactly as the theory says: below 1.0 it converges, at 1.0 it oscillates between +3 and −3 forever, and
+at 1.01 it grows.
+
+Two things in that table are worth pausing on.
+
+**`lr = 0.4` and `lr = 0.6` give identical results** (3.80295e-70). The multipliers are `1 − 0.8 = 0.2`
+and `1 − 1.2 = −0.2`: same magnitude, opposite sign. One creeps in from the same side, the other
+overshoots each step, and after 100 steps they are equally close.
+
+**`lr = 0.99` is barely converging** — 0.398 after 100 steps, against 1.96e-22 at `lr = 0.8`. The
+multiplier is `−0.98`, so it shrinks by only 2% per step. The fastest convergence for a quadratic is at
+`lr = 1/L` (here 0.5, which reaches exact zero), and it degrades sharply as you approach the threshold.
+**The good region is wide but the cliff at `2/L` is sheer**, which is why learning-rate tuning feels
+like walking an edge — it is one.
+
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+<Accordion title="1. Why does gradient descent have a minus sign?">
+The gradient points uphill (Module 4). To reduce the function you step in the opposite direction.
+</Accordion>
+<Accordion title="2. What exactly happens at lr = 2/L?">
+Each step multiplies the distance from the optimum by `|1 − lr·L| = 1`, so you bounce between two
+points forever — neither converging nor diverging.
+</Accordion>
+<Accordion title="3. Why is a long narrow valley hard for gradient descent?">
+The stability limit is set by the largest curvature, but progress along the valley is governed by the
+smallest. The ratio — the condition number — is how many times slower you go than you would in a bowl.
+</Accordion>
+<Accordion title="4. What does momentum actually average away?">
+The alternating component. Gradients that flip sign each step cancel in the running average, while
+gradients that point consistently one way accumulate — so oscillation is damped and progress is
+amplified.
+</Accordion>
+<Accordion title="5. What does Adam store per parameter, and how much?">
+Two extra values: `m` (gradient average) and `v` (squared-gradient average), each the same size as the
+parameter. In fp32 that is 8 bytes per parameter.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### The five optimizers, from scratch
+
+```python
+import numpy as np
+
+def gd(p, g, t, s, lr=1e-3):
+    return p - lr * g
+
+def momentum(p, g, t, s, lr=1e-3, beta=0.9):
+    s['v'] = beta * s.get('v', 0) + g
+    return p - lr * s['v']
+
+def nesterov(p, g, t, s, lr=1e-3, beta=0.9):
+    s['v'] = beta * s.get('v', 0) + g
+    return p - lr * (g + beta * s['v'])          # look ahead one step
+
+def rmsprop(p, g, t, s, lr=1e-2, beta=0.99, eps=1e-8):
+    s['sq'] = beta * s.get('sq', 0) + (1 - beta) * g * g
+    return p - lr * g / (np.sqrt(s['sq']) + eps)
+
+def adam(p, g, t, s, lr=1e-2, b1=0.9, b2=0.999, eps=1e-8):
+    s['m'] = b1 * s.get('m', 0) + (1 - b1) * g
+    s['v'] = b2 * s.get('v', 0) + (1 - b2) * g * g
+    mh = s['m'] / (1 - b1 ** t)                  # bias correction
+    vh = s['v'] / (1 - b2 ** t)
+    return p - lr * mh / (np.sqrt(vh) + eps)
+```
+
+### Measured: the Rosenbrock race
+
+Rosenbrock's function, `f(x, y) = (1 − x)² + 100(y − x²)²`, is the standard hard test: a narrow curved
+valley with the minimum at `(1, 1)`. Starting from `(−1.2, 1.0)`, 5,000 steps, learning rate tuned per
+optimizer:
+
+| Optimizer | lr | final f | distance to (1,1) | steps to reach f &lt; 1e-3 |
+|---|---|---|---|---|
+| GD | 1e-3 | 3.761e-03 | 1.339e-01 | never |
+| Momentum | 1e-4 | 3.583e-03 | 1.308e-01 | never |
+| Nesterov | 1e-4 | 3.654e-03 | 1.320e-01 | never |
+| RMSProp | 1e-2 | 2.246e-02 | 3.388e-02 | never |
+| **Adam** | **1e-2** | **4.724e-10** | **4.864e-05** | **3,051** |
+
+Adam is not marginally better here. It is **seven orders of magnitude** better in final loss, and it is
+the only one that reached the target at all within the budget.
+
+**Why Rosenbrock is so hard, quantified.** The Hessian's eigenvalues tell you:
+
+| Point | Eigenvalues | Condition number | Stability limit `2/L` |
+|---|---|---|---|
+| Start `(−1.2, 1.0)` | 23.6, 1506.4 | 64 | 1.33e-3 |
+| Optimum `(1, 1)` | 0.4, 1001.6 | **2,508** | 2.00e-3 |
+
+At the optimum the curvature ratio is 2,508:1, and the largest curvature caps the learning rate at
+2.0e-3. So gradient descent must take steps of at most 2e-3 in a direction whose curvature is 0.4 —
+progress per step along the valley floor is about `2e-3 × 0.4 = 0.0008` of the distance. That is why
+it never arrives.
+
+And it explains the divergence sweep exactly:
+
+| lr | final f after 2000 steps |
+|---|---|
+| 1e-4 | 3.479 |
+| 1e-3 | 7.82e-02 |
+| **2e-3** | **8.65e-03** (best) |
+| 3e-3 | 3.27e-01 (past the limit) |
+| 5e-3 | 7.89e-01 |
+
+The best learning rate for plain GD is `2e-3`, which is *exactly* the computed stability limit
+`2/L = 2.00e-3`. The theory is not approximate — it predicts the empirical optimum to two significant
+figures.
+
+**This is the practical takeaway of the whole module:** the best learning rate sits right at the
+stability boundary, and the boundary is set by the largest curvature. Adam wins because dividing by
+`sqrt(v)` gives each parameter *its own* effective learning rate, so no single high-curvature direction
+holds everything else back.
+
+### Learning-rate schedules
+
+A constant learning rate is rarely right. Two schedules dominate practice.
+
+**Warmup.** Start near zero and ramp linearly over the first few hundred to few thousand steps. Reasons:
+
+- Adam's `v` estimate is based on very few samples early on, so it is noisy and can produce enormous
+  effective steps. (This is the RAdam analysis: the variance of the adaptive term is unbounded at the
+  start.)
+- Early in training the loss landscape is at its most ill-conditioned.
+- Large-batch training empirically needs it: Goyal et al. (2017) trained ImageNet with batch size 8,192
+  in one hour using a 5-epoch linear warmup, and stated that without warmup the run diverged.
+
+**Cosine decay.** After warmup, decay following `lr(t) = lr_min + ½(lr_max − lr_min)(1 + cos(πt/T))`.
+Smooth, no discontinuities, spends most of its time at moderate learning rates and finishes very low.
+
+```python
+import math
+def lr_schedule(step, warmup=2000, total=100_000, peak=3e-4, floor=3e-5):
+    if step < warmup:
+        return peak * step / warmup
+    progress = (step - warmup) / max(1, total - warmup)
+    return floor + 0.5 * (peak - floor) * (1 + math.cos(math.pi * progress))
+```
+
+That function, with those defaults, is close to what most large language model training runs use.
+Chinchilla, Llama and GPT-family training all use linear warmup followed by cosine decay to about 10%
+of peak.
+
+### Gradient clipping
+
+If a gradient is enormous — a bad batch, a numerical spike — one step can destroy the model. Clip by
+**global norm**:
+
+```python
+def clip_global_norm(grads, max_norm=1.0):
+    total = np.sqrt(sum((g ** 2).sum() for g in grads))
+    if total > max_norm:
+        scale = max_norm / (total + 1e-6)
+        grads = [g * scale for g in grads]
+    return grads, total
+```
+
+Clip by *global* norm, not per-parameter: per-parameter clipping changes the gradient's **direction**,
+which is no longer the direction of steepest descent. Global-norm clipping only changes its
+*magnitude*. `max_norm = 1.0` is the standard default in LLM training.
+
+**Log the pre-clip norm.** It is one of the most informative training diagnostics available: a sudden
+spike tells you a bad batch arrived, and a steadily rising norm tells you training is going unstable
+before the loss shows it.
+
+### Trade-offs
+
+| Decision | Choose this when… | Choose the other when… | The number |
+|---|---|---|---|
+| **Adam / AdamW** | Default for everything, especially Transformers | Memory-constrained; or vision CNNs where tuned SGD+momentum often generalises slightly better | Adam costs 8 bytes/param of state; SGD+momentum costs 4 |
+| **SGD + momentum** | You can afford to tune, memory is tight, and you want the best final generalisation on vision | You want it to work without tuning | Half the optimizer state; commonly reported small generalisation edge on ImageNet-style tasks |
+| **AdamW** vs **Adam** | Always AdamW when using weight decay | Never | Adam's L2 penalty gets divided by `sqrt(v)`, so it is *not* weight decay; AdamW applies decay directly |
+| **Warmup** | Large batches, Transformers, Adam | Small batches, short runs, SGD | Goyal et al. needed a 5-epoch warmup to train at batch 8,192 without divergence |
+| **Larger batch** | You have parallel hardware and want throughput | Data efficiency per example matters | Gradient noise falls as `1/sqrt(B)`, so doubling batch reduces noise by only 1.41× — diminishing returns, and past a critical batch size you get no further speedup per step |
+
+### Reference implementation
+
+```python
+# optim.py — five optimizers plus the diagnostics, all runnable.
+import numpy as np
+
+def rosen(p):    x, y = p; return (1 - x) ** 2 + 100 * (y - x * x) ** 2
+def rosen_g(p):
+    x, y = p
+    return np.array([-2 * (1 - x) - 400 * x * (y - x * x), 200 * (y - x * x)])
+
+def run(opt, grad, p0, steps, **kw):
+    p, state, traj = np.array(p0, float), {}, []
+    for t in range(1, steps + 1):
+        p = opt(p, grad(p), t, state, **kw)
+        traj.append(p.copy())
+        if not np.all(np.isfinite(p)):
+            break
+    return np.array(traj)
+
+def hessian_rosen(p):
+    x, y = p
+    return np.array([[2 - 400 * (y - 3 * x * x), -400 * x], [-400 * x, 200.0]])
+
+if __name__ == "__main__":
+    for name, o, lr in [("GD", gd, 1e-3), ("Momentum", momentum, 1e-4),
+                        ("Nesterov", nesterov, 1e-4), ("RMSProp", rmsprop, 1e-2),
+                        ("Adam", adam, 1e-2)]:
+        tr = run(o, rosen_g, (-1.2, 1.0), 5000, lr=lr)
+        fs = np.array([rosen(p) for p in tr])
+        hit = int(np.argmax(fs < 1e-3)) if (fs < 1e-3).any() else None
+        print(f"{name:<10} lr={lr:<7g} final f={fs[-1]:.3e}  "
+              f"steps to 1e-3: {hit if hit else 'never'}")
+
+    for p in [(-1.2, 1.0), (1.0, 1.0)]:
+        e = np.linalg.eigvalsh(hessian_rosen(p))
+        print(f"Hessian at {p}: eigenvalues {e[0]:.1f}, {e[1]:.1f}  "
+              f"kappa={e[1]/e[0]:.0f}  lr limit = 2/L = {2/e[1]:.2e}")
+```
+
+The Hessian block is what turns this from a race into an explanation. Without it you observe that Adam
+wins; with it you can say *by how much the problem is ill-conditioned* and *what learning rate the
+geometry permits*.
+
+### What breaks in the real world
+
+A team fine-tuning a 1.3 B model saw the loss drop normally for 400 steps and then jump to `nan`. It
+happened at a different step every run. They tried lower learning rates (it survived longer but still
+died), gradient clipping at 5.0 (no change), and switching to fp32 (much slower and it still happened
+occasionally).
+
+The gradient-norm log — added on the fourth day — showed the answer immediately. The pre-clip global
+norm sat around 0.8 for hundreds of steps and then spiked to over 300 in a single step, every time on a
+batch containing one very long, mostly-repeated document. Clipping at 5.0 still allowed a step 6× the
+usual size, and in bf16 the resulting activations overflowed.
+
+Three fixes shipped together: clip at 1.0 rather than 5.0, add a warmup (there was none), and filter
+the pathological documents at the data level. The last one was the real fix; the first two would have
+survived it.
+
+**The reusable practice: log the pre-clip gradient norm from step 1 of every training run.** It costs
+nothing, and it is the difference between "training became unstable" and "batch 4,317 had a gradient
+norm of 312".
+
+### Design checkpoint
+
+<Accordion title="You have one 24 GB GPU and want to fine-tune a 7-billion-parameter model. Compute what fits, and decide.">
+
+Do the memory arithmetic before anything else. For `N` parameters in a standard mixed-precision setup:
+
+| Component | Bytes per parameter | 7 B model |
+|---|---|---|
+| Weights (bf16) | 2 | 13.48 GB |
+| fp32 master weights | 4 | 26.96 GB |
+| Gradients (bf16) | 2 | 13.48 GB |
+| Adam `m` + `v` (fp32) | 8 | 53.92 GB |
+| **Subtotal** | **16** | **107.84 GB** |
+| Activations | depends on batch × sequence | often another 10–40 GB |
+
+**107.84 GB before activations, on a 24 GB card.** Full fine-tuning is off by more than 4× even
+ignoring activations. This is not a tuning problem; it is arithmetic.
+
+The options, in order of how much they buy:
+
+1. **LoRA** (Module 3). Only the adapters get gradients and optimizer state. With `r = 16` on q and v
+   across 32 layers that is 8,388,608 trainable parameters — `8.39 M × 16 bytes ≈ 134 MB` of state
+   instead of 94 GB. The frozen base still needs 13.48 GB in bf16.
+2. **QLoRA** (Dettmers et al., 2023). Quantise the frozen base to 4-bit — 3.37 GB — and keep the LoRA
+   adapters in higher precision. **Total: about 3.50 GB**, versus 107.84 GB. A **31× reduction**, and
+   it comfortably fits with room for activations and a reasonable batch size.
+3. **Gradient checkpointing** for the activation term: roughly 50–70% less activation memory for about
+   30% more compute (Module 4).
+4. **8-bit Adam** (`bitsandbytes`): optimizer state at 2 bytes per parameter instead of 8, cutting
+   53.92 GB to 13.48 GB. Useful when you *are* doing full fine-tuning on bigger hardware.
+5. **Paged optimizers / CPU offload**: correct but slow; PCIe bandwidth becomes the bottleneck.
+
+The same table for other sizes:
+
+| Model | Full fine-tune (16 B/param) | QLoRA (4-bit base + r=16 adapters) |
+|---|---|---|
+| GPT-2 small (124 M) | 1.98 GB | trivial |
+| Llama-2-7B | **107.84 GB** | **3.50 GB** |
+| Llama-2-13B | 208.00 GB | ~6.6 GB |
+| Llama-2-70B | 1,120.00 GB | **35.67 GB** |
+
+Read the last row: **full fine-tuning a 70 B model needs 1.12 TB of accelerator memory — fourteen
+80 GB A100s just to hold the state — while QLoRA needs 35.67 GB, which is one A100 or two consumer
+cards.** That is the entire reason parameter-efficient fine-tuning became the default, and every number
+in it comes from "Adam stores two extra floats per parameter".
+
+**The answer to the question:** QLoRA, `r = 16`, on q and v (or all four attention projections if
+quality demands it), with gradient checkpointing, batch size chosen to fill what remains of the 24 GB.
+And say the number in the ticket: 3.50 GB against 107.84 GB.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim carries a measured or computed number. Optimizer races and Hessian spectra were measured
+with numpy 2.5.2 on Python 3.13.2. Memory tables are computed from parameter counts and published
+model dimensions, not measured on hardware — treat them as the planning figure they are.
+</Warning>
+
+### Convergence rates, stated properly
+
+For a function that is `L`-smooth (curvature bounded above by `L`) and `μ`-strongly convex (curvature
+bounded below by `μ`), with condition number `κ = L/μ`:
+
+| Method | Iterations to reach ε accuracy |
+|---|---|
+| Gradient descent | `O(κ · log(1/ε))` |
+| **Nesterov accelerated gradient** | `O(sqrt(κ) · log(1/ε))` |
+| Newton's method | `O(log log(1/ε))` — but each step costs `O(n³)` |
+
+The `sqrt(κ)` result is the important one. At Rosenbrock's measured `κ = 2,508`, that is the difference
+between roughly 2,508 and roughly 50 iterations per digit of accuracy — a **50× speedup**, and it is
+the theoretical justification for momentum. Nesterov (1983) proved this rate is optimal for
+first-order methods, so no gradient-only method can do better in the worst case.
+
+Note what this does *not* say: deep learning losses are neither convex nor strongly convex, so these
+rates do not apply directly. They apply locally near a minimum, and they correctly predict the shape of
+what you observe.
+
+### Why Adam wins, and what it costs
+
+Adam's update is:
+
+```
+p ← p − lr · m̂ / (sqrt(v̂) + ε)
+```
+
+The key property: **the update magnitude is approximately bounded by `lr`, regardless of the gradient's
+scale.** If gradients are consistent, `m̂ ≈ g` and `sqrt(v̂) ≈ |g|`, so the ratio is about ±1 and the
+step is about `lr`. Multiply every gradient in your problem by 1,000 and Adam's trajectory is nearly
+unchanged; gradient descent's diverges.
+
+That scale invariance is the whole advantage, and it is why Adam needs so little tuning: `3e-4` works
+across an enormous range of models because it is a step *size*, not a step *scale*.
+
+Two things it costs:
+
+- **Memory:** `m` and `v` are full-size copies, 8 bytes per parameter in fp32.
+- **Generalisation, sometimes:** Wilson et al. (2017) showed adaptive methods can converge to
+  different, sometimes worse-generalising solutions than tuned SGD, particularly on vision tasks. In
+  language modelling Adam remains dominant, and the gap on vision has narrowed with better schedules.
+
+**AdamW versus Adam is not cosmetic.** In Adam, an L2 penalty added to the loss becomes part of `g` and
+is then divided by `sqrt(v̂)` — so parameters with large gradients get *less* regularisation, which is
+backwards. AdamW (Loshchilov and Hutter, 2019) applies the decay directly to the weights, outside the
+adaptive scaling. Every serious Transformer training run uses AdamW, and using `Adam` with
+`weight_decay` set is a silent bug.
+
+### Saddle points, not local minima
+
+The folk story is that optimisation gets stuck in local minima. In high dimensions that is not what
+happens.
+
+At a critical point, the Hessian's eigenvalues determine the type. For a local minimum, **all `n`
+eigenvalues must be positive.** If eigenvalue signs were independent coin flips, the probability of
+that is `2^(−n)` — for `n = 10⁹` parameters, indistinguishable from zero.
+
+Almost every critical point in a high-dimensional non-convex problem is therefore a **saddle**: down in
+some directions, up in others. Dauphin et al. (2014) argued this in detail and connected it to random
+matrix theory, and the practical implications are:
+
+- **You are not stuck in a local minimum.** You are on a plateau near a saddle, where the gradient is
+  small but a descent direction exists.
+- **Noise helps escape.** SGD's gradient noise pushes you off the saddle. Full-batch gradient descent
+  can stall on one indefinitely.
+- **Momentum helps.** It builds velocity through low-gradient regions.
+
+This reframes the goal. You are not searching for the global minimum; you are looking for *any*
+sufficiently good minimum, and in overparameterised networks there are very many of them with similar
+loss.
+
+### Sharp versus flat minima
+
+Not all minima generalise equally. The **sharpness** of a minimum — how fast the loss rises as you move
+away, i.e. the largest Hessian eigenvalue — correlates with worse generalisation. Intuition: a sharp
+minimum found on the training loss surface can sit on a slope of the (slightly different) test loss
+surface, so a small shift in the landscape costs a lot; a flat one tolerates the shift.
+
+Keskar et al. (2017) linked large-batch training to sharper minima and to a measured generalisation
+gap, and proposed a sharpness measure. This is the theoretical basis of several practical techniques:
+
+- **SAM (Sharpness-Aware Minimisation)**, Foret et al. (2021): minimise the *worst* loss in a small
+  neighbourhood rather than the loss at a point, which explicitly seeks flat minima at roughly 2× the
+  compute per step.
+- **Keeping SGD noise up** — smaller batches, or scaling the learning rate with the batch size — as an
+  implicit flatness bias.
+- **Model averaging** (SWA, EMA): averaging weights along the trajectory lands in a flatter region than
+  any single point. EMA of weights is nearly free and is used in most modern training recipes.
+
+The picture is not fully settled — sharpness is reparameterisation-dependent, and Dinh et al. (2017)
+showed you can rescale a network to make a minimum arbitrarily sharp without changing its function.
+Treat it as a useful heuristic with a caveat, not a law.
+
+### The memory arithmetic, completely
+
+This is the table that decides hardware, and it is the single most reusable thing in Week 11.
+
+Mixed-precision training with Adam, per parameter:
+
+```
+bf16 weights          2 bytes
+fp32 master weights   4 bytes
+bf16 gradients        2 bytes
+Adam m (fp32)         4 bytes
+Adam v (fp32)         4 bytes
+------------------------------
+total                16 bytes per parameter
+```
+
+| Model | Params | Weights | Master | Adam m+v | Grads | **Total** |
+|---|---|---|---|---|---|---|
+| GPT-2 small | 0.124 B | 0.25 GB | 0.50 GB | 0.99 GB | 0.25 GB | **1.98 GB** |
+| Llama-2-7B | 6.74 B | 13.48 GB | 26.96 GB | 53.92 GB | 13.48 GB | **107.84 GB** |
+| Llama-2-13B | 13.0 B | 26.00 GB | 52.00 GB | 104.00 GB | 26.00 GB | **208.00 GB** |
+| Llama-2-70B | 70 B | 140.00 GB | 280.00 GB | 560.00 GB | 140.00 GB | **1,120.00 GB** |
+
+**Adam's state alone is 50% of the total.** For a 70 B model that is 560 GB of `m` and `v` — seven
+80 GB A100s holding nothing but running averages.
+
+Now the same models under QLoRA (4-bit frozen base, `r = 16` LoRA on q and v):
+
+| Model | 4-bit base | Trainable params | Optimizer state | **Total** | Reduction |
+|---|---|---|---|---|---|
+| Llama-2-7B | 3.37 GB | 8.39 M | 134.2 MB | **3.50 GB** | **31×** |
+| Llama-2-70B | 35.00 GB | 41.94 M | 671.1 MB | **35.67 GB** | **31×** |
+
+Three observations. The reduction is **31× at both scales**, because both terms scale with `N`. The
+70 B model becomes trainable on a single 80 GB accelerator. And the optimizer state — the thing that
+was 50% of the budget — becomes 1.9% of it.
+
+Techniques that reduce the full-fine-tuning figure without LoRA, with their published trade-offs:
+
+| Technique | Saves | Costs |
+|---|---|---|
+| 8-bit Adam (`bitsandbytes`) | Optimizer state 8 → 2 bytes/param (75% of 53.92 GB for a 7B) | Small accuracy impact, generally negligible |
+| ZeRO stage 1 / 2 / 3 | Shards optimizer / +gradients / +parameters across `k` devices | Communication volume; stage 3 is bandwidth-hungry |
+| Gradient checkpointing | ~50–70% of activation memory | ~30% more compute |
+| Gradient accumulation | Effective batch without the memory | More steps per update; no throughput gain |
+| Adafactor | Factored second moment: `O(n + m)` instead of `O(nm)` per matrix | Slightly worse convergence in some settings |
+
+### Production failure modes
+
+| Failure | Signature | Detection |
+|---|---|---|
+| **Learning rate above `2/L`** | Loss increases or oscillates from the first steps | Compute or estimate the top Hessian eigenvalue (power iteration on Hessian-vector products); or simply LR-range-test |
+| **`nan` after a stable period** | Loss fine, then `nan` at a random step | Log the **pre-clip** gradient norm. A spike identifies the batch |
+| **No warmup with Adam and a large batch** | Divergence in the first few hundred steps | Add linear warmup over 1–5% of total steps |
+| **`Adam` used with `weight_decay`** | Regularisation is weaker than intended and scale-dependent | Use `AdamW`. Adam's L2 is divided by `sqrt(v)` and is not weight decay |
+| **Per-parameter gradient clipping** | Training is stable but converges to a worse point | Clip by global norm; per-parameter clipping changes the direction |
+| **Optimizer state lost on resume** | Loss jumps upward after restarting from a checkpoint | Checkpoint `m`, `v` and the step counter, not just the weights |
+| **LR schedule not resumed** | Restart drops back to peak LR mid-run | Persist the scheduler state alongside the optimizer |
+| **Batch size increased without touching LR** | Slower convergence per epoch | Gradient noise scales as `1/sqrt(B)`; the linear scaling rule (`lr ∝ B`) with warmup is the standard starting point |
+
+### Frontier and further pointers
+
+- **D. P. Kingma and J. Ba, "Adam: A Method for Stochastic Optimization," ICLR 2015.** Takeaway:
+  dividing the momentum-averaged gradient by the root of its second moment makes the step size
+  approximately invariant to gradient scale, which is why one learning rate works across very
+  different models — at a cost of two extra full-size state tensors.
+- **I. Loshchilov and F. Hutter, "Decoupled Weight Decay Regularization," ICLR 2019.** Takeaway:
+  L2 added to the loss is not weight decay under an adaptive optimizer, because the penalty is divided
+  by `sqrt(v)`; decoupling it fixes a systematic regularisation error present in every Adam run before
+  2019.
+- **Y. Dauphin et al., "Identifying and attacking the saddle point problem in high-dimensional
+  non-convex optimization," NeurIPS 2014.** Takeaway: in high dimensions critical points are
+  overwhelmingly saddles rather than local minima, so the practical obstacle is plateaus, not traps —
+  which is why noise and momentum matter more than restarts.
+- **N. S. Keskar et al., "On Large-Batch Training for Deep Learning: Generalization Gap and Sharp
+  Minima," ICLR 2017.** Takeaway: large-batch training tends towards sharper minima and a measurable
+  generalisation gap, which motivates warmup, LR scaling and explicit flatness-seeking methods.
+- **P. Goyal et al., "Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour," 2017.** Takeaway:
+  scaling the learning rate linearly with batch size, with a gradual warmup, makes batch-8,192
+  training match small-batch accuracy — and without the warmup it does not train at all.
+- **T. Dettmers et al., "QLoRA: Efficient Finetuning of Quantized LLMs," NeurIPS 2023.** Takeaway:
+  a 4-bit NormalFloat base with paged optimizers and LoRA adapters fine-tunes a 65 B model on a single
+  48 GB GPU with no measured quality loss relative to 16-bit LoRA — the practical realisation of this
+  module's memory table.
+
+### Stretch challenge
+
+Build an optimizer diagnostic suite and use it to explain, not just observe.
+
+1. Implement **Hessian-vector products** without forming the Hessian: `Hv = ∇(∇f · v)`, which is one
+   extra backward pass (`torch.autograd.grad(grad_f @ v, params)`). Verify against a finite-difference
+   Hessian on a small problem.
+2. Use power iteration (Module 3) on the Hessian-vector product to estimate the **top eigenvalue `L`**
+   of a real network's loss at initialisation, at step 100, and at convergence. Plot how it evolves.
+3. Compare the stability threshold `2/L` at each point against the learning rate you are actually
+   using. Modern findings on "edge of stability" report that training often *sits at* `lr ≈ 2/L`, with
+   `L` rising until it reaches that boundary and then hovering. Do you observe that?
+4. Race five optimizers on Rosenbrock, a noisy quadratic at condition numbers 1, 10, 100 and 1,000, and
+   a small real network. Produce trajectory plots and a recommendation table.
+5. Finally, measure the memory: instrument a real training loop and compare actual peak allocation
+   against the `16 bytes/param` prediction. Where does the difference come from? (Activations,
+   fragmentation, workspace buffers, and the allocator's caching all contribute.) Report the error in
+   the prediction and what would make it better.
+
+There is no single right answer — the edge-of-stability question in particular is an active research
+area, and a careful measurement on your own model is a genuine contribution to your understanding of
+it.
+
+</Tab>
+
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Race five optimizers on Rosenbrock and on a noisy quadratic, produce the trajectory plots, and write a
+recommendation. Then compute the Hessian eigenvalues at the start and at the optimum, and check that
+the best learning rate for plain GD matches the predicted `2/L`.
+</Card>
+
+Reference results: Adam reached `f < 1e-3` at step **3,051**; GD, momentum, Nesterov and RMSProp never
+did in 5,000 steps. The Hessian at `(1, 1)` has eigenvalues 0.4 and 1001.6 (κ = 2,508), giving
+`2/L = 2.00e-3` — and the measured best GD learning rate was **2e-3**.
+
+Then compute the training memory for a model you care about and state whether it fits on your hardware.
+
+## The whiteboard
+
+<Tip>
+**Draw it yourself.** Draw the four learning-rate regimes on a parabola with the `2/L` threshold marked,
+then the narrow valley with GD zig-zagging and Adam going straight, then the memory bar chart:
+13.5 + 27.0 + 53.9 + 13.5 = 107.84 GB beside QLoRA's 3.50 GB.
+[Blank version](/assets/diagrams/p2-w11-m5-blank.svg) · [Editable source](/assets/diagrams/p2-w11-m5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Implemented GD, momentum, Nesterov, RMSProp and Adam from scratch and benchmarked
+them on Rosenbrock — Adam reached `f < 1e-3` in 3,051 steps while no other method did within 5,000 —
+then explained the result from the Hessian spectrum (κ = 2,508 at the optimum) and verified that plain
+gradient descent's empirically optimal learning rate of 2e-3 matches the predicted stability threshold
+`2/L = 2.00e-3` to two significant figures."
+
+**The interview answer this earns:** "why Adam?" — per-parameter step scaling makes it invariant to
+gradient scale, which solves the ill-conditioning that caps plain GD's learning rate at `2/L`. Then the
+cost: 8 bytes per parameter of state, 53.92 GB for a 7 B model, which is why LoRA exists. Connecting an
+optimizer choice to a hardware constraint is a senior-level move.
+
+**Learn the memory table.** `16 bytes per parameter` for Adam mixed-precision training is one of the
+most reusable numbers in the entire course, and you can derive it from first principles in ten seconds.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Log the pre-clip gradient norm from step 1 of every training run.** One line. It is the single
+most informative training diagnostic, and it converts "training became unstable" into "batch 4,317 had
+a gradient norm of 312".
+
+**2. Check whether you are using `Adam` with `weight_decay`.** If so, switch to `AdamW`. Adam's L2
+penalty is divided by `sqrt(v)` and is not weight decay — it under-regularises exactly the parameters
+that need it most.
+
+**3. Do the memory arithmetic before provisioning.** `16 bytes × parameter count` for full
+fine-tuning; a few hundred MB plus the quantised base for QLoRA. It takes thirty seconds and it decides
+whether the ticket says "one A100" or "eight". Put the number in the ticket.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Loss increases from step 1 | Learning rate above `2/L` | Reduce it; run an LR range test; estimate `L` with Hessian power iteration |
+| Loss `nan` after hundreds of stable steps | A single huge gradient overflowing in low precision | Log the pre-clip norm; clip at 1.0; add warmup; find the offending batch |
+| Divergence only with a large batch | No warmup with Adam | Linear warmup over 1–5% of total steps |
+| Regularisation weaker than expected | `Adam` with `weight_decay` instead of `AdamW` | AdamW decouples decay from the adaptive scaling |
+| Training worse after clipping | Clipped per-parameter, changing the gradient direction | Clip by global norm only |
+| Loss jumps after resuming a checkpoint | Optimizer state or scheduler state not saved | Checkpoint `m`, `v`, step count and scheduler together with the weights |
+| Convergence stalls with the gradient near zero | A saddle, not a minimum | Add noise (smaller batch), momentum, or check the Hessian's eigenvalue signs |
+| Out of memory at the optimizer step, not the forward pass | Adam's `m` and `v` allocated lazily on the first step | Budget 16 bytes/param up front; consider 8-bit Adam or LoRA |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="Concept questions (8)">
+1. Why the minus sign in gradient descent? *(The gradient points uphill; to minimise, step against it.)*
+2. Derive the stability threshold for `f = ½Lx²`. *(One step gives `x(1 − lr·L)`, so convergence needs `|1 − lr·L| < 1`, i.e. `0 < lr < 2/L`.)*
+3. What makes a problem hard for plain gradient descent? *(A large condition number: the step size is capped by the largest curvature while progress is governed by the smallest.)*
+4. What does momentum average away, and what does it amplify? *(It cancels the alternating cross-valley component and accumulates the consistent along-valley one.)*
+5. What are Adam's two state tensors, and what does each do? *(`m`, the gradient average, gives momentum; `v`, the squared-gradient average, gives per-parameter scaling.)*
+6. Why does Adam need bias correction? *(`m` and `v` start at zero and are biased towards it early; dividing by `1 − β^t` corrects this, and without it the first steps are far too small.)*
+7. How much memory does Adam mixed-precision training need per parameter? *(16 bytes: 2 weights + 4 master + 2 grads + 8 optimizer state. 107.84 GB for a 7 B model.)*
+8. Why are saddle points, not local minima, the practical obstacle? *(A local minimum requires all `n` Hessian eigenvalues positive, which is vanishingly unlikely at `n = 10⁹`; almost every critical point is a saddle.)*
+</Accordion>
+<Accordion title="Coding challenge">
+Implement GD, momentum, Nesterov, RMSProp, Adam and AdamW, plus global-norm clipping and a
+warmup-plus-cosine schedule. Hidden tests: on `f = ½Lx²`, each optimizer converges below `2/L` and
+diverges above `2.01/L`; Adam reaches `f < 1e-3` on Rosenbrock within 5,000 steps from `(−1.2, 1.0)`;
+bias correction is present (the first step's magnitude must be within 10% of `lr`); global-norm
+clipping preserves gradient direction to 1e-9; and the schedule's value at step 0 is 0 and at the
+warmup boundary is exactly the peak.
+</Accordion>
+<Accordion title="Interview questions">
+- **Junior:** "What is gradient descent and what does the learning rate do?" *(Step downhill along the negative gradient; the learning rate sets the step size, and it must stay below `2/L` where `L` is the largest curvature.)*
+- **Mid:** "Your training loss goes to `nan` after 400 steps, at a different step each run. Diagnose it." *(Log the pre-clip global gradient norm — a spike identifies the batch. Then: clip at 1.0, add warmup, and inspect the offending data. Randomness across runs points at data order, not at a code bug.)*
+- **Senior:** "You have one 24 GB GPU and want to fine-tune a 7 B model. Walk me through it." *(16 bytes/param = 107.84 GB, so full fine-tuning is out by 4× before activations. Then QLoRA: 4-bit base 3.37 GB plus 8.39 M trainable at r=16 giving 134 MB of state, total ~3.50 GB — a 31× reduction. Add gradient checkpointing for activations and size the batch to what remains.)*
+</Accordion>
+<Accordion title="Draw it from memory">
+Draw the four learning-rate regimes with the `2/L` threshold, the narrow-valley trajectories for GD
+versus Adam, and the memory bar chart with all four components summing to 107.84 GB. Five minutes.
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+
+- [PyTorch `torch.optim` documentation: `SGD`, `Adam`, `AdamW`, `lr_scheduler.CosineAnnealingLR`, and
+  `torch.nn.utils.clip_grad_norm_`.](https://pytorch.org/docs/stable/optim.html) **Read this for:** the exact update equations as implemented
+  (including the `maximize`, `amsgrad` and `foreach` variants), and the explicit note that `Adam` with
+  `weight_decay` is not the same as `AdamW`.
+- [`bitsandbytes` documentation on 8-bit optimizers, and Hugging Face PEFT's `LoraConfig`.](https://huggingface.co/docs/bitsandbytes/)
+  **Read this for:** the measured memory savings and the exact quantisation scheme behind the QLoRA
+  numbers in Layer 3.
+- [DeepSpeed ZeRO documentation, stages 1–3.](https://www.deepspeed.ai/tutorials/zero/) **Read this for:** which memory component each stage
+  shards and the communication volume each costs — the multi-GPU counterpart to this module's
+  single-device arithmetic.
+
+**Papers**
+
+- [D. P. Kingma and J. Ba, "Adam: A Method for Stochastic Optimization," ICLR 2015.](https://arxiv.org/abs/1412.6980) **Takeaway:**
+  normalising the momentum-averaged gradient by the root of its second moment makes the step
+  approximately scale-invariant, which is why a single learning rate transfers across models — at the
+  cost of two full-size state tensors.
+- [I. Loshchilov and F. Hutter, "Decoupled Weight Decay Regularization," ICLR 2019.](https://arxiv.org/abs/1711.05101) **Takeaway:** under
+  an adaptive optimizer, an L2 term in the loss is divided by `sqrt(v)` and therefore is not weight
+  decay; decoupling it corrects a systematic error in every pre-2019 Adam training run.
+- [Y. Dauphin, R. Pascanu, C. Gulcehre, K. Cho, S. Ganguli and Y. Bengio, "Identifying and attacking the
+  saddle point problem in high-dimensional non-convex optimization," NeurIPS 2014.](https://arxiv.org/abs/1406.2572) **Takeaway:**
+  critical points in high dimensions are overwhelmingly saddles rather than minima, so plateaus rather
+  than traps are the real obstacle — which is why noise and momentum help and restarts do not.
+- [P. Goyal et al., "Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour," arXiv 1706.02677,
+  2017.](https://arxiv.org/abs/1706.02677) **Takeaway:** scaling the learning rate linearly with batch size and applying a gradual warmup
+  makes batch-8,192 training match small-batch accuracy; without the warmup the run diverges.
+- [T. Dettmers, A. Pagnoni, A. Holtzman and L. Zettlemoyer, "QLoRA: Efficient Finetuning of Quantized
+  LLMs," NeurIPS 2023.](https://arxiv.org/abs/2305.14314) **Takeaway:** 4-bit quantisation of the frozen base plus LoRA adapters and
+  paged optimizers fine-tunes a 65 B model on one 48 GB GPU without measurable quality loss — the
+  practical answer to this module's memory table.
+
+**Go deeper**
+
+- [S. Ruder, "An overview of gradient descent optimization algorithms" (2016, maintained online).](https://www.ruder.io/optimizing-gradient-descent/)
+  **Why:** the clearest single-page comparison of every optimizer in this module with consistent
+  notation and honest statements of what each is good for.
+- [S. Boyd and L. Vandenberghe, *Convex Optimization* (2004), Chapter 9.](https://web.stanford.edu/~boyd/cvxbook/) **Why:** where the convergence
+  rates and the `2/L` condition come from, stated and proved — and reading the convex case is what lets
+  you say precisely which parts do *not* transfer to deep learning.
+- [G. Goh, "Why Momentum Really Works," *Distill*, 2017.](https://distill.pub/2017/momentum/) **Why:** an interactive treatment that makes
+  the eigenvalue picture of momentum — why it fixes ill-conditioning and where the `sqrt(κ)` comes from
+  — genuinely visible rather than asserted.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p2/week-11/p2-w11-m5">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

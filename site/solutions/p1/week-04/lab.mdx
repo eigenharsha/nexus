@@ -1,0 +1,283 @@
+---
+title: "Lab — Async Concurrent Downloader"
+description: "Reference solution — Week 4"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `LAB-P1-W04`
+
+The `hard` track is the interesting one: **10,000 URLs, a 500 req/min shared limit, a 300 MB ceiling, and proof that nothing was corrupted.**
+
+### The shape that satisfies all four constraints
+
+Four invariants, and every acceptance criterion follows from one of them:
+
+1. **Bounded workers pulling from a bounded queue** — not `gather` over 10,000 jobs. This bounds memory and gives back-pressure.
+2. **A token bucket in front of every send, including retries** — this is what keeps you inside the shared limit.
+3. **Write to `NAME.part`, `os.replace` to publish** — atomic, so a kill never leaves a truncated final file.
+4. **A durable record of what is done** — so a restart skips completed work and resumes partial work.
+
+```python
+"""downloader.py (hard track, abridged to the parts that carry the criteria)."""
+from __future__ import annotations
+
+import asyncio, hashlib, json, os, random, signal, time
+from dataclasses import dataclass
+from pathlib import Path
+
+import aiohttp
+
+RETRYABLE = {408, 425, 429, 500, 502, 503, 504}
+
+
+@dataclass(frozen=True, slots=True)
+class Job:
+    url: str
+    dest: Path
+    sha256: str
+
+
+class Downloader:
+    def __init__(self, *, workers: int = 25, rate_per_sec: float = 8.0,
+                 attempts: int = 5, budget_seconds: float = 3600.0) -> None:
+        self.bucket = TokenBucket(rate_per_sec)          # the org-wide limit, our share
+        self.attempts = attempts
+        self.deadline = time.monotonic() + budget_seconds
+        self.workers = workers
+        self.queue: asyncio.Queue[Job] = asyncio.Queue(maxsize=workers * 4)   # BOUNDED
+        self.done: set[str] = set()
+        self._stopping = asyncio.Event()
+
+    # ---- criterion 3: resumable ------------------------------------------
+    def _load_manifest(self, path: Path) -> None:
+        """Completed URLs with verified checksums. Written append-only, one JSON per line."""
+        if path.exists():
+            for line in path.read_text().splitlines():
+                rec = json.loads(line)
+                self.done.add(rec["url"])
+
+    async def _resume_offset(self, job: Job) -> int:
+        """Bytes already verified in NAME.part. We record this explicitly rather than
+        trusting the file length, because a kill mid-write leaves unverified tail bytes."""
+        side = job.dest.with_suffix(job.dest.suffix + ".part.meta")
+        if not side.exists():
+            return 0
+        try:
+            return int(json.loads(side.read_text())["verified_bytes"])
+        except (ValueError, KeyError):
+            return 0
+
+    # ---- criteria 1, 4, 5: one attempt ------------------------------------
+    async def _fetch_once(self, sess: aiohttp.ClientSession, job: Job) -> int:
+        part = job.dest.with_suffix(job.dest.suffix + ".part")
+        start = await self._resume_offset(job)
+        headers = {"Range": f"bytes={start}-"} if start else {}
+        digest = hashlib.sha256()
+        if start:
+            with part.open("rb") as f:                   # re-hash the verified prefix
+                digest.update(f.read(start))
+        written = start
+        async with sess.get(job.url, headers=headers) as resp:
+            if resp.status in RETRYABLE:
+                raise aiohttp.ClientResponseError(resp.request_info, resp.history,
+                                                  status=resp.status)
+            resp.raise_for_status()
+            mode = "r+b" if start and resp.status == 206 else "wb"
+            if resp.status != 206:
+                written, digest = 0, hashlib.sha256()    # server ignored Range: start over
+            with part.open(mode) as f:
+                if written:
+                    f.seek(written)
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    f.write(chunk)
+                    digest.update(chunk)
+                    written += len(chunk)
+                f.flush(); os.fsync(f.fileno())          # durable BEFORE we record it
+        if digest.hexdigest() != job.sha256:
+            part.unlink(missing_ok=True)
+            raise ValueError(f"checksum mismatch for {job.url}")
+        os.replace(part, job.dest)                        # ATOMIC publish (criterion 4)
+        return written
+
+
+class TokenBucket:
+    def __init__(self, rate: float, capacity: float | None = None) -> None:
+        self.rate = rate
+        self.capacity = capacity if capacity is not None else rate
+        self._tokens, self._ts = self.capacity, time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, n: float = 1.0) -> None:
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                self._tokens = min(self.capacity, self._tokens + (now - self._ts) * self.rate)
+                self._ts = now
+                if self._tokens >= n:
+                    self._tokens -= n
+                    return
+                wait = (n - self._tokens) / self.rate
+            await asyncio.sleep(wait)                     # sleep OUTSIDE the lock
+```
+
+The worker loop and shutdown:
+
+```python
+    async def _worker(self, sess: aiohttp.ClientSession, results: list) -> None:
+        while True:
+            job = await self.queue.get()
+            try:
+                if job.url in self.done:
+                    continue                              # criterion 3: skip completed work
+                results.append(await self._fetch_with_retry(sess, job))
+            except asyncio.CancelledError:
+                job.dest.with_suffix(job.dest.suffix + ".part").unlink(missing_ok=True)
+                raise                                      # NEVER swallow cancellation
+            except Exception as exc:
+                results.append((job, exc))
+            finally:
+                self.queue.task_done()
+
+    async def run(self, jobs: "Iterable[Job]") -> list:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, self._stopping.set)   # criterion 6
+        results: list = []
+        conn = aiohttp.TCPConnector(limit=self.workers, limit_per_host=self.workers)
+        timeout = aiohttp.ClientTimeout(total=120, connect=5, sock_read=30)
+        async with aiohttp.ClientSession(connector=conn, timeout=timeout) as sess:
+            async with asyncio.TaskGroup() as tg:
+                workers = [tg.create_task(self._worker(sess, results))
+                           for _ in range(self.workers)]
+                for job in jobs:                           # a GENERATOR: never materialised
+                    if self._stopping.is_set() or time.monotonic() > self.deadline:
+                        break
+                    await self.queue.put(job)              # blocks when full: back-pressure
+                await self.queue.join()
+                for w in workers:
+                    w.cancel()
+        return results
+```
+
+## Why this solution and not the obvious one
+
+### Wrong turn 1: `gather` over 10,000 jobs
+
+```python
+await asyncio.gather(*(self.fetch(j) for j in jobs))       # blows criteria 1 and 2
+```
+
+This creates **10,000 tasks immediately**, each holding a coroutine frame, a job object and eventually a response buffer. Memory scales with the job count rather than with the concurrency, which fails the 300 MB ceiling outright. It also opens sockets as fast as the connector allows and exhausts file descriptors — 256 on macOS by default (Week 2, Module 1).
+
+Bounded workers pulling from a bounded `asyncio.Queue` is the shape with an upper bound on resources:
+
+- memory is `O(workers + queue maxsize)`, not `O(jobs)`;
+- `await queue.put(job)` blocks when the queue is full, so the producer — which may be reading a 10,000-line manifest — is throttled by the consumers for free;
+- the job source can be a **generator**, so the manifest is never materialised.
+
+The measured shape from Module 4 confirms the throughput is unaffected: at concurrency 20 against a 54 ms service, Little's law predicts 370 req/s and we measured **371.2**. The bound costs nothing and buys the ceiling.
+
+### Wrong turn 2: trusting the `.part` file's length on resume
+
+The natural resume is `start = part.stat().st_size`. It is wrong, and it produces a file that passes every length check and fails the checksum — or worse, passes both because the corruption is in the middle.
+
+A process killed during `f.write(chunk)` may have written a partial chunk; a process killed after `write` but before `fsync` may have data in the page cache that never reached disk. **The file's length is not the number of bytes you know are good.**
+
+The reference records `verified_bytes` in a sidecar written *after* `fsync`, so the recorded number is always ≤ the durable bytes. On resume it re-hashes exactly that prefix and requests `Range: bytes=N-`.
+
+Three details that follow:
+
+- **Check for HTTP 206, not 200.** A server that ignores `Range` returns 200 with the *whole* body; appending it to your prefix produces a file that is the right length and complete nonsense. If the status is 200, discard the prefix and start over.
+- **`fsync` before recording.** Atomicity (`os.replace`) is not durability (Week 2, Module 3). Without the `fsync`, a power failure leaves a recorded offset larger than what is on disk.
+- **The checksum is the real proof.** Range resumption has enough edge cases that the only trustworthy statement is "the final file hashes correctly", which is criterion 4.
+
+### Wrong turn 3: retries that ignore the shared limit
+
+The measured comparison from Module 5, on the flaky fixture server:
+
+| Client | Success | Retries | Server 429s | Wall |
+|---|---|---|---|---|
+| naive | 285/400 (71.3%) | 0 | 0 | 0.16 s |
+| retry + full jitter | 358/400 (89.5%) | 327 | **185** | 14.20 s |
+| retry + token bucket | **400/400 (100%)** | 156 | **0** | 68.59 s |
+
+The middle row is the ticket's first incident: **185 of its 327 retries were answered with a rate-limit response**, and those 429s were caused by the retrying. In the lab's scenario the limit is shared across the organisation, so those 429s land on other teams — which is exactly what happened before the ticket was filed.
+
+The bucket must be in front of **every send, including retries**, and it must be a *client-side* limiter rather than a reaction to 429s. Reacting is too late: by the time you see a 429 you have already consumed someone else's budget.
+
+### A fourth thing worth knowing: 500/min is a 20-minute floor
+
+10,000 requests ÷ 8.33 req/s = **1,200 seconds = 20 minutes**, before a single retry. No amount of concurrency changes that; the limit is a rate, and concurrency only helps until you are rate-limited.
+
+This reframes the ticket. The original 9-hour job was 10,000 sequential requests at ~3.2 s each — it was slow because it was sequential, not because of the limit. Getting to ~22 minutes is a **24× improvement and it is the arithmetic maximum.** Saying that plainly in the README is worth more than any optimisation, because it tells the platform team what to expect and stops someone "improving" it back into rate-limit territory.
+
+## The measured numbers this solution produces
+
+Apple M3 Pro (11 cores, 18 GB), macOS 15, CPython 3.13.2, aiohttp 3.14.3, local fixture servers.
+
+**The three-way model comparison** (40 requests × 50 ms, Module 1):
+
+| Model | Time | Speedup | Efficiency |
+|---|---|---|---|
+| sequential | 2.184 s | 1.00× | — |
+| threads (20) | 0.155 s | 14.09× | 70% |
+| **asyncio `gather`** | **0.081 s** | **27.02×** | — |
+| floor (one round trip) | 0.050 s | 43.7× | — |
+
+**Concurrency and Little's law** (500 requests, 50 ms server):
+
+| Semaphore | Throughput | Predicted |
+|---|---|---|
+| 20 | 371.2 req/s | 370 |
+| 50 | 884.7 req/s | 893 |
+
+**Client strategies** (400 requests, flaky server, fresh window each):
+
+| Client | Success | Retries | 429s | Wall | p50 | p99 |
+|---|---|---|---|---|---|---|
+| naive | 71.3% | 0 | 0 | 0.16 s | 87 ms | 132 ms |
+| retry | 89.5% | 327 | 185 | 14.20 s | 612 ms | 12,885 ms |
+| **bucket** | **100%** | 156 | **0** | 68.59 s | 34,342 ms | 68,164 ms |
+
+**Hard-track floor:** 10,000 requests at 8.33 req/s = **20 minutes**, against the original job's 9 hours — a 24× improvement that is also the arithmetic ceiling.
+
+## Grading notes
+
+**3/3 on correctness** means checksums verified on all 10,000 files, `Retry-After` honoured in both formats, 4xx not retried, and a deadline enforced per attempt rather than only an attempt count.
+
+**3/3 on concurrency** means the semaphore **and** connector limits are both set, sized with Little's law, and the server never observes more than the configured concurrency or more than 500 requests in any 60-second window across the whole run, retries included.
+
+**3/3 on robustness** means N random kills produce zero corrupt files, resumption is within 5% of a clean run's bytes, no final filename is ever written twice, and `Ctrl-C` exits 130 within two seconds with no `.part` files left behind.
+
+**3/3 on explanation** means the three-way benchmark with efficiency and load average, the bucket-rate sweep with your chosen value defended, the p50-versus-p99 gap explained, the 20-minute floor stated, and one wrong turn told honestly.
+
+The seven most common ways submissions lose points:
+
+1. **`gather` over all jobs.** Fails the memory ceiling immediately and usually the descriptor limit too.
+2. **Resume from `stat().st_size`.** Produces a right-length, wrong-content file. Record verified bytes after `fsync`.
+3. **No 206 check.** A server ignoring `Range` returns the whole body with status 200 and your append corrupts the file silently.
+4. **Retries outside the token bucket.** The measured 185 self-inflicted 429s; in this lab they land on other teams.
+5. **Writing in place instead of `.part` plus `os.replace`.** This is the ticket's second incident — a truncated `.safetensors` that a training run loaded.
+6. **`CancelledError` swallowed.** Shutdown hangs and `.part` files leak; `TaskGroup` exit never completes.
+7. **The 20-minute floor not stated.** Without it, nobody knows whether 22 minutes is excellent or terrible, and the next person will "optimise" the concurrency back into rate-limit territory.
+
+<Tip>
+**The portfolio version of this lab** is the benchmark README, and the two things to put above
+the fold are the three-way comparison (sync/threaded/async on identical work, with efficiency)
+and the chaos evidence (N kills, zero corruption, checksums verified). Both are short, both are
+concrete, and together they demonstrate that you can make something fast *and* prove it is
+still correct — which is a rarer combination than either alone.
+</Tip>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

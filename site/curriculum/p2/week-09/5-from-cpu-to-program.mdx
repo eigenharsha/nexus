@@ -1,0 +1,807 @@
+---
+title: "From CPU to program"
+description: "Week 9 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 9 · Module 5 · `P2-W09-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** `P2-W09-M3` (the ALU and its control bits), `P2-W09-M4` (registers, RAM, the PC).
+- **Unlocks:** Week 13 (why algorithmic complexity is not the whole story), Phase 3 (SIMD is the
+  direct ancestor of the GPU), Week 26 (why quantisation and batching change throughput).
+- **One-line:** after this you can trace a program from source to machine code to gate activity, and
+  explain — with a measured number — why two loops that do the same arithmetic differ by 4.8×.
+
+## What you'll be able to do
+
+1. Execute the fetch-decode-execute cycle by hand on paper.
+2. Read and write Hack assembly, and map a C `for` loop onto it instruction by instruction.
+3. Explain instruction encoding: how 16 bits become "which ALU control bits, which registers, which jump".
+4. Explain pipelining, branch prediction, out-of-order execution and SIMD, and name what each buys.
+5. Produce a measured speedup on a numeric loop by making it vectorisable, and explain the assembly.
+
+## Why you should care
+
+**Aarav (student).** This is the module that closes the loop opened in Module 1. You built gates,
+then an adder, then an ALU, then registers. Now you connect them and a *program* runs. Being able to
+say "here is the instruction, here are the six control bits it sets, here is the ALU output, here is
+the new PC value" is a complete answer to the most common systems interview question there is.
+
+**Meera (working professional).** You have profiled code and seen two functions with identical Big-O
+differ by 5×. This module is why. Pipelines, branch predictors and SIMD are the reason instruction
+count is a poor predictor of runtime, and the reason "make the compiler's job easier" is often a
+better optimisation than "do less work". You will also learn to read the assembly your compiler
+emits, which is a permanent upgrade to your debugging.
+
+## The mental model
+
+A CPU is a very small loop:
+
+```
+forever:
+    instruction = memory[PC]        # fetch
+    control     = decode(instruction)   # decode
+    result      = ALU(registers, control)   # execute
+    write back; PC = next(PC, result)
+```
+
+That is it. Everything a computer does is that loop, running billions of times a second. Every
+sophistication in a modern CPU — pipelining, speculation, out-of-order, SIMD — exists to run *that
+loop* faster without changing what it means.
+
+The instruction is not a command in any deep sense. It is a bit pattern that gets fanned out to
+control wires: some bits go to the ALU's `zx/nx/zy/ny/f/no`, some select which register is written,
+some decide whether the PC takes its next value from `PC+1` or from somewhere else.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p2-w09-m5.svg" alt="Hand-drawn sketch: from CPU to program" className="block dark:hidden" />
+  <img src="/assets/diagrams/p2-w09-m5-dark.svg" alt="Hand-drawn sketch: from CPU to program" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p2-w09-m5
+tier: T3
+one-sentence-goal: An instruction is just wires: 16 bits fanning out into ALU control, register selects and a PC decision, looping forever.
+elements:
+  - centre-left: the four-box loop FETCH -> DECODE -> EXECUTE -> WRITEBACK drawn as a circle with the PC box in the middle
+  - above: a 16-bit instruction drawn as 16 little boxes, with hand-drawn arrows peeling off groups of bits to labels: "1 = C-instruction", "a bit", "c1..c6 -> straight into the ALU control bits from Module 3", "d1 d2 d3 -> which of A, D, M gets written", "j1 j2 j3 -> compare against zr/ng"
+  - circle the phrase "c1..c6" and write beside it "these ARE zx nx zy ny f no"
+  - right: a worked trace table, hand-ruled, 5 rows: instruction, A, D, M, PC after - for the program @2 / D=A / @3 / D=D+A / @0 / M=D
+  - lower strip: pipeline drawn as 5 overlapping bars (IF ID EX MEM WB) for 4 instructions, staircase style; one instruction's EX crossed out in red with "branch mispredict - flush" and "~15-20 cycles" written beside
+  - far right small panel: 4 lanes of a SIMD register drawn as a 4-wide box with one instruction arrow feeding all four, "4.79x measured" written beside
+  - amber margin note: "the loop you wrote may not exist in the binary. Check."
+  - dangling arrow: "...and if you have 16,896 of these lanes? -> Phase 3"
+numbers-to-write-in: 16-bit instruction; measured 1.71 -> 8.17 GFLOP/s (4.79x) from vectorisation; branch mispredict ~15-20 cycles; -O2 turned a 3-instruction loop into 8 straight-line instructions with no loop at all
+alt: A whiteboard sketch of the fetch-decode-execute loop with a 16-bit instruction drawn above it and arrows showing which bit groups drive the ALU control lines, the destination registers and the jump logic, a hand-ruled trace table of a six-instruction program, a staircase pipeline diagram with a mispredicted branch crossed out in red, and a small four-lane SIMD panel annotated with a measured speedup.
+*/}
+
+<Tabs>
+
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The words, defined
+
+- **Machine code** — the actual bits stored in memory that the CPU reads as instructions.
+- **Assembly** — a human-readable name for each machine instruction, one line per instruction. It is
+  not a language in the usual sense; it is a spelling of the bits.
+- **Instruction set architecture (ISA)** — the contract between hardware and software: which
+  instructions exist, what they do, and how they are encoded.
+- **Program counter (PC)** — the register holding the address of the next instruction. Built in
+  Module 4.
+- **Register** — a storage location inside the CPU, addressed by name rather than by memory address,
+  and about 100× faster to access.
+
+### The Hack machine, in one page
+
+The Hack computer has three storage locations you write code against:
+
+- **A** — the address register. It holds a value, and it also selects which memory word `M` refers to.
+- **D** — the data register. Pure scratch.
+- **M** — not a register at all: it *means* `RAM[A]`. Whenever you write `M`, you are touching memory
+  at whatever address `A` currently holds.
+
+There are exactly two kinds of instruction.
+
+**A-instruction:** `@value`. Puts a constant into A. Written in binary as `0` followed by 15 bits of
+value. So `@21` is `0000000000010101`.
+
+**C-instruction:** `dest = comp ; jump`, where `dest` and `jump` are optional. This is where the ALU
+lives. Written as `111 a c1c2c3c4c5c6 d1d2d3 j1j2j3`:
+
+- The leading `111` marks it as a C-instruction.
+- `a` chooses whether the ALU's second input is `A` or `M`.
+- `c1..c6` **are literally the six ALU control bits from Module 3** — `zx nx zy ny f no`.
+- `d1 d2 d3` say whether the result is written to A, D and/or M.
+- `j1 j2 j3` say when to jump, tested against the ALU's `zr` and `ng` flags from Module 3.
+
+That is the whole ISA. Read that list again: **the instruction format is the ALU's control interface
+with an address and a jump condition bolted on.** There is no gap between Module 3 and Module 5.
+
+### Hand-execute five instructions
+
+Program: compute `2 + 3` and store it at `RAM[0]`.
+
+```asm
+@2        // A = 2
+D=A       // D = A       -> D = 2
+@3        // A = 3
+D=D+A     // D = D + A   -> D = 5
+@0        // A = 0
+M=D       // RAM[0] = D  -> RAM[0] = 5
+```
+
+Trace it. Fill this in yourself before reading the answer column:
+
+| PC | Instruction | A after | D after | RAM[0] after |
+|---|---|---|---|---|
+| 0 | `@2` | 2 | 0 | – |
+| 1 | `D=A` | 2 | 2 | – |
+| 2 | `@3` | 3 | 2 | – |
+| 3 | `D=D+A` | 3 | 5 | – |
+| 4 | `@0` | 0 | 5 | – |
+| 5 | `M=D` | 0 | 5 | 5 |
+
+Two observations that matter more than the arithmetic:
+
+1. **`@3` destroyed the 2 that was in A.** A is a single register; there is no stack of them. Every
+   assembly program is an exercise in not losing values you still need. High-level languages exist
+   almost entirely to do that bookkeeping for you.
+2. **`D=D+A` is one C-instruction**, and its `c1..c6` bits are `000010` — the pattern for `x+y` from
+   the Module 3 table. The instruction *is* the control bits.
+
+### The fetch-decode-execute cycle
+
+Each clock cycle:
+
+1. **Fetch** — read `ROM[PC]`. This is combinational: the PC's output wires are the ROM's address
+   wires, and the instruction bits appear.
+2. **Decode** — the instruction bits fan out to control wires. No computation, just wiring.
+3. **Execute** — the ALU computes with whatever control bits it was given. It computes *every*
+   cycle, whether or not the instruction is arithmetic, because it is combinational logic.
+4. **Write back** — at the clock edge, the destination registers latch the result, and the PC latches
+   either `PC+1` or the jump target.
+
+Everything except step 4 is combinational. **The entire cycle is one clock tick**, and the clock
+period must be long enough for the longest path through all of it to settle — which is exactly the
+depth argument from Modules 1–3.
+
+### A loop, in assembly
+
+Here is `RAM[2] = 1 + 2 + ... + RAM[0]`, the assembly version of a `for` loop:
+
+```asm
+// R2 = sum of 1..R0
+    @R2
+    M=0          // total = 0
+    @i
+    M=0          // i = 0
+(LOOP)
+    @i
+    D=M          // D = i
+    @R0
+    D=D-M        // D = i - n
+    @END
+    D;JGT        // if (i - n) > 0 goto END
+    @i
+    D=M
+    @R2
+    M=M+D        // total += i
+    @i
+    M=M+1        // i++
+    @LOOP
+    0;JMP        // goto LOOP
+(END)
+    @END
+    0;JMP        // halt: jump to self forever
+```
+
+Trace it with `R0 = 3`: `i` goes 0, 1, 2, 3, 4; `R2` accumulates 0, 1, 3, 6; on `i = 4` the test
+`4 - 3 = 1 > 0` fires and it exits with `R2 = 6`. Correct: `1 + 2 + 3 = 6`.
+
+Two things to take from this:
+
+- **A loop is a conditional jump backwards.** There is no loop construct in hardware. `for`, `while`,
+  and recursion all compile to compare-and-jump.
+- **`D;JGT` uses the ALU flags from Module 3.** `D` is computed by the ALU (control bits for "x",
+  i.e. pass through), which sets `zr` and `ng`, and the jump logic reads those two wires. The `if`
+  statement you write in Python is, at bottom, one wire.
+- **The halt is a jump to itself.** A CPU has no "stop". It always fetches something.
+
+### Guided practice
+
+Write Hack assembly for `if (RAM[0] > RAM[1]) RAM[2] = 1; else RAM[2] = 0;`. Skeleton given:
+
+```asm
+    @R0
+    D=M          // D = RAM[0]
+    @R1
+    D=D-M        // D = RAM[0] - RAM[1]
+    @GREATER
+    D;___        // TODO: which jump condition?
+    @R2
+    M=___        // TODO: the else branch
+    @END
+    0;JMP
+(GREATER)
+    @R2
+    M=___        // TODO: the then branch
+(END)
+    @END
+    0;JMP
+```
+
+<Accordion title="Answer">
+
+```asm
+    D;JGT        // jump if RAM[0] - RAM[1] > 0
+    ...
+    M=0          // else branch
+    ...
+    M=1          // then branch
+```
+
+Note the structure: the **else** branch comes first in memory and the **then** branch is jumped to.
+That is not arbitrary — it is what almost every compiler does, because it lets the common path fall
+through without a taken branch. On a machine with a branch predictor that assumes not-taken for
+forward branches, this layout is measurably faster, and it is why `__builtin_expect` and
+`[[likely]]` exist.
+
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+<Accordion title="1. What is M?">
+Not a register — a name for `RAM[A]`. Writing `M=D` stores `D` into memory at whatever address `A`
+currently holds.
+</Accordion>
+<Accordion title="2. Why does the ALU compute on every cycle, even during `@2`?">
+It is combinational logic with no enable — the gates always evaluate. The destination bits simply
+discard the result when nothing is meant to be written.
+</Accordion>
+<Accordion title="3. How does an `if` become hardware?">
+The ALU computes the comparison and sets `zr` and `ng`; the jump bits `j1 j2 j3` select a condition
+over those two flags; the result is a single wire into the PC's `load` input.
+</Accordion>
+<Accordion title="4. Why is there no 'halt' instruction?">
+The PC is a counter that latches a value on every clock edge — it cannot decline to. An infinite
+self-jump is the closest thing to stopping. Real CPUs have a `HLT`/`WFI` instruction that gates the
+clock, which is a power feature, not a control-flow one.
+</Accordion>
+<Accordion title="5. `D=D+A` sets which ALU control bits?">
+`zx nx zy ny f no = 0 0 0 0 1 0` — the `x+y` row of the Module 3 table. The `a` bit is 0 because the
+second operand is `A`, not `M`.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### From C to assembly: what the compiler actually does
+
+Take the simplest possible loop:
+
+```c
+int sum_to(int n) {
+    int total = 0;
+    for (int i = 0; i < n; i++) total += i;
+    return total;
+}
+```
+
+Compiled with Apple clang 17 for arm64 at `-O0`, the loop is a faithful transcription — every
+variable lives on the stack and is reloaded every iteration:
+
+```asm
+_sum_to:
+    sub  sp, sp, #16
+    str  w0, [sp, #12]        ; n
+    str  wzr, [sp, #8]        ; total = 0
+    str  wzr, [sp, #4]        ; i = 0
+LBB0_1:                       ; loop header
+    ldr  w8, [sp, #4]         ; load i
+    ldr  w9, [sp, #12]        ; load n
+    subs w8, w8, w9           ; i - n, setting flags
+    cset w8, ge               ; w8 = (i >= n)
+    tbnz w8, #0, LBB0_4       ; if so, exit
+    ldr  w9, [sp, #4]         ; load i again
+    ldr  w8, [sp, #8]         ; load total
+    add  w8, w8, w9           ; total += i
+    str  w8, [sp, #8]         ; store total
+    ldr  w8, [sp, #4]         ; load i AGAIN
+    add  w8, w8, #1
+    str  w8, [sp, #4]         ; i++
+    b    LBB0_1
+LBB0_4:
+    ldr  w0, [sp, #8]
+    add  sp, sp, #16
+    ret
+```
+
+That is 12 instructions per iteration, most of them loads and stores of values that never needed to
+leave a register. Now the same function at `-O2`:
+
+```asm
+_sum_to:
+    sub   w8, w0, #1
+    sub   w9, w0, #2
+    umull x9, w8, w9
+    lsr   x9, x9, #1
+    add   w8, w8, w9
+    cmp   w0, #1
+    csel  w0, wzr, w8, lt
+    ret
+```
+
+**There is no loop.** The compiler recognised the summation and replaced it with the closed form
+`(n−1)n/2`, computed with a multiply and a shift, plus a `csel` to return 0 when `n < 1`. An
+`O(n)` loop became eight straight-line instructions — `O(1)`.
+
+Three lessons, all of which you will use:
+
+1. **Never benchmark at `-O0`.** The difference here is unbounded, not a constant factor.
+2. **Never assume the machine code resembles your source.** If you are reasoning about instruction
+   counts, read the assembly. `godbolt.org` (Compiler Explorer) or `clang -O2 -S` takes ten seconds.
+3. **The optimiser needs information.** It could do this only because `int` overflow is undefined
+   behaviour in C, so it may assume the sum does not wrap. Compile with `-fwrapv` and the closed-form
+   rewrite disappears. Optimisations are bought with assumptions.
+
+### Pipelining, in numbers
+
+A non-pipelined CPU does fetch, decode, execute, memory and write-back in one long cycle. Suppose
+those stages take 200, 100, 250, 200 and 100 ps. Non-pipelined, the cycle must be 850 ps →
+**1.18 GHz**, one instruction per cycle.
+
+Pipelined into five stages, the clock is set by the *slowest stage* plus register overhead: 250 +
+50 = 300 ps → **3.33 GHz**, still one instruction per cycle at steady state. That is a **2.8×
+throughput improvement** with no change to the logic, only added pipeline registers.
+
+The catch is that pipelining makes *latency* slightly worse (5 × 300 = 1500 ps for one instruction
+end to end, versus 850 ps) and introduces three hazard classes:
+
+- **Structural** — two instructions need the same hardware in the same cycle. Fixed with duplicated
+  units or separate instruction/data caches (which is why L1 is split into L1i and L1d).
+- **Data** — an instruction needs a result that is still in flight. Fixed by *forwarding* the value
+  from a later pipeline stage directly to an earlier one; when forwarding cannot help (a load
+  followed immediately by a use), you stall.
+- **Control** — a branch's direction is not known until it executes, so which instruction to fetch
+  next is unknown. This one is expensive, and it is why branch prediction exists.
+
+### Branch prediction
+
+A modern CPU with a 15–20 stage pipeline that guessed randomly would flush half its pipeline on
+every branch — a 15–20 cycle penalty on roughly one instruction in five. That would be
+catastrophic, so predictors are very good: on typical code, modern TAGE-class predictors achieve
+**over 99% accuracy**, and the residual misprediction rate is one of the top few limits on
+single-thread performance.
+
+Here is where a well-known demonstration stops working, and the reason is instructive. The classic
+StackOverflow result is that summing only the elements above a threshold is several times faster on
+sorted data than unsorted, because the branch becomes predictable. On an Apple M3 Pro with Apple
+clang 17 at `-O2`, that effect **does not appear**: measured best-of-7, the branchy loop over random
+data ran at 0.11 ns/element and over sorted data at 0.12 ns/element — no difference.
+
+Looking at the generated assembly explains it:
+
+```asm
+    ldr   w10, [x19, x9, lsl #2]
+    cmp   w10, #128
+    csel  w10, w10, wzr, gt      ; <- conditional SELECT, not a branch
+    add   x8, x8, w10, sxtw
+```
+
+The compiler performed **if-conversion**: it replaced the branch with `csel`, a conditional select
+that computes both possibilities and picks one with no control flow at all. There is no branch, so
+there is nothing to mispredict. This is exactly the hardware "compute both and MUX" pattern from
+Module 3, applied by the compiler.
+
+The lesson is not "branch prediction does not matter". It is: **a performance folk theorem is only
+true for a specific compiler, ISA and optimisation level, and you must check the assembly before
+repeating it.** On this machine the branch cost was already optimised away; on a machine or a code
+shape where if-conversion is not legal (side effects, memory writes, loop-carried control flow), the
+original result stands.
+
+### SIMD: the measured 4.79×
+
+SIMD — Single Instruction, Multiple Data — is one instruction operating on a vector of values.
+ARM NEON registers are 128 bits: four `float`s, or eight `__fp16`, or sixteen `int8`s. x86 AVX2 is
+256 bits, AVX-512 is 512.
+
+The benchmark is a dot product, deliberately trivial:
+
+```c
+// vec.c — the same dot product, compiled two ways.
+// clang -O2            -o slow vec.c
+// clang -O2 -ffast-math -o fast vec.c
+float dot(const float *a, const float *b, int n) {
+    float s = 0;
+    for (int i = 0; i < n; i++) s += a[i] * b[i];
+    return s;
+}
+```
+
+Measured on an Apple M3 Pro, `n = 1,048,576`, 50 repetitions per timing, best of 15:
+
+| Build | Time | Throughput | ns/element |
+|---|---|---|---|
+| `-O2` | 61.4 ms | **1.71 GFLOP/s** | 1.172 |
+| `-O2 -ffast-math` | 12.8 ms | **8.17 GFLOP/s** | 0.245 |
+| | | **4.79× faster** | |
+
+Identical source. Identical arithmetic to within floating-point rounding. The only difference is
+that `-ffast-math` grants permission to reassociate the sum.
+
+Why permission is needed: floating-point addition is **not associative**.
+`(a + b) + c` can differ from `a + (b + c)` because each addition rounds. Vectorising a reduction
+means splitting it into four partial sums and combining them at the end — a different association
+order, hence a possibly different result in the last bits. Strict IEEE 754 semantics forbid the
+compiler from doing that on its own. So at plain `-O2` the loop is a serial chain of dependent
+`fadd` instructions, each waiting on the previous one, and the machine's four-wide vector units and
+multiple FP pipelines sit idle.
+
+**This is the single most important performance idea in the module**, and it recurs constantly:
+the loop was slow not because it did too much work but because the work was a *chain*. Same shape as
+the carry chain in Module 2. Same fix: break the dependency.
+
+Safer alternatives to blanket `-ffast-math` (which also disables NaN and infinity handling, and can
+change results in ways that break numerical code):
+
+- `#pragma clang loop vectorize(enable)` on the specific loop.
+- `-ffp-contract=fast` alone (allows fused multiply-add) plus manual multi-accumulator unrolling.
+- Explicit intrinsics or `std::reduce` with an execution policy in C++17 and later.
+- In Python: use NumPy, whose reductions are already implemented this way — which is most of the
+  reason NumPy is 10–100× faster than a Python loop.
+
+### Trade-offs
+
+| Decision | Choose this when… | Choose the other when… | The number |
+|---|---|---|---|
+| **Branch** vs **branchless (`csel`/`cmov`)** | The branch is highly predictable (>95%) and one side is expensive | The branch is unpredictable, or both sides are cheap | Mispredict ~15–20 cycles; a `csel` costs 1 and always does both sides' work |
+| **`-ffast-math`** vs **explicit vectorisation** | Throughput matters more than the last bits; the code is not numerically delicate | You have accumulating error, NaN semantics, or reproducibility requirements | Measured 4.79× here — but you gave up IEEE conformance to get it |
+| **Deeper pipeline** vs **shallower** | You want clock frequency | You want low mispredict penalty | Pentium 4's 31 stages bought clock and cost ~20 cycles per mispredict; it lost |
+| **Trust the compiler** vs **read the assembly** | Prototyping | Anything you are about to make a performance claim about | The `sum_to` loop went from 12 instructions/iteration to 8 total — an unbounded difference you would never guess from the source |
+
+### What breaks in the real world
+
+A trading-adjacent service had a hot function computing a weighted sum over about 4,000 doubles per
+message. It was the top entry in the profile. The team spent a week reducing the number of
+multiplications with algebraic identities and got 8%.
+
+The actual problem was that the accumulator was a single `double`, so the loop was a serial chain of
+`vaddsd` at ~4 cycles latency each — 4,000 × 4 = 16,000 cycles regardless of how many multiplies
+they removed, since the multiplies were free in the shadow of the add chain. Splitting into four
+independent accumulators and combining at the end took it to about 4,300 cycles, a **3.7×
+improvement**, with an eight-line change and a documented note about floating-point associativity so
+that a future reader would not "fix" it back.
+
+The tell was visible in `perf stat` all along: IPC of 0.9 on a machine capable of 4–6, with almost
+no cache misses. **Low IPC plus low miss rate means a dependency chain**, not a memory problem and
+not a work problem.
+
+### Design checkpoint
+
+<Accordion title="A colleague reports that adding `-ffast-math` made a numerical simulation 5x faster and 'the results look the same'. Do you merge it?">
+
+Not on that evidence, and the objection is specific rather than conservative.
+
+`-ffast-math` bundles several distinct relaxations: reassociation (`-fassociative-math`), assuming
+no NaNs (`-ffinite-math-only`), assuming no signed zeros, allowing reciprocal approximation
+(`-freciprocal-math`), and flushing denormals to zero. The reassociation is what bought the 5×. The
+others are what will hurt you: a NaN check written as `x != x` is optimised to `false` under
+`-ffinite-math-only`, so an existing guard silently stops working.
+
+What to ask for instead:
+
+1. Which flag actually produced the speedup? Try `-fassociative-math -ffp-contract=fast` alone.
+2. What is the measured error? Not "looks the same" — run the reference and the fast build on the
+   same inputs and report max absolute and relative deviation. For a summation, error grows with
+   `sqrt(n)` for random rounding but can grow with `n` in the worst case.
+3. Is anything downstream sensitive to bit-exactness? Reproducible builds, golden-file tests,
+   checksums of results, or anything compared across machines will break.
+4. Is there a NaN or infinity guard anywhere in the affected translation units?
+
+Then the good outcome: keep IEEE semantics globally, apply `#pragma clang loop vectorize(enable)` or
+multiple accumulators to the one hot loop, and get most of the 5× with none of the semantic change.
+That is usually available, and it is what the war story above did.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim here carries a measured or cited number. Measurements were taken on an Apple M3 Pro
+(macOS 26.2, Apple clang 17), best-of-N timings on a machine under concurrent load.
+</Warning>
+
+### Under the hood: out-of-order execution
+
+A modern high-performance core does not execute your instructions in order. It:
+
+1. **Fetches and decodes** several instructions per cycle (4–8 wide) into internal micro-ops.
+2. **Renames** architectural registers onto a much larger physical register file, eliminating
+   write-after-read and write-after-write hazards. An x86 core has 16 architectural GPRs and on the
+   order of 200–300 physical ones.
+3. **Issues** micro-ops to execution ports as soon as their operands are ready — not in program
+   order. A scheduler window of 300–600+ micro-ops is typical on recent cores.
+4. **Retires** them in order, so architectural state and exceptions still look sequential.
+
+The consequences you can measure:
+
+- **IPC (instructions per cycle) can exceed 1.** Modern cores sustain 2–5 IPC on friendly code.
+  `perf stat` reports it directly. If you see IPC below 1 with a low cache-miss rate, you have a
+  dependency chain (see the war story) or a mispredict problem.
+- **True dependencies are the hard limit.** Renaming removes false dependencies; it cannot remove
+  real ones. Your `total += a[i]` chain is a real dependency, and no amount of transistors fixes it —
+  only restructuring does.
+- **The reorder window hides latency, up to a point.** A ~100 ns DRAM miss at 4 GHz is about 400
+  cycles. A 500-entry window cannot cover that with useful work unless the code has many independent
+  memory accesses in flight, which is exactly what prefetching and memory-level parallelism provide.
+
+### Speculation, and Spectre in one paragraph
+
+Speculation means executing past an unresolved branch and discarding the work if the guess was
+wrong. Architecturally the discard is complete — no registers, no memory. But it is not complete
+*microarchitecturally*: speculatively executed loads leave lines in the cache. **Spectre** (Kocher
+et al., 2019) weaponises this: train the branch predictor to guess a particular way, then feed an
+input that makes the speculative path read out-of-bounds secret data and use it to index an array.
+The out-of-bounds read is discarded, but the array access it caused left a cache footprint, and
+timing which line is now fast reveals the secret byte. The vulnerability is not a bug in any one
+chip; it is inherent to the combination of speculation and shared microarchitectural state, which is
+why mitigation (`retpoline`, IBRS, array index masking, and process isolation) costs real
+performance — reported overheads ranged from low single digits to over 30% on syscall-heavy
+workloads.
+
+The transferable idea: **performance optimisations that leave observable side effects create
+side channels.** You will meet the same reasoning in Phase 4 when caching model responses across
+tenants turns into a data-leak question.
+
+### SIMD to tensor cores: the line to Phase 3
+
+SIMD widens the datapath. Each widening is the same trick from Module 3 — one control signal, many
+copies of the arithmetic hardware:
+
+| Generation | Width | FP32 lanes | Notes |
+|---|---|---|---|
+| SSE2 (2001) | 128 bit | 4 | |
+| AVX2 (2013) | 256 bit | 8 | plus FMA: multiply-add as one instruction |
+| AVX-512 (2016) | 512 bit | 16 | often clocks down under heavy use |
+| ARM NEON | 128 bit | 4 | what the 4.79× measurement above uses |
+| ARM SVE2 | 128–2048 bit | vector-length agnostic | code does not hard-code the width |
+
+Then the discontinuity. A **tensor core** does not widen a vector operation; it implements a
+*different* operation: a small matrix multiply-accumulate (e.g. 4×4×4) as a single instruction. That
+changes the arithmetic intensity, because one instruction now does `2 × 4³ = 128` FLOPs while
+reading `3 × 16` elements. Concretely: an NVIDIA H100 SXM delivers roughly 67 TFLOP/s in FP32 vector
+form and roughly 990 TFLOP/s FP16 through tensor cores — about **15×** for the same silicon, by
+making the instruction bigger rather than the vector wider.
+
+That is why every model in Phase 3 and 4 is expressed as matrix multiplication even when the maths
+would be more naturally written another way. The hardware has one fast operation, and everything
+that wants to be fast is rewritten in terms of it. It is the exact same reasoning as the Hack ALU
+expressing 18 operations with one adder — the constraint just moved up eight levels of abstraction.
+
+### At scale: the four things that limit a modern core
+
+Given a profile, these are the four candidate bottlenecks, and each has a distinct signature:
+
+| Limit | Signature in `perf stat` | Typical fix |
+|---|---|---|
+| **Front-end (fetch/decode)** | High `idq_uops_not_delivered`, large code footprint, high `iTLB` misses | Reduce code size, PGO, avoid megamorphic call sites |
+| **Bad speculation** | `branch-misses` above ~1% of branches | Make branches predictable, or make them branchless |
+| **Back-end: memory** | High `LLC-load-misses`, low IPC | Locality, blocking, prefetch, layout (Module 4) |
+| **Back-end: dependencies** | Low IPC with low miss rate and low mispredict rate | Break the chain — multiple accumulators, reassociation, SIMD |
+
+The Top-Down methodology (Yasin, 2014) formalises exactly this into a decision tree, and it is
+implemented as `perf stat --topdown` on Linux and in Intel VTune. Learning to attribute a slowdown
+to one of these four buckets in under five minutes is a genuinely senior skill, and it is available
+to you now.
+
+### Production failure modes
+
+| Failure | Signature | Detection |
+|---|---|---|
+| **Benchmarked at `-O0`** | "This C code is barely faster than Python" | Always benchmark release builds; check the assembly exists |
+| **Dead-code-eliminated benchmark** | Suspiciously fast, time independent of `n` | The compiler removed the loop because the result is unused. Sink the result into a `volatile` |
+| **Serial FP accumulator** | IPC below 1, few cache misses, time linear in `n` at ~4 cycles per element | Multiple accumulators or explicit vectorisation |
+| **`-ffast-math` breaking a NaN guard** | A validity check that used to catch bad data silently stops | Never enable globally; enable per-loop, and grep for `x != x` / `isnan` in affected files |
+| **Denormal stall** | 10–100× slowdown that appears only with certain data (values near zero) | Flush-to-zero mode, or clamp tiny values. Common in audio and physics code |
+| **Spectre mitigation cost** | Throughput regression after a kernel/microcode update, worst on syscall-heavy paths | Compare with mitigations off in a test environment only; budget for the loss rather than disabling it in production |
+
+### Frontier and further pointers
+
+- **Kocher et al. (2019), "Spectre Attacks: Exploiting Speculative Execution," IEEE S&P.**
+  Takeaway: speculative execution leaves microarchitectural traces that survive architectural
+  rollback, so any shared predictor or cache is a potential channel between security domains.
+- **A. Yasin (2014), "A Top-Down Method for Performance Analysis and Counters Architecture," ISPASS.**
+  Takeaway: every cycle a core does not retire a useful micro-op falls into exactly one of four
+  buckets (front-end, bad speculation, memory-bound, core-bound), which converts profiling from
+  guesswork into a decision tree.
+- **Seznec & Michaud (2006), "A case for (partially) TAgged GEometric history length branch
+  prediction," JILP.** Takeaway: combining predictors indexed by geometrically increasing history
+  lengths captures both short and very long correlations, which is why modern predictors exceed 99%
+  accuracy on ordinary code.
+- **Lomont / Intel & ARM optimisation manuals on FMA and reassociation.** Takeaway: fused
+  multiply-add both halves the instruction count and *changes the rounding*, which is why it is
+  gated behind `-ffp-contract` and why bit-exact reproducibility and peak performance are in
+  tension.
+
+### Stretch challenge
+
+Take one real hot loop from a project you own and drive it through the full Top-Down analysis.
+
+1. Measure a baseline: wall time, IPC, `branch-misses`, `LLC-load-misses`. On macOS use Instruments'
+   Counters template; on Linux use `perf stat -d`.
+2. Classify it into one of the four buckets, and **write down your prediction of the speedup** from
+   the corresponding fix before you make it.
+3. Apply the fix, re-measure, and record the error in your prediction.
+4. Now read the generated assembly for both versions and explain the difference at instruction level.
+   If the compiler already did what you were about to do (as it did in `sum_to` and in the branch
+   benchmark), say so and find the next bottleneck.
+5. Write up the result including the prediction you got wrong. That write-up is more valuable than
+   the speedup, and it is the artefact that makes this a portfolio item rather than a tweak.
+
+There is no single right answer — the point is calibrating your intuition against counters.
+
+</Tab>
+
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Show at least a 3× speedup on a numeric loop purely by making it vectorisable, and verify with
+counters and with the generated assembly. Reference result: 1.71 → 8.17 GFLOP/s, a **4.79×**
+improvement, from `-ffast-math` alone on a float dot product.
+</Card>
+
+Then write and hand-trace two Hack assembly programs: the `1..n` sum above, and a program that
+computes `RAM[2] = RAM[0] * RAM[1]` by repeated addition. Trace the second one on paper for
+`R0 = 3, R1 = 4` before you run it, and check that your trace matches the simulator cycle for cycle.
+
+## The whiteboard
+
+<Tip>
+**Draw it yourself.** Draw the fetch-decode-execute loop, then a 16-bit C-instruction with every bit
+group labelled and an arrow from `c1..c6` to the ALU's six control inputs. Then draw the five-stage
+pipeline staircase and mark where a mispredicted branch flushes.
+[Blank version](/assets/diagrams/p2-w09-m5-blank.svg) · [Editable source](/assets/diagrams/p2-w09-m5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Traced a program from Hack assembly through instruction encoding to ALU control
+bits; then, on modern hardware, produced a measured 4.79× speedup (1.71 → 8.17 GFLOP/s) on a float
+reduction by breaking the serial dependency chain, and verified the mechanism by reading the
+generated NEON assembly."
+
+**The differentiating detail:** also report the *negative* result — that the famous sorted-vs-
+unsorted branch benchmark shows no difference on Apple silicon at `-O2` because clang emits `csel`
+instead of a branch, with the assembly to prove it. Reporting a folk theorem that failed to
+reproduce, with the mechanism, is a stronger signal than any successful benchmark.
+
+**Interview:** when asked "how would you speed this up?", ask "is it front-end bound, bad
+speculation, memory bound, or core bound?" before proposing anything. That single question is a
+senior-level move.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Add IPC to your performance vocabulary.** Next time you profile, capture instructions and cycles
+alongside wall time. IPC below 1 with a low miss rate almost always means a dependency chain, and
+the fix (multiple accumulators, restructuring) is usually a few lines and rarely the first thing
+anyone tries.
+
+**2. Read the assembly before claiming an optimisation worked.** `clang -O2 -S`, or paste it into
+Compiler Explorer. Twice a year this will save you from shipping a "3× speedup" that is actually
+dead-code elimination, and once a year it will show you the compiler already did the thing you were
+about to spend a sprint on.
+
+**3. Push work into vectorised libraries rather than writing loops.** In Python this means NumPy,
+Polars or DuckDB rather than `for` loops over rows; in Java, streams over primitive arrays; in
+JavaScript, typed arrays. You are not competing with C, you are competing with an interpreter — and
+the libraries have already done the reassociation, blocking and SIMD work described here.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Assembly loop never terminates | Jump condition uses the wrong flag, or `D` was clobbered between compute and jump | Compute the comparison immediately before the jump; nothing may write `D` in between |
+| `@LABEL` jumps to the wrong place | Forgot that labels resolve to the address of the *next* instruction | Assemble and read the symbol table; do not count lines by eye |
+| Benchmark shows 1000× speedup | The compiler deleted the loop as dead code | Consume the result via `volatile` or return it |
+| "C is no faster than Python" | Benchmarked at `-O0` | Use `-O2`; verify with `-S` that the loop was optimised |
+| Vectorisation flag has no effect | The loop has a serial FP reduction, a loop-carried dependency, aliasing the compiler cannot rule out, or a function call inside | `-Rpass-missed=loop-vectorize` tells you exactly which; `restrict` fixes aliasing |
+| Speedup vanishes on the production machine | Different microarchitecture, different vector width, or clock throttling under AVX-512 | Benchmark on the deployment target; report the machine with every number |
+| Results changed after enabling fast math | Reassociation and denormal flushing altered rounding | Quantify the deviation; prefer per-loop pragmas over global flags |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="Concept questions (8)">
+1. What are the four steps of the instruction cycle? *(Fetch, decode, execute, write back — with only write back happening at the clock edge.)*
+2. In a Hack C-instruction, what are bits `c1..c6`? *(Exactly the ALU control bits `zx nx zy ny f no` from Module 3.)*
+3. Why is `M` not a register? *(It denotes `RAM[A]` — memory at the address currently in A.)*
+4. What does pipelining improve, and what does it make worse? *(Throughput improves — measured 2.8× in the worked example — while single-instruction latency gets slightly worse and hazards appear.)*
+5. Why does floating-point reduction resist vectorisation? *(FP addition is not associative, so splitting the sum changes the rounding; IEEE semantics forbid the compiler from doing it without permission.)*
+6. What is `csel` and why does it matter here? *(A conditional select — computes both sides and picks one with no branch. It is why the sorted-array benchmark shows no speedup on arm64 at `-O2`.)*
+7. Name the four Top-Down bottleneck categories. *(Front-end bound, bad speculation, memory bound, core bound.)*
+8. What does Spectre exploit? *(Speculatively executed instructions are rolled back architecturally but leave microarchitectural state, notably cache residency, which can be timed to recover the data they touched.)*
+</Accordion>
+<Accordion title="Coding challenge">
+Write a Hack assembly program that computes `RAM[2] = RAM[0] * RAM[1]` by repeated addition, handling
+zero and negative inputs correctly, and a Python simulator that executes Hack machine code and
+reports cycles. Hidden tests: 200 random `(a, b)` pairs including negatives and zero; the simulator's
+cycle count must match a reference within 5%; and the program must terminate for every input.
+</Accordion>
+<Accordion title="Interview questions">
+- **Junior:** "Walk me through what happens when the CPU executes one instruction." *(Fetch from `ROM[PC]`, fan the bits out to control lines, ALU computes combinationally, and at the clock edge destinations latch and the PC takes `PC+1` or the jump target.)*
+- **Mid:** "Two functions have identical Big-O and identical instruction counts, but one is 4× slower. Give me three possible causes." *(Dependency chain limiting IPC; cache/TLB behaviour from data layout; branch mispredictions. Say how you would distinguish them with counters.)*
+- **Senior:** "Your team wants to enable `-ffast-math` for a 5× win. What do you require before approving it?" *(Isolate which relaxation produced the win; quantified max absolute and relative deviation against the reference; audit for NaN/infinity guards and denormal sensitivity; check reproducibility requirements; propose per-loop pragmas or multiple accumulators as the narrower fix.)*
+</Accordion>
+<Accordion title="Draw it from memory">
+Draw the fetch-decode-execute loop with the PC in the middle and a 16-bit C-instruction above it,
+every bit group labelled and `c1..c6` wired to the ALU. Then add the pipeline staircase with a
+mispredict flush marked in red. Five minutes.
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+
+- [*The Elements of Computing Systems*, 2nd ed. (Nisan & Schocken, MIT Press 2021), Chapters 4 and 5.](https://www.nand2tetris.org/)
+  **Read this for:** the complete Hack instruction encoding table and the CPU/Computer chip
+  specifications the lab is graded against.
+- ARM Architecture Reference Manual for A-profile (ARM DDI 0487), and the Arm Neoverse/Cortex
+  software optimization guides. **Read this for:** the definitions of `csel`, NEON reduction
+  patterns, and per-instruction latency and throughput tables behind the measurements above.
+- [LLVM/Clang documentation on `-ffast-math` and its component flags, plus
+  `-Rpass-missed=loop-vectorize`.](https://clang.llvm.org/docs/UsersManual.html) **Read this for:** exactly which semantic guarantees each flag
+  gives up, and how to ask the compiler why a loop did not vectorise.
+
+**Papers**
+
+- [P. Kocher et al., "Spectre Attacks: Exploiting Speculative Execution," IEEE Symposium on Security
+  and Privacy, 2019.](https://doi.org/10.1109/SP.2019.00002) **Takeaway:** speculation plus shared microarchitectural state is a
+  cross-domain information channel, independent of any implementation bug.
+- [A. Yasin, "A Top-Down Method for Performance Analysis and Counters Architecture," ISPASS 2014.](https://doi.org/10.1109/ISPASS.2014.6844459)
+  **Takeaway:** stall cycles partition cleanly into front-end, bad-speculation, memory-bound and
+  core-bound, giving profiling a decision procedure instead of a hunch.
+- [A. Seznec and P. Michaud, "A case for (partially) TAgged GEometric history length branch
+  prediction," *Journal of Instruction-Level Parallelism* 8, 2006.](http://www.jilp.org/vol8/v8paper1.pdf) **Takeaway:** indexing multiple
+  predictor tables with geometrically increasing history lengths captures both local and very long
+  branch correlations, which is how modern predictors exceed 99% accuracy.
+
+**Go deeper**
+
+- [Hennessy & Patterson, *Computer Architecture: A Quantitative Approach* (6th ed.), Chapters 3
+  (instruction-level parallelism) and 4 (data-level parallelism / SIMD).](https://shop.elsevier.com/books/computer-architecture/hennessy/978-0-12-811905-1) **Why:** the canonical
+  treatment of every mechanism in Layer 3, with the quantitative models behind the pipeline and
+  speculation arithmetic used here.
+- [Agner Fog, *Optimizing Subroutines in Assembly Language* and *Instruction Tables*.](https://www.agner.org/optimize/) **Why:**
+  measured latency, throughput and port assignment for essentially every instruction on every recent
+  x86 microarchitecture — the reference you need to turn "this loop is slow" into "this loop is
+  limited by a 4-cycle FP add dependency".
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p2/week-09/p2-w09-m5">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

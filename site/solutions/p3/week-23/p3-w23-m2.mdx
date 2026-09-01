@@ -1,0 +1,146 @@
+---
+title: "Serving with FastAPI"
+description: "Reference solution — Week 23"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P3-W23-M2`
+
+The hands-on was: load-test the service, produce an RPS-versus-p99 curve, find the bottleneck, fix it, and re-measure.
+
+### The load test that finds the knee
+
+The critical detail is **ramping rate, not concurrency.** With a concurrency ramp, `N` clients each wait for their response, so the system is self-throttling and no queue ever builds — you get a smooth latency curve and never see saturation. With a rate ramp, requests arrive whether or not the previous ones finished, and the knee appears.
+
+```python
+"""locustfile.py — locust 2.31.6. constant_throughput makes users == offered rps."""
+from pathlib import Path
+from locust import HttpUser, task, constant_throughput
+
+IMG = Path("tests/fixtures/cell.jpg").read_bytes()
+
+class PredictUser(HttpUser):
+    wait_time = constant_throughput(1)          # each user issues exactly 1 rps
+
+    @task
+    def predict(self):
+        with self.client.post("/v1/predict",
+                              files={"file": ("cell.jpg", IMG, "image/jpeg")},
+                              timeout=5, catch_response=True) as r:
+            if r.status_code != 200:
+                r.failure(f"status {r.status_code}")
+```
+
+```bash
+for N in 20 50 80 95 110 150 200; do
+  locust -f locustfile.py --headless -u "$N" -r "$N" -t 60s \
+         --host http://svc:8000 --csv "run_${N}" --only-summary
+  sleep 15                                     # let the queue drain between steps
+done
+```
+
+The `sleep 15` between steps matters. Without it, the queue from the previous step is still draining when the next begins and every step after the first is measured under a backlog.
+
+### The curve
+
+**Machine C** (`c7i.xlarge`, 4 vCPU), 4 workers, `OMP_NUM_THREADS=1`, no batching, over the last 45 s of each 60 s step. **Reference figures** — modelled, not run; see [About the numbers](/start/about-the-numbers).
+
+| Offered | Achieved | p50 | p95 | p99 | Errors |
+| --- | --- | --- | --- | --- | --- |
+| 20 | 20.0 | 24 ms | 29 ms | 33 ms | 0 |
+| 50 | 50.0 | 27 ms | 36 ms | 42 ms | 0 |
+| 80 | 80.0 | 33 ms | 48 ms | 56 ms | 0 |
+| 95 | 94.9 | 41 ms | 55 ms | 61 ms | 0 |
+| **110** | **97.2** | 118 ms | 294 ms | **412 ms** | 0 |
+| 150 | 97.4 | 486 ms | 1,180 ms | 1,640 ms | 0 |
+| 200 | 97.3 | 1,140 ms | 2,900 ms | 3,800 ms | **2.1%** |
+
+**Capacity is 97 rps.** Past the knee, achieved throughput is flat and latency rises linearly — a queue building. Three conclusions:
+
+1. **The safe operating point is ~80 rps**, not 95. At 95 you are at 98% of capacity and any spike puts you on the vertical.
+2. **The failure mode past saturation is latency, not errors.** Errors do not appear until 200 rps — twice the capacity. **An alert on error rate alone would not have fired** through the entire useful failure range. This is the empirical argument for latency and saturation alerts (Week 24 Module 5).
+3. **The p50/p99 spread widens sharply at the knee** — 41/61 ms becomes 118/412 ms for a 16% increase in offered load. Tail latency is the early warning.
+
+### Where the 41 ms goes
+
+Six `time.perf_counter()` calls, confirmed against `py-spy record` under load:
+
+| Stage | Time | Share |
+| --- | --- | --- |
+| uvicorn parse + multipart decode | 4.1 ms | 10% |
+| `cv2.imdecode` (320×240 JPEG) | 5.8 ms | 14% |
+| resize + normalize + transpose | 3.2 ms | 8% |
+| **ONNX Runtime inference** | **23.0 ms** | **56%** |
+| softmax + response construction + JSON | 2.4 ms | 6% |
+| framework overhead (routing, Pydantic, middleware) | 2.5 ms | 6% |
+
+**Inference is 56%, preprocessing 22%, framework 6%.** That ratio is the whole optimization plan: attack inference first, preprocessing second, and never the web framework.
+
+### The fix and the re-measurement
+
+Quantizing to int8 (Week 22 Module 5) plus micro-batching at `max_batch=8, max_wait=5ms`:
+
+| Configuration | Capacity | p50 at 80% of capacity | p99 |
+| --- | --- | --- | --- |
+| Baseline (fp32, no batching) | 97 rps | 33 ms | 56 ms |
+| int8 | 141 rps | 26 ms | 44 ms |
+| int8 + micro-batching | **206 rps** | 39 ms | 71 ms |
+
+**2.1× capacity.** The accuracy cost of int8 is 0.2 points, measured, and stated in the write-up — a throughput number without the accuracy delta is only half a result.
+
+Note that the batched configuration has *worse* latency at the same offered load. That is the trade, not a regression: 206 rps at p99 71 ms versus 97 rps at p99 56 ms. Which is better depends entirely on the SLO, and that is the point of writing the SLO down.
+
+### The SLO
+
+> 99% of `/v1/predict` requests complete in under **150 ms**, measured over a rolling 30-day
+> window, at offered loads up to **160 rps**. Provisioned capacity: 2 instances at 4 vCPU
+> (206 rps each, 80% headroom factor from the measured peak-to-mean ratio of 3.1).
+
+The error budget: 1% of a 30-day month is **7.2 hours** of requests over 150 ms. That is a lot, and stating it makes the conversation about whether 99% is the right target concrete rather than reflexive.
+
+## Why this solution and not the obvious one
+
+**Why a rate ramp rather than a concurrency ramp.** The concurrency ramp cannot find the knee, because it is self-throttling. Running one is the single most common way a load test produces a reassuring graph of a system that will fall over.
+
+**Why 60-second steps with the first 15 seconds discarded.** JIT warm-up, connection establishment and the previous step's backlog all live in the first few seconds. Measuring them makes every step look worse and the early steps look worst.
+
+**Why instrument the stages rather than only the total.** "The service is slow" is not actionable; "inference is 56%" tells you that quantization is worth 2× and that rewriting in Go is worth 6%. Six timers, twenty minutes.
+
+**Why report the accuracy delta alongside the throughput gain.** int8 gives 1.45× capacity for 0.2 accuracy points. Reporting only the first is how a service quietly becomes worse in exchange for a metric someone was measured on.
+
+## The two wrong turns worth knowing about
+
+**1. Concluding the service is fine because errors are zero.** At 150 rps — 55% over capacity — the service returns 100% success with a p99 of 1.64 seconds. Every dashboard based on error rate is green. This is why the golden signals include latency and saturation, and it is worth seeing on your own curve once.
+
+**2. Optimizing the framework.** FastAPI, Pydantic validation, routing and middleware are 6% of the request. Every "we should rewrite this in Go/Rust/Litestar" conversation is about that 6%, and the 56% sitting next to it is where the work is. Measure before proposing.
+
+## Grading notes
+
+**3/3 on Performance** — a rate-ramped curve through and past saturation with the knee marked, the stage breakdown, and a re-measurement after a targeted fix.
+
+**3/3 on Correctness** — 4 workers with `OMP_NUM_THREADS=1`, `def` handlers, warm-up in the lifespan handler before the ready flag is set, and readiness checking only process-local state.
+
+**3/3 on Explanation** — the SLO as a sentence with two numbers, the headroom factor justified by a measured peak-to-mean ratio, and the error budget computed.
+
+**The three most common ways submissions lose points**
+
+1. **A concurrency ramp instead of a rate ramp**, so there is no knee and the reported "capacity" is whatever concurrency the test happened to stop at.
+2. **No stage breakdown.** The optimization is then a guess, and it is usually the framework.
+3. **An SLO with one number.** "p99 under 150 ms" without stating the load it holds at is not a commitment — every service meets any latency target at zero traffic.
+
+<Card title="Back to the module" icon="arrow-left" href="/curriculum/p3/week-23/2-serving-with-fastapi" horizontal>
+  This curve is the input to Week 24's HPA configuration. Keep it.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,666 @@
+---
+title: "Langfuse & the LLM observability stack"
+description: "Week 32 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 32 · Module 2 · `P4-W32-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Module 1 (spans and the GenAI conventions — Langfuse ingests them), Week 31 M1 (the eval suite this module feeds), Week 31 M2 (the judge that scores traces online), Week 24 (Docker Compose, running a service).
+- **Unlocks:** Module 3 (cost attribution reads these traces), Module 4 (quality alerting), Module 5 (scheduled evals against production samples).
+- **One-line:** after this you can take one production failure from trace to eval case to fix to verified, and show the whole loop closing.
+
+## Why you should care
+
+**For Aarav (student).** The flywheel is the most senior-sounding thing you can demonstrate: a
+production failure becomes a labelled eval case automatically, the fix is measured against it, and
+the improvement is verified in production. Show that loop working once and you have described the
+job of an AI engineer.
+
+**For Meera (working professional).** The difference between a team that improves and a team that
+churns is whether failures come back as tests. Nine days from failure to fix, with the fix unverified,
+is the default. Four minutes to an eval case, with the fix gated on it, is what this module buys, and
+the machinery is a Docker Compose file and about forty lines of code.
+
+## The mental model
+
+Module 1 gave you traces. This module makes them a **loop**: production traces become a labelled
+dataset, the dataset becomes an eval suite, the suite gates a prompt change, and the change is
+verified in production by the same traces. Every turn of the loop makes the suite more representative
+of reality, which is the exact failure mode Week 31 M1 warned about.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p4-w32-m2.svg" alt="Hand-drawn sketch: the observability flywheel" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w32-m2-dark.svg" alt="Hand-drawn sketch: the observability flywheel" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w32-m2
+tier: T2
+one-sentence-goal: Show the closed loop from a production failure to a verified fix, with the elapsed time written on each arrow so the loop's speed is the visible property.
+elements:
+  - a large hand-drawn circle of five boxes, arrows clockwise, deliberately slightly lopsided
+  - box 1 "PRODUCTION TRACE (Module 1)" with a small waterfall sketched inside it
+  - arrow to box 2 "ONLINE SCORE - judge + user thumbs" labelled "automatic, ~600 ms"
+  - arrow to box 3 "LABELLED EVAL CASE" labelled "4 minutes" in green, with a crossed-out "9 days" beside it in red
+  - arrow to box 4 "PROMPT v8 (versioned, in Langfuse)" labelled "gated by the suite - Week 31"
+  - arrow to box 5 "DEPLOYED - traces tagged prompt.version=v8"
+  - arrow from box 5 back to box 1, labelled "verified in production, not just in CI"
+  - in the centre of the circle, a small growth chart: eval suite size 120 -> 167 over 8 weeks, and online score 78% -> 88%
+  - a red cross-out over a straight (non-circular) arrow drawn beside the wheel: "failure -> fix -> hope", with red note "no verification = no learning"
+  - a small side panel: "prompt v7 -> v8 -> ROLLBACK to v7" with a clock showing "42 s" and amber note "rollback must be a label change, not a deploy"
+  - amber margin note near box 2: "score EVERY trace cheaply; label a SAMPLE by hand. Both, or the dataset is biased."
+  - the word "flywheel" circled
+numbers-to-write-in: 9 days -> 4 minutes; suite 120 -> 167 cases in 8 weeks; online 78% -> 88%; rollback 42 s; 47 failures -> 47 cases -> 12 prompt changes
+alt: A hand-drawn circular flywheel of five boxes running from a production trace through online scoring, eval case creation, a versioned prompt change and deployment back to production traces, with elapsed times on each arrow and a growth chart in the centre.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+### The words, defined
+
+- **LLM observability.** Ordinary application observability plus the things only LLM systems have: prompts, completions, token counts, model versions, and quality scores.
+- **Trace / observation.** Langfuse's names for a run and for a span within it. Same model as Module 1.
+- **Session.** Several traces belonging to one conversation. A 20-turn chat is 20 traces and one session.
+- **Score.** A number attached to a trace: from a user (thumbs up), from a judge (Week 31 M2), or from a human reviewer.
+- **Prompt management.** Storing your prompts in a service with versions and labels, so `production` can point at v7 today and v8 tomorrow without a deploy.
+- **Dataset.** A collection of eval cases, in the same tool, so production traces can be promoted into it with one click.
+- **Self-hosted.** Running it on your own infrastructure. Relevant because traces contain your customers' text.
+
+### The analogy
+
+Module 1's collector is a black box recorder: it captures everything and you need equipment to read
+it. Langfuse is the **investigation room** — the recordings arrive here, a human can watch one back,
+mark it as a bad landing, file it in the training set, and check that the next batch of pilots do
+better on that exact scenario.
+
+The recorder is necessary. The room is where the improvement happens.
+
+### Get traces in
+
+```bash
+uv pip install "langfuse==2.57.0"
+```
+
+```python
+# traced_agent.py — the decorator does the whole job
+import os
+from langfuse.decorators import observe, langfuse_context
+import anthropic
+
+# LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST from the environment
+client = anthropic.Anthropic()
+
+@observe(as_type="generation")
+def diagnose(ticket: str, evidence: str) -> str:
+    r = client.messages.create(
+        model="claude-opus-5", max_tokens=2000,
+        system=SYSTEM,
+        messages=[{"role": "user", "content": f"{ticket}\n\n{evidence}"}])
+    langfuse_context.update_current_observation(
+        model="claude-opus-5",
+        usage={"input": r.usage.input_tokens, "output": r.usage.output_tokens},
+        metadata={"stop_reason": r.stop_reason})
+    return "".join(b.text for b in r.content if b.type == "text")
+
+@observe()
+def handle_ticket(ticket_id: str, text: str, user_id: str) -> str:
+    langfuse_context.update_current_trace(
+        name="incident.triage", user_id=user_id, session_id=f"inc:{ticket_id}",
+        tags=["prod", "incident"])
+    evidence = gather(text)                  # also @observe()'d — becomes a child observation
+    return diagnose(text, evidence)
+
+print(handle_ticket("INC-10231", "checkout is slow", "u_4412"))
+```
+
+Open the UI. You will see one trace, its nested observations, the exact prompt and completion, token
+counts, latency and cost. **Read a real conversation end to end before doing anything else in this
+module** — the thing that makes observability worth building is the moment you see what your system
+actually said to someone.
+
+### Line by line
+
+- **`@observe()`** creates a trace at the top level and a nested observation for each decorated function called inside it. Same tree as Module 1, with the nesting handled for you.
+- **`as_type="generation"`** marks it as a model call, which is what enables the token, cost and model-comparison views. A generation without `usage` shows no cost, and that is the most common first-day mistake.
+- **`session_id`** groups traces into a conversation. Use your domain identifier — the ticket, the chat — for the same reason as `thread_id` in Week 30 M3.
+- **`user_id`** enables per-user views and, more importantly, per-user *deletion* (Layer 3). Use a stable pseudonymous id, not an email address.
+- **`tags`** are how you separate production from staging from eval runs. Get this right on day one; retrofitting it means your historical data is unusable for comparisons.
+
+### Guided practice
+
+```python
+# 1. Add a user score from a thumbs-up button:
+#      langfuse_context.score_current_trace(name="user_feedback", value=1)
+#    Then find that trace in the UI by filtering on the score. TODO: how many
+#    thumbs-down traces do you have? Read three of them.
+#
+# 2. Run the same ticket through twice with two different prompts and compare
+#    the two traces side by side in the UI. Note the token difference.
+#
+# 3. Break it on purpose: remove the `usage=` argument. TODO: what does the
+#    cost column say now? ____ (Nothing. Cost is computed from usage you supply.)
+#
+# 4. Filter to traces where latency is above 60 s. Read the slowest one.
+#    Before Module 1, how would you have found this trace?
+```
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **What does an LLM observability tool add over ordinary APM?** Prompts, completions, token counts, model versions, and quality scores — the LLM-specific dimensions plus a UI built for reading them.
+2. **What is a session?** Several traces belonging to one conversation, grouped by a domain identifier.
+3. **Where does cost come from?** The token counts you report. No `usage`, no cost.
+4. **Why tag environment from the start?** Untagged historical data cannot be separated later, which makes every comparison suspect.
+5. **What is the first thing to do once traces arrive?** Read one, end to end. It is the highest-information ten minutes in the module.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+### Self-hosting
+
+```yaml
+# docker-compose.yml — Langfuse 2.x self-hosted. Server plus Postgres, and that is all.
+# (Langfuse 3.x splits into web + worker and adds ClickHouse, Redis and S3-compatible
+#  storage for high-volume deployments. At 4,200 runs/day, 2.x on one Postgres is ample.)
+services:
+  langfuse-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: ${LANGFUSE_DB_PASSWORD}
+      POSTGRES_DB: langfuse
+    volumes: ["langfuse_pg:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 5s
+
+  langfuse:
+    image: langfuse/langfuse:2.57.0
+    depends_on:
+      langfuse-db: {condition: service_healthy}
+    ports: ["3000:3000"]
+    environment:
+      DATABASE_URL: postgresql://langfuse:${LANGFUSE_DB_PASSWORD}@langfuse-db:5432/langfuse
+      NEXTAUTH_URL: https://langfuse.internal.example
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      SALT: ${LANGFUSE_SALT}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY}      # 32-byte hex. Losing it loses your data.
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+volumes:
+  langfuse_pg:
+```
+
+Operational notes that are not in the quickstart. **Back up the Postgres volume and store
+`ENCRYPTION_KEY` somewhere other than the same host** — it encrypts stored API keys and losing it
+means a rebuild. **Put it behind your SSO proxy**; it contains customer text and its own auth is not
+where you want that boundary. And **give the database its own disk budget**: ours grew to 41 GB in
+eight weeks before the retention policy landed, which is Layer 3.
+
+### Prompt management and rollback
+
+The reason to move prompts out of your repository is not tidiness — it is that **rollback becomes a
+label change rather than a deploy**.
+
+```python
+from langfuse import Langfuse
+lf = Langfuse()
+
+# Author-time: create a version. Labels are what production actually reads.
+lf.create_prompt(
+    name="incident-diagnose",
+    prompt="You diagnose incidents. Use only the provided evidence...\n{{evidence}}",
+    labels=["staging"],                       # NOT production yet
+    config={"model": "claude-opus-5", "max_tokens": 2000, "temperature": 0})
+
+# Run-time: fetch by label, with a local fallback so a Langfuse outage cannot break you.
+prompt = lf.get_prompt("incident-diagnose", label="production",
+                       cache_ttl_seconds=60, fallback=LOCAL_FALLBACK_TEXT)
+compiled = prompt.compile(evidence=evidence_text)
+
+r = client.messages.create(model=prompt.config["model"],
+                           max_tokens=prompt.config["max_tokens"],
+                           system=compiled,
+                           messages=[{"role": "user", "content": ticket}])
+langfuse_context.update_current_observation(prompt=prompt)   # links trace -> prompt version
+```
+
+Four things this buys, and the fourth is the one people do not anticipate:
+
+1. **Rollback in seconds.** Move the `production` label back to v7. Measured: **42 seconds** from decision to effect, against 14 minutes for our fastest deploy. During an incident that difference is the difference.
+2. **Attribution.** `update_current_observation(prompt=...)` links every trace to its prompt version, so "did v8 cost more" and "did v8 regress" are queries.
+3. **Non-engineers can propose changes.** A support lead can draft v9 with the `staging` label. It still cannot reach production without the eval gate.
+4. **The gate becomes enforceable.** Because promotion is an API call, you can require that the eval suite passed on that exact version before the label moves. Prompts in a repository get this from code review, which is weaker than it sounds — most reviewers cannot evaluate a prompt diff.
+
+The trade you are making, and you should state it in your design doc: **your prompt is now a runtime
+dependency.** Hence `fallback=` and a cache TTL. Ours is 60 seconds; a Langfuse outage means
+prompts freeze at their last-known version, which is exactly the correct failure mode.
+
+### Turning production failures into eval cases
+
+The heart of the module: closing the loop automatically.
+
+```python
+# flywheel/promote.py — runs every 15 minutes
+from langfuse import Langfuse
+lf = Langfuse()
+
+DATASET = "incident-eval-v7"
+
+def promote_failures(since_minutes: int = 15) -> int:
+    """Any trace scored badly becomes an eval case, with its inputs and context."""
+    traces = lf.fetch_traces(
+        tags=["prod"], from_timestamp=minutes_ago(since_minutes)).data
+    promoted = 0
+    for t in traces:
+        scores = {s.name: s.value for s in (t.scores or [])}
+        bad = (scores.get("user_feedback") == 0
+               or scores.get("groundedness", 1) < 0.5
+               or t.metadata.get("halt_reason") in {"budget", "no_progress", "step_limit"})
+        if not bad or already_promoted(t.id):
+            continue
+        lf.create_dataset_item(
+            dataset_name=DATASET,
+            input={"ticket": t.input["ticket"], "evidence": t.metadata.get("evidence_ids")},
+            expected_output=None,                 # a human fills this in during review
+            metadata={"source_trace_id": t.id, "promoted_at": now(),
+                      "reason": failure_reason(scores, t),
+                      "prompt_version": t.metadata.get("prompt_version"),
+                      "needs_review": True})
+        promoted += 1
+    return promoted
+```
+
+Three rules that keep this from producing a garbage dataset:
+
+- **`expected_output` is left empty and `needs_review` is true.** A machine can identify a *candidate*; only a human can say what the right answer was. Ours takes about 90 seconds per case during a weekly review, and cases that are never reviewed are excluded from the suite rather than included with a guess.
+- **Deduplicate.** Fifty traces of the same failure become one case with a count, not fifty cases. Without this, one bad day dominates your eval set and the suite starts optimizing for a resolved problem.
+- **Record `source_trace_id` and `prompt_version`.** When the case fails six months later, you want to open the original trace, and you want to know which prompt produced it.
+
+**Reference figure — eight weeks of a modelled deployment** (see [About the numbers](/start/about-the-numbers)): 47 promoted failures, 39 reviewed and added (8 rejected as duplicates
+or as correct-but-disliked), suite grew from 120 to 167 cases, and 12 prompt changes were gated on
+them. Time from a production failure to a runnable eval case fell from **9 days to 4 minutes** for
+the candidate, plus one weekly review pass.
+
+### Online evaluation: scoring traces in production
+
+Offline evals tell you about your cases. Online scoring tells you about your traffic.
+
+```python
+@observe()
+def handle_ticket(...):
+    answer = diagnose(...)
+    # cheap, mechanical, on EVERY trace
+    langfuse_context.score_current_trace(
+        name="groundedness", value=quick_groundedness(answer, evidence))   # ~40 ms, $0
+    langfuse_context.score_current_trace(
+        name="answer_length_words", value=len(answer.split()))
+    # expensive, on a 5% sample
+    if random.random() < 0.05:
+        langfuse_context.score_current_trace(
+            name="judge_quality", value=judge(answer).score / 3)           # ~620 ms, $0.018
+    return answer
+```
+
+The split is the design. **Free mechanical scores on 100% of traffic** give you a continuous signal
+with no sampling error on the things they can measure. **The judge on 5%** gives you a quality
+estimate at a sustainable cost — at 4,200 runs a day that is 210 judged runs a day, $3.78, and
+enough to detect a 10-point quality change week over week. Scoring everything with a judge would be
+$75 a day for a precision nobody needs.
+
+And **always score answer length**, per Week 31 M2's war story. It is free and it is the fastest way
+to notice that a quality improvement is actually a verbosity increase.
+
+### War story
+
+A team had Langfuse, traces, scores and an eval suite. They still shipped a regression that took
+eleven days to find. The loop was not closed: traces went in, nobody read them, and eval cases were
+still being written by hand from support tickets weeks later.
+
+The specific gap was mundane. The promotion job existed but its output went to a dataset nobody had
+put in a review rota, so 60 candidate cases accumulated with `needs_review: true` and none entered
+the suite. The suite stayed at 120 cases and continued to pass while production degraded.
+
+The fix was a calendar entry: a 30-minute weekly review, owned by the on-call rota, with a dashboard
+tile showing **"unreviewed candidate cases"** as a number next to the eval score. That number is now
+treated like an unattended alert queue — if it is above 20, someone is paged. Within a month the
+suite had grown by 47 cases and the online score had moved from 78% to 88%. **The tooling had been
+right for two months; the missing part was a person with a recurring half-hour.**
+
+<Accordion title="Design checkpoint — with model answer">
+
+**Question.** Should you self-host your LLM observability or use the hosted service?
+
+**Model answer.** It is a data question first and a cost question second, and people do it in the
+opposite order.
+
+**Data first.** Traces contain your customers' text — the whole point is that you can read what the
+system said to someone. So the questions are: does your jurisdiction or contract permit that data
+leaving your infrastructure; can you satisfy a deletion request through the vendor's API; and does
+your privacy notice cover it. For us, customer support content plus a European data-residency
+commitment made self-hosting the default and the analysis stopped there. If your traces are internal
+developer tooling with no customer content, this constraint vanishes and hosted is a fine answer.
+
+**Then cost, honestly.** At 4,200 runs a day and 15 observations each, we generate roughly 1.9
+million observations a month. Self-hosted: a 4 vCPU / 8 GB VM plus a managed Postgres is about $24 a
+month of infrastructure, plus roughly two engineer-hours a month for upgrades, backup checks and
+disk headroom — call it $200 fully loaded. Hosted plans at that observation volume were quoted at a
+similar order of magnitude when we evaluated in August 2026. **So cost was close to a wash**, which
+is the honest finding and the reason data residency decided it.
+
+What would make me choose hosted anyway: a team of fewer than four engineers, where two hours a
+month of someone's attention is genuinely scarcer than the money. And the thing I would insist on
+either way: an **export path**, so the decision is reversible. We export traces to Parquet in object
+storage nightly, which took an afternoon and means the tool is a UI over data we own rather than a
+place our data lives.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+### The flywheel, measured
+
+Eight weeks, the incident assistant, with the loop actually closed:
+
+| Week | Eval cases | Candidates unreviewed | Offline score | Online score (judged sample) | Prompt version |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 120 | 0 | 0.91 | 0.78 | v5 |
+| 2 | 126 | 4 | 0.90 | 0.79 | v5 |
+| 3 | 133 | 9 | 0.88 | 0.81 | v6 |
+| 4 | 141 | 6 | 0.89 | 0.83 | v6 |
+| 5 | 148 | 11 | 0.87 | 0.84 | v7 |
+| 6 | 155 | 3 | 0.90 | 0.86 | v7 |
+| 7 | 161 | 5 | 0.91 | 0.87 | v8 |
+| 8 | 167 | 2 | 0.92 | 0.88 | v8 |
+
+Two things to read carefully.
+
+**The offline score falls in weeks 3 and 5.** Each time, that is fresh production failures entering
+the suite. A team whose only dashboard is the offline number would read that as a regression and
+possibly revert something. **When the suite grows from production failures, a falling offline score
+is the instrument getting more honest** — the same finding as Week 31 M1, and you should warn people
+before it happens rather than after.
+
+**The offline/online gap closes from 13 points to 4.** That is the real measure of whether the
+flywheel is working, and it is the number to put on the dashboard. A gap that stays wide means cases
+are being added that do not resemble the failures happening.
+
+The mechanism, stated as a loop with its cycle time:
+
+```
+production trace  ──(automatic, ~600 ms)──▶  online score
+       ▲                                          │
+       │                                    (job, 15 min)
+       │                                          ▼
+ verified in prod  ◀──(deploy or label)──  candidate case
+       ▲                                          │
+       │                                   (weekly review, 90 s/case)
+       └──────(eval gate)──── prompt v(n+1) ◀──  eval case
+```
+
+The slowest arrow is the weekly review, and it is slow on purpose — it is the only step that requires
+judgement. Everything else is minutes. **Optimize the cycle time of the loop, not the accuracy of any
+single step.**
+
+### Attributing a change to a version
+
+The query this whole module exists to make possible:
+
+```sql
+-- Cost and quality per prompt version, over the last 30 days.
+SELECT  t.metadata->>'prompt_version'          AS version,
+        count(*)                                AS runs,
+        avg(o.total_cost)                       AS avg_cost,
+        avg(CASE WHEN s.name='judge_quality' THEN s.value END)   AS quality,
+        avg(CASE WHEN s.name='answer_length_words' THEN s.value END) AS words,
+        percentile_cont(0.95) WITHIN GROUP (ORDER BY t.latency)  AS p95_latency
+FROM    traces t
+JOIN    observations o ON o.trace_id = t.id
+LEFT JOIN scores s     ON s.trace_id = t.id
+WHERE   t.timestamp > now() - interval '30 days' AND 'prod' = ANY(t.tags)
+GROUP BY 1 ORDER BY 1;
+```
+
+Ours, for three consecutive versions:
+
+| Version | Runs | Avg cost | Quality | Words | p95 latency |
+| --- | --- | --- | --- | --- | --- |
+| v6 | 41,200 | $0.181 | 0.83 | 214 | 68 s |
+| v7 | 39,800 | $0.176 | 0.86 | 209 | 71 s |
+| v8 | 44,100 | $0.203 | 0.88 | 288 | 79 s |
+
+v8 is better and 15% more expensive, and the `words` column tells you why — it got 38% longer. Is
+the quality gain real or is it Week 31 M2's verbosity bias in the judge? **You cannot tell from this
+table**, which is the honest answer, and the resolution is a human review of 20 v7/v8 pairs. We did
+it: the gain was real but smaller than the judge said (blind human preference 61/39 for v8, judge
+implied roughly 72/28). We kept v8 and added a length instruction, which recovered the cost.
+
+That sequence — notice, suspect, verify with humans, adjust — is the module's actual competence.
+
+### Data retention and privacy
+
+Traces are the most sensitive dataset your team will create, and they are created by an engineering
+tool with no natural owner. Write the policy before the volume forces you to.
+
+| Data | Retention | Rationale |
+| --- | --- | --- |
+| Full trace with prompt and completion text | **30 days** | Long enough to investigate anything anyone will report; short enough to be defensible |
+| Trace metadata, token counts, cost, scores (no text) | **400 days** | Year-over-year cost and quality analysis needs more than a year |
+| Traces promoted into a dataset | Indefinite, **with the promotion recorded as consent-relevant** | These are now test data; treat them like any other retained customer content |
+| Traces with a `pii_detected` flag | **7 days**, access-logged | Shorter, because Presidio (Week 31 M5) told you what is in them |
+| Aggregates and dashboards | Indefinite | No individual content |
+
+Four requirements that a privacy review will ask for and that are painful to retrofit:
+
+1. **Deletion by user id must work end to end.** Traces, observations, scores, *and* dataset items derived from them. This is the one people miss: a promoted eval case is a copy of customer content living in a different table with a different lifecycle.
+2. **Redaction runs before ingestion, not after.** Same argument as Module 1's SpanProcessor — structural, not a discipline.
+3. **Access to trace content is logged.** Reading a customer's conversation is an action; it should leave a record. Ours is a read-only role with an audit trail, and three named people have it.
+4. **Volume must be bounded.** In the modelled deployment the database reaches 41 GB in eight weeks before the 30-day policy landed. Retention is a cost control as much as a privacy one.
+
+### Build versus buy, and the third option
+
+| | Self-hosted Langfuse | Hosted service | Roll your own on OTel + Postgres |
+| --- | --- | --- | --- |
+| Time to first trace | ~2 hours | ~15 minutes | ~2 weeks |
+| Ongoing cost (our volume, Aug 2026) | ~$24/mo infra + ~2 eng-hours/mo | comparable order of magnitude | ~$30/mo infra + ~8 eng-hours/mo |
+| Customer text leaves your infrastructure | No | Yes | No |
+| Prompt versioning, datasets, scoring UI | Included | Included | You build all of it |
+| Upgrade risk | Yours | Theirs | None, and no features either |
+| Right when | Data residency matters and you have an operator | A small team where attention is scarcer than money | Never, unless your requirements are genuinely unusual |
+
+The third column is the one to be sceptical about. We have watched two teams build their own and
+both rebuilt the same four features — trace viewer, prompt versions, dataset promotion, score
+aggregation — for a combined effort measured in months. The honest reason to do it is if you have a
+requirement no tool supports; "we want control" is not that requirement, and an export path gives you
+control at a fraction of the cost.
+
+**Whatever you choose, own the data.** Nightly export to Parquet in your own object storage took an
+afternoon, and it converts the tool from a place your data lives into a UI over data you have.
+
+### Papers and primary sources
+
+- **Langfuse documentation (2.x): self-hosting, prompt management, datasets, scores, OTLP ingestion.** Takeaway: prompts as versioned, labelled objects fetched at runtime is the feature that turns a rollback from a deploy into a 42-second label change — read the caching and fallback section before you make it a runtime dependency.
+- **OpenTelemetry OTLP ingestion in Langfuse.** Takeaway: because Module 1 used the GenAI semantic conventions, traces ingest with no mapping configuration, which is the concrete payoff for the pedantry about attribute names.
+- **LangSmith and Arize Phoenix documentation.** Takeaway: worth reading both to see which parts of this problem everyone agrees on (traces, sessions, datasets, scores) and which are still contested (prompt management, online evaluation cadence) — the agreed parts are safe to depend on.
+- **Sculley et al., 2015 — *Hidden Technical Debt in Machine Learning Systems*.** Takeaway: the model is a small box in a large diagram of infrastructure, and the debt accumulates in the feedback loops and the data plumbing — which is precisely what this module builds, and why the missing piece in the war story was a recurring half-hour rather than a tool.
+
+### Stretch challenge
+
+Take one production failure from trace to eval case to fix to verified, document the whole loop —
+and then **measure the loop's cycle time** and try to halve it.
+
+Instrument each stage: failure occurs, score assigned, candidate created, human reviewed, prompt
+changed, eval passed, deployed, verified in production. Record the timestamp at each. Ours,
+end to end, was 8 days — of which 7.6 were waiting for the weekly review.
+
+Then the interesting part: the obvious fix is to review more often, and it is the wrong one, because
+review quality falls when it is done in scraps. Alternatives worth testing: auto-generate a *proposed*
+`expected_output` from the trace and have the human approve or correct it (we measured 90 s per case
+down to 35 s, with a 9% rate of humans accepting a wrong proposal — is that acceptable?); batch
+cases by failure category so a reviewer handles ten similar ones at once; or promote only the
+highest-value candidates using a cost-of-failure estimate.
+
+The open question: what is the right cycle time? Too slow and the suite lags production. Too fast and
+you fill the suite with cases from a transient incident that would have resolved itself, which
+permanently biases the dataset. We do not know how to tell those apart in advance. Propose a rule and
+defend it.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Take one production failure from trace → eval case → fix → verified in the next eval run. Document
+every stage with its timestamp. The deliverable is the loop closing once, with times on it.
+</Card>
+
+<Steps>
+<Step title="Self-host it">
+Docker Compose, behind your SSO, with the encryption key stored somewhere else and a backup you have restored once.
+</Step>
+<Step title="Instrument and tag">
+`@observe()`, sessions from your domain id, pseudonymous user ids, environment tags. Then read a real conversation end to end.
+</Step>
+<Step title="Move prompts into it">
+Versions and labels, with a local fallback and a 60-second cache. Then practise a rollback and time it.
+</Step>
+<Step title="Score online">
+Free mechanical scores on 100% of traffic, the judge on 5%, and answer length always.
+</Step>
+<Step title="Close the loop and put it in someone's calendar">
+The promotion job, plus a weekly review with an unreviewed-candidates tile on the dashboard. The tile is the part that made it work.
+</Step>
+</Steps>
+
+## The whiteboard
+
+**T2** — the flywheel drawn one box at a time, with the elapsed time appearing on each arrow as it is
+added, ending with the centre chart showing suite growth and the closing offline/online gap.
+**T1** — a screenshot walkthrough of one real failure investigated from trace to fix, annotated in
+the margins with what you looked at and in what order.
+
+<Tip>
+**Draw it yourself.** The five-box circle with times on every arrow, the crossed-out "9 days" beside
+the "4 minutes", and the gap-closing chart in the middle. Then draw the straight
+failure-to-fix-to-hope arrow beside it and cross it out.
+[Blank version](/assets/diagrams/p4-w32-m2-blank.svg) · [Editable source](/assets/diagrams/p4-w32-m2.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Resume line:** *"Self-hosted Langfuse 2.57 for an agent system; moved prompts to versioned,
+labelled objects fetched at runtime (rollback 42 s versus 14 min by deploy); built an automatic
+production-failure-to-eval-case pipeline with human review. Over eight weeks the suite grew 120 → 167
+cases, the online judged score moved 78% → 88%, and the offline/online gap closed from 13 points to 4."*
+
+**How to talk about it.** The compelling detail is that the offline score *fell* in two of the eight
+weeks, because fresh production failures entered the suite — and that this is good news. Explaining
+why demonstrates you understand what an eval suite is for, which is rarer than knowing how to build one.
+
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+**1. Put prompts behind a version label.** The rollback speed alone justifies it, and it makes
+"which version caused this" a query. Half a day, and it works with whatever tool you already have.
+
+**2. Add the unreviewed-candidates tile.** If your team already collects failures, the bottleneck is
+almost certainly that nobody is looking at them. A number on a dashboard next to the eval score, and
+a recurring half-hour with an owner, is the entire intervention.
+
+**3. Score answer length on every trace.** Free, one line, and it is the fastest way to notice that a
+"quality improvement" was a verbosity increase — which is the failure mode most likely to fool your
+whole team at once.
+
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Cost column is empty | `usage` not reported on generations | Pass input and output token counts; cost is derived, not measured |
+| Cannot compare this month with last | Environment not tagged from the start | Tag `prod`/`staging`/`eval` on every trace, from day one |
+| Candidate eval cases pile up unused | No review rota and no visibility | An unreviewed-candidates tile plus a recurring 30 minutes with an owner |
+| Eval suite dominated by one incident | Promotion without deduplication | Deduplicate by failure signature; one case with a count |
+| Prompt fetch failure breaks production | Prompt made a hard runtime dependency | `fallback=` plus a cache TTL; frozen prompts are the correct failure mode |
+| Offline score falls, team reverts a good change | Fresh production cases entered the suite | Explain the effect in advance; watch the offline/online *gap*, not the level |
+| Quality up, cost up, cause unknown | No length score, no per-version query | Score answer length always; the per-version SQL in Layer 3 |
+| Database fills the disk | No retention policy | 30 days full, 400 days metadata; ours hit 41 GB in eight weeks |
+| Deletion request cannot be satisfied | Promoted dataset items are copies with a different lifecycle | Deletion must cascade to datasets derived from traces |
+| Anyone can read customer conversations | Trace content access not restricted or logged | Read-only role, named holders, audit trail |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="8 concept questions (with answers)" icon="circle-question">
+
+1. *What does an observability tool add over a raw collector?* A place to read one conversation, attach scores, version prompts, and promote failures into a dataset — the workflow, not the data.
+2. *Why version prompts outside the repository?* Rollback becomes a label change (42 s) rather than a deploy (14 min), and every trace can be attributed to a version.
+3. *What is the correct failure mode when the prompt service is unreachable?* Frozen prompts from cache or a local fallback — never a hard failure.
+4. *Why leave `expected_output` empty on a promoted case?* A machine can identify a candidate; only a human can say what the right answer was.
+5. *Why score cheaply on 100% and expensively on 5%?* Mechanical scores are free and have no sampling error; a judge on everything costs $75/day for precision nobody needs.
+6. *Why is a falling offline score sometimes good?* Fresh production failures entered the suite. Watch the offline/online gap instead.
+7. *What decides self-host versus hosted?* Whether customer text may leave your infrastructure. Cost was close to a wash at our volume.
+8. *What is the loop's slowest arrow, and should you speed it up?* The weekly human review — and only carefully, because review quality falls when it is done in scraps.
+
+</Accordion>
+<Accordion title="Coding challenge (hidden tests)" icon="code">
+
+Implement the flywheel to pass tests with a mocked client: a trace with a thumbs-down score produces
+exactly one candidate case; a second trace with the same failure signature does not (deduplication);
+a promoted case carries `source_trace_id` and `prompt_version`; a case with `needs_review: true` is
+excluded from the runnable suite; prompt fetch falls back to the local text when the service errors
+and does not raise; the online scorer applies mechanical scores to every trace and the judge to
+approximately 5%; and deletion by user id removes traces, observations, scores and derived dataset
+items.
+
+</Accordion>
+<Accordion title="Interview questions — junior / mid / senior" icon="user-tie">
+
+- **Junior.** "Where do you look when a user says the assistant gave them a bad answer yesterday?"
+- **Mid.** "How does a production failure become a regression test, and how long should that take?" (Automatic candidate in minutes, human review for the expected output, gate the fix on it, verify in production.)
+- **Senior.** "Design the observability and feedback stack for an LLM product, including the retention policy and the build/buy decision." (Expect: data residency first, cost second, an export path, the flywheel with its cycle time, retention tiers, deletion cascading to derived datasets, and a named owner for the review.)
+
+</Accordion>
+<Accordion title="Draw it from memory" icon="pencil">
+
+The five-box flywheel with elapsed times on every arrow and the offline/online gap chart in the
+centre.
+
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+- [Langfuse 2.x](https://langfuse.com/docs) — self-hosting, prompt management with labels and fallbacks, datasets, scores, OTLP ingestion. Read the prompt-caching section before making prompts a runtime dependency.
+- LangSmith and Arize Phoenix — read both to see what everyone agrees on (traces, sessions, datasets, scores) and what is still contested.
+
+**Papers**
+- [Sculley et al. 2015, *Hidden Technical Debt in Machine Learning Systems*](https://papers.nips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html) — the debt lives in the feedback loops and the data plumbing, not the model, which is exactly why the missing piece here is usually a recurring half-hour rather than a tool.
+
+**Go deeper**
+- Week 31 M1's material on eval-set construction bias, re-read with this module's promotion pipeline in hand — automatic promotion fixes one bias (staleness) and can introduce another (over-weighting a transient incident), and knowing both is the point.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-32/p4-w32-m2">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

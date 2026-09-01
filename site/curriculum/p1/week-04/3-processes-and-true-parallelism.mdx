@@ -1,0 +1,654 @@
+---
+title: "Processes and true parallelism"
+description: "Week 4 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 4 · Module 3 · `P1-W04-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Parallelise a CPU-heavy loop with `ProcessPoolExecutor` and measure the real speedup on your core count.
+2. Say why the `if __name__ == "__main__":` guard is mandatory, and what happens without it.
+3. Find the task size at which process-pool overhead is repaid — measured here at **between 10,000 and 100,000 inner iterations**.
+4. Recognise BLAS oversubscription, the silent multi-fold slowdown in a great deal of production ML code.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/P1-W04-M3.svg" alt="Hand-drawn sketch: Processes and true parallelism" className="block dark:hidden" />
+  <img src="/assets/diagrams/P1-W04-M3-dark.svg" alt="Hand-drawn sketch: Processes and true parallelism" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: P1-W04-M3
+tier: T2
+one-sentence-goal: A process pool buys real cores and charges you startup plus pickling for every task, so it wins only once each task is bigger than the toll.
+elements:
+  - left: the parent process drawn as a box containing "your data", with four arrows to four child boxes, each child drawn with its OWN small interpreter icon and its OWN GIL key — the key term "own GIL" circled
+  - on each arrow, a hand-drawn toll booth labelled "pickle" with the measured cost written beside it: "100k-int list: dumps 659 us + loads 1313 us = ~2 ms round trip"
+  - above the children, a startup cost band: "spawn 54.0 ms | forkserver 43.2 ms | fork 3.8 ms" with "fork is 14.2x cheaper AND unsafe with threads" in amber
+  - centre: a hand-drawn crossover curve, x = work per task (log), y = speedup, crossing y=1 between 10,000 and 100,000, with the measured points written in: "100: 0.00x / 10k: 0.22x / 100k: 1.55x / 1M: 3.88x / 5M: 3.91x"
+  - the region left of the crossing hatched in red and labelled "the pool is SLOWER here. 64 tiny tasks cost 50 ms of pure overhead."
+  - lower-right: the oversubscription failure, drawn as 8 process boxes each sprouting 11 little thread lines onto a strip of 11 cores, with a red scribble over the cores and the amber note "8 x 11 = 88 threads for 11 cores. silent multi-fold slowdown. set OMP_NUM_THREADS=1."
+  - a red cross-out over a script with no `if __name__ == "__main__":`, with a small recursive spiral of processes drawn beside it
+  - dangling arrow: "…and why does RSS per worker equal the parent's? -> copy-on-write, Layer 3"
+numbers-to-write-in: spawn 54.0 ms / fork 3.8 ms / forkserver 43.2 ms · pickle 100k ints 659+1313 us · crossover between 10k and 100k iterations · max speedup 3.91x
+alt: A hand-drawn diagram of a parent process fanning work out to four child processes, each with its own interpreter and GIL, with pickling drawn as a toll booth on every arrow, a crossover curve showing the pool losing below about ten thousand iterations of work per task, and a sketch of BLAS oversubscription putting eighty-eight threads on eleven cores.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term is defined where it first appears.
+
+### The one idea
+
+A **process** is a whole separate running program with its own memory. Because each Python process has its own interpreter, it has its own GIL — so eight processes really do run Python code on eight cores at the same time.
+
+You pay for that in two currencies: **starting a process is expensive**, and **nothing is shared**, so every argument and every result must be copied between processes. Processes win when the work per task is large enough to cover both tolls.
+
+### The analogy
+
+Threads are colleagues in one office. They share the whiteboard, so passing information costs nothing and two people editing it at once is a disaster.
+
+Processes are colleagues in **separate buildings**. Nobody can touch anyone else's whiteboard — no races, ever — but every question and answer has to go in an envelope and be couriered across town. Setting up a new building takes time, and the courier charges by the kilogram.
+
+That is the whole trade. If the job is "answer this one quick question", the courier costs more than the answer is worth. If the job is "spend an hour analysing this", the courier is irrelevant.
+
+### The vocabulary, defined
+
+- **Process** — an independent running program with its own memory space and its own PID.
+- **Child process** — a process created by another (the **parent**).
+- **`fork()`** — a way to create a child by copying the parent process.
+- **`spawn`** — a way to create a child by starting a fresh Python interpreter and re-importing your module.
+- **Start method** — which of those Python uses. `spawn`, `fork`, or `forkserver`.
+- **Pickling (serialisation)** — turning a Python object into bytes so it can be sent to another process, and back again on the other side.
+- **IPC (inter-process communication)** — any mechanism for processes to exchange data: pipes, queues, shared memory.
+- **`ProcessPoolExecutor`** — a fixed set of worker processes you submit jobs to.
+- **Shared memory** — a block of memory two processes can both map, avoiding a copy. `multiprocessing.shared_memory`.
+- **Copy-on-write** — after `fork`, parent and child share physical memory pages until one of them writes, at which point that page is duplicated.
+- **Oversubscription** — running more compute threads than you have cores, so they fight rather than help.
+
+### Smallest working example
+
+```python
+import os
+import time
+from concurrent.futures import ProcessPoolExecutor
+
+
+def count_primes(n: int) -> int:
+    count = 0
+    for x in range(2, n):
+        d, is_prime = 2, True
+        while d * d <= x:
+            if x % d == 0:
+                is_prime = False
+                break
+            d += 1
+        count += is_prime
+    return count
+
+
+def main() -> None:
+    tasks = [200_000] * 8
+
+    t = time.perf_counter()
+    [count_primes(n) for n in tasks]
+    seq = time.perf_counter() - t
+
+    t = time.perf_counter()
+    with ProcessPoolExecutor(max_workers=8) as ex:
+        list(ex.map(count_primes, tasks))
+    par = time.perf_counter() - t
+
+    print(f"cores      {os.cpu_count()}")
+    print(f"sequential {seq:6.3f} s")
+    print(f"8 processes{par:6.3f} s   speedup {seq/par:.2f}x   efficiency {seq/par/8:.0%}")
+
+
+if __name__ == "__main__":          # MANDATORY — see the walkthrough
+    main()
+```
+
+Measured on this machine (11 cores, under load):
+
+```
+cores      11
+sequential  2.392 s
+8 processes 0.874 s   speedup 2.74x   efficiency 34%
+```
+
+Real parallelism. Compare with the same code using threads, which measured **0.86× — slower than sequential** (Module 1).
+
+### Line-by-line walkthrough
+
+- `def count_primes(n)` at **module level**, not nested inside `main`. A process pool must send the function to the workers, and only module-level functions can be pickled by reference. A nested function or a lambda raises `PicklingError`.
+- `ProcessPoolExecutor(max_workers=8)` — start eight worker processes. On macOS and Windows this uses `spawn`: each worker launches a fresh Python and **imports your module**.
+- `ex.map(count_primes, tasks)` — send each task to a worker, collect results in order. `map` is lazy; wrapping it in `list()` is what forces the work to happen.
+- `with ... as ex:` — on exit, `shutdown(wait=True)` runs, so the pool waits for outstanding work and cleans up the processes. Forgetting this leaves orphan processes.
+- **`if __name__ == "__main__":`** — the critical line. With `spawn`, each child imports your module to find `count_primes`. If pool creation happens at module level, the child creates its own pool, whose children import the module, which create pools… Python detects this and raises, but the error is confusing and the fix is one line. **Every script that uses multiprocessing needs this guard**, on every platform, because the default start method is `spawn` on macOS and Windows now and on Linux from Python 3.14.
+- `os.cpu_count()` — logical cores. On a machine with efficiency cores (Apple silicon) or hyper-threading, that number is optimistic for CPU-bound work; measure rather than assume.
+
+### Guided practice
+
+<Steps>
+<Step title="Find your own speedup curve">
+
+```python
+for workers in (1, 2, 4, 8, os.cpu_count()):
+    t = time.perf_counter()
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(count_primes, [200_000] * 16))
+    el = time.perf_counter() - t
+    print(f"{workers:>3} workers: {el:6.3f} s   speedup {base/el:5.2f}x   efficiency {base/el/workers:5.0%}")
+```
+
+Plot it. The curve flattens, and where it flattens tells you your real usable parallelism — which is rarely `os.cpu_count()`.
+</Step>
+<Step title="Hit the pickling wall on purpose">
+
+```python
+def total(rows: list[int]) -> int:
+    return sum(rows)
+
+big = list(range(1_000_000))
+
+# Sending 1M ints to a worker to do almost nothing with them
+with ProcessPoolExecutor(4) as ex:
+    t = time.perf_counter()
+    list(ex.map(total, [big] * 4))
+    print(f"with pickling: {time.perf_counter() - t:.3f} s")
+
+t = time.perf_counter()
+[total(big) for _ in range(4)]
+print(f"sequential:    {time.perf_counter() - t:.3f} s")
+```
+
+The parallel version loses, badly. The work is trivial and the data is enormous, so you paid four couriers to deliver four million integers so that someone could add them up. **Send the smallest description of the work, not the work's data** — a filename, an offset, an index range.
+</Step>
+<Step title="See what is NOT shared">
+
+```python
+counter = 0
+
+def bump(_):
+    global counter
+    counter += 1
+    return counter
+
+with ProcessPoolExecutor(4) as ex:
+    print(list(ex.map(bump, range(8))))     # [1, 2, 1, 1, 2, 1, 2, 2] or similar
+print("parent counter:", counter)           # 0
+```
+
+Each worker has its **own** `counter` and the parent's is untouched. This is the opposite of the threading problem from Module 2 — there are no races because there is no sharing, and there is also no way to accumulate without explicitly returning values.
+</Step>
+<Step title="Handle a worker that dies">
+
+```python
+def risky(n: int) -> int:
+    if n == 3:
+        raise ValueError("bad input")
+    return n * 2
+
+with ProcessPoolExecutor(4) as ex:
+    futures = {ex.submit(risky, n): n for n in range(6)}
+    for fut in as_completed(futures):
+        n = futures[fut]
+        try:
+            print(n, "->", fut.result())
+        except Exception as exc:
+            print(n, "FAILED:", exc)
+```
+
+The exception is pickled in the worker and re-raised in the parent when you call `result()`. Note the consequence: **your exception classes must be picklable too**, which means no unpicklable attributes on them — a common surprise when a custom exception holds a database connection or a file handle.
+</Step>
+</Steps>
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **Why do processes give real parallelism where threads do not?** — each process has its own interpreter and therefore its own GIL, so they can execute bytecode simultaneously on different cores.
+2. **Why is `if __name__ == "__main__":` required?** — with `spawn`, each child imports your module to find the target function; without the guard, that import starts more children, recursively.
+3. **Why must the worker function be at module level?** — the pool sends the function by name; lambdas and nested functions cannot be pickled.
+4. **Does a worker see the parent's global variables?** — with `spawn`, no: it re-imports the module fresh. With `fork` it starts with a copy, which then diverges.
+5. **When does a process pool lose?** — when the per-task work is smaller than the startup and pickling cost. Layer 2 measures exactly where.
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions. Measured with CPython 3.13.2 on an Apple M3 Pro (11 cores, 18 GB), macOS 15, under substantial background load.
+
+### The crossover, measured
+
+64 tasks, pool of 8 workers, task = a float accumulation loop of *n* iterations:
+
+| Work per task | Sequential | Process pool (8) | Speedup |
+|---|---|---|---|
+| 100 | 0.1 ms | **55.1 ms** | **0.00×** |
+| 1,000 | 1.2 ms | 50.5 ms | 0.02× |
+| 10,000 | 13.2 ms | 58.6 ms | **0.22×** |
+| **100,000** | 130.1 ms | **83.9 ms** | **1.55×** |
+| 1,000,000 | 1,398.1 ms | 360.2 ms | **3.88×** |
+| 5,000,000 | 6,553.9 ms | 1,674.7 ms | 3.91× |
+
+**The crossover is between 10,000 and 100,000 iterations per task.** Below it the pool is slower — at 100 iterations it is *550× slower*, because the entire 55 ms is pool startup and the actual work is 0.1 ms.
+
+Notice the shape of the pool column: it is flat at ~50–58 ms until the work becomes significant. That flat floor is the fixed cost, and it is the number to internalise: **a process pool costs roughly 50 ms to exist on this machine before it does anything.**
+
+Also notice that the speedup saturates at **3.91×** rather than approaching 8. Three causes, in order: the machine was loaded (load average ~44 on 11 cores); `spawn` startup is paid once per pool; and memory bandwidth is shared. Report your efficiency (3.91 / 8 = 49%) and your load average, or the number is not reproducible.
+
+### Start methods, measured
+
+| Start method | Pool of 4, create + one `map` |
+|---|---|
+| `spawn` | **54.0 ms** |
+| `forkserver` | 43.2 ms |
+| `fork` | **3.8 ms** — **14.2× cheaper** |
+
+| | `fork` | `spawn` | `forkserver` |
+|---|---|---|---|
+| How | copy the parent process | fresh interpreter, re-import your module | fork from a small pre-forked server process |
+| Speed | **fastest** | slowest | middle |
+| Inherits parent state | everything, including open files and locks | nothing but the module import | only what the server had at start |
+| Safe with threads | **no** | yes | yes |
+| Availability | Unix only | everywhere | Unix only |
+| Default | Linux ≤ 3.13 | **macOS and Windows; Linux from 3.14** | — |
+
+**`fork` is unsafe in a process that has threads**, and this is not theoretical. `fork` duplicates only the calling thread, but it duplicates *all* the memory — including any mutex another thread happened to be holding at that instant. The child inherits a locked mutex whose owner does not exist, so the first time the child touches that subsystem it deadlocks forever.
+
+This is exactly why macOS made `spawn` the default in 3.8, and why Python 3.14 makes `spawn` the default on Linux too. If your program has *any* threads — and a logging `QueueListener`, a metrics client, a gRPC channel or a database pool all create them — `fork` is a latent hang.
+
+`forkserver` is the good compromise on Linux: a small, thread-free server process is forked once at start, and every worker is forked from *that*, so you get fork's speed without the parent's thread state.
+
+```python
+import multiprocessing as mp
+
+if __name__ == "__main__":
+    mp.set_start_method("forkserver")     # or "spawn"; set it ONCE, before any pool
+```
+
+### Pickling: the toll on every task
+
+| Object | Pickled size | `dumps` | `loads` |
+|---|---|---|---|
+| `int` | 5 B | 0.4 µs | 0.1 µs |
+| list of 1,000 ints | 2,760 B | 6.3 µs | 10.6 µs |
+| **list of 100,000 ints** | **368,931 B** | **658.9 µs** | **1,313.0 µs** |
+| dict of 10,000 items | 108,679 B | 308.8 µs | 424.2 µs |
+| 1 MB string | 1,000,009 B | 14.4 µs | 47.9 µs |
+
+Round-tripping a 100,000-element list costs about **2 ms** — and it happens twice per task if you send data in and get data out. At 1,000 tasks that is 4 seconds of pure serialisation.
+
+Two things stand out. **Deserialisation is roughly 2× serialisation** for containers, because it allocates objects; the pickled list of 100,000 ints costs 659 µs to write and 1,313 µs to read. And **bytes are nearly free** — the 1 MB string costs 14 µs to pickle because there is nothing to construct. That asymmetry is the whole argument for sending compact representations: a NumPy array of a million floats pickles as one 8 MB buffer, while a Python list of a million ints pickles as a million objects.
+
+The design rules that follow:
+
+- **Send the smallest description of the work.** A file path and a byte range, not the file's contents. An index range, not the slice.
+- **Return the smallest answer.** Aggregate in the worker; return a count, not the rows you counted.
+- **Use `chunksize` on `map`.** `ex.map(fn, items, chunksize=100)` sends 100 items per message instead of one, amortising the per-message overhead. For a million tiny items this is the difference between usable and hopeless.
+- **For large numeric arrays, use `shared_memory`** rather than pickling (below).
+
+### `shared_memory` for large arrays
+
+```python
+from multiprocessing import shared_memory
+import numpy as np
+
+def make_shared(a: np.ndarray) -> tuple[str, tuple, np.dtype]:
+    shm = shared_memory.SharedMemory(create=True, size=a.nbytes)
+    buf = np.ndarray(a.shape, dtype=a.dtype, buffer=shm.buf)
+    buf[:] = a[:]
+    return shm.name, a.shape, a.dtype          # send only these three tiny things
+
+def worker(name: str, shape: tuple, dtype) -> float:
+    shm = shared_memory.SharedMemory(name=name)       # attach, no copy
+    a = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+    try:
+        return float(a.mean())
+    finally:
+        shm.close()                                    # detach; do NOT unlink in the worker
+```
+
+The worker receives a name and a shape — a few dozen bytes — instead of the array. The parent must `close()` **and** `unlink()` when finished; a forgotten `unlink` leaks a segment that survives the process and shows up in `/dev/shm` on Linux. Use a `try/finally` or a context manager, and note that Python 3.13 changed the resource-tracker behaviour here, so pin your version in the docs you write.
+
+### Trade-offs table
+
+| Decision | Choose X when… | Choose Y when… |
+|---|---|---|
+| Threads vs processes for CPU work | **Threads** only if the hot loop is in a C extension that releases the GIL (NumPy, Pillow's core, `hashlib`) | **Processes** for pure Python. Measured 2.74× versus threads' 0.86× on the same task |
+| `fork` vs `spawn` vs `forkserver` | **`fork`** only in a single-threaded parent on Unix where 3.8 ms versus 54 ms matters — a short-lived CLI, for instance | **`spawn`** everywhere safety matters, **`forkserver`** on Linux for the middle ground. Any parent with threads must not fork |
+| Pickle vs `shared_memory` | **Pickle** for small arguments and results; it is simple and has no lifecycle | **`shared_memory`** above roughly a megabyte of numeric data. 100,000 ints cost 2 ms to round-trip; a shared buffer costs a name |
+| Pool vs one process per task | **Pool** essentially always: 50 ms of startup amortised over many tasks | **One process** for isolation — an untrusted plugin, or work that may crash the interpreter and must not take the pool with it |
+| `map` vs `submit` + `as_completed` | **`map`** when you want results in order and all tasks are similar | **`submit`/`as_completed`** when you want results as they finish, per-task error handling, or heterogeneous work |
+
+### Reference implementation — a pool that behaves under load
+
+```python
+"""parallel.py — a CPU pool with chunking, per-task error handling and a hard timeout."""
+from __future__ import annotations
+
+import multiprocessing as mp
+import os
+import signal
+from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ProcessPoolExecutor, TimeoutError as FutureTimeout, as_completed
+from typing import Any, TypeVar
+
+T = TypeVar("T")
+R = TypeVar("R")
+
+
+def _init_worker() -> None:
+    """Runs once per worker at startup."""
+    # 1. Ignore SIGINT in workers so Ctrl-C is handled once, by the parent.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # 2. One BLAS thread per worker. Without this, N workers x M BLAS threads
+    #    oversubscribe the machine — see Layer 3.
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[var] = "1"
+
+
+def parallel_map(
+    fn: Callable[[T], R],
+    items: Sequence[T],
+    *,
+    workers: int | None = None,
+    chunksize: int | None = None,
+    timeout: float | None = None,
+) -> list[tuple[T, R | BaseException]]:
+    """Run fn over items in a process pool. Returns (item, result-or-exception) pairs.
+
+    fn MUST be a module-level function: the pool pickles it by reference.
+    """
+    workers = workers or os.cpu_count() or 4
+    if chunksize is None:
+        # Amortise per-message overhead: aim for ~4 chunks per worker.
+        chunksize = max(1, len(items) // (workers * 4))
+
+    ctx = mp.get_context("spawn")          # safe with threads in the parent; see Layer 2
+    out: list[tuple[T, R | BaseException]] = []
+    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
+                             initializer=_init_worker) as ex:
+        futures = {ex.submit(fn, item): item for item in items}
+        for fut in as_completed(futures, timeout=timeout):
+            item = futures[fut]
+            try:
+                out.append((item, fut.result()))
+            except FutureTimeout:
+                out.append((item, TimeoutError(f"task for {item!r} timed out")))
+            except BaseException as exc:    # includes BrokenProcessPool
+                out.append((item, exc))
+    return out
+```
+
+Four decisions worth defending in review:
+
+- **`initializer=_init_worker`** is the only place to set worker-side environment and signal handling, because it runs inside each worker after startup. Setting `OMP_NUM_THREADS` in the parent works only if you do it before NumPy is imported anywhere, which is fragile.
+- **`SIG_IGN` for `SIGINT` in workers** means Ctrl-C raises `KeyboardInterrupt` once, in the parent, which then shuts the pool down cleanly. Without it every worker also raises, and the tracebacks interleave into noise.
+- **`chunksize` computed rather than defaulted.** `ProcessPoolExecutor.map` defaults to 1, which for a million small items is a million IPC messages.
+- **Catching `BaseException`** captures `BrokenProcessPool`, which is what you get when a worker is killed by the OOM killer or segfaults in a C extension. Without it, one dead worker fails the whole batch with an opaque error.
+
+### What breaks in the real world
+
+A feature-engineering job used `ProcessPoolExecutor(32)` on a 32-core box to compute embeddings with NumPy. It was **slower than the single-process version** — 51 minutes against 34 — and nobody could explain it. CPU utilisation showed all 32 cores at 100%, which was taken as evidence that parallelism was working.
+
+The cause was **oversubscription**. NumPy's linear algebra runs on OpenBLAS, which by default starts one thread per core. Thirty-two worker processes each started 32 BLAS threads: **1,024 compute threads on 32 cores.** Every thread got about 3% of a core, context switches dominated, and each core's cache was being thrashed by 32 different working sets. The 100% CPU reading was real and meaningless — the cores were busy switching, not computing.
+
+The fix was one line in the pool initialiser:
+
+```python
+os.environ["OMP_NUM_THREADS"] = "1"
+```
+
+Runtime went to 4.5 minutes: **11.3× faster than the broken parallel version and 7.6× faster than sequential.**
+
+Three things worth taking from it. **`OMP_NUM_THREADS` must be set before NumPy is imported in the worker**, which is why the `initializer` is the right place — setting it after import has no effect because the thread pool is already created. **The symptom actively misleads**: 100% CPU across all cores looks like success. And **this is extremely common**: any process pool over code touching NumPy, SciPy, scikit-learn, PyTorch or Pillow has this problem unless someone explicitly prevented it. `threadpoolctl` is the library that inspects and controls it at runtime if you cannot set the environment early enough.
+
+<Accordion title="Design checkpoint — one question, with a model answer">
+
+**Question.** A colleague's batch job processes 2 million small records, each taking about 200 µs of pure-Python work. They used `ProcessPoolExecutor(16)` and it is slower than sequential. What is happening and what do you propose?
+
+**Model answer.** Per-task overhead exceeds per-task work, by a wide margin, and the fix is chunking rather than a different pool size.
+
+**The arithmetic.** Sequential is 2,000,000 × 200 µs = **400 seconds**. With `chunksize=1` (the default), each of 2 million tasks costs an IPC round trip: pickle the argument, write to a pipe, the worker reads and unpickles, runs 200 µs of work, pickles the result, writes back. Even at a generous 50 µs of overhead per task that is 100 seconds of pure overhead *serialised through the parent's queue*, and in practice it is worse because the parent becomes a bottleneck feeding 16 workers one item at a time. The measured crossover on this machine is **between 10,000 and 100,000 iterations of work per task**; 200 µs is well below it.
+
+**The fix is chunking**, which changes the unit of work rather than the number of workers:
+
+```python
+def process_chunk(records: list[Record]) -> list[Result]:      # module level
+    return [process_one(r) for r in records]
+
+chunks = [records[i:i + 5000] for i in range(0, len(records), 5000)]
+with ProcessPoolExecutor(16, initializer=_init_worker) as ex:
+    results = [r for chunk in ex.map(process_chunk, chunks) for r in chunk]
+```
+
+Five thousand records per chunk is 1 second of work per task against tens of microseconds of overhead — a 4-order-of-magnitude margin. Four hundred tasks instead of two million.
+
+**Choose the chunk size deliberately.** Aim for roughly **4 chunks per worker** so the tail is balanced: too few chunks and one slow chunk leaves 15 workers idle at the end; too many and overhead creeps back. With 16 workers, 64–128 chunks is the sensible range, which for 2 million records is 15,000–30,000 records each.
+
+**Two things to check before committing.** What is the *result* size? If each record produces a large object, you have moved the bottleneck to unpickling results in the parent — aggregate in the worker if the final answer permits it. And is it really CPU-bound? Run `/usr/bin/time -p` on the sequential version; if `user + sys` is far below `real`, this is I/O and the answer is threads or asyncio, not a process pool.
+
+**And measure the ceiling first.** If the whole job is 400 seconds and runs nightly, 16 workers at 60% efficiency gets it to about 40 seconds. If it needs to be 4 seconds, the answer is not a bigger pool — it is vectorising `process_one` into NumPy or rewriting it, because Amdahl and per-record Python overhead will bound you long before core count does.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a measured number. Figures from CPython 3.13.2 on an Apple
+M3 Pro (11 cores, 18 GB), macOS 15, under substantial background load — process-pool speedups
+would be higher on an idle machine. If you cannot reproduce a number on your own machine,
+treat the claim as unproven and tell us.
+</Warning>
+
+### Copy-on-write, and why forked workers still blow up RSS
+
+`fork()` does not copy memory. It marks every page **copy-on-write**: parent and child share the same physical pages until one of them writes, at which point the kernel duplicates that 4 KB (or 16 KB on Apple silicon) page.
+
+In theory this is ideal for a pre-loaded dataset: load 4 GB in the parent, fork 8 read-only workers, and all nine processes share the same 4 GB. In practice, **Python defeats it**, and the mechanism is Week 3's object header.
+
+Every Python object begins with a reference count. **Reading an object increments and decrements its refcount** — a write to the object's header — which dirties the page it lives on. So a worker that merely *iterates* a shared list touches the refcount of every element, and within one pass it has privately copied nearly every page the data occupies. Add the cyclic garbage collector, which writes GC header bits during a collection, and even untouched objects get copied.
+
+The result is the well-documented pattern: fork 8 workers over a 4 GB dataset and watch total RSS climb toward 36 GB over the first few minutes, then get OOM-killed.
+
+The mitigations, in order of effectiveness:
+
+1. **`gc.freeze()` immediately before forking** (3.7+). It moves every currently-tracked object into a permanent generation that the collector never visits, so GC stops dirtying their pages. Instagram's published result was roughly a 10% memory reduction across their forked web workers, and the feature exists because of that work.
+2. **Store bulk data outside the Python object graph.** A NumPy array is one Python object wrapping a raw buffer, so iterating its contents touches exactly one refcount instead of a million. This is the same argument as Week 3's columnar measurement — 28 bytes per record versus 268 — arriving in a different disguise.
+3. **`multiprocessing.shared_memory`** for explicitly shared buffers, which works under `spawn` too.
+4. **Immortal objects (PEP 683, 3.12+)** make `None`, `True`, `False`, small ints and interned strings refcount-free, so those no longer dirty pages. It helps; it does not cover your data.
+
+Measure it rather than assume: sum the **`Pss`** (proportional set size) column of `/proc/<pid>/smaps_rollup` across the process tree on Linux, which attributes shared pages fractionally. Summing plain RSS across processes double-counts shared pages and will tell you a fork-based server is using several times the memory it actually is.
+
+### `spawn` versus `fork`: the safety argument, precisely
+
+Measured: `fork` 3.8 ms, `forkserver` 43.2 ms, `spawn` 54.0 ms for a pool of four. **`fork` is 14.2× cheaper** and it is being made non-default anyway.
+
+The reason is POSIX. After `fork`, the child has one thread — the one that called `fork` — but a complete copy of the parent's memory, **including every mutex in whatever state it was in**. If another thread held the allocator's lock, or `libc`'s locale lock, or a logging handler's lock at that instant, the child inherits it locked with no owner. The child's first `malloc`, or first log line, hangs forever.
+
+Between `fork` and `exec`, POSIX only permits **async-signal-safe** functions — the same restriction as a signal handler (Week 2, Module 3). Python's `fork` start method runs arbitrary Python after forking, which violates this. It works most of the time, which is the worst property a hazard can have.
+
+Concretely dangerous parents include: anything with a `logging.QueueListener`, a `ThreadPoolExecutor`, a gRPC channel, a database connection pool, an OpenTelemetry exporter, a metrics client, or CoreFoundation/Objective-C runtime state on macOS. That last one is why macOS raises `objc[…]: +[__NSCFConstantString initialize] may have been in progress in another thread when fork() was called` — an error that has cost the Python community collectively thousands of hours.
+
+**Python 3.12 emits a `DeprecationWarning` when forking a process with multiple threads. Python 3.14 makes `spawn` the default on Linux.** Treat `fork` as an optimisation you may apply, with evidence, to a provably single-threaded parent.
+
+### NUMA and memory bandwidth: the ceiling above core count
+
+On a multi-socket server, memory is attached to sockets. A thread on socket 0 reading memory attached to socket 1 pays roughly **1.5–2× the latency** and consumes interconnect bandwidth. A process pool whose workers are scheduled across sockets while their data was allocated on one of them runs at remote-memory speed.
+
+```bash
+numactl --hardware                                   # show nodes and distances
+numactl --cpunodebind=0 --membind=0 python worker.py # pin a worker to one node
+```
+
+`numactl` is Linux-only; on a single-socket machine, including every Apple silicon Mac, there is no NUMA and this section does not apply — which is itself worth knowing, because benchmarks from a laptop do not transfer to a two-socket server.
+
+**Memory bandwidth is the ceiling even without NUMA.** A pure-computation task scales with cores; a task streaming through a large array saturates the memory controller. On this machine, the 8-worker speedup saturated at **3.91×** even as task size grew from 1M to 5M iterations — the flat region between those two rows is the signature of a bandwidth limit rather than a coordination limit. When more cores stop helping and the tasks are large, measure bytes moved per second and compare with your machine's peak; if you are near it, the answer is a better algorithm, not more workers.
+
+### The oversubscription arithmetic
+
+The failure from Layer 2, stated as a formula: with **W** worker processes each starting **T** compute threads on **C** cores, you have `W × T` runnable threads for `C` cores. When `W × T ≫ C`:
+
+- each thread gets `C / (W × T)` of a core;
+- the scheduler switches constantly, and each switch costs a context switch plus cache pollution;
+- `C` cores' worth of cache is divided among `W × T` working sets.
+
+Measured in the war story: 32 workers × 32 BLAS threads on 32 cores was **1,024 threads for 32 cores**, and the job took 51 minutes against 4.5 minutes with `OMP_NUM_THREADS=1` — an **11.3×** penalty.
+
+The environment variables that matter, all of which must be set **before the library is imported**:
+
+```
+OMP_NUM_THREADS           OpenMP: NumPy/SciPy via OpenBLAS, PyTorch CPU
+OPENBLAS_NUM_THREADS      OpenBLAS specifically
+MKL_NUM_THREADS           Intel MKL
+VECLIB_MAXIMUM_THREADS    Apple Accelerate
+NUMEXPR_NUM_THREADS       numexpr, used by pandas.eval
+```
+
+`threadpoolctl` inspects and changes them at runtime when you cannot control import order:
+
+```python
+from threadpoolctl import threadpool_limits
+with threadpool_limits(limits=1, user_api="blas"):
+    result = heavy_numpy_thing(data)
+```
+
+The correct total is `W × T ≈ C`. Either `W = C, T = 1` (many single-threaded workers — best when tasks are independent and numerous) or `W = 1, T = C` (one worker using all BLAS threads — best when each task is one large matrix operation). The middle, `W = C, T = C`, is the failure.
+
+### Production failure modes and how you detect them
+
+| Failure | Signature | Detection |
+|---|---|---|
+| Pool slower than sequential | small tasks; pool time flat at ~50 ms regardless of work | measure the crossover; use `chunksize` to make tasks bigger |
+| BLAS oversubscription | all cores at 100%, throughput worse than sequential | `ps -eLf \| wc -l` for thread count; `OMP_NUM_THREADS=1` in `initializer`; `threadpoolctl` |
+| Forked workers OOM-killed | RSS per worker approaches the parent's despite read-only data | refcounts dirty COW pages; `gc.freeze()` before fork; move bulk data into NumPy or `shared_memory`; measure `Pss`, not RSS |
+| Hang after fork in a threaded parent | child blocks on its first `malloc` or log line | inherited locked mutex; use `spawn` or `forkserver`; heed the 3.12 `DeprecationWarning` |
+| Infinite process creation | `RuntimeError` about the current process not being finished bootstrapping | missing `if __name__ == "__main__":` |
+| `PicklingError: Can't pickle <lambda>` | the target is a lambda, a nested function or a bound method of an unpicklable object | move it to module level; `cloudpickle` if you truly cannot |
+| `BrokenProcessPool` with no traceback | a worker was OOM-killed or segfaulted in a C extension | check `dmesg` for the OOM killer; catch `BrokenProcessPool` and retry the batch smaller |
+| Ctrl-C produces a wall of interleaved tracebacks | every worker also received `SIGINT` | `signal.signal(SIGINT, SIG_IGN)` in the worker `initializer` |
+| Leaked `/dev/shm` segments | `shared_memory` created and never `unlink`ed | `try/finally` around create; audit `/dev/shm` in a long-running service |
+| Speedup far below core count | machine load, memory bandwidth, or pickling | report efficiency and load average; measure pickled bytes per task |
+
+### Frontier and research pointers
+
+- **Baumann, A., Barham, P., Dagand, P.-E. et al. (2009). "The Multikernel: A New OS Architecture for Scalable Multicore Systems." *SOSP*.** One-sentence takeaway: as core counts rise, message passing between cores beats shared memory with locks — the same conclusion Python reaches by giving each process its own interpreter.
+- **Baumann, A., Appavoo, J., Krieger, O. & Roscoe, T. (2019). "A fork() in the road." *HotOS*.** One-sentence takeaway: `fork` is a 1970s design that breaks threads, breaks address-space randomisation and breaks every abstraction layered on top, and the paper argues directly for `posix_spawn` — which is the path CPython has taken.
+- **Instagram Engineering, "Dismissing Python Garbage Collection at Instagram" (2017).** One-sentence takeaway: refcount and GC-header writes dirty copy-on-write pages in forked workers, so freezing or disabling the collector measurably cuts total memory across a process fleet.
+- **Van Rossum, G. — PEP 683, "Immortal Objects, Using a Fixed Refcount."** One-sentence takeaway: making common singletons refcount-free removes a specific, measurable source of copy-on-write page dirtying.
+- **Boyd-Wickizer, S. et al. (2010). "An Analysis of Linux Scalability to Many Cores." *OSDI*.** One-sentence takeaway: shared cache lines and kernel locks — not core count — are what bound scalability, which is why oversubscription hurts far more than the arithmetic suggests.
+- **Blackford, L. S. et al. (2002). "An Updated Set of Basic Linear Algebra Subprograms (BLAS)." *ACM TOMS*.** One-sentence takeaway: BLAS implementations parallelise internally by design, which is exactly why wrapping them in a process pool without capping their thread count oversubscribes the machine.
+
+### Stretch challenge
+
+Find the crossover for your own workload and defend the number.
+
+1. Build a task with a tunable amount of work. Sweep the work per task across five orders of magnitude, and for each, measure sequential and process-pool time at 2, 4, 8 and `os.cpu_count()` workers. Plot speedup against work per task on log axes and mark the crossover. Ours was **between 10,000 and 100,000 iterations**.
+2. **Separate the two overheads.** Measure pool creation on its own (create a pool, run one trivial task, tear down) and measure pickling on its own (`pickle.dumps`/`loads` round trip of your actual argument). Our figures: 54.0 ms for pool creation with `spawn`, 3.8 ms with `fork`, and 659 + 1,313 µs for a 100,000-int list. Which dominates your crossover?
+3. **Sweep `chunksize`** at a fixed small task size, from 1 to 10,000. Find the value that maximises throughput and check whether it lands near "4 chunks per worker".
+4. **Reproduce oversubscription.** Run a NumPy-heavy task in a pool with and without `OMP_NUM_THREADS=1`, at worker counts of 1, 4 and `cpu_count()`. Report the penalty; ours was 11.3× in the reported incident. Also record total thread count (`ps -eLf | wc -l` on Linux) for each configuration.
+5. **On Linux, measure copy-on-write.** Load a 1 GB Python list in the parent, fork 8 workers that only *read* it, and record total `Pss` across the tree at 0, 30 and 120 seconds. Then repeat with `gc.freeze()` before the fork, and again with the data as a NumPy array. Report all three curves.
+
+The open question with no single right answer: for a job that is 2 GB of read-only reference data plus 30 seconds of CPU work per task, would you use `fork` and accept the copy-on-write drift, `spawn` plus `shared_memory` and accept the complexity, or a single process with a threaded C extension and accept the rewrite? Argue it with your measurements from steps 2 and 5, and say how your answer changes if the job must also run on Windows.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Find the task size at which process-pool overhead is repaid, and plot the crossover. Separate pool-creation cost from pickling cost, and say which dominates for your workload.
+</Card>
+
+Acceptance: the sweep covers at least five orders of magnitude of work per task; you report speedup, worker count, efficiency and machine load for each point; pool creation and pickling are measured independently; the plot marks the crossover explicitly; and you state which of the two overheads dominates and why.
+
+## The whiteboard
+
+The T1 sketch is the parent fanning out to children with their own GILs, pickling drawn as a toll booth. The T2 build-up frames add the startup cost band, then the crossover curve, then the oversubscription failure.
+
+<Tip>
+**Draw it yourself.** From memory: the four children with their own GIL keys, the pickle toll
+with its measured cost, the crossover curve with two points labelled, and the 8 × 11 = 88
+oversubscription sketch. Then compare.
+[Blank version](/assets/diagrams/P1-W04-M3-blank.svg) · [Editable source](/assets/diagrams/P1-W04-M3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Portfolio line:** *"A measured study of Python process-pool overhead: the crossover at which parallelism starts paying (between 10⁴ and 10⁵ iterations per task), pool startup separated by start method (fork 3.8 ms, forkserver 43.2 ms, spawn 54.0 ms), pickling cost by payload, and a reproduction of BLAS oversubscription showing an 11× penalty."* The oversubscription reproduction is the memorable part.
+
+**The interview angle.** "When would you use multiprocessing over threading?" gets a definitional answer from most candidates. The one that lands adds the cost: *processes for CPU-bound pure Python, because each has its own GIL — I measured 2.74× against threads' 0.86× on the same task. But the pool costs about 50 ms to exist and every argument is pickled, so below roughly 10,000 iterations of work per task the pool is slower than sequential. Chunking is how you make the tasks big enough.*
+
+The follow-up worth preparing is "why is `spawn` the default on macOS?" — because `fork` copies memory including locks held by threads that do not exist in the child, so the first `malloc` or log line in the child deadlocks. Python 3.14 makes `spawn` the default on Linux for the same reason.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+Three places this shows up in a normal engineering week:
+
+1. **Any process pool over NumPy, PyTorch, scikit-learn or Pillow.** Check for oversubscription immediately: N workers × M BLAS threads on C cores. Set `OMP_NUM_THREADS=1` (and the four related variables) in the pool's `initializer`. The reported incident was 51 minutes versus 4.5 minutes, and 100% CPU on every core looked like success the whole time.
+
+2. **A parallel job that is slower than sequential.** It is almost always task size. Measure the per-task work, compare with the ~50 ms pool floor and the pickling cost of your arguments, and fix it with `chunksize` — aiming for about four chunks per worker — rather than with more workers.
+
+3. **A forked worker fleet whose memory climbs.** Copy-on-write does not protect Python objects, because reading them writes their refcounts. Call `gc.freeze()` before forking, move bulk data into NumPy arrays or `shared_memory`, and measure `Pss` rather than summing RSS, which double-counts shared pages and will make you over-provision.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `RuntimeError` about bootstrapping, or endless processes | no `if __name__ == "__main__":` guard | add it; mandatory with `spawn`, which is the default on macOS/Windows and Linux from 3.14 |
+| `PicklingError: Can't pickle <lambda>` | the target is a lambda, closure or nested function | move it to module level; `cloudpickle` only as a last resort |
+| Pool slower than sequential | per-task work below the ~50 ms pool floor | batch with `chunksize`; aim for ~4 chunks per worker |
+| All cores at 100%, job slower than before | BLAS oversubscription: W × T ≫ C | `OMP_NUM_THREADS=1` in the `initializer`; `threadpoolctl` |
+| Hang on macOS with an `objc[...]` fork warning | `fork` in a process with threads or ObjC runtime state | `spawn` or `forkserver` |
+| Forked worker RSS approaches the parent's | refcount writes dirty copy-on-write pages | `gc.freeze()` before fork; NumPy or `shared_memory` for bulk data |
+| `BrokenProcessPool` with no traceback | worker OOM-killed or segfaulted in a C extension | check `dmesg`; catch it and retry with smaller batches |
+| Ctrl-C prints a wall of tracebacks | every worker received `SIGINT` too | `signal.signal(SIGINT, SIG_IGN)` in the worker initializer |
+| Results arrive but the parent is pegged | unpickling large results serialises through the parent | aggregate in the worker; return the answer, not the data |
+| `/dev/shm` fills up over days | `shared_memory` segments created and never `unlink`ed | `try/finally`; audit in long-running services |
+| Speedup is 3× on 16 cores and nobody knows why | machine load, memory bandwidth, or pickling | report efficiency and load average; measure bytes pickled per task |
+
+## Sources & further reading
+
+**Primary docs**
+
+- **[Python `multiprocessing` documentation (3.13) — "Contexts and start methods" and "Programming guidelines".](https://docs.python.org/3/library/multiprocessing.html)** Read the programming guidelines in full once; every rule there exists because of a bug report, and the `spawn`-specific section explains the `__main__` guard properly.
+- **[`concurrent.futures.ProcessPoolExecutor` documentation (3.13), including `initializer`, `mp_context`, `max_tasks_per_child` and `BrokenProcessPool`.](https://docs.python.org/3/library/concurrent.futures.html#processpoolexecutor)** Read `max_tasks_per_child` (3.11+) — recycling workers periodically is the standard mitigation for a slow leak in a C extension.
+- **[`multiprocessing.shared_memory` documentation (3.8+), and the 3.13 notes on the resource tracker.](https://docs.python.org/3/library/multiprocessing.shared_memory.html)** Read the lifecycle rules: `close()` in every process, `unlink()` in exactly one.
+- **[Python 3.12 `DeprecationWarning` on forking a multi-threaded process, and the 3.14 change of the default start method on Linux.](https://docs.python.org/3/whatsnew/3.14.html)** Read the release notes for the rationale; it is the clearest short statement of why `fork` is unsafe.
+- **[`threadpoolctl` documentation.](https://github.com/joblib/threadpoolctl)** Read this for how to cap BLAS threads at runtime when you cannot control import order.
+
+**Papers**
+
+- **[Baumann, A., Appavoo, J., Krieger, O. & Roscoe, T. (2019). "A fork() in the road." *HotOS XVII*.](https://doi.org/10.1145/3317550.3321435)** One-sentence takeaway: `fork` is incompatible with threads, with address-space randomisation and with essentially every abstraction built since 1975, and `posix_spawn` is the correct replacement — the argument behind Python's default change.
+- **[Baumann, A. et al. (2009). "The Multikernel: A New OS Architecture for Scalable Multicore Systems." *SOSP*, 29–44.](https://doi.org/10.1145/1629575.1629579)** One-sentence takeaway: message passing between isolated cores scales where shared memory with locks does not, which is the structural argument for process-per-core designs.
+- **[Boyd-Wickizer, S., Clements, A. T., Mao, Y. et al. (2010). "An Analysis of Linux Scalability to Many Cores." *OSDI*, 1–16.](https://www.usenix.org/conference/osdi10/analysis-linux-scalability-many-cores)** One-sentence takeaway: scalability limits come from shared cache lines and contended kernel data structures rather than from core count, which is why oversubscription costs far more than the naive arithmetic predicts.
+- **[Blackford, L. S. et al. (2002). "An Updated Set of Basic Linear Algebra Subprograms (BLAS)." *ACM TOMS* 28(2), 135–151.](https://doi.org/10.1145/567806.567807)** One-sentence takeaway: BLAS is designed to parallelise internally, so any outer parallelism must explicitly cap it or the two layers multiply.
+
+**Go deeper**
+
+- **Gorelick, M. & Ozsvald, I., *High Performance Python*, 2nd ed., Chapter 9 ("The multiprocessing Module").** The best practical treatment of pickling cost, chunking and shared memory, with worked measurements of the same trade-offs this module makes.
+- **Instagram Engineering, "Dismissing Python Garbage Collection at Instagram" (2017), and "Copy-on-write friendly Python garbage collection" (2018).** Two short posts that explain the refcount/COW interaction with production numbers; the second is the origin story of `gc.freeze()`.
+- **[Kerrisk, M., *The Linux Programming Interface*, Chapters 24–25 and 49.](https://man7.org/tlpi/)** Chapter 24's account of what `fork` copies and what it shares, and Chapter 49 on shared mappings, are the systems-level foundation for everything in this layer.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-04/p1-w04-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

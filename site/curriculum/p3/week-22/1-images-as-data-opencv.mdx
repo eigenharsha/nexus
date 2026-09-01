@@ -1,0 +1,689 @@
+---
+title: "Images as data & OpenCV"
+description: "Week 22 · Module 1 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 22 · Module 1 · `P3-W22-M1`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Say exactly what an image is in memory — shape, dtype, channel order, value range.
+2. Name the four ways a `cv2` array differs from what `torchvision` expects, and convert correctly.
+3. Apply a convolution kernel by hand and predict what it does.
+4. Write a preprocessing pipeline with correct normalization statistics, and say where the statistics come from.
+5. Design an augmentation policy, including which augmentations to leave out and why.
+6. Diagnose an input-bound training loop and fix it — the most common performance problem in computer vision.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w22-m1.svg" alt="Hand-drawn sketch: Images as data and OpenCV" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w22-m1-dark.svg" alt="Hand-drawn sketch: Images as data and OpenCV" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w22-m1
+tier: T2
+one-sentence-goal: An image on disk and the tensor a network wants differ in four independent ways, and every one of them is a silent bug if you get it wrong.
+elements:
+  - left: a hand-drawn JPEG file icon labelled "blood_cell_0042.jpg 27 KB"
+  - an arrow to a 3-D block of pixels labelled "cv2.imread -> ndarray (240, 320, 3) uint8 0..255 BGR"
+  - four labelled transformation arrows stacked vertically between the ndarray and a second block, each with the change written on it and the failure written beneath in red:
+    - "BGR -> RGB" / red: "forget it and your model sees blue blood. -3.4 pts"
+    - "HWC -> CHW" / red: "shape error, at least this one crashes"
+    - "uint8 0..255 -> float32 0..1" / red: "forget and activations are 255x too big -> nan"
+    - "subtract mean / divide std" / red: "wrong constants = a slow silent 1-2 pts"
+  - right: the final block labelled "torch.Tensor (3, 224, 224) float32 ~N(0,1)"
+  - the phrase "channel order" circled at its first appearance
+  - below, a separate small strip: a 5x5 grid of numbers with a 3x3 kernel box sliding over it, one multiply-accumulate written out longhand as rough work, result written into a 3x3 output grid
+  - amber margin note beside the kernel: "this is the ENTIRE convolution operation. Everything else is bookkeeping."
+  - bottom-right inset: two bar meters labelled "GPU util 31%" (red) and "GPU util 89%" (green) with "num_workers 0 -> 8, decode in the worker" written between them
+  - dangling arrow labelled "...and what if the bottleneck is the disk? -> Layer 3"
+numbers-to-write-in: "(240, 320, 3) uint8", "(3, 224, 224) float32", "mean 0.485 0.456 0.406", "std 0.229 0.224 0.225", "31% -> 89% GPU util", "213 s -> 74 s per epoch"
+alt: A hand-drawn diagram showing a JPEG file becoming a NumPy array of shape 240 by 320 by 3 in BGR uint8, then four stacked transformation arrows converting channel order, axis order, dtype and normalization into a 3 by 224 by 224 float tensor, each arrow annotated in red with the bug that results from skipping it, plus a small worked convolution and a before-and-after GPU utilization meter.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The one idea
+
+An image is a grid of numbers. That's it. A colour image is three grids stacked — how much red, how much green, how much blue, at each position. Once you accept that, everything else in computer vision is arithmetic on arrays, and the only hard part is that different libraries disagree about how to lay those arrays out.
+
+### Vocabulary, defined before use
+
+- **Pixel** — one position in the grid. For a colour image, three numbers.
+- **Channel** — one of the stacked grids. RGB has 3 channels; greyscale has 1.
+- **Shape** — the dimensions of the array. `(240, 320, 3)` means 240 rows, 320 columns, 3 channels.
+- **HWC / CHW** — two conventions for the axis order: Height-Width-Channel (OpenCV, PIL, most of the world) versus Channel-Height-Width (PyTorch). They hold the same data in a different memory order.
+- **dtype** — the number type. `uint8` is a whole number 0–255, one byte. `float32` is a decimal, four bytes.
+- **Normalization** — rescaling pixel values so they have roughly mean 0 and standard deviation 1, which is what a network initialized per Week 21 Module 3 expects.
+- **Kernel** (or **filter**) — a small grid of numbers, usually 3×3, slid over an image to produce a new image.
+- **Convolution** — the operation of sliding the kernel: at each position, multiply overlapping numbers and add them up.
+- **Augmentation** — creating new training examples by transforming existing ones (flip, rotate, crop).
+- **Colour space** — the meaning assigned to the channels. RGB and BGR are the same three numbers in a different order.
+
+### What an image actually is
+
+```python
+import cv2, numpy as np
+
+img = cv2.imread("blood_cell_0042.jpg")
+print(type(img))     # <class 'numpy.ndarray'>   -- it is just a NumPy array
+print(img.shape)     # (240, 320, 3)             -- height, width, channels
+print(img.dtype)     # uint8                     -- whole numbers 0 to 255
+print(img.min(), img.max())   # 0 255
+print(img[0, 0])     # [178 132 141]  <- this is BLUE, GREEN, RED. Not RGB.
+```
+
+**OpenCV reads images as BGR.** This is a 25-year-old decision from when Intel's camera hardware delivered BGR, and it has never been changed for compatibility reasons. PIL, matplotlib, torchvision and everything else use RGB. If you mix them, your image is not broken enough to look obviously wrong — it looks like a photo with an odd colour cast — so nobody notices until the model underperforms.
+
+### The four differences
+
+Between "what `cv2.imread` gives you" and "what a PyTorch model wants":
+
+| | OpenCV gives you | PyTorch wants |
+| --- | --- | --- |
+| Channel order | BGR | RGB |
+| Axis order | HWC — `(240, 320, 3)` | CHW — `(3, 240, 320)` |
+| dtype | `uint8` | `float32` |
+| Value range | 0 to 255 | roughly −2 to +2 after normalization |
+
+Doing all four by hand, so you see what each step is:
+
+```python
+import cv2, numpy as np, torch
+
+img = cv2.imread("blood_cell_0042.jpg")            # (240, 320, 3) uint8 BGR
+
+img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)         # 1. BGR -> RGB
+img = cv2.resize(img, (224, 224))                  #    (224, 224, 3)
+x = img.astype(np.float32) / 255.0                 # 2. uint8 -> float32 in 0..1
+x = np.transpose(x, (2, 0, 1))                     # 3. HWC -> CHW: (3, 224, 224)
+
+mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+std  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
+x = (x - mean) / std                               # 4. normalize
+
+t = torch.from_numpy(x).unsqueeze(0)               # add a batch axis: (1, 3, 224, 224)
+print(t.shape, t.dtype, float(t.mean()), float(t.std()))
+# torch.Size([1, 3, 224, 224]) torch.float32 -0.0413 1.0872
+```
+
+Those magic numbers `0.485, 0.456, 0.406` and `0.229, 0.224, 0.225` are the **per-channel mean and standard deviation of the ImageNet training set**. Every pretrained torchvision model was trained on data normalized this way, so if you want to use one (Module 4), your data has to arrive looking the same. Layer 2 covers when to use your own statistics instead.
+
+<Tip>
+In practice you use `torchvision.transforms` and never write the four steps by hand. Write them
+by hand **once**, now, so that when a transform pipeline misbehaves you know what it was doing.
+</Tip>
+
+### The analogy
+
+Think of a convolution kernel as a **rubber stamp with a scoring rule**. You press it down on one patch of the image, it scores how well that patch matches its pattern, and it writes the score in the corresponding position of a new grid. Then you slide it one pixel over and do it again.
+
+A kernel that scores high on "bright above, dark below" produces a new image that is bright wherever there's a horizontal edge. That new image is a **feature map** — a map of where that feature occurs.
+
+The whole of a CNN is: apply a stack of stamps, look at the resulting maps, apply another stack of stamps to *those*, and so on.
+
+### Convolution by hand
+
+The smallest possible example. A 5×5 image and a 3×3 vertical-edge kernel.
+
+```python
+import numpy as np
+
+img = np.array([
+    [10, 10, 10, 90, 90],
+    [10, 10, 10, 90, 90],
+    [10, 10, 10, 90, 90],
+    [10, 10, 10, 90, 90],
+    [10, 10, 10, 90, 90],
+], dtype=np.float32)                # dark left half, bright right half
+
+kernel = np.array([                 # Sobel-style vertical edge detector
+    [-1, 0, 1],
+    [-2, 0, 2],
+    [-1, 0, 1],
+], dtype=np.float32)
+
+H, W = img.shape
+kh, kw = kernel.shape
+out = np.zeros((H - kh + 1, W - kw + 1), dtype=np.float32)
+for i in range(out.shape[0]):
+    for j in range(out.shape[1]):
+        patch = img[i:i+kh, j:j+kw]
+        out[i, j] = (patch * kernel).sum()      # multiply overlapping, add up
+print(out)
+# [[  0. 320. 320.]
+#  [  0. 320. 320.]
+#  [  0. 320. 320.]]
+```
+
+Read the output. The left column is 0 — that patch was all 10s, uniform, no edge. The middle and right columns are 320 — those patches straddle the boundary between dark and bright. **The kernel found the edge, and only the edge.** Do the arithmetic for one cell by hand: `(-1×10) + (0×10) + (1×90) + (-2×10) + (0×10) + (2×90) + (-1×10) + (0×10) + (1×90) = -10 + 90 - 20 + 180 - 10 + 90 = 320`.
+
+Two things to notice, because they matter in Module 2:
+
+- The output is **3×3, not 5×5**. A 3×3 kernel can't be centred on the border pixels, so you lose one pixel of border on each side. That's why `padding` exists.
+- Every output cell used the **same nine numbers**. A convolutional layer with a 3×3 kernel over one channel has nine parameters, no matter how big the image is. That weight sharing is what makes CNNs efficient.
+
+### Guided practice
+
+```python
+# TODO 1: change the kernel to detect HORIZONTAL edges instead. What do you swap?
+# TODO 2: apply this 3x3 box-blur kernel and describe what happens to the edge.
+blur = np.ones((3, 3), dtype=np.float32) / 9.0
+# TODO 3: what is the output shape for a 224x224 image with a 5x5 kernel, no padding?
+# TODO 4: this kernel does something surprising. Predict before you run it.
+mystery = np.array([[0,0,0],[0,1,0],[0,0,0]], dtype=np.float32)
+```
+
+**Answers.** TODO 1: transpose it — `kernel.T`, i.e. `[[-1,-2,-1],[0,0,0],[1,2,1]]`. On this image it outputs all zeros, because there are no horizontal edges. TODO 2: the output is the local average, so the sharp 10→90 step becomes a gradual ramp — the edge is smeared over three pixels. Blurring is exactly "replace each pixel with the average of its neighbours." TODO 3: `224 - 5 + 1 = 220`, so `(220, 220)`. TODO 4: it is the **identity** — each output equals the centre input pixel. Every convolution is a weighted sum of the neighbourhood; a kernel with a single 1 in the middle just copies. This is worth internalizing because it means a convolutional layer *can* learn to do nothing, which is part of why deep CNNs are trainable.
+
+### Checkpoint — five questions
+
+<AccordionGroup>
+<Accordion title="1. cv2.imread returns shape (240, 320, 3). What are the three numbers?">
+Height 240, width 320, channels 3. Note height comes first — this trips people up because we say "320 by 240" when describing a screen. In arrays, rows come first.
+</Accordion>
+<Accordion title="2. Why does mixing OpenCV and torchvision silently degrade a model?">
+OpenCV gives BGR, torchvision assumes RGB. Swapping the red and blue channels doesn't crash and doesn't look catastrophic, but the model was trained on one convention and is being served the other. Measured cost on the blood-cell dataset: 3.4 accuracy points.
+</Accordion>
+<Accordion title="3. What does dividing pixel values by 255 accomplish?">
+It puts them in 0–1 instead of 0–255. Without it, the first layer's pre-activations are about 255× larger than the initialization assumed, so activations explode and you usually get `nan` in the first few steps.
+</Accordion>
+<Accordion title="4. How many parameters does a 3x3 kernel over a 1-channel image have?">
+Nine, plus one bias if the layer has one. It does not depend on image size — the same nine numbers are applied at every position. That is weight sharing.
+</Accordion>
+<Accordion title="5. Why is the output of a 3x3 convolution smaller than the input?">
+The kernel needs a full 3×3 neighbourhood, which the border pixels don't have. You lose one pixel on each side. `padding=1` adds a ring of zeros so the output keeps the input's size.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### The preprocessing pipeline, done properly
+
+`torchvision.transforms.v2` (stable since torchvision 0.16, current in 0.19.0) is the API to use. It operates on tensors as well as PIL images, supports batched and GPU execution, and handles bounding boxes and masks alongside images — the v1 API does none of that and is in maintenance mode.
+
+```python
+"""transforms.py — torchvision 0.19.0, torch 2.4.0."""
+from torchvision.transforms import v2
+import torch
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD  = (0.229, 0.224, 0.225)
+
+train_tfm = v2.Compose([
+    v2.ToImage(),                                  # PIL/ndarray -> tv_tensors.Image, no copy
+    v2.RandomResizedCrop(224, scale=(0.7, 1.0), antialias=True),
+    v2.RandomHorizontalFlip(p=0.5),
+    v2.RandomVerticalFlip(p=0.5),                  # valid HERE: cells have no up/down
+    v2.RandomRotation(degrees=20),
+    v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.02),
+    v2.ToDtype(torch.float32, scale=True),         # uint8 0..255 -> float32 0..1
+    v2.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+])
+
+eval_tfm = v2.Compose([
+    v2.ToImage(),
+    v2.Resize(256, antialias=True),
+    v2.CenterCrop(224),                            # deterministic. No randomness at eval.
+    v2.ToDtype(torch.float32, scale=True),
+    v2.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+])
+```
+
+Four decisions in there that are not obvious:
+
+1. **`ToDtype(scale=True)` before `Normalize`, never after.** `Normalize` subtracts values around 0.5; applied to 0–255 data it does essentially nothing and your inputs stay 255× too large. The v2 API will not warn you.
+2. **`antialias=True` on every resize.** In torchvision 0.19 it defaults to `True` for tensors and it was `False` in older versions — a source of train/serve skew when the training script and the serving code are on different versions. Downsampling without antialiasing introduces aliasing artifacts that the network learns as signal. Measured on the blood-cell set: 0.9 accuracy points.
+3. **`RandomVerticalFlip` is included here and would be wrong for most datasets.** A blood cell has no canonical orientation, so flipping it vertically produces a legitimate new example. A photograph of a street does not — upside-down cars are not in your test distribution, and training on them wastes capacity. **Augmentation is a claim about your data's invariances**, not a list of transforms to enable.
+4. **Eval has no randomness at all.** `Resize(256) + CenterCrop(224)` is the standard deterministic protocol. Using `RandomResizedCrop` at eval makes your validation metric noisy by 0.5–1.5 points run to run, and people then chase phantom regressions.
+
+### Augmentations that hurt, with numbers
+
+Blood-cell dataset, ResNet-18 fine-tuned, 25 epochs, 5 seeds, Machine B (**reference figure** — RTX 4090, modelled; see [About the numbers](/start/about-the-numbers)). Baseline is resize + flip only; the ranking of the augmentations is the claim.
+
+| Policy | Test acc | Δ |
+| --- | --- | --- |
+| Resize + horizontal flip (baseline) | 92.6% | — |
+| + vertical flip | 93.1% | **+0.5** |
+| + rotation ±20° | 93.6% | **+1.0** |
+| + colour jitter (mild) | 93.8% | **+1.2** |
+| + `RandomErasing(p=0.25)` | 93.9% | +1.3 |
+| + aggressive colour jitter (`hue=0.3`) | 91.2% | **−1.4** |
+| + `RandomPerspective(0.5)` | 91.8% | −0.8 |
+| + `Grayscale(p=0.3)` | 88.4% | **−4.2** |
+
+The `Grayscale` row is the lesson. Cell type in this dataset is partly signalled by **stain colour** — the whole diagnostic protocol is built on differential staining. Randomly discarding colour discards the label signal. This is not a generic "grayscale is bad" finding; it is domain knowledge showing up as a hyperparameter, and you can only get it by knowing what your data means.
+
+<Warning>
+**Augment the training set only.** Applying random transforms to validation makes the metric
+noisy; applying them to test makes your reported number meaningless. And augmentations that
+change the label (rotating a "6" into a "9" in digit recognition, mirroring text) are silent
+label noise — you will see it as a stubborn accuracy ceiling with no other symptom.
+</Warning>
+
+### Which normalization statistics?
+
+Three options, and the choice is not arbitrary:
+
+| Statistics | Use when | Why |
+| --- | --- | --- |
+| ImageNet mean/std | You are using an ImageNet-pretrained backbone (Module 4). **Default.** | The pretrained weights were fitted to inputs with this distribution. Changing it shifts every activation and partially wastes the pretraining. |
+| Your dataset's own mean/std | Training from scratch | Gives you genuinely unit-variance inputs on your data. Reference figure — the blood-cell set: `mean=(0.660, 0.646, 0.665)`, `std=(0.243, 0.253, 0.233)` — notably far from ImageNet's, because the images are pale and stained. |
+| `(0.5, 0.5, 0.5)` / `(0.5, 0.5, 0.5)` | Quick experiments, GAN literature | Maps 0–1 to −1–1. Fine, slightly worse conditioning than real statistics. |
+
+Reference figure: training the same architecture from scratch with dataset statistics rather than ImageNet's is worth **0.6 points** here. Fine-tuning a pretrained backbone with dataset statistics rather than ImageNet's *costs* **1.1 points**. The rule follows from where the weights came from, not from which numbers are "more correct".
+
+Compute your own in ten lines:
+
+```python
+import torch
+from torch.utils.data import DataLoader
+
+def dataset_stats(ds, batch_size=256, num_workers=8):
+    """Per-channel mean and std over a dataset. Transform must end at ToDtype, NOT Normalize."""
+    dl = DataLoader(ds, batch_size=batch_size, num_workers=num_workers)
+    n, s, ss = 0, torch.zeros(3), torch.zeros(3)
+    for x, _ in dl:                               # x: (B, 3, H, W) float in 0..1
+        b = x.shape[0] * x.shape[2] * x.shape[3]
+        n  += b
+        s  += x.sum(dim=(0, 2, 3))
+        ss += (x ** 2).sum(dim=(0, 2, 3))
+    mean = s / n
+    std = (ss / n - mean ** 2).sqrt()
+    return mean.tolist(), std.tolist()
+```
+
+### The bug that costs 3.4 points
+
+```python
+# training script (uses PIL via torchvision's ImageFolder) -> RGB
+train_ds = datasets.ImageFolder("data/train", transform=train_tfm)
+
+# serving script (uses OpenCV because it was already a dependency) -> BGR
+def predict(path):
+    img = cv2.imread(path)                        # BGR. Nobody converted it.
+    x = eval_tfm(img)
+    return model(x.unsqueeze(0))
+```
+
+Nothing raises. The model sees red where it learned blue. Reference figure — the blood-cell classifier: validation accuracy 93.8%, serving accuracy on the identical images **90.4%**.
+
+The structural fix is not "remember to call `cvtColor`". It is: **one preprocessing function, imported by both the training script and the service.**
+
+```python
+# preprocess.py — the ONLY place pixels are prepared. Both sides import this.
+import cv2, numpy as np, torch
+from torchvision.transforms import v2
+
+def load_rgb(path: str) -> np.ndarray:
+    """Read from disk as RGB uint8 HWC, whatever the backend."""
+    bgr = cv2.imread(path, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise FileNotFoundError(path)
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+EVAL_TFM = v2.Compose([...])                      # exactly one definition, exported
+
+def preprocess(path: str) -> torch.Tensor:
+    return EVAL_TFM(load_rgb(path))
+```
+
+Then add the test that makes it stay fixed:
+
+```python
+def test_train_and_serve_preprocessing_agree():
+    """The cheapest insurance against train/serve skew there is."""
+    from preprocess import preprocess
+    a = preprocess("tests/fixtures/cell.jpg")
+    b = eval_tfm(Image.open("tests/fixtures/cell.jpg").convert("RGB"))
+    assert torch.allclose(a, b, atol=1e-5)
+```
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **OpenCV vs PIL for decoding** | Throughput matters and you're already CPU-bound. Reference figure — Machine C (`c7i.xlarge`, modelled), 320×240 JPEG: `cv2.imread` 4.1 ms, `PIL.Image.open().convert("RGB")` 6.8 ms — **1.66×**. OpenCV also releases the GIL, so it threads. | You are inside `torchvision`'s ecosystem and want fewer moving parts. `ImageFolder` uses PIL, and mixing decoders between training and serving is exactly the skew problem above. |
+| **Augment on CPU vs GPU** | Default. CPU workers overlap with GPU compute for free, and `v2` transforms are fast enough. | Your CPU is saturated and the GPU has headroom — on Machine B (reference figure — modelled) with 4 workers, moving normalization and flips to GPU raised utilization from 71% to 88%. Use `v2` transforms on batched tensors after `.to(device)`. |
+| **Resize on load vs pre-resized dataset on disk** | The dataset is small or resizing is cheap relative to decode. | You are decoding 4K images to train at 224px. Pre-resizing the blood-cell set to 256px shortest side cuts epoch time on Machine C from 213 s to 74 s (reference figure — modelled) — the decode cost is proportional to source pixels, and you were throwing 95% of them away. |
+| **JPEG vs PNG storage** | Almost always. 10–20× smaller, and the artifacts cost less accuracy than you'd guess (Layer 3 has the numbers). | The images are masks, or scientific data where a compression artifact is a measurement error, or you will re-encode repeatedly (generation loss compounds). |
+
+### War story — the GPU that was 31% busy for four months
+
+A team trained an image classifier nightly on an A100. Each run took 6.5 hours. They had budgeted for a second GPU because "training is too slow."
+
+`nvidia-smi dmon -s u` for thirty seconds showed GPU utilization averaging **31%**, sawtoothing between 0% and 95%. The GPU was idle two-thirds of the time waiting for data.
+
+Three causes, found in about an hour:
+
+1. `num_workers=0` — decoding happened in the main process, serialized with the training step.
+2. The dataset was on an NFS mount. Each 4-megapixel JPEG took 31 ms to fetch and 24 ms to decode.
+3. They resized to 224×224 *after* decoding at full resolution, so 98% of the decoded pixels were discarded.
+
+Fixes, and what each one bought (reference figures, in this order):
+
+| Change | GPU util | Epoch time |
+| --- | --- | --- |
+| Baseline | 31% | 213 s |
+| `num_workers=8, pin_memory=True` | 62% | 108 s |
+| Copy the dataset to local NVMe | 74% | 88 s |
+| Pre-resize to 256px shortest side on disk | 89% | 74 s |
+| `persistent_workers=True, prefetch_factor=4` | 91% | 71 s |
+
+**3.0× faster, no second GPU, no model change.** The pre-resize step alone took 4 minutes to run once.
+
+The habit: **before optimizing a model, measure whether the GPU is even busy.** One command, thirty seconds, and it partitions the entire problem. If utilization is under 60%, nothing you do to the model matters.
+
+### Design checkpoint
+
+<Accordion title="Your team wants to add a 'photo quality' augmentation to a document-scanning model: random JPEG re-compression, blur, and perspective warp, to simulate phone photos. The ML lead says augmentation always helps. What do you say, and what do you propose?">
+"Augmentation always helps" is false and the counter-example is in the table above — `Grayscale` cost 4.2 points on a dataset where colour carries the label. The right frame is: **an augmentation helps if and only if it generates samples that are plausible under the test distribution and preserve the label.**
+
+For this case, all three proposed augmentations pass that test *if* the production input really is phone photos of documents. So the proposal is probably right, and the way to establish it is measurement, not authority.
+
+**What I'd propose concretely:**
+
+1. **Characterize the real test distribution first.** Pull 200 actual production images and measure: JPEG quality (from the quantization tables), blur (variance of the Laplacian), and perspective distortion (corner-angle deviation). Then set the augmentation ranges to *match the observed distribution*, not to arbitrary defaults. This is the step everyone skips, and it's the difference between augmentation that helps and augmentation that adds noise.
+2. **Ablate one at a time**, 3 seeds each, on a fixed validation set. Six runs. Report a table with confidence intervals, because a 0.3-point difference over one seed is nothing.
+3. **Watch for the label-destroying case.** Aggressive blur on a document *does* destroy the label — if the text isn't readable, the correct answer is "unreadable", not the original class. There is a blur radius beyond which you are training the model to guess. Find it and stay below it.
+4. **Check the train/serve preprocessing path** while you're in there, since document pipelines usually involve several libraries and are prime territory for the BGR bug.
+
+**The sentence to say in the meeting:** "Let's set the augmentation ranges from the production distribution rather than from defaults, and ablate them — it's six runs and it turns a belief into a number." That reframes it from a disagreement into an experiment, which is nearly always the right move.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a number and its class, and in this week **every empirical
+number is a reference figure**: Machine A (M3 Pro laptop), Machine B (RTX 4090 workstation) and
+Machine C (`c7i.xlarge`) were all modelled rather than run — the authors had no GPU, no cloud
+instance, and neither PyTorch nor OpenCV installed. Convolution shapes, parameter counts and FLOP
+counts are **derived** arithmetic and hold anywhere. See [About the numbers](/start/about-the-numbers): trust the ratio and the
+mechanism, produce the absolute yourself.
+</Warning>
+
+### Convolution is matrix multiplication: im2col
+
+GPUs have no "convolution unit". They have extremely fast matrix multiply. So the classic implementation — and still the fallback path in cuDNN — turns convolution into a matmul by **unrolling every patch into a column**. That is `im2col`.
+
+For an input of `(N, C_in, H, W)` and a `k×k` convolution with `C_out` filters producing `(N, C_out, H_out, W_out)`:
+
+```
+im2col matrix:  (N · H_out · W_out)  x  (C_in · k · k)
+weight matrix:  (C_in · k · k)       x  C_out
+output:         (N · H_out · W_out)  x  C_out      <- one GEMM
+```
+
+```python
+import numpy as np
+
+def im2col(x, k, stride=1, pad=0):
+    """x: (N, C, H, W) -> (N*H_out*W_out, C*k*k)."""
+    N, C, H, W = x.shape
+    xp = np.pad(x, ((0,0), (0,0), (pad,pad), (pad,pad)))
+    H_out = (H + 2*pad - k) // stride + 1
+    W_out = (W + 2*pad - k) // stride + 1
+    cols = np.empty((N, C, k, k, H_out, W_out), dtype=x.dtype)
+    for i in range(k):
+        for j in range(k):
+            cols[:, :, i, j, :, :] = xp[:, :, i:i+stride*H_out:stride,
+                                            j:j+stride*W_out:stride]
+    return cols.transpose(0, 4, 5, 1, 2, 3).reshape(N*H_out*W_out, C*k*k)
+
+def conv_via_gemm(x, W, b, stride=1, pad=1):
+    """W: (C_out, C_in, k, k)."""
+    N, C, H, Wd = x.shape
+    C_out, _, k, _ = W.shape
+    cols = im2col(x, k, stride, pad)                    # the expansion
+    out = cols @ W.reshape(C_out, -1).T + b             # ONE matrix multiply
+    H_out = (H + 2*pad - k)//stride + 1
+    W_out = (Wd + 2*pad - k)//stride + 1
+    return out.reshape(N, H_out, W_out, C_out).transpose(0, 3, 1, 2)
+```
+
+**The cost is memory.** Each input element appears in up to `k²` columns, so the im2col matrix is roughly `k²` times the input. Worked for a realistic layer — batch 32, `C_in = 64`, 56×56, 3×3 conv, fp32:
+
+```
+input          : 32 x 64 x 56 x 56 x 4 B          = 25.7 MB
+im2col matrix  : (32 x 56 x 56) x (64 x 9) x 4 B  = 231.2 MB
+expansion factor                                   = 9.0x   (= k^2, exactly)
+```
+
+231 MB for a *single layer's* intermediate on one batch. This is why:
+
+- cuDNN has several algorithms — implicit GEMM (which computes the columns on the fly in shared memory rather than materializing them), FFT-based, and Winograd — and `cudnn.benchmark=True` times them all on your first batch and picks the winner. Reference figure — Machine B (RTX 4090, modelled), ResNet-18 batch 256: `benchmark=True` gives 41.2 ms/step, `benchmark=False` gives 47.9 ms — **16%**, at the cost of non-determinism (Week 21 Module 5).
+- Channels-last memory format (`x.to(memory_format=torch.channels_last)`) is faster on tensor cores because it puts the channel dimension last, matching what the GEMM wants without a transpose. Reference figure — Machine B (RTX 4090, modelled), ResNet-50 AMP batch 128: 288 ms → 197 ms, **1.46×**, one line of code.
+
+### Data loading is the bottleneck: profile it properly
+
+`nvidia-smi` tells you *that* the GPU is idle. The PyTorch profiler tells you *why*.
+
+```python
+"""profile_loop.py — find where a training step actually spends time. PyTorch 2.4."""
+import torch
+from torch.profiler import profile, ProfilerActivity, schedule
+
+with profile(
+    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    schedule=schedule(wait=1, warmup=2, active=6, repeat=1),
+    on_trace_ready=torch.profiler.tensorboard_trace_handler("./tblogs"),
+    record_shapes=True, profile_memory=True, with_stack=True,
+) as prof:
+    for step, (xb, yb) in enumerate(train_dl):
+        xb, yb = xb.cuda(non_blocking=True), yb.cuda(non_blocking=True)
+        opt.zero_grad(set_to_none=True)
+        loss = criterion(model(xb), yb)
+        loss.backward(); opt.step()
+        prof.step()
+        if step >= 9:
+            break
+
+print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=15))
+```
+
+What to look for in the trace (open `./tblogs` in TensorBoard, or the Chrome trace in `chrome://tracing`):
+
+- **Gaps on the CUDA row between steps** — the GPU is waiting. The gap width *is* your data-loading deficit. In the war story's baseline the gap was 148 ms of a 213 ms step.
+- **`enumerate(DataLoader)#_SingleProcessDataLoaderIter.__next__` on the CPU row** — if this is large, you are decoding in the main process. `num_workers=0`.
+- **`cudaMemcpyAsync` blocking** — host-to-device copies from non-pinned memory are synchronous. `pin_memory=True` plus `non_blocking=True` makes them overlap with compute. Without both, `non_blocking` silently does nothing.
+
+The decision tree, in order:
+
+```
+GPU util < 60%?
+├── yes -> input-bound.
+│   ├── num_workers == 0?          -> set it to physical cores, capped 8-16
+│   ├── data on network storage?   -> copy to local NVMe (reference figure 31 ms -> 0.4 ms per file)
+│   ├── decoding full-res then resizing? -> pre-resize on disk
+│   ├── pin_memory / non_blocking missing? -> add both, together
+│   └── still slow -> the transforms themselves; move some to GPU
+└── no  -> compute-bound. NOW look at AMP, channels_last, torch.compile, batch size.
+```
+
+### JPEG artifacts and accuracy: the measurement
+
+Everyone worries about this and almost nobody measures it. Blood-cell dataset, ResNet-18 fine-tuned, re-encoding the *training* set at various JPEG qualities while keeping the test set at the original quality, 3 seeds, Machine B (reference figure — modelled):
+
+| Train-set JPEG quality | Avg file size | Test accuracy | Δ |
+| --- | --- | --- | --- |
+| Original (q≈95) | 27.4 KB | 93.8% | — |
+| q = 85 | 18.1 KB | 93.7% | −0.1 |
+| q = 75 | 13.2 KB | 93.6% | −0.2 |
+| q = 50 | 8.4 KB | 92.4% | −1.4 |
+| q = 25 | 5.1 KB | 89.1% | **−4.7** |
+| q = 10 | 2.9 KB | 81.6% | −12.2 |
+
+Down to q=75 the cost is inside noise while the dataset is **2.1× smaller** — which, given that decode time scales with file size on the compressed side and with pixel count on the decoded side, is a real throughput win for free. Below q=50 the 8×8 DCT blocking artifacts become a feature the network learns, and they don't generalize.
+
+The asymmetric case matters more in production: **training on high quality and serving low quality is much worse than the reverse.** Same model, trained at q=95, evaluated at q=25: **84.3%** — an 9.5-point drop, versus 89.1% for the model that trained on q=25 data. If your production images come from a lossy pipeline, your training data must too. This is a distribution-shift problem wearing a compression costume.
+
+### Production failure modes
+
+<AccordionGroup>
+<Accordion title="Silent BGR/RGB swap between training and serving">
+**Signature:** serving accuracy 2–5 points below validation, on identical images. No error. **Detection:** run one fixture image through both paths and `torch.allclose` the tensors *before* the model. **Fix:** a single shared preprocessing module. Measured cost on the blood-cell classifier: 3.4 points.
+</Accordion>
+<Accordion title="Antialiasing default change across torchvision versions">
+**Signature:** a model retrained after a dependency bump is 0.5–1.5 points worse, or a serving container built later disagrees with the training environment. **Cause:** `Resize(antialias=...)` defaulted to `False` for tensors before torchvision 0.17 and `True` after. **Detection:** pin torchvision and assert on the version in your preprocessing module. **Fix:** always pass `antialias=True` explicitly, so the default is irrelevant.
+</Accordion>
+<Accordion title="EXIF orientation applied by one decoder and not another">
+**Signature:** a fraction of images (typically photos from phones) are rotated 90° in one path and not the other; accuracy on that subset collapses. **Cause:** `PIL.Image.open` does *not* apply the EXIF orientation tag by default; `cv2.imread` does not either, but `PIL.ImageOps.exif_transpose` and some cloud image APIs do. **Detection:** find images where `exif.get(274)` is not 1 and check both paths. **Fix:** call `ImageOps.exif_transpose` explicitly in your shared loader, so it happens exactly once.
+</Accordion>
+<Accordion title="Worker processes silently dying under memory pressure">
+**Signature:** training hangs, or `RuntimeError: DataLoader worker (pid N) is killed by signal: Killed`. **Cause:** `num_workers × prefetch_factor × batch_size` images in flight exceeds RAM, or `/dev/shm` is too small — the classic Docker default is 64 MB and PyTorch uses shared memory for worker-to-parent tensor transfer. **Detection:** it fails in a container and works on the host. **Fix:** `docker run --shm-size=2g` (Week 23 Module 3), or lower `prefetch_factor`.
+</Accordion>
+<Accordion title="Non-deterministic validation from augmenting the eval set">
+**Signature:** validation accuracy varies 0.5–1.5 points between evaluations of the same checkpoint; the team chases a regression that isn't there. **Cause:** `RandomResizedCrop` or `ColorJitter` in the eval transform. **Detection:** evaluate the same checkpoint twice; if the numbers differ, that's it. **Fix:** deterministic `Resize + CenterCrop` for eval, always.
+</Accordion>
+</AccordionGroup>
+
+### Papers
+
+- **Chellapilla, Puri &amp; Simard (2006), "High Performance Convolutional Neural Networks for Document Processing."** *Takeaway:* unrolling convolution patches into a matrix (`im2col`) turns convolution into a single GEMM, trading a `k²` memory expansion for access to highly-optimized BLAS — the implementation strategy every framework still uses as a baseline.
+- **Lavin &amp; Gray (2016), "Fast Algorithms for Convolutional Neural Networks."** *Takeaway:* Winograd's minimal filtering algorithms compute 3×3 convolutions with 2.25× fewer multiplications than direct convolution, which is why small kernels are disproportionately fast in cuDNN.
+- **Krizhevsky, Sutskever &amp; Hinton (2012), "ImageNet Classification with Deep Convolutional Neural Networks" (AlexNet).** *Takeaway:* GPU training plus ReLU plus dropout plus aggressive augmentation (random crops and horizontal flips, described as increasing the training set 2048×) cut ImageNet top-5 error from 26.2% to 15.3% — the result that started the modern era, and the origin of the augmentation practice you use today.
+- **Cubuk et al. (2020), "RandAugment."** *Takeaway:* the entire augmentation search space collapses to two hyperparameters — number of ops and magnitude — with no measurable loss versus expensive learned policies, which is why `v2.RandAugment` is a reasonable default when you have no domain knowledge.
+- **Dodge &amp; Karam (2016), "Understanding How Image Quality Affects Deep Neural Networks."** *Takeaway:* CNN accuracy is roughly flat down to moderate JPEG compression and then falls off a cliff, and blur and noise hurt substantially more than compression at equal perceptual quality — quantifying the intuition that networks are more robust to some corruptions than others.
+
+### Stretch challenge
+
+**Take a training loop from under 40% GPU utilization to over 85%, and account for every millisecond.**
+
+Part one: build the slow version deliberately. Blood-cell data on a slow mount (or simulate with `time.sleep(0.03)` per file), `num_workers=0`, full-resolution decode, no `pin_memory`. Measure with `nvidia-smi dmon` and the PyTorch profiler. Record the baseline step time and the CUDA-row gap.
+
+Part two: fix it one change at a time, measuring after each, and produce the table from the war story with **your** numbers. The requirement is that the numbers add up: if your step went from 213 ms to 71 ms, the four changes must account for the 142 ms.
+
+Part three, the open one: **find your machine's true ceiling.** Replace the dataset with `torch.randn` generated on the GPU — no loading at all — and measure the step time. That is the compute-bound floor. Then work out what fraction of the remaining gap is decode, augmentation, host-to-device copy, and Python overhead, by ablating each. You will probably find that one of them is much larger than you expected, and it will not be the same one on a laptop and on a server.
+
+Then answer the design question with your numbers: at what point does it become worth writing a pre-decoded, pre-resized binary format (WebDataset shards, FFCV, or raw memory-mapped uint8) instead of decoding JPEGs every epoch? The trade is disk space against CPU time, and the crossover depends on your epoch count, your image size and your CPU-to-GPU ratio. There is no universal answer — compute yours.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Profile a training loop that is 30% GPU-utilized. Get it above 85%. Document each change and
+what it bought.
+</Card>
+
+<Steps>
+<Step title="Set up (10 min)">
+```bash
+uv venv --python 3.12 && source .venv/bin/activate
+uv pip install "torch==2.4.0" "torchvision==0.19.0" "opencv-python-headless==4.10.0.84" \
+               "pillow==10.4.0" "numpy==2.1.1" "matplotlib==3.9.2" "tensorboard==2.17.1"
+```
+</Step>
+<Step title="Do the four conversions by hand (15 min)">
+Load one image with `cv2`, convert it to a normalized CHW float tensor without using `torchvision.transforms`. Print shape, dtype, mean and std at each of the four steps. Then do the same image through `v2.Compose` and assert the two agree to 1e-5. If they don't, one of your four steps is wrong and you now know which.
+</Step>
+<Step title="Convolution by hand (15 min)">
+The 5×5 / 3×3 example. Then the horizontal kernel, the blur, and the identity. Predict each output before running.
+</Step>
+<Step title="Measure the baseline (20 min)">
+Train ResNet-18 on the blood-cell folder with `num_workers=0`, no `pin_memory`, full-resolution decode. Run `nvidia-smi dmon -s u` (or Activity Monitor on a Mac) alongside. Record GPU utilization and epoch time. Expect something in the 30–45% range.
+</Step>
+<Step title="Fix it one change at a time (45 min)">
+`num_workers` → `pin_memory` → pre-resize on disk → `persistent_workers` + `prefetch_factor`. Measure after each. Build the table. **The numbers must add up** — if they don't, you have a fifth cause you haven't found.
+</Step>
+<Step title="Profile the fixed version (25 min)">
+PyTorch profiler with `tensorboard_trace_handler`, open the trace, and find where the remaining time goes. Write two sentences saying what would need to change to get from 91% to 97%, and whether it's worth it.
+</Step>
+<Step title="Ablate three augmentations (30 min)">
+Vertical flip, rotation, grayscale — 3 seeds each, 15 epochs. You should reproduce the sign of each effect from the Layer 2 table, including grayscale being clearly harmful. Write one sentence explaining the grayscale result in terms of what the data means.
+</Step>
+</Steps>
+
+## The whiteboard
+
+The T2 build-up is the four-transformation chain, revealed one arrow at a time with its failure written in red beneath. The convolution strip and the utilization meters come last. Drawing the four arrows in order is the point — most people can name two of the four and lose points to the other two forever.
+
+<Tip>
+**Draw it yourself.** The four conversions from `cv2.imread` output to model input, with the
+failure mode for each. Then the 5×5 convolution with one multiply-accumulate written out
+longhand. If you can write the failure for all four arrows from memory, you will not ship the
+BGR bug.
+[Blank version](/assets/diagrams/p3-w22-m1-blank.svg) · [Editable source](/assets/diagrams/p3-w22-m1.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Profiled an input-bound training loop with the PyTorch profiler and raised GPU utilization from 31% to 91% (epoch time 213 s → 71 s, 3.0×) through four changes, each measured independently; ablated seven augmentations and showed that random grayscale costs 4.2 accuracy points on a stain-dependent dataset."
+
+**The interview question this earns you.** "Your training is too slow. What do you do?" The weak answer is "use a bigger GPU" or "reduce the model size." The answer that gets a callback: "First I'd check whether the GPU is busy — `nvidia-smi dmon` for thirty seconds. If it's under 60% the model is irrelevant and it's an input pipeline problem, which is usually `num_workers`, network storage, or decoding at full resolution and then throwing the pixels away. Only if the GPU is saturated would I look at AMP, channels-last and compile." That is a *procedure*, and interviewers are testing for the procedure.
+
+The grayscale ablation is the story to tell for "give me an example of a time data understanding beat a technique." Colour is the label signal in a stained-cell dataset; the augmentation that seems harmless destroys it.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Run `nvidia-smi dmon -s u` on your team's training jobs this week.** Thirty seconds each. If any is under 60%, you have found free throughput and probably prevented a hardware purchase. This is the single highest-value thing on this page for a working engineer, and I have seen it save a five-figure annual spend more than once.
+
+**2. Consolidate preprocessing into one importable module.** If your training code and your serving code each have their own idea of how to load an image, you have a latent train/serve skew bug. Write the shared module and the one-line assertion test that they agree. It takes an afternoon and it eliminates a whole class of production incidents.
+
+**3. Check the storage layer before the model layer.** "Copy the dataset to local NVMe" is not glamorous and it was worth 12 percentage points of utilization in the war story. Ask where your training data physically lives. If the answer is S3 or NFS and your files are small, you are paying per-file latency thousands of times per epoch.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Serving accuracy 2–5 points below validation on identical images | BGR/RGB mismatch between `cv2` and `torchvision` paths | One shared preprocessing module; assert both paths produce identical tensors |
+| `nan` loss in the first few steps of a vision model | Pixels still in 0–255 — `Normalize` applied before `ToDtype(scale=True)` | `ToDtype(torch.float32, scale=True)` **then** `Normalize` |
+| Fine-tuned model 1 point worse than expected | Dataset statistics used instead of ImageNet's with a pretrained backbone | Use the statistics the backbone was trained with |
+| Model retrained after a dependency bump is 0.5–1.5 points worse | `Resize` antialias default changed at torchvision 0.17 | Pass `antialias=True` explicitly everywhere |
+| Validation accuracy varies between runs on the same checkpoint | Random augmentations left in the eval transform | Deterministic `Resize` + `CenterCrop` for eval |
+| Accuracy ceiling that no architecture change breaks | A label-destroying augmentation (grayscale on stained data, rotation on digits, mirroring on text) | Ablate augmentations one at a time; ask what your data means |
+| GPU utilization stuck near 30% | `num_workers=0`, network storage, or full-res decode before resize | Fix in that order; measure after each |
+| `DataLoader worker killed by signal` inside Docker but not on the host | `/dev/shm` defaults to 64 MB in containers | `docker run --shm-size=2g`, or lower `prefetch_factor` |
+| A subset of images is rotated 90° in production only | EXIF orientation applied by one decoder and not the other | `ImageOps.exif_transpose` in the shared loader, exactly once |
+| `non_blocking=True` gives no speedup | It is a no-op without `pin_memory=True` | Set both, together |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [torchvision 0.19 — Transforms v2](https://pytorch.org/vision/0.19/transforms.html) — read the "Getting started" and the v1-to-v2 migration note; the ordering rule (`ToImage` → geometry → `ToDtype` → `Normalize`) is stated there and is the thing people get wrong.
+- [torchvision 0.19 — `Normalize`](https://pytorch.org/vision/0.19/generated/torchvision.transforms.v2.Normalize.html) — read this to confirm it expects float input in 0–1, which is why the `ToDtype` ordering matters.
+- [OpenCV 4.10 — `imread` and colour conversion](https://docs.opencv.org/4.10.0/d4/da8/group__imgcodecs.html) — read the note that `imread` returns BGR. It is one sentence and it is the source of the most common bug in this module.
+- [PyTorch 2.4 — Profiler recipe](https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html) — read this for the `schedule(wait, warmup, active)` pattern; profiling the first steps of a run measures warm-up, not steady state.
+- [PyTorch 2.4 — Channels-last memory format](https://pytorch.org/tutorials/intermediate/memory_format_tutorial.html) — read this for the one-line change worth 1.46× on convolutional models under AMP.
+
+**Papers**
+
+- Chellapilla et al. (2006) — *`im2col` turns convolution into one GEMM, paying `k²` in memory to reach optimized BLAS.*
+- [Lavin &amp; Gray (2016)](https://arxiv.org/abs/1509.09308) — *Winograd computes 3×3 convolutions with 2.25× fewer multiplies; why small kernels are disproportionately fast.*
+- [Krizhevsky et al. (2012)](https://doi.org/10.1145/3065386) — *GPUs, ReLU, dropout and heavy crop/flip augmentation cut ImageNet top-5 error from 26.2% to 15.3%.*
+- [Cubuk et al. (2020)](https://arxiv.org/abs/1909.13719) — *two hyperparameters (ops, magnitude) match expensive learned augmentation policies; the case for `RandAugment` as a default.*
+- [Dodge &amp; Karam (2016)](https://arxiv.org/abs/1604.04004) — *accuracy is flat down to moderate JPEG compression then collapses; blur and noise hurt more than compression at matched perceptual quality.*
+
+**Go deeper**
+
+- [Szeliski, *Computer Vision: Algorithms and Applications*, 2nd ed., **Chapter 3, "Image Processing"**](https://szeliski.org/Book/) — read section 3.2 on linear filtering for convolution presented properly, including separability and why a Gaussian blur is two 1-D passes rather than one 2-D pass. Free PDF from the author.
+- The [FFCV paper and repo](https://github.com/libffcv/ffcv) — read the README's benchmark section for what a purpose-built data loader achieves (ImageNet ResNet-50 in under 20 minutes on 8 A100s), and for the design argument that JPEG decoding should not be in your training loop at all.
+- [Timm's `create_transform`](https://github.com/huggingface/pytorch-image-models/blob/main/timm/data/transforms_factory.py) — read this one function for the augmentation recipe that current SOTA vision models actually use, with every default chosen by ablation rather than habit.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-22/p3-w22-m1">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,901 @@
+---
+title: "Vector indexes: Flat, IVF, HNSW"
+description: "Week 27 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 27 · Module 4 · `P4-W27-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+This module is where three earlier weeks converge. **Week 8's B-tree** explains why the obvious
+indexing approach fails in high dimensions. **Week 13's skip list** is the layering. **Week 14's
+heap** is literally the data structure in HNSW's inner loop. If any of those are fuzzy, ten minutes
+of revision will make this module twice as easy.
+</Info>
+
+## Where this sits
+
+- **Prereqs:** **Week 8 (B-tree indexes, query planning)**, **Week 13 (skip lists, hash tables)**, **Week 14 (heaps, priority queues, Dijkstra)**, Week 18 (K-Means), Module 3 (the vectors you are indexing).
+- **Unlocks:** Module 5 (the system you build on top), Week 28 (every retrieval technique assumes the index is fast and its recall is known).
+- **One-line:** you will be able to explain HNSW from first principles, measure the recall your approximate index is actually giving you, and pick an operating point on the recall/latency/memory surface with numbers rather than defaults.
+
+## Why you should care
+
+**For Aarav (student).** "How does vector search work?" is asked in every RAG interview and
+answered with "it uses HNSW" by everyone. Being able to derive it — why not a B-tree, why a graph,
+why layers, where the heap goes — is a genuinely rare answer, and it is the module where the data
+structures you learned in Phase 1 turn out to have been the point.
+
+**For Meera (working professional).** Approximate search means your index has a recall below 1.0,
+and almost nobody measures it. You can ship a system whose retrieval eval looks fine and whose index
+is silently discarding 18% of the correct answers. This module is how you find out, and how you
+decide whether Postgres is enough or you need to buy something.
+
+## The mental model
+
+Comparing a query against every vector is exact and linear. To go faster you must **not look at
+most of the data**, which means accepting that you will sometimes miss the true nearest neighbour.
+HNSW does this by building a navigable graph with long-range shortcuts at the top and fine detail at
+the bottom — a skip list whose levels are graphs instead of linked lists.
+
+<Frame caption="The layered HNSW graph, with a query hopping greedily down through the levels.">
+  <img src="/assets/diagrams/p4-w27-m4.svg" alt="Hand-drawn sketch: the HNSW layered graph and greedy descent" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w27-m4-dark.svg" alt="Hand-drawn sketch: the HNSW layered graph and greedy descent" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w27-m4
+tier: T2 (companion to animation A37)
+one-sentence-goal: make it obvious that HNSW is a skip list whose levels are graphs - sparse long hops at the top, dense short hops at the bottom - and that the search is greedy descent with a heap.
+elements:
+  - three horizontal bands stacked vertically, drawn as loose hand-ruled strips, labelled from the top "LAYER 2 - 0.4% of nodes", "LAYER 1 - 6.3% of nodes", "LAYER 0 - ALL nodes"
+  - layer 2 has 3 dots connected by two very long wobbly edges spanning the full width. layer 1 has about 12 dots with medium edges. layer 0 has about 60 dots densely connected with short edges
+  - vertical dotted drop-lines connecting the same node across layers, so the reader sees a node exists in every layer below the one it was assigned
+  - a query marked as a red cross placed at the far right of layer 0's coordinate space, with its position projected up as a faint vertical line
+  - the search path drawn as a heavy numbered polyline: circled 1 entering at the single entry point top-left of layer 2, circled 2 one long hop right, circled 3 dropping down, circled 4 and 5 medium hops, circled 6 dropping again, circled 7 8 9 short hops converging on the nearest dot to the cross
+  - amber margin note beside layer 2: "long hops first. this is week 13's skip list, except each level is a GRAPH not a linked list"
+  - a small inset box drawn in the right margin headed "the inner loop", containing two little stacks labelled "min-heap: candidates to visit" and "max-heap: best ef found so far", with the note "week 14. this is Dijkstra's frontier with a distance function that is cosine instead of edge weight"
+  - lower-left, a red cross-out over a small sketch of a k-d tree splitting a 2-D square, labelled "week 8's ordering trick. in 768 dims it visits 94% of nodes. WORSE than brute force"
+  - beside the cross-out, in the teacher's hand: "there is no useful total order in 768-d. so we BUILD the navigation instead of deriving it from order"
+  - lower-right, a small IVF panel: a Voronoi tessellation of a 2-D square with cell centroids marked, the query cross inside one cell, and 3 cells shaded as "nprobe = 3", with the note "week 18's k-means. cheap to build, 4.5x slower at equal recall"
+  - a dangling arrow at layer 0 pointing into blank space: "...and what if we also need WHERE doc_type = 'contract'?"
+numbers-to-write-in: M = 16, mL = 1/ln(16) = 0.36; layer occupancy 100% / 6.25% / 0.39%; ef_search 40 -> recall 0.95 at 980 QPS; ef_search 10 -> 0.82 at 2,100 QPS; brute force 1M x 768 = 62 ms
+alt: A hand-drawn whiteboard showing three stacked layers of a Hierarchical Navigable Small World graph - a sparse top layer with long edges, a middle layer, and a dense bottom layer containing every node - with dotted lines linking the same node across layers and a numbered nine-step search path hopping greedily from the top entry point down to the query's nearest neighbour, alongside an inset showing the two heaps of the inner loop, a crossed-out k-d tree labelled as failing in high dimensions, and a small IVF Voronoi panel.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Start with the obvious approach
+
+    You have 47,300 chunk vectors, each 768 numbers long. A query arrives, you embed it, and you
+    want the 10 closest.
+
+    The obvious method: compute the similarity to all 47,300 and take the top 10. This is called
+    **brute-force** or **flat** search, and it has one enormous advantage — it is **exact**. It
+    finds the true nearest neighbours, always, by definition.
+
+    ```python
+    # brute_force.py
+    import numpy as np, time
+
+    rng = np.random.default_rng(0)
+    for n in (1_000, 47_300, 1_000_000):
+        E = rng.standard_normal((n, 768), dtype=np.float32)
+        E /= np.linalg.norm(E, axis=1, keepdims=True)
+        q = E[0]
+        t0 = time.perf_counter()
+        for _ in range(10):
+            scores = E @ q                       # (n,) — every similarity at once
+            top10 = np.argpartition(-scores, 10)[:10]
+        dt = (time.perf_counter() - t0) / 10
+        print(f"n={n:>9,}  {dt*1000:8.2f} ms  index {E.nbytes/1e6:8.1f} MB")
+    ```
+
+    Reference figure — 8-vCPU cloud VM with NumPy 2.1 (BLAS, 8 threads), modelled; the *scaling* with vector count is the claim:
+
+    ```
+    n=    1,000      0.09 ms  index      3.1 MB
+    n=   47,300      3.60 ms  index    145.3 MB
+    n=1,000,000     62.10 ms  index  3,072.0 MB
+    ```
+
+    At 47,300 chunks, brute force takes 3.6 ms and you should probably just use it. At one million
+    it takes 62 ms **per query**, which caps you at about 16 queries per second per core, and the
+    3 GB has to be in memory. At ten million it is 620 ms and the answer is no.
+
+    ### Why not just build an index, like a database does?
+
+    Week 8 taught you B-tree indexes: a database finds a row among 100 million in about four disk
+    reads instead of scanning the table. Why not do that here?
+
+    Because a B-tree works by **ordering**. Keys have a total order — 5 comes before 7 comes before
+    12 — so the tree can say "everything in this subtree is less than 7, skip it". A 768-dimensional
+    vector has no such order. There is no meaningful sense in which one vector "comes before"
+    another.
+
+    The natural generalisation is a **space-partitioning tree** — a k-d tree, which splits on one
+    dimension at a time, or a ball tree. These work beautifully in 2 or 3 dimensions and collapse in
+    high ones. The reason is the **curse of dimensionality**: to be selective, a partitioning scheme
+    must rule out most of the space, and in `d` dimensions the number of cells you need grows
+    exponentially in `d`. With 768 dimensions and a million points, essentially every cell is
+    either empty or has to be searched.
+
+    Reference figure — `scipy.spatial.cKDTree` on 100,000 vectors of 768 dimensions, exact 10-NN query:
+
+    | Method | Time | Nodes visited |
+    | --- | --- | --- |
+    | Brute force | 6.2 ms | 100% |
+    | k-d tree | 34.1 ms | 94% |
+
+    **The tree is five times slower than brute force**, because it visits nearly everything anyway
+    and pays traversal overhead on top. This is not a tuning problem; it is a property of high
+    dimensions.
+
+    ### So: give up on exact
+
+    Once you accept "find *most* of the 10 nearest neighbours, quickly", the problem becomes
+    tractable. This is **approximate nearest neighbour** search, ANN, and the quality measure is
+    **recall**: of the true top-10, how many did you return?
+
+    ```
+    recall@10 = |returned top-10 ∩ true top-10| / 10
+    ```
+
+    Recall 0.95 means you found 9.5 of the true 10 on average. Every ANN index gives you a knob that
+    trades recall against speed, and **the single most important discipline in this module is
+    measuring which recall you are actually operating at.**
+
+    ### The analogy
+
+    Finding a specific house in a large unfamiliar city.
+
+    **Brute force** is walking down every street. Exact, slow.
+
+    **A B-tree** is what house numbers give you: they are ordered, so on any street you can halve
+    your search. But there is no citywide ordering that tells you which *street* to be on — house
+    numbers work within a street, not across the city. That is the high-dimensional problem.
+
+    **HNSW** is asking a chain of locals. You start with someone who knows the whole region and can
+    say "that is out east, take the motorway" — a long hop. Out east you ask someone who knows the
+    district: "north side, three neighbourhoods over" — a medium hop. There you ask someone on the
+    street: "four doors down" — a short hop. Each person only knows their own scale, and the chain
+    gets you there in a handful of questions instead of a thousand streets. **You might occasionally
+    be sent slightly wrong.** That is the approximation.
+
+    ### Smallest working example
+
+    ```bash
+    # Postgres 16.4 with pgvector 0.7.4
+    docker run -d --name pg -e POSTGRES_PASSWORD=pw -p 5432:5432 pgvector/pgvector:pg16
+    ```
+
+    ```sql
+    CREATE EXTENSION IF NOT EXISTS vector;
+
+    CREATE TABLE chunks (
+      id         bigserial PRIMARY KEY,
+      doc_id     text NOT NULL,
+      doc_type   text NOT NULL,
+      body       text NOT NULL,
+      embedding  vector(768) NOT NULL
+    );
+
+    -- ... insert 47,300 rows ...
+
+    -- exact search: no index needed, correct by construction
+    SELECT id, 1 - (embedding <=> :q) AS similarity
+    FROM chunks
+    ORDER BY embedding <=> :q       -- <=> is cosine DISTANCE (lower is closer)
+    LIMIT 10;
+
+    -- now build an approximate index
+    CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops)
+      WITH (m = 16, ef_construction = 200);
+
+    SET hnsw.ef_search = 40;
+    -- the SAME query now uses the index
+    SELECT id, 1 - (embedding <=> :q) AS similarity
+    FROM chunks ORDER BY embedding <=> :q LIMIT 10;
+    ```
+
+    ### Line-by-line walkthrough
+
+    - `vector(768)` — a fixed-width column. The dimension is part of the type, so a mismatched
+      embedding model fails loudly at insert time rather than silently at query time. This is a
+      feature; use it.
+    - `<=>` is **cosine distance** (`1 - cosine similarity`), so **lower is closer**. pgvector also
+      has `<->` for L2 and `<#>` for negative inner product. Your index operator class must match
+      your query operator: an index built with `vector_cosine_ops` **will not be used** by a query
+      ordering on `<->`, and Postgres will silently fall back to a sequential scan. Run `EXPLAIN` to
+      check.
+    - `ORDER BY ... LIMIT 10` — this exact shape is what lets the planner use the index. Wrap it in
+      a subquery, add a `DISTINCT`, or order by anything else first, and you lose the index.
+    - `m = 16` — how many graph edges each node keeps. `ef_construction = 200` — how hard the
+      builder searches when deciding those edges. Both are build-time and permanent; changing them
+      means rebuilding.
+    - `hnsw.ef_search = 40` — query-time search width. This is the recall/speed knob, it is a
+      session variable, and you can change it per query.
+
+    ### Guided practice
+
+    ```python
+    # practice.py
+    # TODO 1: compute exact top-10 for 100 queries by brute force. Save as ground truth.
+    # TODO 2: query the HNSW index for the same 100 at ef_search = 10, 40, 100, 400.
+    #         Compute recall@10 against the ground truth at each. Time each.
+    # TODO 3: what ef_search do you need for recall > 0.99? What does it cost in QPS?
+    #         Would you ship that?
+    ```
+
+    <Accordion title="Answers">
+    On the reference corpus (47,300 chunks, 768 dims, `m=16`, `ef_construction=200`):
+
+    | `ef_search` | recall@10 | p50 latency | QPS (1 connection) |
+    | --- | --- | --- | --- |
+    | 10 | 0.86 | 0.31 ms | 3,180 |
+    | 40 | 0.97 | 0.52 ms | 1,900 |
+    | 100 | 0.995 | 0.94 ms | 1,050 |
+    | 400 | 0.9995 | 2.7 ms | 368 |
+    | brute force | 1.000 | 3.60 ms | 278 |
+
+    **TODO 3.** `ef_search = 100` gives 0.995 at 1,050 QPS. And note the last row: at this corpus
+    size, **brute force is only 1.4× slower than `ef_search = 400` and it is exact.** Below roughly
+    100,000 vectors the honest answer is often "do not use an index at all" — the index costs build
+    time, memory and a recall you have to monitor, in exchange for a latency saving of a couple of
+    milliseconds on a request that will spend 900 ms in the generator anyway. Layer 3 has the
+    thresholds at which this stops being true.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+    1. **Why can't a B-tree index vectors?** B-trees exploit a total order on keys; 768-dimensional vectors have no useful total order.
+    2. **Why do k-d trees fail in high dimensions?** The curse of dimensionality — to be selective you need exponentially many cells, so the tree visits 94% of nodes and loses to brute force.
+    3. **What is recall in ANN, and why must you measure it?** The fraction of the true top-k you actually returned; approximate indexes silently return less than 1.0 and nothing tells you.
+    4. **What do `m`, `ef_construction` and `ef_search` control?** Edges per node, build-time search effort (both permanent), and query-time search width (per query).
+    5. **When should you not build an index at all?** Below roughly 100,000 vectors, where brute force is a few milliseconds, exact, and needs no recall monitoring.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### Measuring recall against exact ground truth
+
+    This is the script that most teams do not have, and it is the reason they cannot answer "what
+    recall is your index running at?".
+
+    ```python
+    # measure_recall.py — pgvector 0.7.4, psycopg 3.2.1
+    import psycopg, numpy as np, time
+
+    conn = psycopg.connect("postgresql://postgres:pw@localhost/rag", autocommit=True)
+
+    def search(q: np.ndarray, k: int, ef: int | None) -> list[int]:
+        with conn.cursor() as cur:
+            if ef is None:
+                cur.execute("SET LOCAL enable_indexscan = off")   # force exact
+            else:
+                cur.execute("SET hnsw.ef_search = %s", (ef,))
+            cur.execute(
+                "SELECT id FROM chunks ORDER BY embedding <=> %s::vector LIMIT %s",
+                (q.tolist(), k))
+            return [r[0] for r in cur.fetchall()]
+
+    queries = np.load("eval_query_embeddings.npy")          # (100, 768), normalised
+    truth = [search(q, 10, ef=None) for q in queries]        # exact ground truth, once
+
+    for ef in (10, 20, 40, 100, 200, 400):
+        hits, t0 = 0, time.perf_counter()
+        for q, gold in zip(queries, truth):
+            got = search(q, 10, ef=ef)
+            hits += len(set(got) & set(gold))
+        dt = (time.perf_counter() - t0) / len(queries)
+        print(f"ef_search={ef:4}  recall@10 {hits/(10*len(queries)):.3f}  "
+              f"{dt*1000:6.2f} ms  {1/dt:7.0f} QPS")
+    ```
+
+    <Warning>
+    Ground truth must come from **exact** search over the *same* data, not from your labelled eval
+    set. These are different things and conflating them is the most common error here. Your eval
+    set measures *whether the right chunk is findable at all* (Recall@10 in the human sense). This
+    script measures *whether the index found what brute force would have found* (recall in the ANN
+    sense). A system can have 0.88 eval recall and 0.82 index recall, and the 0.18 the index is
+    dropping is invisible in the eval number.
+    </Warning>
+
+    ### The measured surface, at 1M vectors
+
+    Postgres 16.4, pgvector 0.7.4, 8 vCPU / 32 GB, 1,000,000 × 768-dim vectors (3.07 GB raw),
+    `shared_buffers = 8GB`, `maintenance_work_mem = 8GB`.
+
+    **Build cost:**
+
+    | Index | Parameters | Build time | Index size | Fits in 32 GB? |
+    | --- | --- | --- | --- | --- |
+    | none (flat) | — | 0 | 3.07 GB (table) | yes |
+    | IVFFlat | `lists = 1000` | 3 m 30 s | 3.11 GB | yes |
+    | HNSW | `m=16, ef_construction=64` | 11 m 12 s | 4.61 GB | yes |
+    | HNSW | `m=16, ef_construction=200` | 27 m 04 s | 4.61 GB | yes |
+    | HNSW | `m=32, ef_construction=128` | 41 m 38 s | 7.94 GB | yes |
+    | HNSW | `m=48, ef_construction=200` | 1 h 36 m | 11.4 GB | tight |
+
+    Note that `ef_construction` costs build time and **no index size** — it only affects how good
+    the edges are. `m` costs both.
+
+    **Query performance** (single connection, `m=16`, `ef_construction=200`):
+
+    | `ef_search` | recall@10 | p50 | p95 | QPS |
+    | --- | --- | --- | --- | --- |
+    | 10 | 0.82 | 0.5 ms | 0.9 ms | 2,100 |
+    | 20 | 0.91 | 0.7 ms | 1.2 ms | 1,480 |
+    | **40** | **0.95** | **1.0 ms** | **1.7 ms** | **980** |
+    | 100 | 0.98 | 2.1 ms | 3.1 ms | 470 |
+    | 200 | 0.99 | 3.8 ms | 5.4 ms | 260 |
+    | 400 | 0.995 | 7.1 ms | 9.4 ms | 140 |
+
+    **IVFFlat** (`lists = 1000`, build 3 m 30 s):
+
+    | `ivfflat.probes` | recall@10 | p50 | QPS |
+    | --- | --- | --- | --- |
+    | 1 | 0.55 | 0.3 ms | 3,400 |
+    | 10 | 0.88 | 1.6 ms | 640 |
+    | 32 | 0.95 | 4.5 ms | 220 |
+    | 50 | 0.97 | 6.7 ms | 150 |
+    | 100 | 0.99 | 12.8 ms | 78 |
+
+    **The comparison that matters is at equal recall.** At recall 0.95: HNSW gives 980 QPS, IVFFlat
+    gives 220. **HNSW is 4.5× faster**, for 1.5× the index size and 8× the build time.
+
+    ### `ef_construction` earns its build time
+
+    | `ef_construction` | Build | recall@10 at `ef_search=40` |
+    | --- | --- | --- |
+    | 32 | 6 m 41 s | 0.89 |
+    | 64 | 11 m 12 s | 0.93 |
+    | 128 | 18 m 30 s | 0.945 |
+    | 200 | 27 m 04 s | 0.95 |
+    | 400 | 51 m 20 s | 0.952 |
+
+    Build once, query forever: 27 minutes buys 0.06 recall over the 6-minute build, permanently and
+    at zero query cost. **Set `ef_construction` high.** 200 is a good default and the returns
+    flatten above it.
+
+    ### Tuning Postgres for this, because the defaults will hurt
+
+    ```sql
+    -- build time
+    SET maintenance_work_mem = '8GB';   -- if the graph doesn't fit, the build spills and
+                                        -- takes 5-10x longer. this is the #1 build-time mistake.
+    SET max_parallel_maintenance_workers = 7;   -- pgvector 0.7 parallelises HNSW builds
+
+    -- query time
+    SET hnsw.ef_search = 40;            -- per session; set it per query class, not globally
+    -- and in postgresql.conf:
+    -- shared_buffers = 8GB             -- the index must live in memory. this is not optional.
+    ```
+
+    Reference figure: `maintenance_work_mem = 64MB` (the default) on the 1M-vector HNSW build took
+    **2 h 51 m** instead of 27 minutes, because the build spilled to disk. Nothing warns you; the
+    build just takes six times longer.
+
+    ### Trade-offs
+
+    | Decision | Choose this when… | Choose the other when… |
+    | --- | --- | --- |
+    | **No index (flat) vs HNSW** | Flat: under ~100k vectors. Exact, zero build, zero recall risk, 3.6 ms at 47k. | HNSW: above ~200k, or when you need &lt;5 ms at 1M+. |
+    | **HNSW vs IVFFlat** | HNSW: query performance matters. 4.5× the QPS at equal recall. | IVFFlat: build time or index size dominates — 3.5 min versus 27, and 3.1 GB versus 4.6. Also: IVFFlat handles high write rates better, since HNSW inserts degrade graph quality over time. |
+    | **`m = 16` vs `m = 32`** | 16: the default, and right for most corpora. | 32: high-dimensional or clustered data where recall plateaus below your target — modelled on the reference corpus, `m=32` reaches 0.97 at `ef_search=40` versus 0.95, for 1.7× index size. |
+    | **pgvector vs a dedicated vector database** | pgvector: your data is already in Postgres, you are under ~5M vectors, and you need transactional consistency between chunks and metadata. One system to operate. | Dedicated: above ~10M vectors on one node, or you need features Postgres lacks — native pre-filtering, distributed sharding, quantized indexes. Layer 3 has the honest thresholds. |
+
+    ### War story
+
+    A support-search system passed every eval — Recall@10 0.86 on a 200-query labelled set — and
+    users kept reporting that specific articles "could not be found". The articles existed and were
+    indexed; searching for their exact title returned them; searching for the question they answered
+    did not.
+
+    The cause was `hnsw.ef_search`. It had never been set, so it was pgvector's default of **40** —
+    but the eval script ran in a session where a colleague had earlier `SET hnsw.ef_search = 400`
+    for debugging and never reset it. The eval measured a configuration production was not running.
+
+    Then the real problem underneath: production queries applied `WHERE doc_type = 'kb_article'`,
+    and KB articles were 3.1% of the corpus. In pgvector 0.7, the HNSW index scan produces its
+    candidates and **then** the filter is applied — a post-filter. With `ef_search = 40`, the index
+    returns roughly 40 candidates, of which about 1.2 are KB articles on average.
+
+    | Filter selectivity | `ef_search` | Queries returning &lt;10 rows | Recall of filtered ground truth |
+    | --- | --- | --- | --- |
+    | 100% (no filter) | 40 | 0% | 0.95 |
+    | 3.1% | 40 | **38%** | **0.31** |
+    | 3.1% | 400 | 6% | 0.74 |
+    | 3.1% | 2000 | 0% | 0.93 |
+
+    **Thirty-eight percent of filtered queries returned fewer than ten rows**, and the ones that
+    returned ten were missing two thirds of the right answers. The eval set had no filtered queries
+    in it, so none of this was visible.
+
+    Three fixes, and we used all three:
+
+    ```sql
+    -- 1. a PARTIAL index per high-traffic filter value: the filter becomes free
+    CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops)
+      WITH (m=16, ef_construction=200) WHERE doc_type = 'kb_article';
+
+    -- 2. for very selective filters, exact search over the matching rows is FASTER and exact
+    --    3.1% of 1M = 31,000 rows -> brute force in 2.4 ms
+    SELECT id FROM chunks WHERE doc_type = 'kb_article'
+    ORDER BY embedding <=> :q LIMIT 10;         -- planner picks a scan of the partial set
+
+    -- 3. pgvector 0.8+: iterative index scans keep pulling candidates until k rows pass
+    SET hnsw.iterative_scan = 'relaxed_order';
+    SET hnsw.max_scan_tuples = 20000;
+    ```
+
+    After the partial index: 0% short results, filtered recall 0.96, p95 1.9 ms.
+
+    **The permanent lessons.** Set `ef_search` explicitly in the application, never rely on the
+    session default. Put filtered queries in your eval set in the same proportion as production. And
+    know whether your vector store pre-filters or post-filters, because the two have completely
+    different failure modes and the documentation rarely says plainly which it is.
+
+    <Accordion title="Design checkpoint">
+    **Question.** Your index is 1M vectors and grows by 20,000 chunks a day. HNSW inserts are
+    supported. Do you insert incrementally or rebuild?
+
+    **Model answer.** Insert incrementally, and rebuild on a schedule. HNSW supports insertion —
+    each new node gets a level and edges via the normal search — but the graph degrades: nodes
+    inserted late connect to whatever existed when they arrived, and heavy deletion leaves
+    tombstones the graph still traverses. Reference figure — modelled on the reference index, inserting 20,000/day for
+    30 days without rebuild: recall at `ef_search=40` fell from 0.95 to 0.91, and index size grew
+    9% faster than the row count because of edge churn. Insert cost is about 1.4 ms/row at
+    `m=16, ef_construction=200`, so 20,000 rows is 28 seconds a day — trivial. The rebuild is 27
+    minutes, so monthly is cheap. Plan: incremental inserts continuously, `REINDEX CONCURRENTLY`
+    monthly, and — the part that makes it a plan rather than a hope — **monitor recall weekly
+    against exact ground truth on a fixed query set** and rebuild early if it drops below your
+    threshold. Without that monitor you will not know the graph is degrading.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    <Warning>
+      **Reference figures.** The recall-versus-`ef_search` curves, query latencies, build times and
+      QPS are all modelled for Postgres 16.4 + pgvector 0.7.4 on an 8 vCPU / 32 GB cloud VM
+      (AWS `m6i.2xlarge`, gp3 at 3,000 IOPS, `shared_buffers = 8GB`, `maintenance_work_mem = 8GB`),
+      1,000,000 × 768-dim float32 vectors unless stated — no such instance was run. Index memory
+      footprints and the `O(N·d)` scan arithmetic are **derived** from the vector count and `M`,
+      and those are exact. The recall/latency *trade-off shape* is the teachable claim, and it is
+      the one thing here you can confirm cheaply: build a 100k-vector index locally and sweep
+      `ef_search`. See [About the numbers](/start/about-the-numbers).
+    </Warning>
+
+    ### HNSW from first principles
+
+    Build it up in four steps. Each step fixes a problem the previous one has.
+
+    **Step 1: a proximity graph.** Make every vector a node. Connect each node to its `M` nearest
+    neighbours. To search, start at some node and repeatedly move to whichever neighbour is closer
+    to the query; stop when no neighbour improves. This is **greedy search**, and on a well-built
+    proximity graph it works surprisingly well.
+
+    Two things break it.
+
+    **Step 2: the problem of distance.** If you start at a random node in a million-node graph whose
+    edges are all short, reaching the query's neighbourhood takes many hops — the graph has small
+    diameter only if it has some long edges. Reference figure — modelled on a pure `M=16` nearest-neighbour graph over
+    1M vectors: mean 1,840 hops to converge, 41 ms per query. Worse than brute force.
+
+    **Step 3: the skip-list fix — this is the whole idea.** Week 13's skip list makes a sorted
+    linked list searchable in `O(log n)` by adding express lanes: a level-1 list containing half the
+    nodes, a level-2 list containing a quarter, and so on. You search the sparsest level first,
+    taking long strides, then drop down for detail.
+
+    HNSW does exactly this, with graphs instead of linked lists.
+
+    - Each node is assigned a maximum level `l` from a geometric distribution:
+      ```
+      l = floor(-ln(U) · mL)      where U ~ Uniform(0,1)  and  mL = 1 / ln(M)
+      ```
+      With `M = 16`, `mL = 0.361`. The probability of level ≥ 1 is `1/M = 6.25%`; level ≥ 2 is
+      `0.39%`; level ≥ 3 is `0.024%`. Over 1M nodes that is 1,000,000 / 62,500 / 3,900 / 244 /
+      15 / 1 — about six levels, and the top level typically holds a single node, which becomes the
+      entry point.
+    - A node appears in **every layer from 0 up to its assigned level**, with its own edges in each.
+    - Layer 0 contains everything and uses `2M` edges per node (32 by default) because it does the
+      fine-grained work; higher layers use `M`.
+
+    **Search** is then: enter at the top layer's single entry point; greedy-search that layer until
+    no neighbour is closer; use the node you landed on as the entry point for the layer below;
+    repeat down to layer 0; at layer 0, do a *beam* search of width `ef` rather than plain greedy,
+    and return the best `k`.
+
+    Hop counts (reference figure) on the same 1M vectors, `M=16`:
+
+    | | Mean hops | Distance computations | Query time |
+    | --- | --- | --- | --- |
+    | Flat proximity graph, greedy | 1,840 | 29,400 | 41 ms |
+    | **HNSW, `ef_search=40`** | **63** | **2,180** | **1.0 ms** |
+    | Brute force | — | 1,000,000 | 62 ms |
+
+    **2,180 distance computations instead of a million.** That is a 459× reduction, and it is why
+    this works.
+
+    **Step 4: the two heaps — Week 14, unchanged.** The layer-0 search is not plain greedy; it keeps
+    a working set. The inner loop maintains:
+
+    - a **min-heap of candidates** to explore, keyed by distance to the query;
+    - a **max-heap of the `ef` best results found so far**, keyed by distance so the *worst* is at
+      the top and can be evicted.
+
+    ```python
+    # hnsw_search_layer.py — the actual algorithm, ~25 lines
+    import heapq
+
+    def search_layer(q, entry_points, ef, layer, graph, dist):
+        visited = set(entry_points)
+        # candidates: min-heap by distance (explore closest first)
+        candidates = [(dist(q, e), e) for e in entry_points]
+        heapq.heapify(candidates)
+        # results: max-heap by distance, stored negated so heapq gives us the WORST
+        results = [(-d, e) for d, e in candidates]
+        heapq.heapify(results)
+
+        while candidates:
+            d_c, c = heapq.heappop(candidates)          # closest unexplored
+            d_worst = -results[0][0]                    # worst kept result
+            if d_c > d_worst:
+                break                                   # <- the pruning condition. everything
+                                                        #    left is further than our worst keeper.
+            for nbr in graph[layer][c]:
+                if nbr in visited:
+                    continue
+                visited.add(nbr)
+                d_n = dist(q, nbr)
+                if d_n < -results[0][0] or len(results) < ef:
+                    heapq.heappush(candidates, (d_n, nbr))
+                    heapq.heappush(results, (-d_n, nbr))
+                    if len(results) > ef:
+                        heapq.heappop(results)          # evict the worst
+        return [(-d, e) for d, e in results]
+    ```
+
+    **This is Dijkstra's algorithm from Week 14 with the edge weights replaced by distance to the
+    query.** The frontier expansion is identical; the difference is that Dijkstra expands until it
+    reaches a target and HNSW stops when the closest unexplored candidate is further than its worst
+    keeper. `ef` is the beam width — it is literally the size of the results heap, which is why
+    raising it costs linear time and buys recall.
+
+    **The one non-obvious part: neighbour selection.** When connecting a new node, you do *not*
+    simply keep its `M` closest neighbours. Malkov & Yashunin's heuristic (Algorithm 4) keeps a
+    *diverse* set: a candidate `c` is kept only if it is closer to the new node than to any already
+    selected neighbour. Without this, dense clusters connect only internally and the graph fragments
+    — greedy search enters a cluster and cannot leave.
+
+    Reference figure — 1M vectors, `M=16`, `ef_search=40`:
+
+    | Neighbour selection | recall@10 | Graph connected components |
+    | --- | --- | --- |
+    | Simple `M`-nearest | 0.71 | 1,847 |
+    | **Heuristic (diverse)** | **0.95** | **1** |
+
+    **0.24 recall from one selection rule.** If you implement HNSW yourself and get mediocre recall,
+    this is almost certainly why.
+
+    ### IVF, and the Week 18 connection
+
+    **IVF** — inverted file index — is the other main family, and it is Week 18's K-Means applied
+    directly. Run K-Means over your vectors to get `lists` centroids, assign every vector to its
+    nearest centroid, and store an inverted list per centroid. At query time, find the `probes`
+    nearest centroids and search only their lists exhaustively.
+
+    The Voronoi cells partition the space; `probes` controls how many cells you look in. The failure
+    mode is intrinsic: **if the true nearest neighbour is just across a cell boundary and you did
+    not probe that cell, you miss it.** More probes fixes it and costs linearly.
+
+    Rule of thumb from FAISS: `lists ≈ sqrt(n)` for up to ~1M vectors. On our 1M corpus that is
+    1,000, which is what the Layer 2 table uses.
+
+    Why IVF loses to HNSW on QPS at equal recall: probing 32 of 1,000 lists means scanning about
+    32,000 vectors exhaustively (32,000 distance computations) against HNSW's 2,180. IVF's
+    advantages are elsewhere: 8× faster build, 33% smaller index, trivially updatable, and it
+    composes with product quantization for large-scale compressed indexes.
+
+    ### The three-way trade-off surface
+
+    Recall, latency and memory. You get to pick two.
+
+    | Configuration | recall@10 | p95 | Index | Build |
+    | --- | --- | --- | --- | --- |
+    | Flat (exact) | 1.000 | 62 ms | 3.07 GB | 0 |
+    | HNSW `m=8, ef_c=200`, `ef_s=40` | 0.89 | 1.4 ms | 3.85 GB | 19 m |
+    | HNSW `m=16, ef_c=200`, `ef_s=40` | 0.95 | 1.7 ms | 4.61 GB | 27 m |
+    | HNSW `m=16, ef_c=200`, `ef_s=200` | 0.99 | 5.4 ms | 4.61 GB | 27 m |
+    | HNSW `m=32, ef_c=200`, `ef_s=40` | 0.97 | 1.9 ms | 7.94 GB | 1 h 12 m |
+    | HNSW `m=32, ef_c=200`, `ef_s=200` | 0.995 | 5.9 ms | 7.94 GB | 1 h 12 m |
+    | IVFFlat `lists=1000, probes=32` | 0.95 | 5.1 ms | 3.11 GB | 3.5 m |
+
+    **Choosing the operating point.** Suppose the end-to-end p95 budget is 250 ms, of which
+    generation takes 180 ms and reranking (Week 28 M4) takes 64 ms. Retrieval gets 6 ms. Every HNSW
+    row above fits. So **latency is not the binding constraint — memory is**, and the decision is
+    `m=16, ef_search=200` at recall 0.99 in 4.61 GB, rather than `m=32` at 0.995 in 7.94 GB. The
+    0.005 of recall is not worth 3.3 GB of RAM you will need for the next million vectors.
+
+    **This is the argument to make in a design review**: find the binding constraint first, then
+    optimise the other axes to their cheap limits.
+
+    ### When Postgres is enough, honestly
+
+    The question is asked constantly and answered by vendor. Here are thresholds with numbers behind
+    them, for 768-dimensional float32 vectors:
+
+    | Corpus | HNSW index (`m=16`) | Verdict on one 32 GB node |
+    | --- | --- | --- |
+    | 100k | 0.46 GB | pgvector, or no index at all |
+    | 1M | 4.6 GB | pgvector comfortably; 980 QPS at recall 0.95 |
+    | 5M | 23.1 GB | pgvector, tight. Index plus `shared_buffers` plus the table needs care; build is 2 h 20 m |
+    | 10M | 46.2 GB | **does not fit.** Shard, quantize, or move |
+    | 50M+ | 231 GB | dedicated system, or scalar/product quantization |
+
+    **The wall is memory, and it arrives around 5M vectors on a 32 GB box.** The HNSW index must be
+    resident; measured, when the index exceeds `shared_buffers` and starts reading from gp3 storage,
+    p95 goes from 1.7 ms to **340 ms** — a 200× cliff, not a gradual degradation.
+
+    Three ways past it, in order of how much they cost you:
+
+    1. **Halve the dimensions.** Module 3's Matryoshka result: 256 dims of a 3,072-dim model keeps
+       Recall@10 within 0.03 and cuts the index to a third. 10M vectors at 256 dims is 15.4 GB and
+       fits. This is the cheapest option and almost nobody tries it first.
+    2. **Scalar quantization.** pgvector 0.7 supports `halfvec` (fp16): half the storage, measured
+       recall@10 0.95 → 0.945 and p95 1.7 ms → 1.5 ms. 10M vectors at 768 dims in `halfvec` is
+       23.1 GB — borderline but survivable.
+    3. **Shard or move.** Partition by tenant or document type with a partial index per partition
+       (which also fixes the filtering problem), or move to a system with disk-resident quantized
+       indexes.
+
+    **The honest statement about dedicated vector databases:** below 5M vectors they buy you very
+    little that pgvector does not have, and cost you a second system to operate, a second consistency
+    boundary between your chunks and your metadata, and a second thing to back up. Above 10M on one
+    node they buy you genuine capabilities — native pre-filtering, distributed sharding, quantized
+    and disk-resident indexes. The crossover is a corpus-size question, not a preference.
+
+    ### The filtering correctness trap, generalised
+
+    Every ANN index faces the same problem: **the index does not know about your `WHERE` clause.**
+    Three strategies, and every system uses one or a mixture:
+
+    | Strategy | Mechanism | Correct? | Failure mode |
+    | --- | --- | --- | --- |
+    | **Post-filter** | ANN returns `ef` candidates, filter applied after | Incomplete | Selective filters return fewer than `k` rows; 38% of queries at 3.1% selectivity |
+    | **Pre-filter** | Restrict to matching IDs, then search among them | Correct | Requires an ID set the index can intersect; can be slower than exact scan for large sets |
+    | **Filtered/iterative search** | Index keeps pulling until `k` rows pass the filter | Correct | Unbounded work on filters matching nothing; needs a scan cap |
+
+    pgvector 0.7 post-filters. pgvector 0.8 added `hnsw.iterative_scan` with a
+    `hnsw.max_scan_tuples` cap. Qdrant and Weaviate implement filtered search inside the graph
+    traversal. **Find out which your system does before you ship a filtered query**, because the
+    post-filter failure is silent — you get results, they are just wrong, and the query does not
+    error.
+
+    The decision rule that works, and it is a query-planning decision in the Week 8 sense:
+
+    ```
+    if estimated_matching_rows < 50_000:
+        exact scan over the filtered subset      # 50k x 768 = 3.1 ms. exact, no recall risk.
+    elif filter value is one of a few hot values:
+        partial HNSW index per value             # filter becomes free
+    else:
+        iterative/filtered ANN with a scan cap, and MEASURE the filtered recall
+    ```
+
+    Reference figure — modelled on the reference corpus at 3.1% selectivity (31,000 rows): exact scan over the filtered
+    subset is **2.4 ms and recall 1.000**, against post-filtered HNSW at 1.1 ms and recall 0.31.
+    **The "slow" exact path is twice the latency and three times the quality.** Filtered search is
+    the case where the approximate index most often should not be used at all.
+
+    ### Failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Index recall never measured | Eval looks fine; specific items unfindable | Exact ground truth on 100 queries, weekly; alert below your threshold |
+    | Post-filter with a selective `WHERE` | Filtered queries return fewer than `k` rows | Log result counts; alert when `count &lt; k`; add filtered queries to the eval set |
+    | Operator class mismatch | Sudden 60 ms queries; index appears unused | `EXPLAIN (ANALYZE)` and look for `Seq Scan`; match `vector_cosine_ops` with `<=>` |
+    | `maintenance_work_mem` too low | Build takes 6× longer with no warning | Set it to 8 GB before `CREATE INDEX`; measured 27 m versus 2 h 51 m |
+    | Index exceeds `shared_buffers` | p95 jumps 200× at a corpus-size threshold | Track index size against `shared_buffers`; alarm at 70% |
+    | Graph degradation from incremental inserts | Recall drifts down over months | Weekly recall monitor; `REINDEX CONCURRENTLY` monthly |
+    | `ef_search` set in a session, not the app | Eval measures a configuration production never runs | Set it explicitly per query in application code |
+    | Query shape defeats the planner | Index unused after adding `DISTINCT` or a wrapper | Keep `ORDER BY embedding <=> q LIMIT k` as the innermost operation |
+
+    ### Papers and primary sources
+
+    - **Malkov & Yashunin 2016, "Efficient and robust approximate nearest neighbor search using
+      Hierarchical Navigable Small World graphs".** *Takeaway:* layering a proximity graph like a
+      skip list gives logarithmic search complexity, and a diversity heuristic for neighbour
+      selection is what keeps the graph navigable rather than clustered. **Read Algorithms 1–5** —
+      they are the entire method in two pages — and **Algorithm 4 especially**, the neighbour
+      heuristic that was worth 0.24 recall in the measurement above.
+    - **Johnson, Douze & Jégou 2017, "Billion-scale similarity search with GPUs" (FAISS).**
+      *Takeaway:* IVF plus product quantization makes billion-scale search feasible by compressing
+      vectors to a few bytes and searching only a few Voronoi cells. **Read §3 and §5** for the
+      `lists ≈ sqrt(n)` guidance and the IVF-PQ construction.
+    - **Beyer et al. 1999, "When Is 'Nearest Neighbor' Meaningful?"** *Takeaway:* under broad
+      conditions, as dimension grows the distance to the nearest and farthest points converges, so
+      nearest-neighbour queries become unstable — which is the formal reason space-partitioning
+      trees fail. **Read §3** for the concentration result; it is the theory behind the k-d tree
+      measurement in Layer 1.
+    - **pgvector documentation (0.7 and 0.8).** *Takeaway:* HNSW parameters, the `halfvec` type, and
+      — critically — the filtering behaviour and `hnsw.iterative_scan`. **Read the "Filtering" and
+      "Index Options" sections**; the filtering section is the one that would have prevented the war
+      story.
+    - **ANN-Benchmarks (Aumüller et al.).** *Takeaway:* recall-versus-QPS curves are the only
+      meaningful way to compare ANN implementations, since any index can be made fast or accurate in
+      isolation. **Read the methodology page**, then reproduce its plot shape for your own data —
+      that plot is the deliverable of this module's lab.
+
+    ### Stretch challenge
+
+    Produce the recall-versus-QPS curve for HNSW at five parameter settings and IVFFlat at five, on
+    1M vectors, pick an operating point and defend it against a stated latency budget and a stated
+    memory budget. That is the lab.
+
+    The stretch is the filtering problem, properly. Build a filtered-search benchmark: filter
+    selectivities of 50%, 10%, 3%, 1% and 0.1%, crossed with the four strategies (post-filter at
+    default `ef`, post-filter at high `ef`, partial index, exact scan over the filtered subset).
+    Measure filtered recall and p95 for all twenty cells. You will find a crossover where exact scan
+    beats the index.
+
+    Then the open question, which is a genuine research-adjacent problem: **can you predict which
+    strategy to use from statistics the planner already has?** Postgres knows the estimated row count
+    for a `WHERE` clause. Write a rule that reads that estimate and chooses the strategy, implement
+    it as a function in front of your queries, and measure how often it picks the strategy that a
+    post-hoc oracle would have chosen. Report the cases where it is wrong — my prediction is that
+    correlated filters (where the matching rows are *clustered* in vector space rather than
+    scattered) break it, because 3% of rows that are all near each other behave nothing like 3%
+    scattered uniformly. If you can detect that clustering cheaply, you have something genuinely
+    novel.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+On 1M vectors, produce the recall-versus-QPS curve for HNSW at five parameter settings and IVFFlat
+at five, with recall measured against **exact** search on the same data. Report build time and index
+size for each. Then pick an operating point and defend it in a paragraph naming your binding
+constraint — latency, memory or build time — and what you gave up on the other two. Add at least
+three filtered queries to your eval set and report filtered recall separately; if it is much lower
+than unfiltered recall, you have found the trap.
+</Card>
+
+## The whiteboard
+
+The T2 layered-graph sketch above, plus **A37 — HNSW search**, one of the course's key animations:
+
+{/* ANIMATION-SPEC
+id: A37
+tier: T3
+week: 27
+duration: 18 s, plays once on scroll into view, replay button, respects prefers-reduced-motion
+one-sentence-goal: let the viewer watch a query enter at the sparse top layer, take long hops, drop down, and converge - so that "logarithmic because of the layers" is seen rather than asserted.
+canvas: hand-drawn whiteboard, paper #fffdf7 light / #1a1a19 dark, Excalifont, roughness 1.5, stroke 2
+scene 1 (0-3 s): three layer bands draw themselves top to bottom. Layer 0 fills with about 60 dots and short edges, layer 1 with 12 dots and medium edges, layer 2 with 3 dots and two very long edges. Node counts write themselves at the right of each band: "1,000,000 / 62,500 / 3,900". The same node's position is shown by faint vertical dotted lines across all three.
+scene 2 (3-5 s): a red cross appears at the query's position in layer 0's coordinate space, and a faint vertical guide line rises from it through all layers.
+scene 3 (5-9 s): the search path animates. Entry point at top-left of layer 2 pulses, then a long arc to the layer-2 node nearest the guide line. A hop counter in the corner ticks "hops: 1, 2". Then a vertical drop arrow into layer 1, counter continues, three medium hops. Each visited node fills with hachure as it is evaluated, and a running "distance computations" counter ticks upward beside the hop counter.
+scene 4 (9-14 s): at layer 0, the beam search runs - instead of a single path, a small cloud of ef=40 nodes is evaluated around the converging point, drawn as a widening then narrowing set of hachured dots. The two heaps appear as small stacks in the right margin, growing and evicting, with the worst-result eviction shown as a dot being flicked off the top.
+scene 5 (14-18 s): the final top-10 are circled in green. The counters settle at "hops: 63" and "distance computations: 2,180". Beside them, a greyed-out comparison writes itself: "brute force: 1,000,000". An amber margin note appears: "459x fewer. and we miss 0.5 of the true 10. that is the deal."
+static fallback frame: scene 5, complete three-layer graph with the full numbered search path drawn, both counters shown, top-10 circled green, and the brute-force comparison written in.
+accessibility: alt text describes the three layers with their node counts, the descent from sparse to dense, the beam search at layer 0, and the final 2,180-versus-1,000,000 comparison. Path steps are numbered as well as coloured; visited nodes are hachured as well as tinted.
+*/}
+
+Also earned: **T4 — the HNSW parameter explorer.** Sliders for `M` and `ef_search` on a 2-D toy
+dataset, showing the graph redrawing and a live recall-versus-latency readout, so the learner feels
+the trade rather than reading a table.
+
+<Tip>
+**Draw it yourself.** From memory: three layers with their occupancy percentages, the numbered
+greedy descent path, the two heaps in the margin labelled with what each one holds, and the
+crossed-out k-d tree with "94% of nodes" written beside it. Then compare.
+[Blank version](/assets/diagrams/p4-w27-m4-blank.svg) · [Editable source](/assets/diagrams/p4-w27-m4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    Deriving HNSW is the strongest possible answer to "how does vector search work". The chain is:
+    B-trees need a total order, high-dimensional vectors have none, space partitioning dies to the
+    curse of dimensionality, so build an explicit navigable graph — then add skip-list layers for
+    long-range hops, and the inner loop is Dijkstra's frontier with two heaps. Portfolio: the
+    recall-versus-QPS curves for both index families plus the filtered-search benchmark. Resume
+    line: *"Benchmarked HNSW and IVFFlat on 1M×768 vectors across 10 configurations; identified a
+    filtered-query failure where post-filtering dropped recall from 0.95 to 0.31 and fixed it with
+    partial indexes."*
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    1. **Measure your index recall this week.** Exact ground truth on 100 queries, compared against
+       your production `ef_search`. Most teams have never done it, and the number is frequently
+       lower than they assume. Then put it on a weekly schedule — HNSW graphs degrade with
+       incremental inserts.
+    2. **Find out whether your vector store pre-filters or post-filters, and put filtered queries in
+       your eval set.** The post-filter failure is silent: results come back, they are just missing
+       most of the right answers. It cost 0.64 of filtered recall in the war story.
+    3. **Set `ef_search` explicitly in application code.** Relying on a session or server default
+       means your eval and your production can be running different configurations, and you will not
+       find out from any error.
+  </Accordion>
+</AccordionGroup>
+
+## Assessment
+
+<AccordionGroup>
+  <Accordion title="8 concept questions">
+  1. Why can a B-tree not index vectors, and what happens if you use a k-d tree instead? (No total order in high dimensions; a k-d tree visits 94% of nodes and is 5× slower than brute force at 768 dims.)
+  2. Give the HNSW level-assignment formula and the layer occupancy for `M=16`. (`l = floor(-ln(U)·mL)`, `mL = 1/ln(M) = 0.361`; 100% / 6.25% / 0.39% / 0.024%.)
+  3. What data structures are in HNSW's inner loop, and what earlier week are they from? (A min-heap of candidates and a max-heap of the `ef` best results — Week 14's priority queues; the loop is Dijkstra's frontier with distance-to-query as the key.)
+  4. What does the neighbour-selection heuristic do and what is it worth? (Keeps a diverse rather than merely nearest set so the graph stays connected; measured 0.71 → 0.95 recall and 1,847 → 1 connected components.)
+  5. Compare HNSW and IVFFlat at equal recall on 1M vectors. (At recall 0.95: HNSW 980 QPS, IVFFlat 220 — 4.5× — for 1.5× index size and 8× build time.)
+  6. What is the memory wall for pgvector on a 32 GB node, and what happens at it? (About 5M vectors at 768 dims; once the index exceeds `shared_buffers`, p95 goes from 1.7 ms to 340 ms — a 200× cliff.)
+  7. Describe the post-filter trap with numbers. (The index returns `ef` candidates and then filters; at 3.1% selectivity and `ef_search=40`, 38% of queries returned fewer than 10 rows and filtered recall was 0.31.)
+  8. When is exact search the right answer for a filtered query? (When the filter matches few enough rows — under ~50,000 — that a scan is fast: 2.4 ms at recall 1.000 versus 1.1 ms at recall 0.31.)
+  </Accordion>
+  <Accordion title="Coding challenge">
+  Implement HNSW from scratch: level assignment, insertion with the diversity heuristic,
+  `search_layer` with both heaps, and multi-layer descent. Hidden tests check: level distribution
+  matches the geometric expectation over 100,000 insertions (chi-squared); the graph has exactly one
+  connected component at layer 0; recall@10 exceeds 0.90 at `ef_search=40` on 100k random 128-dim
+  vectors; distance computations are fewer than 5% of the corpus; the search is deterministic given
+  a seed; and — the one that catches the common bug — that disabling the diversity heuristic
+  measurably *drops* recall, proving you implemented it rather than the simple `M`-nearest version.
+  Then benchmark yours against pgvector and report the gap honestly; a pure-Python implementation
+  being 40× slower is expected and fine, but its *recall* should match.
+  </Accordion>
+  <Accordion title="Interview questions (junior / mid / senior)">
+  - **Junior:** "How does a vector database find similar vectors quickly, and what does it give up?"
+  - **Mid:** "Explain HNSW's parameters and how you would choose them against a 5 ms p95 budget."
+  - **Senior:** "Your ANN index is at 0.95 recall unfiltered. A product requirement adds a tenant filter matching 2% of rows. What happens, why, and what are your options?"
+  </Accordion>
+  <Accordion title="Draw it from memory">
+  Reproduce the three-layer HNSW graph with occupancy percentages, the numbered greedy descent path
+  from the top entry point to the query's neighbourhood, and the two heaps labelled with what each
+  holds and where it is used.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Queries suddenly take 60 ms | Index unused — operator class mismatch or a query shape the planner cannot use | `EXPLAIN (ANALYZE)`; match `vector_cosine_ops` with `<=>`; keep `ORDER BY ... LIMIT k` innermost |
+| Filtered queries return fewer than `k` rows | Post-filtering after an `ef`-limited index scan | Partial index per hot filter value, exact scan for selective filters, or iterative scan with a cap |
+| Index build takes hours | `maintenance_work_mem` at the 64 MB default, build spilling to disk | Set 8 GB before `CREATE INDEX`; 27 min versus 2 h 51 m |
+| Recall drifts down over months | HNSW graph degradation from incremental inserts and deletes | Weekly recall monitor; `REINDEX CONCURRENTLY` monthly |
+| p95 jumps 200× overnight | Index outgrew `shared_buffers` and is now reading from disk | Alarm at 70% of `shared_buffers`; reduce dimensions or use `halfvec` |
+| Eval and production disagree | `ef_search` set in a session rather than the application | Set it explicitly per query in code |
+| Own HNSW gets 0.7 recall | Neighbour selection uses simple `M`-nearest instead of the diversity heuristic | Implement Algorithm 4; measured 0.71 → 0.95 |
+| "Vector DB is slow" at 50k vectors | Using an index where brute force is 3.6 ms and exact | Below ~100k vectors, do not build an index |
+
+## Sources & further reading
+
+**Primary docs**
+- [pgvector 0.7 / 0.8](https://github.com/pgvector/pgvector) — read "Index Options", "Filtering" and the HNSW build-tuning notes; the filtering section is the one that prevents the war story.
+- [FAISS wiki, "Guidelines to choose an index"](https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index) — read it for the corpus-size decision tree; it is the most useful single page in the ANN ecosystem.
+- [ANN-Benchmarks](https://ann-benchmarks.com/) — read the methodology, then reproduce the recall-versus-QPS plot shape on your own data.
+
+**Papers**
+- [Malkov & Yashunin 2016 (HNSW)](https://arxiv.org/abs/1603.09320) — *skip-list layering over a proximity graph gives logarithmic search; the neighbour diversity heuristic keeps it navigable*; Algorithms 1–5, especially 4.
+- [Johnson et al. 2017 (FAISS)](https://arxiv.org/abs/1702.08734) — *IVF plus product quantization makes billion-scale search feasible*; §3, §5.
+- [Beyer et al. 1999 (nearest neighbour meaningfulness)](https://doi.org/10.1007/3-540-49257-7_15) — *distances concentrate as dimension grows, which is why partitioning trees fail*; §3.
+
+**Go deeper**
+- [Pinecone's "Hierarchical Navigable Small Worlds" explainer](https://www.pinecone.io/learn/series/faiss/hnsw/) — the best visual walkthrough of the layered graph, with the skip-list connection drawn out; read it alongside the paper, then implement it, because reading it is not the same as getting the neighbour heuristic right.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-27/p4-w27-m4">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

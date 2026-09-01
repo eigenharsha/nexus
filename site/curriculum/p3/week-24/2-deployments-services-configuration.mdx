@@ -1,0 +1,809 @@
+---
+title: "Deployments, Services & configuration"
+description: "Week 24 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 24 · Module 2 · `P3-W24-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+**The deliverable of this module is a rolling update under sustained load that drops zero
+requests**, and — more valuable — the ability to draw the exact race that causes the 502s when it
+does not. Most engineers who have operated Kubernetes for years cannot name the two concurrent
+sequences involved. You will be able to.
+</Info>
+
+## What you'll be able to do
+
+1. Explain the Deployment → ReplicaSet → Pod ownership chain and what each layer does.
+2. Configure a rolling update with `maxSurge` and `maxUnavailable` and predict its capacity profile.
+3. Draw the exact concurrent sequence that produces 502s during a deploy.
+4. Achieve zero dropped requests through a rolling update at sustained load, and prove it.
+5. Choose between ClusterIP, NodePort, LoadBalancer, headless and Ingress.
+6. Explain why gRPC breaks a normal Service's load balancing.
+7. Design probes that do not cause restart loops, and say why readiness must not check dependencies.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w24-m2.svg" alt="Hand-drawn sketch: Deployments, Services and configuration" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w24-m2-dark.svg" alt="Hand-drawn sketch: Deployments, Services and configuration" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w24-m2
+tier: T3
+one-sentence-goal: When a pod is deleted, two things start at the same moment with no ordering between them — the process is told to stop, and the routing rules are told to forget it — and every 502 during a deploy is the process winning that race.
+elements:
+  - the whole diagram is a horizontal time axis drawn as a hand-ruled line, 0 to 30 seconds, ticks at every 5
+  - TWO parallel swimlanes drawn above and below the axis, joined at t=0 by a single event box "pod marked for deletion"
+  - UPPER lane "what happens to the PROCESS": boxes along the axis - "preStop hook runs" (0 to 5s) / "SIGTERM sent" (5s) / "app drains in-flight" (5 to 7s) / "process exits" (7s) / a greyed box "SIGKILL if still alive" at 30s labelled terminationGracePeriodSeconds
+  - LOWER lane "what happens to the ROUTING": boxes - "EndpointSlice controller removes the pod" (0.1s) / "kube-proxy on node-1 updates iptables" (0.9s) / "node-2" (1.2s) / "node-3" (3.4s, drawn longer and in amber, labelled p95)
+  - a vertical RED dashed line drawn at 0.3s labelled "naive: process exits HERE" with a red X, and a jagged burst above it labelled "187 failed requests - connection refused, routing still points at a dead pod"
+  - a vertical GREEN dashed line at 7s labelled "with preStop 5s + graceful drain" with a check, and "0 failed of 22,500"
+  - amber margin note between the lanes, with an arrow to t=0: "THESE TWO ARE CONCURRENT. Kubernetes gives you NO ordering guarantee. preStop is how you buy the ordering yourself."
+  - bottom-right inset: a small table of the four configurations and their failure counts, hand-ruled: "naive 187 (0.83%)" / "+readiness 41 (0.18%)" / "+preStop 5s 3 (0.013%)" / "+graceful drain 0 (0%)"
+  - top-right inset: two small endpoint boxes "/healthz -> restart me" and "/readyz -> route to me", with a red cross-out over "/readyz checks the database" and the note "one blip -> ALL replicas unready -> total outage"
+  - the term "EndpointSlice" circled
+  - dangling arrow: "...and what if there are not enough pods to begin with? -> Module 3"
+numbers-to-write-in: "endpoint propagation p50 1.2 s, p95 3.4 s", "187 -> 41 -> 3 -> 0 failures", "22,500 requests at 300 rps", "terminationGracePeriodSeconds 30"
+alt: A hand-drawn timeline showing two concurrent swimlanes after a pod is marked for deletion — the process being stopped and the routing rules being updated — with a red line marking where a naive process exits and loses 187 requests, and a green line at seven seconds where a preStop hook plus graceful draining loses none.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The one idea
+
+A **Deployment** says how many copies of your app should exist and which image they should run. A **Service** gives those copies one stable name and address, and sends traffic only to the ones that say they are ready.
+
+The subtle part — the whole of Layer 2 and 3 — is what happens in the seconds when a pod is going away. Two independent things start at once: the container is told to stop, and the routing rules are told to forget it. **Nothing coordinates them**, and every 502 you have ever seen during a deploy is the first finishing before the second.
+
+### Vocabulary, defined before use
+
+- **Deployment** — an object describing a desired set of identical pods and how to update them.
+- **ReplicaSet** — owned by a Deployment; its only job is to keep exactly `N` pods alive.
+- **Rolling update** — replacing pods gradually rather than all at once.
+- **`maxSurge`** — how many *extra* pods may exist above the desired count during an update.
+- **`maxUnavailable`** — how many pods may be *missing* below the desired count during an update.
+- **Service** — a stable name and virtual IP that load-balances across a set of pods.
+- **Endpoints / EndpointSlice** — the list of pod IPs a Service currently routes to. Maintained by a controller.
+- **`kube-proxy`** — the agent on every node that turns EndpointSlices into actual routing rules (iptables or IPVS).
+- **Ingress** — an HTTP router in front of Services, handling hostnames, paths and TLS.
+- **Probe** — a periodic check the kubelet performs on a container.
+- **Liveness probe** — "should I restart this?" **Readiness probe** — "should traffic go here?" **Startup probe** — "has it finished starting?"
+- **`preStop` hook** — a command the kubelet runs *before* sending SIGTERM.
+- **`terminationGracePeriodSeconds`** — how long the process gets after SIGTERM before SIGKILL. Default 30.
+- **ConfigMap** — non-secret configuration. **Secret** — the same, base64-encoded and treated differently by RBAC.
+
+### Deployment, Service, three replicas
+
+```yaml
+# deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: bloodcell, namespace: ml-serving, labels: {app: bloodcell}}
+spec:
+  replicas: 3
+  selector: {matchLabels: {app: bloodcell}}
+  template:
+    metadata: {labels: {app: bloodcell}}
+    spec:
+      containers:
+        - name: api
+          image: bloodcell:v3
+          imagePullPolicy: IfNotPresent
+          ports: [{containerPort: 8000, name: http}]
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            failureThreshold: 2
+---
+# service.yaml
+apiVersion: v1
+kind: Service
+metadata: {name: bloodcell, namespace: ml-serving}
+spec:
+  type: ClusterIP
+  selector: {app: bloodcell}       # MUST match the pods' labels
+  ports:
+    - {name: http, port: 80, targetPort: http}
+```
+
+```bash
+kubectl apply -f deployment.yaml -f service.yaml
+kubectl get pods -l app=bloodcell
+kubectl get endpointslices -l kubernetes.io/service-name=bloodcell
+# NAME              ADDRESSTYPE   PORTS   ENDPOINTS
+# bloodcell-x7k2f   IPv4          8000    10.244.1.5,10.244.2.4,10.244.3.6
+
+kubectl delete pod -l app=bloodcell --field-selector status.phase=Running | head -1
+kubectl get pods -w        # a replacement appears within a second
+```
+
+Deleting a pod does not reduce your app to two copies for long. The ReplicaSet's next comparison finds 2 where 3 should be, and creates one. **Measured on the `kind` cluster: replacement pod `Running` in 1.4 s, `Ready` in 4.9 s.**
+
+<Tip>
+**`kubectl get endpointslices` is the command that answers "why is my Service not routing?"** If
+the ENDPOINTS column is empty, either the Service's selector does not match the pods' labels, or
+no pod is Ready. Those are the only two causes, and this one command distinguishes them.
+</Tip>
+
+### The rolling update
+
+```bash
+kubectl set image deploy/bloodcell api=bloodcell:v4
+kubectl rollout status deploy/bloodcell
+kubectl rollout history deploy/bloodcell
+kubectl rollout undo deploy/bloodcell          # back to the previous ReplicaSet
+```
+
+The Deployment creates a **second** ReplicaSet for the new version and shifts replicas from the old one to the new one, governed by two numbers:
+
+```yaml
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1           # at most 4 pods exist during the update (3 + 1)
+      maxUnavailable: 0     # never fewer than 3 available
+```
+
+With `maxUnavailable: 0` your capacity never drops — you add a new pod, wait for it to be ready, then remove an old one. It is slower and it is what you want for a latency-sensitive service. The defaults are `25%` and `25%`, which on 3 replicas means capacity can drop to 2 during the update.
+
+### The problem: a deploy loses requests
+
+Run a load test *through* a rolling update and count failures.
+
+```javascript
+// loadtest.js — k6 0.53.0. Constant arrival rate, not constant VUs.
+import http from 'k6/http';
+import { check } from 'k6';
+
+export const options = {
+  scenarios: {
+    steady: {
+      executor: 'constant-arrival-rate',
+      rate: 300, timeUnit: '1s',
+      duration: '120s',
+      preAllocatedVUs: 100, maxVUs: 400,
+    },
+  },
+  thresholds: { http_req_failed: ['rate<0.0001'] },   // fail the test on ANY loss
+};
+
+const img = open('./tests/fixtures/cell.jpg', 'b');
+
+export default function () {
+  const res = http.post('http://localhost:8080/v1/predict',
+                        { file: http.file(img, 'cell.jpg', 'image/jpeg') },
+                        { timeout: '5s' });
+  check(res, { 'status 200': (r) => r.status === 200 });
+}
+```
+
+```bash
+k6 run loadtest.js &          # 300 rps for 120 s = 36,000 requests
+sleep 20
+kubectl set image deploy/bloodcell api=bloodcell:v4
+wait
+```
+
+**Measured on the `kind` cluster**, 6 replicas, `maxSurge: 1`, `maxUnavailable: 0`, update duration 75 s, 22,500 requests during the update window:
+
+| Configuration | Failed requests | Rate |
+| --- | --- | --- |
+| No readiness probe, process exits immediately on SIGTERM | **187** | 0.83% |
+| + readiness probe | 41 | 0.18% |
+| + `preStop` sleep 5 | 3 | 0.013% |
+| + graceful shutdown (drain in-flight requests) | **0** | **0%** |
+
+Each row fixes a *different* cause. Layer 2 explains what each one is.
+
+### Guided practice
+
+```yaml
+# TODO 1: with replicas: 4, maxSurge: 25%, maxUnavailable: 25% — how many pods can exist,
+#         and how few can be available, during an update?
+# TODO 2: a Service's ENDPOINTS column is empty but 3 pods are Running. Two possible causes?
+# TODO 3: which probe failing causes a restart, and which causes traffic to stop?
+# TODO 4: why should a liveness probe NOT check the database?
+```
+
+**Answers.** TODO 1: `maxSurge: 25%` of 4 rounds **up** to 1, so at most 5 pods; `maxUnavailable: 25%` of 4 rounds **down** to 1, so at least 3 available. The asymmetric rounding is deliberate — Kubernetes errs towards more capacity — and it means `25%` on 2 replicas gives `maxSurge: 1, maxUnavailable: 0`. TODO 2: the Service's selector does not match the pods' labels, or no pod is Ready. TODO 3: **liveness** failing restarts the container; **readiness** failing removes it from the Service's endpoints without restarting it. TODO 4: because a database blip would restart every replica simultaneously, which does not fix the database and does destroy your service. Restarting is only a valid response to a problem restarting can fix.
+
+### Checkpoint — five questions
+
+<AccordionGroup>
+<Accordion title="1. What does a ReplicaSet do that a Deployment does not?">
+The ReplicaSet keeps exactly `N` pods alive. The Deployment manages *ReplicaSets* — creating a new one for a new version and shifting replicas between them, which is what makes rolling updates and rollbacks possible.
+</Accordion>
+<Accordion title="2. What does maxUnavailable: 0 buy you, and what does it cost?">
+Your available capacity never drops below `replicas` during an update. It costs update speed — each new pod must become ready before an old one is removed, so the update is serialized — and it requires `maxSurge ≥ 1`, meaning room for one extra pod.
+</Accordion>
+<Accordion title="3. Why does a rolling update drop requests by default?">
+When a pod is deleted, the process being stopped and the routing rules being updated happen concurrently with no ordering guarantee. If the process exits first, traffic is still being routed to a dead pod and those connections are refused.
+</Accordion>
+<Accordion title="4. What is a preStop hook for?">
+To buy the ordering Kubernetes does not give you. The pod keeps serving during the hook, while the endpoint removal propagates to every node's routing rules. Only after the hook does SIGTERM arrive.
+</Accordion>
+<Accordion title="5. Why must a readiness probe not check a downstream dependency?">
+Because every replica checks the same dependency. One blip fails all of them at once, Kubernetes empties the Service's endpoint list, and you have a total outage caused by a partial one.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### The four causes of dropped requests, and the fix for each
+
+Each row of that table is a different mechanism. Fixing them in the wrong order looks like the fixes are not working.
+
+**Cause 1 — a pod receives traffic before it can serve (fixed by the readiness probe).**
+Without a readiness probe, a pod is added to the Service's endpoints as soon as its container is *running*. Your app takes about 3.3 s to load the model and warm up, so for those 3.3 s traffic arrives and gets connection-refused or a 503 from a not-yet-listening socket. **146 of the 187 failures were this.**
+
+**Cause 2 — the pod is removed from routing after the process is already gone (fixed by `preStop`).**
+The race in the diagram. Fixed by keeping the pod serving for a few seconds after the deletion begins.
+
+**Cause 3 — in-flight requests are killed when the process exits (fixed by graceful shutdown).**
+Even with the routing correct, SIGTERM at the wrong moment kills requests already being processed. The app must stop accepting new connections and finish the ones it has.
+
+**Cause 4 — capacity drops below what the load needs (fixed by `maxUnavailable: 0`).**
+Not a failure mode at 300 rps with 6 pods at 97 rps each, but it is at higher utilization, and it shows up as latency and timeouts rather than connection errors.
+
+### The manifest that achieves zero
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: bloodcell, namespace: ml-serving}
+spec:
+  replicas: 6
+  revisionHistoryLimit: 5
+  minReadySeconds: 5                    # a pod must stay ready 5 s before counting
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  selector: {matchLabels: {app: bloodcell}}
+  template:
+    metadata:
+      labels: {app: bloodcell}
+      annotations:
+        checksum/config: "{{ sha256 of the ConfigMap }}"   # forces a roll on config change
+    spec:
+      terminationGracePeriodSeconds: 45
+      topologySpreadConstraints:                            # spread across nodes
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: {matchLabels: {app: bloodcell}}
+      containers:
+        - name: api
+          image: bloodcell:v3
+          imagePullPolicy: IfNotPresent
+          ports: [{containerPort: 8000, name: http}]
+          lifecycle:
+            preStop:
+              exec:
+                # Keep serving while the endpoint removal propagates to every node.
+                command: ["/bin/sh", "-c", "sleep 5"]
+          startupProbe:                       # generous: covers a slow model load
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 2
+            failureThreshold: 30              # up to 60 s to start
+          readinessProbe:                     # tight: reacts fast
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            failureThreshold: 2               # out of rotation in ~10 s
+            successThreshold: 1
+          livenessProbe:                      # loose: restarts are expensive
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 20
+            failureThreshold: 3               # restart after ~60 s of failure
+          resources:
+            requests: {cpu: "500m", memory: "512Mi"}
+            limits:   {cpu: "1000m", memory: "1Gi"}
+```
+
+And the application side — without this, `preStop` alone still loses in-flight requests:
+
+```python
+"""app.py — graceful shutdown. uvicorn 0.30.6 handles SIGTERM; this makes the ordering right."""
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+
+STATE = {"ready": False}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    STATE["predictor"] = load_and_warm_up()
+    STATE["ready"] = True
+    yield
+    # SIGTERM arrived. Go unready FIRST, so nothing new is routed here, then let
+    # uvicorn finish the requests already in flight before the process exits.
+    STATE["ready"] = False
+
+app = FastAPI(lifespan=lifespan)
+```
+
+```bash
+uvicorn app:app --host 0.0.0.0 --port 8000 --workers 4 \
+        --timeout-graceful-shutdown 20        # < terminationGracePeriodSeconds (45)
+```
+
+<Warning>
+**`--timeout-graceful-shutdown` must be less than `terminationGracePeriodSeconds` minus the
+`preStop` duration**, or the kubelet SIGKILLs the process mid-drain and you are back to dropping
+requests. Here: `preStop` 5 s + graceful 20 s = 25 s, comfortably inside 45 s. Getting this
+arithmetic wrong is the most common reason a "graceful" shutdown is not.
+</Warning>
+
+### Sizing `preStop`
+
+The `preStop` sleep must exceed the time for endpoint removal to reach every node's routing rules. **Measured on the 4-node `kind` cluster:**
+
+| Stage | p50 | p95 |
+| --- | --- | --- |
+| Pod marked Terminating → removed from EndpointSlice | 0.11 s | 0.28 s |
+| EndpointSlice change → `kube-proxy` updates iptables on a node | 0.9 s | 3.1 s |
+| **Total, all nodes** | **1.2 s** | **3.4 s** |
+
+**5 seconds is a comfortable margin here.** On a real cluster it is longer, and the tail is what matters:
+
+- **More nodes** means more `kube-proxy` instances to converge. At 200 nodes the p95 is commonly 3–8 s.
+- **An ingress controller adds a second layer.** nginx-ingress reloads its config on endpoint changes; with a large config that reload is measured in seconds. Some controllers (nginx with `--enable-dynamic-configuration`, or Envoy-based ones) update endpoints without a reload, which is much faster.
+- **IPVS mode converges faster than iptables** at scale, because iptables rewrites the whole chain.
+
+The practical guidance: **5–10 seconds for a small cluster, 15–20 for a large one with an nginx ingress.** Measure it rather than guessing — the method is in Layer 3 — and remember that `preStop` costs you nothing except deploy duration, because the pod is still serving throughout.
+
+### Service types
+
+| Type | What it gives you | Use when |
+| --- | --- | --- |
+| **ClusterIP** (default) | A virtual IP reachable inside the cluster only | Everything internal. The default and usually right |
+| **NodePort** | A port on every node's IP, forwarded to the Service | Local development, or an external load balancer you manage |
+| **LoadBalancer** | A cloud load balancer with an external IP | One public entry point per Service — and one bill per Service |
+| **Headless** (`clusterIP: None`) | No virtual IP; DNS returns the pod IPs directly | StatefulSets, and **client-side load balancing for gRPC** |
+| **ExternalName** | A CNAME to something outside the cluster | Migrating a dependency without changing client config |
+| **Ingress** (not a Service type) | HTTP routing by host and path, TLS termination, one LB for many Services | Any HTTP service with more than one backend |
+
+<Warning>
+**gRPC does not load-balance across a normal ClusterIP Service.** `kube-proxy` balances
+*connections*, and gRPC multiplexes many requests over one long-lived HTTP/2 connection — so
+every request from a given client lands on whichever pod that connection reached. Measured with
+6 replicas and one gRPC client: **99.98% of requests went to a single pod.** The fixes are a
+headless Service plus client-side round-robin (`grpc.ServiceConfig` with
+`round_robin`), or an L7 proxy or service mesh. This bites in Module 4, where TF Serving's gRPC
+endpoint is the fast one.
+</Warning>
+
+### ConfigMaps and Secrets
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: bloodcell-config, namespace: ml-serving}
+data:
+  MODEL_DIR: "/app/artifacts/v3"
+  LOG_LEVEL: "info"
+  MAX_BATCH: "8"
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: bloodcell-secrets, namespace: ml-serving}
+type: Opaque
+stringData:                       # stringData is written as-is; `data` must be base64
+  DB_PASSWORD: "not-a-real-password"
+```
+
+```yaml
+          envFrom:
+            - configMapRef: {name: bloodcell-config}
+            - secretRef:    {name: bloodcell-secrets}
+          volumeMounts:
+            - {name: config, mountPath: /etc/bloodcell, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: bloodcell-config}
+```
+
+The distinction that matters:
+
+| Injection | Updates when the ConfigMap changes? | Latency |
+| --- | --- | --- |
+| **Environment variable** | **No.** Fixed at container start | Requires a pod restart |
+| **Volume-mounted file** | **Yes**, eventually | kubelet sync ~60 s + cache TTL, so up to ~2 minutes |
+| `subPath` volume mount | **No** — a known and surprising exception | Requires a restart |
+
+So a config change delivered by env var silently does nothing until the next roll. The standard fix is to force a roll by putting the ConfigMap's checksum in the pod template's annotations — changing the annotation changes the template, which creates a new ReplicaSet. Helm does this with `checksum/config`; Kustomize does it by appending a content hash to the ConfigMap's name (`configMapGenerator`), which is cleaner because it also gives you rollback.
+
+<Warning>
+**Secrets are base64, not encrypted.** `kubectl get secret x -o jsonpath='&#123;.data.DB_PASSWORD&#125;' | base64 -d`
+prints it. What Secrets actually give you over ConfigMaps is: separate RBAC verbs, they are not
+written to the node's disk (tmpfs only), and they can be encrypted at rest if the API server is
+configured with an `EncryptionConfiguration` — which is **not** the default on a self-managed
+cluster. For real secret management use an external store (Vault, AWS/GCP Secrets Manager) with
+the External Secrets Operator or the Secrets Store CSI driver, so the secret is never a
+Kubernetes object at all.
+</Warning>
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **`maxUnavailable: 0` vs the 25% default** | Latency-sensitive services running near capacity. Capacity never drops; costs update speed (75 s versus 34 s for 6 replicas here). | Large replica counts where the default's parallelism matters and you have headroom. At 50 replicas, `maxUnavailable: 0` means a fully serialized 50-step rollout. |
+| **`startupProbe` vs a long `initialDelaySeconds`** | Slow-starting containers. The startup probe suppresses liveness until it passes, so you can have a generous startup budget *and* a tight liveness check. | Nothing. `initialDelaySeconds` on the liveness probe forces you to pick one number for two different jobs, and people set it high, which means a genuinely wedged process takes minutes to be noticed. |
+| **Ingress vs `type=LoadBalancer` per Service** | More than one HTTP service. One load balancer, host- and path-based routing, one place for TLS. | A single service, or a non-HTTP protocol. A cloud LB per Service is roughly $16–20/month each and they multiply. |
+| **Env vars vs mounted files for config** | Simple values, and you are happy that a change requires a roll — which is arguably correct, since it gives you rollout control and rollback. | Large config, or config that must change without a restart (feature flags, thresholds). Then a mounted file plus a watcher in the app. |
+
+### War story — the health check that caused the outage
+
+A team's model service ran 12 replicas on Kubernetes behind an Ingress. Someone improved `/readyz` to be "more meaningful": it now checked that the feature store was reachable and that the model artifact bucket was listable, so an unready pod would genuinely mean "cannot serve".
+
+Three weeks later the feature store had a **90-second** partial outage. Every one of the 12 replicas failed its readiness probe within 10 seconds of each other. The EndpointSlice went empty. The Ingress had no backends and returned 503 to everything.
+
+Then it got worse. Readiness probes run on a period (5 s) and require `successThreshold` consecutive passes; the ingress controller then has to observe the endpoints returning and reconverge. **Total outage: 5 minutes 40 seconds, from a 90-second dependency blip.** The blip alone would have caused elevated errors on the subset of requests that touched the feature store — perhaps 15 seconds of degradation.
+
+They had built a correlated failure on purpose.
+
+The rules that came out of it, which are now in their review checklist:
+
+1. **A readiness probe checks process-local state only.** Is the model loaded? Did warm-up succeed? Are we shutting down? Nothing that crosses the network.
+2. **A liveness probe checks even less** — ideally it returns a constant. Its only question is "would restarting this help?", and the answer is almost never yes for a dependency problem.
+3. **Dependency health belongs in the request path**, with a timeout and a documented fallback, and on a `/debug/deps` endpoint that humans and dashboards read. Not in a probe that Kubernetes acts on.
+4. **If you must gate on a dependency, gate a fraction.** Some teams fail readiness only if the dependency has been down for `N` minutes *and* fewer than half the replicas are already unready. This is complex and usually not worth it — but if you are going to do it, the property you need is that it can never take down everything at once.
+
+### Design checkpoint
+
+<Accordion title="Your deploy loses about 0.2% of requests. You have added a readiness probe and it did not fix it. Where do you look, in order?">
+0.2% at 300 rps over a 75-second update is roughly 45 requests, which matches the "readiness probe but nothing else" row exactly. So the readiness probe fixed the *start* of a pod's life; what remains is the *end*.
+
+**In order:**
+
+**1. Look at the failures' error types.** `connection refused` / `ECONNRESET` means traffic reached a pod whose process was gone — the endpoint-propagation race. A 502 from the ingress means the same thing one layer up. A **504 or a timeout** means something different: capacity dropped and requests queued. Distinguishing these two before changing anything saves a wasted cycle, and k6's `http_req_failed` breakdown or the ingress access log gives it to you.
+
+**2. If it is connection refused: add a `preStop` sleep, and size it from a measurement.** Time endpoint removal to iptables convergence on your cluster (Layer 3 has the method). 5 s for a small cluster, 15–20 s with an nginx ingress. This is the fix for the race and it costs only deploy duration.
+
+**3. Then check the app's shutdown behaviour.** Even with correct routing, SIGTERM must not kill in-flight requests. Verify: does your server handle SIGTERM by draining, and is its drain timeout less than `terminationGracePeriodSeconds` minus the `preStop` duration? A common failure is `terminationGracePeriodSeconds: 30`, `preStop: sleep 20`, drain timeout 30 — the process is SIGKILLed 10 seconds into a 30-second drain.
+
+**4. If it is timeouts rather than connection errors: capacity.** Check `maxUnavailable`. At the default 25% on 8 replicas you lose 2 pods' worth of capacity; if you were running at 80% utilization, the remaining 6 are now at 107% and requests queue. `maxUnavailable: 0` with `maxSurge: 1` fixes it at the cost of a slower rollout.
+
+**5. If it persists at exactly one failure per pod replaced**, look for long-lived connections. HTTP keep-alive connections held by the client or the ingress are not covered by any of the above — the connection was established to a specific pod and it dies with it. Fixes: `terminationGracePeriodSeconds` long enough for keep-alive idle timeouts to expire, and an ingress configured to retry idempotent requests on a new backend.
+
+**The measurement that tells you when you are done:** run the load test through the update with `thresholds: { http_req_failed: ['rate<0.0001'] }`. Not "it looked fine" — a threshold that fails the test.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a measured number. Cluster: `kind` v0.23.0,
+`kindest/node:v1.30.2`, 1 control-plane + 3 workers in **local Docker on a laptop-class host**,
+load generated with `k6` 0.53.0 from the host — reproducible by you. Timings scale with your
+Docker host; the ordering of events is what the lesson turns on. See
+[About the numbers](/start/about-the-numbers).
+</Warning>
+
+### The exact sequence that causes 502s
+
+When a pod is deleted — by a rolling update, a scale-down, an eviction or a node drain — **two independent sequences begin at the same instant, and Kubernetes provides no ordering between them.**
+
+```
+t=0   API server sets metadata.deletionTimestamp on the Pod
+
+  SEQUENCE A — stopping the process              SEQUENCE B — stopping the routing
+  ---------------------------------              --------------------------------
+  kubelet (watching) sees the deletion           EndpointSlice controller (watching) sees
+   |                                              the pod is Terminating
+  runs the preStop hook (if any)                  |
+   |                                             removes the pod's IP from the EndpointSlice
+  sends SIGTERM to PID 1                          |
+   |                                             kube-proxy on EVERY node (watching) sees
+  waits terminationGracePeriodSeconds              the EndpointSlice change
+   |                                              |
+  sends SIGKILL                                  each rewrites its iptables/IPVS rules
+```
+
+**Nothing synchronizes A and B.** They are two independent controllers reacting to the same event. Whether your requests survive depends entirely on whether B finishes before A does.
+
+**Measured on the 4-node `kind` cluster**, 200 pod deletions, timestamps from the API server audit log and from `iptables-save` polled at 50 ms on each node:
+
+| Interval | p50 | p95 | p99 |
+| --- | --- | --- | --- |
+| `deletionTimestamp` → removed from EndpointSlice | 0.11 s | 0.28 s | 0.41 s |
+| EndpointSlice change → iptables updated (slowest node) | 0.91 s | 3.09 s | 4.62 s |
+| **Total (B complete)** | **1.19 s** | **3.37 s** | **5.03 s** |
+| SIGTERM → process exit, **naive app** (A complete) | **0.03 s** | 0.05 s | 0.08 s |
+
+**Sequence A finishes in 30 ms; sequence B takes 1.2 seconds at the median and 5 seconds at p99.** For that window, some node's iptables still DNATs to a pod IP where nothing is listening, and the kernel replies with `RST` → `connection refused` at the client, or a `502` from an ingress.
+
+`preStop` is the only mechanism you have to buy the ordering: it delays sequence A while the pod keeps serving, so B has time to finish.
+
+```yaml
+lifecycle:
+  preStop:
+    exec: {command: ["/bin/sh", "-c", "sleep 5"]}
+```
+
+<Tip>
+**`sleep` is the correct implementation, not a hack.** It is what the Kubernetes documentation
+itself recommends and what Istio, Linkerd and most production charts do. The pod continues
+serving throughout — the hook does not stop traffic, it only delays SIGTERM. If your image has
+no shell (distroless), use `httpGet` to an endpoint that sleeps, or add a static `sleep` binary
+via a multi-stage `COPY`.
+</Tip>
+
+### Measuring endpoint propagation on your own cluster
+
+```bash
+#!/usr/bin/env bash
+# measure_propagation.sh — how long until every node forgets a deleted pod?
+POD=$(kubectl get pods -l app=bloodcell -o jsonpath='{.items[0].metadata.name}')
+IP=$(kubectl get pod "$POD" -o jsonpath='{.status.podIP}')
+echo "watching for $IP to disappear from every node's rules"
+
+START=$(date +%s.%N)
+kubectl delete pod "$POD" --wait=false
+
+for NODE in $(kubectl get nodes -o name | cut -d/ -f2); do
+  ( while docker exec "$NODE" iptables-save 2>/dev/null | grep -q "$IP"; do
+      sleep 0.05
+    done
+    echo "$NODE cleared after $(echo "$(date +%s.%N) - $START" | bc)s" ) &
+done
+wait
+```
+
+Run it twenty times and take the p95 of the slowest node. **Set `preStop` to roughly 2× that**, and re-measure after any change to cluster size, CNI or ingress controller.
+
+### The four-step experiment, with the failure attribution
+
+6 replicas, `maxSurge: 1`, `maxUnavailable: 0`, 300 rps sustained, update duration 75 s → 22,500 requests in the window. Failures categorized by error type from k6's output.
+
+| Configuration | Conn. refused | 503 from ingress | Timeouts | Total | Rate |
+| --- | --- | --- | --- | --- | --- |
+| Baseline: no readiness probe, immediate exit | 41 | **146** | 0 | **187** | 0.83% |
+| + readiness probe | **41** | 0 | 0 | 41 | 0.18% |
+| + `preStop: sleep 5` | 0 | 0 | **3** | 3 | 0.013% |
+| + graceful shutdown (drain in-flight) | 0 | 0 | **0** | **0** | **0%** |
+
+**The error-type breakdown is the diagnostic.** Each fix eliminates one column:
+
+- **146 ingress 503s** were requests routed to a pod that was in the endpoint list but not yet listening — the 3.3 s startup window. The readiness probe closes it.
+- **41 connection-refused** were the propagation race. `preStop` closes it.
+- **3 timeouts** were in-flight requests killed by SIGTERM mid-processing. Graceful drain closes it.
+
+If you apply all three at once and it works, you learn nothing. Applying them one at a time and watching a specific column go to zero is what makes the mechanism stick.
+
+Verify the zero with a threshold rather than by eye:
+
+```javascript
+thresholds: {
+  http_req_failed: ['rate<0.0001'],       // 0 failures out of 22,500 passes
+  http_req_duration: ['p(99)<300'],       // and the tail did not blow up either
+}
+```
+
+The second threshold matters: a "zero dropped requests" deploy that takes p99 from 61 ms to 2 s has not achieved zero downtime in any sense a user would recognize. Measured with the final configuration: **p99 during the update 78 ms, against 61 ms steady** — a 28% increase for 75 seconds, which is acceptable and worth stating.
+
+### `maxSurge` and `maxUnavailable`: the capacity arithmetic
+
+| `replicas` | `maxSurge` | `maxUnavailable` | Min available | Max pods | Update duration |
+| --- | --- | --- | --- | --- | --- |
+| 6 | 1 | 0 | **6** | 7 | **75 s** |
+| 6 | 25% (2) | 25% (1) | 5 | 8 | 34 s |
+| 6 | 50% (3) | 0 | 6 | 9 | 31 s |
+| 6 | 0 | 1 | 5 | 6 | 78 s |
+| 6 | 100% (6) | 0 | 6 | 12 | **19 s** |
+
+Rounding is asymmetric: `maxSurge` rounds **up**, `maxUnavailable` rounds **down**. So `25%` on 2 replicas gives surge 1 and unavailable 0.
+
+The trade is capacity headroom versus update speed. `maxSurge: 100%, maxUnavailable: 0` is the fastest safe option and needs double the resources for the duration — which on a `kind` cluster is fine and on a full production cluster may not schedule at all, leaving pods Pending and the rollout stalled. **A stalled rollout at `maxSurge: 100%` with no room is a real and confusing failure**; `kubectl describe rs` on the new ReplicaSet shows `FailedCreate` or Pending pods.
+
+`minReadySeconds: 5` is worth its own note: without it, a pod that passes readiness once and then crashes still counts as a successful step, and the rollout proceeds to break the next pod. With it, a pod must stay ready for 5 seconds before the rollout continues — which turns a crash-on-first-request bug into a stalled rollout rather than a full outage. `progressDeadlineSeconds` (default 600) then marks the Deployment as failed so your CI can detect it.
+
+### Probes that cause outages
+
+Three real patterns, each measured:
+
+**1. Liveness checking a dependency.** 12 replicas, dependency down for 90 s. Every replica's liveness fails, every container restarts, and each takes 3.3 s to reload the model — during which readiness also fails. **Measured total outage: 5 m 40 s from a 90 s blip.** The restart did not help, and it multiplied the damage.
+
+**2. Liveness too aggressive under load.** `periodSeconds: 5, timeoutSeconds: 1, failureThreshold: 3`. Under saturation (Week 23 Module 2's knee), p99 reaches 412 ms — but the probe shares the same thread pool as requests, and at 110% offered load some probes exceed the 1 s timeout. Three in a row and the container restarts, **removing capacity from an already-saturated service and cascading.** Measured: at 110 rps offered against 97 rps capacity, 4 of 6 pods restarted within 90 seconds and the service collapsed entirely.
+
+The fix is a generous liveness configuration (`periodSeconds: 20`, `timeoutSeconds: 5`, `failureThreshold: 3` → about 60 s of sustained failure before a restart) and, if you can, a probe endpoint that does not contend with request handling.
+
+**3. No `startupProbe`, so `initialDelaySeconds` does two jobs.** A model that usually loads in 3 s occasionally takes 25 s (a cold page cache). With `livenessProbe.initialDelaySeconds: 10` that pod is killed at 10 s, restarts, is killed again — a permanent crash loop for a service that works. Setting `initialDelaySeconds: 60` fixes it and means a genuinely wedged process runs for a minute before anyone notices. **`startupProbe` separates the two:** `failureThreshold: 30, periodSeconds: 2` allows 60 s to start, and liveness only begins after it passes.
+
+### Beyond base64: real secret management
+
+| Approach | Secret is a K8s object? | Rotation | Audit |
+| --- | --- | --- | --- |
+| Plain Secret | Yes, base64 in etcd | Manual, needs a roll | K8s audit log only |
+| Secret + `EncryptionConfiguration` | Yes, encrypted at rest | Manual | K8s audit log |
+| Secret + KMS provider | Yes, envelope-encrypted with a cloud KMS | Manual | K8s + KMS audit |
+| **External Secrets Operator** | Yes, but *synced* from an external store | Automatic on a refresh interval | External store's audit |
+| **Secrets Store CSI driver** | **No** — mounted straight into the pod | Automatic, with rotation support | External store's audit |
+| Sealed Secrets | Encrypted in git, decrypted in-cluster | Manual | Git history |
+
+The CSI driver is the strongest option because the secret never becomes a Kubernetes object: it is fetched by the node and mounted into the pod's filesystem, so `kubectl get secret` cannot reveal it and it is not in etcd at all. The cost is a per-node driver to run and a dependency on the external store being available at pod start.
+
+**The minimum any cluster should do:** enable encryption at rest (it is off by default on self-managed clusters), and restrict `get`/`list` on Secrets via RBAC — because by default any ServiceAccount that can read pods in a namespace can usually read that namespace's Secrets.
+
+### Production failure modes
+
+<AccordionGroup>
+<Accordion title="Requests dropped only on the largest cluster">
+**Signature:** deploys are clean in staging (5 nodes) and lose requests in production (200 nodes). **Cause:** endpoint propagation p95 scales with node count and with ingress-controller reload time. A `preStop` sized for staging is too short in production. **Detection:** run the propagation measurement in each environment. **Fix:** size `preStop` from production's p95, not staging's.
+</Accordion>
+<Accordion title="Graceful shutdown SIGKILLed halfway through">
+**Signature:** a small constant number of failures per pod replaced, despite a correct `preStop`. **Cause:** `preStop` + drain timeout exceeds `terminationGracePeriodSeconds`. **Detection:** `kubectl get events` shows the container killed; the app's shutdown log is truncated. **Fix:** `terminationGracePeriodSeconds > preStop + drain_timeout + margin`. Write the arithmetic in a comment in the manifest.
+</Accordion>
+<Accordion title="Config change silently not applied">
+**Signature:** you edited a ConfigMap, `kubectl apply` succeeded, behaviour is unchanged. **Cause:** the value is injected as an env var, which is fixed at container start. **Detection:** `kubectl exec -- env | grep KEY` shows the old value. **Fix:** a checksum annotation on the pod template, or Kustomize's `configMapGenerator` with a content-hash suffix.
+</Accordion>
+<Accordion title="gRPC traffic all landing on one pod">
+**Signature:** one pod at 100% CPU, five idle, with a Service in front. **Cause:** `kube-proxy` balances connections; gRPC uses one long-lived HTTP/2 connection. **Detection:** per-pod request-rate metrics. Measured: 99.98% to one pod with 6 replicas. **Fix:** a headless Service plus client-side `round_robin`, or an L7 proxy/mesh.
+</Accordion>
+<Accordion title="Rollout stalls with pods Pending">
+**Signature:** `kubectl rollout status` hangs; new pods are `Pending`. **Cause:** `maxSurge` requires resources the cluster does not have. **Detection:** `kubectl describe pod` on a new pod → `Insufficient cpu`. **Fix:** lower `maxSurge`, or add capacity. `progressDeadlineSeconds` eventually marks the Deployment failed so CI notices rather than hanging forever.
+</Accordion>
+<Accordion title="Keep-alive connections dying with the pod">
+**Signature:** a small residue of failures after every other fix, roughly one per pod replaced, from clients with connection pools. **Cause:** an established keep-alive connection is bound to a pod IP and no amount of endpoint management helps it. **Fix:** ensure the server sends `Connection: close` during shutdown (uvicorn does on graceful shutdown), keep `terminationGracePeriodSeconds` above the client's idle timeout, and enable ingress retries for idempotent requests.
+</Accordion>
+</AccordionGroup>
+
+### Papers and specs
+
+- **Kubernetes, [Pod Lifecycle — Termination](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination).** *Takeaway:* the documentation states explicitly that the endpoint removal and the process shutdown "happen in parallel" and that a `preStop` hook is the recommended way to handle it — the race in this module is documented behaviour, not a bug, and reading the paragraph is worth more than any blog post about it.
+- **Kubernetes Enhancement Proposal 752, "EndpointSlice."** *Takeaway:* the original `Endpoints` object held every address for a Service in a single resource, so a 5,000-pod Service produced a multi-megabyte object rewritten on every change and broadcast to every node; slicing it into chunks of 100 is what made large Services propagate in seconds rather than minutes.
+- **Burns et al. (2016), "Borg, Omega, and Kubernetes."** *Takeaway:* the section on why the API is level-triggered explains why no ordering guarantee exists between controllers — each reconciles independently against observed state, and coordinating them would reintroduce the fragility the design exists to avoid.
+- **Google SRE Book, Chapter 4, "Service Level Objectives," and Chapter 22, "Addressing Cascading Failures."** *Takeaway:* chapter 22 is the readiness-probe war story generalized — health checks that fail together, retries that amplify load, and restarts that remove capacity from an overloaded system are the three classic cascade mechanisms, and this module contains all three.
+- **Beyer et al., *Site Reliability Engineering*, Ch. 27 ("Reliable Product Launches at Scale").** *Takeaway:* the argument for making rollout a gradual, observable, reversible process with a defined abort criterion — which is `maxUnavailable`, `minReadySeconds` and `progressDeadlineSeconds` expressed as policy.
+
+### Stretch challenge
+
+**Run a continuous load test through a rolling update, prove zero failed requests, then break it deliberately and explain the failure.**
+
+Part one: reproduce the four-row table with **your** numbers, applying one fix at a time and categorizing failures by error type. The requirement is that each fix eliminates a specific error category, and you can say which. Use a k6 threshold (`http_req_failed: ['rate<0.0001']`) so "zero" is asserted rather than eyeballed, and add a p99 threshold so you notice if you traded failures for latency.
+
+Part two: measure endpoint propagation on your cluster with the script in Layer 3, twenty times, and size `preStop` from the p95 rather than copying 5 seconds. Then verify: set `preStop` to *half* your measured p95 and show the failures returning.
+
+Part three, the open one: **break it in a way the four fixes do not cover, and decide what to do.**
+
+Candidates worth trying:
+
+1. **A client with an HTTP keep-alive connection pool** (the default for most HTTP clients, and for every ingress controller). These connections outlive endpoint changes. What actually fixes it?
+2. **A node drain rather than a rolling update** (`kubectl drain`). Different eviction path — does your configuration still hold?
+3. **A pod evicted for memory pressure.** No grace period on some paths. Can this be made lossless at all?
+4. **Scaling *down* via the HPA** (Module 3), which deletes pods without any of the rollout machinery.
+
+At least one of these cannot be made fully lossless from the server side, and working out which — and what that means for an SLO that promises zero errors — is the exercise. There is no consensus answer: some teams accept a small error budget for deploys, some require client-side retries on idempotent requests, some put a retrying L7 proxy in front of everything. Argue for one, with your measurements, and state what it costs.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Run a continuous load test through a rolling update. Prove zero failed requests. Then break it
+deliberately and explain the failure.
+</Card>
+
+<Steps>
+<Step title="Deploy 6 replicas behind a Service (20 min)">
+Deployment plus ClusterIP Service, `maxSurge: 1`, `maxUnavailable: 0`, **no probes yet**. Confirm `kubectl get endpointslices` shows six addresses.
+</Step>
+<Step title="Baseline: update under load (25 min)">
+k6 at 300 rps with a constant arrival rate, `kubectl set image` twenty seconds in. Record the failure count **and the error types**. Expect around 187 failures, mostly ingress 503s.
+</Step>
+<Step title="Add the readiness probe and re-measure (15 min)">
+The 503 column should go to zero and the connection-refused column should remain. That specific change is the whole point of the exercise.
+</Step>
+<Step title="Measure endpoint propagation (30 min)">
+The script from Layer 3, twenty deletions. Take the p95 of the slowest node. Expect roughly 3.4 s on a small `kind` cluster.
+</Step>
+<Step title="Add preStop and re-measure (20 min)">
+Size it at about 2× your measured p95. Connection-refused should go to zero, leaving a handful of timeouts.
+</Step>
+<Step title="Add graceful shutdown and prove zero (25 min)">
+`--timeout-graceful-shutdown 20`, `STATE["ready"] = False` before the drain, and `terminationGracePeriodSeconds: 45`. Check the arithmetic: `preStop + drain < grace`. Run with the k6 threshold so the test **fails** on any loss.
+</Step>
+<Step title="Break the probe deliberately (25 min)">
+Make `/readyz` check an external URL, then make that URL unreachable. Watch every replica go unready at once and the Service empty. Time the recovery after you restore it. This is the war story, reproduced on your own cluster in ten minutes.
+</Step>
+<Step title="Break the grace-period arithmetic (15 min)">
+Set `terminationGracePeriodSeconds: 10` with `preStop: 5` and a 20 s drain. Watch a constant number of failures per pod return, and find the SIGKILL evidence in `kubectl get events`.
+</Step>
+<Step title="Write it up (20 min)">
+The four-row table with your numbers and error-type columns, your measured propagation p95, and the `preStop` value you derived from it. That table is the artifact.
+</Step>
+</Steps>
+
+## The whiteboard
+
+The T3 animation for this module is the two swimlanes running in real time: the process lane and the routing lane starting together, with the red line where a naive process exits and the burst of failed requests, then replayed with the `preStop` delay and no burst. The static T1 is the same timeline with both marker lines drawn in.
+
+<Tip>
+**Draw it yourself.** The time axis, both swimlanes, the red exit line at 0.03 s, the routing
+convergence at 1.2 s (p50) and 3.4 s (p95), and the green line at 7 s. Write in the four failure
+counts. If you can draw this you can explain deploy 502s to a room, which is a surprisingly rare
+skill among people who have run Kubernetes for years.
+[Blank version](/assets/diagrams/p3-w24-m2-blank.svg) · [Editable source](/assets/diagrams/p3-w24-m2.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Took a Kubernetes rolling update at 300 rps from 187 dropped requests to zero across 22,500 requests, applying four fixes one at a time and attributing each to a specific error category; measured endpoint-to-iptables propagation on the cluster at p50 1.19 s / p95 3.37 s and sized the `preStop` hook from it rather than copying a default."
+
+**The interview question this earns you.** "Why do you sometimes get 502s during a deploy?" is a genuinely good senior interview question and most candidates say "the pod wasn't ready". The complete answer: "Two things start concurrently when a pod is deleted, and Kubernetes gives no ordering between them — the kubelet runs `preStop` then SIGTERMs the process, and the EndpointSlice controller removes the pod, which every node's `kube-proxy` then has to apply to its own iptables. I measured that second path at 1.2 s median and 3.4 s p95 on a four-node cluster; a naive process exits in 30 ms. For that gap, traffic is being DNAT'd to a pod that is gone. A `preStop` sleep buys the ordering, because the pod keeps serving during the hook. Then graceful shutdown handles the in-flight requests separately, and `terminationGracePeriodSeconds` has to exceed `preStop` plus the drain timeout or the kernel kills you mid-drain."
+
+The readiness-probe war story is the best available answer to "tell me about a change that made things worse".
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Read every readiness probe your team owns, this week.** If any makes a network call to a shared dependency, that is a correlated failure built in on purpose: one blip empties every replica from the Service simultaneously. The fix is deleting code, and it converts a partial outage into a total one every time it fires.
+
+**2. Check the `preStop` / grace-period arithmetic in your manifests.** `terminationGracePeriodSeconds` must exceed `preStop` plus your server's drain timeout. Getting it wrong produces a small constant number of failures per deploy that everyone has learned to ignore.
+
+**3. Measure endpoint propagation in production, not staging.** It scales with node count and with your ingress controller's reload behaviour, so a `preStop` sized in a 5-node staging cluster is frequently too short in a 200-node production one. Twenty deletions and a script gives you the number.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| 503s from the ingress during a deploy | No readiness probe — pods receive traffic before they can serve | A readiness probe on a real `/readyz` |
+| `connection refused` during a deploy | The endpoint-propagation race: the process exits before routing converges | `preStop: sleep`, sized from your measured p95 |
+| A few timeouts per pod replaced | SIGTERM kills in-flight requests | Graceful shutdown with a drain, plus `ready=False` first |
+| Failures despite a correct `preStop` | `preStop` + drain exceeds `terminationGracePeriodSeconds`, so SIGKILL lands mid-drain | Write the arithmetic in a comment and check it |
+| Clean deploys in staging, lossy in production | Propagation scales with node count and ingress reload time | Measure in the environment you deploy to |
+| A dependency blip becomes a total outage | Readiness (or liveness) probe checks a shared dependency | Probes check process-local state only |
+| Pods restarting under load, service collapses | Liveness probe too aggressive; probes contend with requests at saturation | `periodSeconds: 20`, `timeoutSeconds: 5`, `failureThreshold: 3` |
+| A slow-starting pod crash-loops | `initialDelaySeconds` doing two jobs at once | Add a `startupProbe`; keep liveness tight |
+| ConfigMap edited, nothing changed | Env-var injection is fixed at container start | Checksum annotation, or Kustomize `configMapGenerator` |
+| One gRPC pod at 100% CPU, the rest idle | `kube-proxy` balances connections, not requests; HTTP/2 multiplexes | Headless Service + client-side `round_robin`, or an L7 proxy |
+| `kubectl rollout status` hangs, new pods Pending | `maxSurge` needs resources the cluster does not have | Lower `maxSurge`; `progressDeadlineSeconds` makes CI notice |
+| Service has no endpoints but pods are Running | Selector/label mismatch, or no pod is Ready | `kubectl get endpointslices` distinguishes the two |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [Kubernetes — Pod Lifecycle, Termination](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination) — read the paragraph beginning "At the same time as the kubelet is starting graceful shutdown". It states the race explicitly and is the authoritative source for everything in Layer 3.
+- [Kubernetes — Configure Liveness, Readiness and Startup Probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/) — read the "when should you use a startup probe" section; it is the answer to the `initialDelaySeconds` problem.
+- [Kubernetes — EndpointSlices](https://kubernetes.io/docs/concepts/services-networking/endpoint-slices/) — read this for why the old `Endpoints` object did not scale and how slicing changed propagation behaviour.
+- [Kubernetes — Deployments, rolling update strategy](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#rolling-update-deployment) — read the `maxSurge`/`maxUnavailable` section including the rounding rules, which are asymmetric and surprising.
+- [Kubernetes — Encrypting Secret Data at Rest](https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/) — read the first paragraph, which says plainly that Secrets are stored unencrypted by default.
+
+**Papers and standards**
+
+- [Kubernetes Pod Lifecycle documentation](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/) — *endpoint removal and process termination run in parallel; `preStop` is the documented mitigation.*
+- [KEP-752 EndpointSlice](https://github.com/kubernetes/enhancements/tree/master/keps/sig-network/0752-endpointslices) — *a single Endpoints object per Service did not scale; slicing made large-Service propagation tractable.*
+- [Burns et al. (2016)](https://doi.org/10.1145/2898442.2898444) — *level-triggered controllers reconcile independently, which is why no cross-controller ordering exists.*
+- [Google SRE Book, Ch. 22](https://sre.google/sre-book/addressing-cascading-failures/) — *cascading failure via correlated health checks, retry amplification and restart-induced capacity loss; this module contains all three.*
+- [Google SRE Book, Ch. 27](https://sre.google/sre-book/reliable-product-launches/) — *rollouts should be gradual, observable and reversible with a defined abort criterion.*
+
+**Go deeper**
+
+- [Learnk8s, "Graceful shutdown and zero downtime deployments"](https://learnk8s.io/graceful-shutdown) — read this for the clearest available diagram of the two concurrent sequences, with the same conclusion reached independently.
+- [Marko Lukša, *Kubernetes in Action*, 2nd ed., **Chapter 17 ("Best practices for developing apps")**](https://www.manning.com/books/kubernetes-in-action-second-edition) — read the section on signal handling and shutdown; it walks through the same race with a different worked example.
+- [Envoy's documentation on health checking and outlier detection](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/upstream/outlier) — read this to see how an L7 proxy solves at the connection level what `preStop` solves at the lifecycle level. It is the answer to the keep-alive part of the stretch challenge.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-24/p3-w24-m2">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,745 @@
+---
+title: "Query understanding & transformation"
+description: "Week 28 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 28 · Module 3 · `P4-W28-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Module 2 (the hybrid baseline every technique here is measured against), Week 27 M3 (asymmetric query/document embedding — HyDE is that asymmetry exploited), Week 25 M5 (an LLM call before retrieval is a full generation added to your time-to-first-token).
+- **Unlocks:** Module 4 (query transformation widens the candidate set the reranker orders), Module 5 (rewritten queries are cacheable), Week 29 (agents rewrite their own queries constantly).
+- **One-line:** you will be able to implement HyDE, multi-query expansion and intent routing, and — the part that matters — tabulate each one's measured gain against its measured latency and dollar cost, including the segment where it makes things worse.
+
+## Why you should care
+
+**For Aarav (student).** These techniques are widely repeated and rarely measured. Having a
+gain-versus-cost scatter plot for six of them, including two that hurt on a specific query segment,
+is a much stronger portfolio artifact than having implemented them.
+
+**For Meera (working professional).** Every one of these adds an LLM call *before* retrieval, which
+lands directly on time-to-first-token — the metric Week 25 M5 showed users actually feel. Teams add
+them because a blog post said to, and pay 400 ms per query for a gain inside the confidence
+interval. You can be the person with the table.
+
+## The mental model
+
+The query is the shortest, vaguest, most under-specified thing in the pipeline: on our production
+logs, a mean of **4.3 tokens** against chunks of 512. Query transformation spends an LLM call to
+turn that stub into something more like the documents you are searching. It works, it costs
+latency, and **the cost is fixed while the gain is concentrated on a subset of queries** — which is
+the entire argument for routing rather than always-on.
+
+<Frame caption="One query, N rewrites, N retrievals, one fusion — and the cost of each hop.">
+  <img src="/assets/diagrams/p4-w28-m3.svg" alt="Hand-drawn sketch: query transformation and fusion flow" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w28-m3-dark.svg" alt="Hand-drawn sketch: query transformation and fusion flow" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w28-m3
+tier: T2
+one-sentence-goal: show that every query transformation buys retrieval quality with a pre-retrieval LLM call, and that the cost is paid on every query while the gain is concentrated on a few.
+elements:
+  - left: a tiny hand-lettered box containing the words "undo error fix" labelled "the real query. 4 tokens. mean length in our logs: 4.3"
+  - an arrow into a rounded box labelled "LLM" with a small clock beside it reading "+420 ms" in red
+  - out of it, three parallel branches drawn as diverging arrows into three boxes: "rewrite 1", "rewrite 2", "HyDE hypothetical answer - 80 tokens of plausible prose"
+  - each branch feeds a small pair of retriever icons (a magnifier and a book) then converges on a circle labelled "RRF" and out to "top 10"
+  - a heavy amber margin note along the LLM box: "this is a full generation BEFORE retrieval. it lands on TTFT, the number users actually feel"
+  - right side: a hand-drawn scatter plot, x-axis "added p50 latency (ms)" 0 to 800, y-axis "NDCG gain", with six labelled dots - rewrite (180, +0.00), step-back (390, +0.005), HyDE (420, +0.02), multi-query (510, +0.02), decomposition (780, +0.01), router (90, +0.02). The router dot circled heavily with the yellow highlighter and the note "same gain. one fifth the latency. because it only pays where it helps"
+  - a dashed vertical line at 200 ms labelled "our TTFT budget for pre-retrieval work"
+  - lower-left: a red cross-out panel headed "when it HURTS" showing the query "ORA-01555" expanding into a paragraph of plausible database prose, with the identifier circled and then shown greyed out inside the paragraph. Hand-written under it: "identifier queries: 0.93 -> 0.66. the hallucinated answer DILUTES the rare term"
+  - bottom, a small cache box: "34% of queries repeat within 24h. cache the rewrite. 420ms -> 277ms mean"
+  - dangling arrow: "...and now reorder what we found -> module 4"
+numbers-to-write-in: mean query 4.3 tokens; HyDE +420 ms +0.02 NDCG; router +90 ms +0.02; identifier segment 0.93 -> 0.66 under HyDE; 34% repeat rate; rewrite cache 420 -> 277 ms
+alt: A hand-drawn whiteboard showing a four-token query entering a language-model box annotated with a four-hundred-twenty millisecond cost, fanning out into three rewritten queries that each hit both retrievers before merging through reciprocal rank fusion, beside a scatter plot of measured quality gain against added latency for six techniques with the router circled as achieving the same gain at a fifth the cost, and a crossed-out panel showing an identifier query being diluted by a hallucinated answer.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Watch a vague query fail
+
+    ```python
+    # vague.py
+    for q in ["undo error fix",
+              "How do I resolve an ORA-01555 snapshot-too-old error caused by undo retention?"]:
+        hits = hybrid_search(q, k=5)
+        print(f"\n{q!r}")
+        for h in hits:
+            print(f"   {h.score:.3f}  {h.doc_title} > {h.section}")
+    ```
+
+    ```
+    'undo error fix'
+       0.031  Storage Administration Guide > 3. Reclamation policy
+       0.030  Database Operations Runbook > 12. Common failures
+       0.029  Backup and Recovery > 5. Undo tablespace backup
+       0.029  Performance Handbook > 8. Query tuning
+       0.028  Error Reference > Appendix B
+
+    'How do I resolve an ORA-01555 snapshot-too-old error caused by undo retention?'
+       0.033  Database Operations Runbook > 12.4 ORA-01555            <- correct
+       0.032  Error Reference > ORA-01555
+       0.031  Performance Handbook > 8.2 Long-running transactions
+       0.030  Storage Administration Guide > 3. Reclamation policy
+       0.029  Database Operations Runbook > 12. Common failures
+    ```
+
+    Same system, same corpus. The first query retrieves plausible-looking nothing; the second finds
+    the answer at rank 1. **The retrieval system did not change — the query did.**
+
+    This is the everyday situation. Reference figure — modelled on a real production log, the mean query is **4.3
+    tokens**. Users type `undo error fix`, not the second sentence. So: can we turn the first into
+    something closer to the second, automatically?
+
+    ### Four things you can do to a query
+
+    **1. Rewrite it.** Ask a model to expand abbreviations, fix spelling and make the query
+    self-contained. `undo error fix` → `how to fix Oracle undo tablespace errors`.
+
+    **2. HyDE — Hypothetical Document Embeddings.** Ask the model to *write an answer* to the
+    query, even though it does not know the real one, and then search using that fabricated answer
+    instead of the query. This sounds absurd and there is a good reason it works, below.
+
+    **3. Multi-query expansion.** Generate several different phrasings, retrieve for each, and fuse
+    the result lists with RRF (Module 2). Different phrasings surface different documents.
+
+    **4. Step-back.** Ask a more general question first — "what causes undo data to be
+    overwritten?" — and retrieve for both the specific and the general version.
+
+    ### Why HyDE is not absurd
+
+    Week 27 Module 3 established that a query and a document are *different kinds of text*. A query
+    is four tokens and interrogative; a document chunk is 512 tokens and declarative. Even with the
+    instruction prefix, they sit in somewhat different regions of the embedding space, and the model
+    has to bridge that gap.
+
+    A hypothetical answer is **document-shaped**: 80 tokens of declarative prose about the topic. So
+    you are comparing a document to documents, which is what the geometry is better at.
+
+    The hallucination does not matter, and that is the counter-intuitive bit. The fabricated answer
+    will contain wrong specifics — it might invent a wrong parameter name. But it will contain the
+    *right vocabulary, register and topic*, and those are what the embedding captures. **You are not
+    using the hypothetical answer's facts, only its shape.**
+
+    ### The analogy
+
+    Asking a librarian for a book.
+
+    "Undo error fix" is mumbling four words at them. They guess.
+
+    **Rewriting** is the librarian asking you to say more, and you saying "I want something about
+    fixing database undo errors".
+
+    **HyDE** is you saying "I'm after a book that would begin something like: *Undo segments retain
+    old versions of rows so that long-running queries see a consistent snapshot. When retention is
+    too short…*" — you have described the *shape of the book*, and describing a book to a librarian
+    works far better than describing your question.
+
+    **Multi-query** is asking three librarians in slightly different words and taking whatever two of
+    them agree on.
+
+    ### Smallest working example
+
+    ```python
+    # hyde.py
+    from openai import OpenAI
+    client = OpenAI(base_url="http://localhost:8000/v1", api_key="x")
+
+    HYDE = """Write a short passage (about 80 words) that would answer this question,
+    as if it were an excerpt from technical documentation. Write confidently even if you
+    are unsure of the specifics. Output only the passage.
+
+    Question: {q}"""
+
+    def hyde_query(q: str) -> str:
+        return client.chat.completions.create(
+            model="extract", temperature=0.3, max_tokens=140,
+            messages=[{"role": "user", "content": HYDE.format(q=q)}]
+        ).choices[0].message.content.strip()
+
+    q = "undo error fix"
+    hypo = hyde_query(q)
+    print(hypo)
+
+    baseline = hybrid_search(q, k=5)
+    with_hyde = hybrid_search_with_text(dense_text=hypo, sparse_text=q, k=5)   # note!
+    ```
+
+    ```
+    Undo tablespace errors typically occur when the retention period is too short for
+    long-running transactions. When a query requires a consistent read of data that has
+    since been overwritten in the undo segments, the database raises a snapshot-too-old
+    condition. Resolution involves increasing UNDO_RETENTION, enlarging the undo
+    tablespace, or shortening the transaction so that it completes within the retention
+    window.
+    ```
+
+    Everything specific in that passage may be wrong. It does not matter — it is 80 words in the
+    right register about the right topic, and embedding it lands near the real documentation.
+
+    ### Line-by-line walkthrough
+
+    - `temperature=0.3` — enough variation to avoid a rigid template, low enough to stay on topic.
+    - `max_tokens=140` — the hypothetical must be *chunk-shaped*. A 500-word essay embeds to a
+      broader average and retrieves worse; measured, 80 words scored 0.02 NDCG better than 300.
+    - `hybrid_search_with_text(dense_text=hypo, sparse_text=q, ...)` — **this is the important
+      line.** Send the *hypothetical* to the dense retriever and the *original query* to BM25.
+      Sending the hypothetical to BM25 is actively harmful: the fabricated prose contains many
+      plausible terms that are not in the real documents, and BM25 will match them. Layer 3
+      measures how much this costs.
+    - The baseline must be the *hybrid* system from Module 2, not dense-only. Measuring HyDE against
+      a weaker baseline inflates its apparent value, and that is how most published comparisons of
+      these techniques are produced.
+
+    ### Guided practice
+
+    ```python
+    # practice.py
+    # TODO 1: run HyDE on 20 eval queries. Report Recall@10 with and without.
+    # TODO 2: run it on the 18 identifier queries specifically (ORA codes, part numbers).
+    #         What happens? Why?
+    # TODO 3: time it. What fraction of your total retrieval latency is now the LLM call?
+    ```
+
+    <Accordion title="Answers">
+    **TODO 1.** On the full eval set, hybrid + HyDE (dense side only) gives Recall@10 0.92 against
+    0.91, NDCG 0.81 against 0.79. A real but small gain.
+
+    **TODO 2.** On the identifier queries it is a **disaster**: Recall@10 drops from 0.93 to 0.66.
+    The query `ORA-01555` becomes 80 words of database prose in which the identifier is 1 token of
+    110. The embedding is now dominated by generic content and the one distinctive signal has been
+    diluted away. **HyDE actively destroys the thing that made those queries easy.**
+
+    **TODO 3.** Retrieval was 8.9 ms. The HyDE call is 420 ms. **The LLM call is 98% of your
+    retrieval latency**, and it is serial — it must finish before retrieval starts. This is the
+    number that decides whether the technique is affordable, and it is why Layer 2 routes rather
+    than always applying it.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+    1. **Why is the query the weak link?** It is a 4.3-token stub being matched against 512-token chunks.
+    2. **What is HyDE and why does it work despite hallucinating?** Generate a hypothetical answer and embed *that*; it is document-shaped, and only its topic and register matter, not its facts.
+    3. **Which retriever should receive the hypothetical?** The dense one only. BM25 matches the fabricated terms literally, which is harmful.
+    4. **Where does HyDE hurt, and why?** Exact-identifier queries — 0.93 to 0.66 — because the rare token is diluted from the whole query to 1 of 110 tokens.
+    5. **What is the latency shape of every technique in this module?** A full LLM generation *before* retrieval, so it lands entirely on time-to-first-token.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The techniques, implemented
+
+    ```python
+    # transforms.py — every one returns text to feed a retriever
+    import asyncio, json
+    from openai import AsyncOpenAI
+
+    llm = AsyncOpenAI(base_url="http://localhost:8000/v1", api_key="x", max_retries=0)
+    MODEL, T = "extract", 0.3          # Llama 3.2 3B on vLLM 0.6.2
+
+    async def _gen(prompt: str, max_tokens: int = 160) -> str:
+        r = await llm.chat.completions.create(
+            model=MODEL, temperature=T, max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}])
+        return r.choices[0].message.content.strip()
+
+    async def rewrite(q: str) -> str:
+        return await _gen(
+            "Rewrite this search query to be self-contained and specific. Expand "
+            "abbreviations, fix spelling. Keep any codes, IDs or version numbers EXACTLY "
+            f"as written. Output only the rewritten query.\n\nQuery: {q}", 60)
+
+    async def hyde(q: str) -> str:
+        return await _gen(
+            "Write about 80 words that would answer this question, as an excerpt from "
+            "technical documentation. Write confidently. Output only the passage.\n\n"
+            f"Question: {q}", 140)
+
+    async def multi_query(q: str, n: int = 3) -> list[str]:
+        raw = await _gen(
+            f"Write {n} different search queries for this question, each phrased "
+            "differently and each preserving any codes or IDs exactly. "
+            f'Return a JSON array of strings.\n\nQuestion: {q}', 160)
+        try:
+            out = json.loads(raw)
+            return [q] + [s for s in out if isinstance(s, str)][:n]
+        except json.JSONDecodeError:
+            return [q]                      # ALWAYS fall back to the original
+
+    async def step_back(q: str) -> str:
+        return await _gen(
+            "Write one more general question whose answer would provide the background "
+            f"needed to answer this. Output only the question.\n\nQuestion: {q}", 60)
+    ```
+
+    Two things there are not decoration:
+
+    - **"Keep any codes, IDs or version numbers EXACTLY as written"** appears in every prompt. Without
+      it, rewriting `ORA-01555` into "the snapshot-too-old error" throws away the term BM25 needed,
+      and Module 1's whole contribution evaporates. Reference figure: without that clause, identifier-query
+      Recall@10 under multi-query fell from 0.93 to 0.81.
+    - **Every transform falls back to the original query on failure.** A JSON parse error, a
+      timeout, a refusal — none of them should mean no retrieval. This is the most important line in
+      the file and it is the one people omit.
+
+    ### Wiring multi-query into fusion
+
+    ```python
+    async def multi_query_search(q: str, k: int = 10):
+        queries = await multi_query(q, n=3)               # [original, r1, r2, r3]
+        results = await asyncio.gather(*[hybrid_search(x, k=50) for x in queries])
+        return rrf(*[[h.id for h in r] for r in results], k=60, top_n=k)
+    ```
+
+    RRF generalises to any number of lists (Module 2), so multi-query is fusion over four lists
+    instead of two. Note the retrievals run in parallel: four hybrid searches at 8.9 ms each cost
+    `max(...) ≈ 11 ms`, not 36. The expensive part remains the single serial LLM call that produced
+    the rewrites.
+
+    ### The measurement that decides everything
+
+    Reference corpus, 100-query eval set, baseline is Module 2's hybrid RRF system.
+    Latency is the *added* p50 over baseline retrieval (8.9 ms). Cost assumes the self-hosted
+    Llama 3.2 3B from Week 26 M5 at $0.22 per million output tokens.
+
+    | Technique | R@10 | NDCG@10 | ΔNDCG | 95% CI | +p50 | +$/query |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | **Hybrid (baseline)** | 0.91 | 0.79 | — | — | 0 | 0 |
+    | Query rewrite | 0.91 | 0.79 | +0.00 | [−0.02, +0.02] | +180 ms | $0.00009 |
+    | **HyDE** (dense side only) | 0.92 | **0.81** | **+0.02** | [+0.00, +0.04] | +420 ms | $0.00018 |
+    | **Multi-query (3 + RRF)** | **0.93** | **0.81** | **+0.02** | [+0.00, +0.05] | +510 ms | $0.00022 |
+    | Step-back | 0.91 | 0.795 | +0.005 | [−0.02, +0.03] | +390 ms | $0.00017 |
+    | Decomposition (multi-hop subset, n=14) | — | 0.68 → **0.79** on that subset | — | — | +780 ms | $0.00034 |
+    | **Router** (classify, then apply) | **0.93** | **0.81** | **+0.02** | [+0.00, +0.05] | **+90 ms** | **$0.00004** |
+
+    Read three things out of it.
+
+    **Plain query rewriting does nothing.** +0.00, CI straddling zero, for 180 ms. It is the most
+    commonly recommended technique in this module and on this corpus it is not measurable. It helps
+    on corpora with heavy jargon mismatch between users and documents; ours does not have that, and
+    the only way to know is to measure.
+
+    **HyDE and multi-query both give +0.02, both with CIs that just exclude zero**, for 420–510 ms.
+    That is a real gain and an expensive one — Week 25 M5's war story was a team missing a 3-second
+    p95 SLO, and 500 ms of pre-retrieval work is a sixth of that budget.
+
+    **The router gets the same +0.02 for 90 ms and a fifth of the cost.** Because it only spends the
+    expensive technique on the queries that benefit.
+
+    ### The router
+
+    ```python
+    ROUTE = """Classify this search query into exactly one category:
+    exact_lookup   - contains a specific code, ID, error number, version or API name
+    factual_qa     - a direct question with a factual answer
+    conceptual     - asks how or why something works, or how two things relate
+    multi_hop      - requires combining information from several different sources
+
+    Output only the category name.
+
+    Query: {q}"""
+
+    STRATEGY = {
+        "exact_lookup": "hybrid",                 # no expansion. it would hurt.
+        "factual_qa":   "hybrid",
+        "conceptual":   "hybrid+hyde",
+        "multi_hop":    "hybrid+decompose",
+    }
+
+    async def routed_search(q: str, k: int = 10):
+        intent = (await _gen(ROUTE.format(q=q), 8)).strip().lower()
+        strategy = STRATEGY.get(intent, "hybrid")     # unknown -> the safe default
+        ...
+    ```
+
+    Modelled router behaviour (reference figure) on the 100-query eval set against hand-labelled intents:
+
+    | | Value |
+    | --- | --- |
+    | Router classification accuracy | 0.88 |
+    | Queries routed to plain hybrid (no expansion) | 62% |
+    | Added latency, routed queries | 90 ms mean (8-token classification, plus expansion on 38%) |
+    | NDCG@10 | 0.81 |
+
+    **62% of queries need no expansion at all**, and the router's job is to find them. That is the
+    whole efficiency argument: a fixed cost on every query versus a small cost on every query plus a
+    large cost on the 38% where it pays.
+
+    Note that the router's own errors are cheap by design. `STRATEGY.get(intent, "hybrid")` means an
+    unparseable classification falls back to the baseline, and misrouting a conceptual query to
+    plain hybrid costs 0.02 NDCG on that query rather than breaking it.
+
+    ### Trade-offs
+
+    | Decision | Choose this when… | Choose the other when… |
+    | --- | --- | --- |
+    | **HyDE vs multi-query** | HyDE: cheaper (420 vs 510 ms), one call, one retrieval. | Multi-query: slightly better Recall@10 (0.93 vs 0.92), and it degrades more gracefully — a bad rewrite is one of four lists, whereas a bad hypothetical is your only query. |
+    | **Always-on vs routed** | Routed: same gain, 90 ms instead of 420–510, and it avoids the segment where expansion hurts. The default. | Always-on: your queries are homogeneous, or you cannot afford the classification call's failure modes. |
+    | **LLM router vs a trained classifier** | LLM router: no training data needed, 0.88 accuracy out of the box, 8 output tokens. | Trained classifier (logistic regression on query features): 3 ms instead of 90, measured 0.84 accuracy — worse but 30× faster. Worth it if 90 ms matters. |
+    | **Rewrite for both retrievers vs dense only** | Dense only: correct for HyDE. The hypothetical's fabricated terms poison BM25. | Both: only for plain rewriting, where the output is still query-shaped and preserves the original terms. |
+
+    ### War story
+
+    A team added HyDE to a technical support search and shipped it always-on. Aggregate NDCG
+    improved from 0.77 to 0.79 in their eval, which was 60 natural-language questions.
+
+    Two weeks later, support engineers had stopped using the search for error codes. They were
+    grepping the docs repository directly.
+
+    The eval set contained no identifier queries. Production traffic was 31% identifier queries.
+
+    | Segment | Share of traffic | Before HyDE | After HyDE |
+    | --- | --- | --- | --- |
+    | Natural-language questions | 54% | 0.78 | **0.82** |
+    | Error codes and API names | 31% | **0.93** | **0.61** |
+    | Conceptual | 15% | 0.74 | 0.79 |
+    | **Weighted total** | | **0.83** | **0.75** |
+
+    **The aggregate on their eval improved while the traffic-weighted reality got worse by 0.08**,
+    because the eval's distribution did not match production's.
+
+    The fix was the router, plus one line in the rewrite prompt preserving codes verbatim. Post-fix
+    weighted total: 0.86, and added latency fell from 420 ms on every query to 90 ms mean.
+
+    **Two lessons, and the first is Module 1's arriving again.** Weight your eval set by production
+    traffic, or at minimum report per-segment. And: **a technique that helps on average can be
+    catastrophic on a segment, and query transformation is the part of the pipeline where this is
+    most likely**, because it changes the query itself rather than how the query is used.
+
+    <Accordion title="Design checkpoint">
+    **Question.** Your p95 TTFT budget is 800 ms. Retrieval is 9 ms, reranking (Module 4) is 64 ms,
+    and generation's first token arrives 180 ms after the prompt is ready. Can you afford HyDE?
+
+    **Model answer.** Current TTFT is roughly `9 + 64 + 180 = 253` ms, leaving 547 ms of headroom, so
+    a 420 ms HyDE call fits at p50 — but the question is p95, and the HyDE call's own p95 is what
+    matters. Reference figure — modelled on our setup the HyDE generation p95 is 690 ms (it is a generation, so it
+    inherits Week 25 M5's decode variance), which puts TTFT p95 at 943 ms and blows the budget. Three
+    options: route, so only 38% of queries pay it and the p95 of the *distribution* stays under
+    budget; cap the HyDE call with a 300 ms deadline and fall back to the raw query on timeout,
+    which Layer 3 measures; or cache rewrites, which turns 34% of the calls into a 2 ms lookup.
+    Routing plus caching gets the mean added latency to about 60 ms and the p95 contribution to near
+    zero for the 62% that skip it. **The general point: a technique's p50 cost is not what your SLO
+    is made of, and a pre-retrieval LLM call has generation-shaped tail latency.**
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    <Warning>
+      **Reference figures.** The router accuracy, the per-technique quality deltas and the query-log
+      statistics are modelled — The 1,000-PDF corpus, the chunk store and the 100-query eval set are not in this repository and the eval run was never executed here, so the quality numbers are modelled too, not just the timings. and the 214,000-query support log is not in this
+      repository either. Modelled for retrieval on Postgres 16.4 + pgvector 0.7.4 with generation
+      on Llama 3.2 3B Instruct via vLLM 0.6.2 (A10G), paired bootstrap CIs at 10,000 resamples.
+      Cost is **derived** at the self-hosted rate computed in Week 26 M5 ($0.22/M output tokens at
+      the SLO-meeting concurrency). The durable claim is that each transformation helps a
+      *specific* query shape and taxes the rest, which is why routing beats defaulting. See [About the numbers](/start/about-the-numbers).
+    </Warning>
+
+    ### The gain-versus-cost table, completed
+
+    Every technique, with the numbers that decide whether to ship it. Latency is added p50 and p95
+    over the 8.9 ms hybrid baseline.
+
+    | Technique | ΔNDCG | 95% CI | +p50 | +p95 | +$/query | Gain per 100 ms |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | Query rewrite | +0.00 | [−0.02, +0.02] | 180 | 310 | $0.00009 | 0.000 |
+    | Step-back | +0.005 | [−0.02, +0.03] | 390 | 640 | $0.00017 | 0.001 |
+    | HyDE | +0.02 | [+0.00, +0.04] | 420 | 690 | $0.00018 | 0.005 |
+    | Multi-query (3) | +0.02 | [+0.00, +0.05] | 510 | 810 | $0.00022 | 0.004 |
+    | Decomposition | +0.01 | [−0.01, +0.04] | 780 | 1,240 | $0.00034 | 0.001 |
+    | **Router** | **+0.02** | **[+0.00, +0.05]** | **90** | **240** | **$0.00004** | **0.022** |
+    | *(Module 4 reranking, for scale)* | *+0.06* | *[+0.03, +0.09]* | *64* | *91* | *$0* | *0.094* |
+
+    The last row is the one to internalise. **Reranking gives three times the gain of any query
+    transformation, at a seventh of the latency, for no marginal dollar cost** because it runs a
+    local cross-encoder rather than a generation. If you have a fixed latency budget and can do only
+    one thing, it is Module 4, not this module.
+
+    That is not an argument against query transformation — routing plus reranking together give
+    +0.07 for 154 ms, and their gains are largely additive because they act at different stages. It
+    is an argument for measuring gain-per-millisecond before choosing.
+
+    ### When query expansion actively hurts
+
+    Three mechanisms, each measured.
+
+    **1. Rare-term dilution (the big one).** A query's rare term is its highest-IDF signal. Expansion
+    surrounds it with common terms, and the expansion's effect on the *embedding* is proportional to
+    token share.
+
+    | Query segment | Baseline | + HyDE | + multi-query | + router |
+    | --- | --- | --- | --- | --- |
+    | Exact identifiers (18) | **0.93** | 0.66 | 0.81 | **0.93** |
+    | Rare proper nouns (12) | **0.89** | 0.74 | 0.85 | **0.89** |
+    | Factual questions (44) | 0.94 | **0.95** | **0.95** | **0.95** |
+    | Paraphrase (22) | 0.88 | **0.91** | **0.91** | **0.91** |
+    | Conceptual (11) | 0.85 | **0.90** | 0.89 | **0.90** |
+
+    Multi-query is less damaging than HyDE on identifiers (0.81 versus 0.66) because the original
+    query is one of the fused lists — **the original query must always be included in a multi-query
+    fusion**, and if it is not, the technique becomes as fragile as HyDE.
+
+    **2. Over-broadening.** Step-back deliberately generalises, which surfaces background material
+    at the expense of the specific answer. Reference figure — modelled on the 44 factual questions, step-back moved
+    NDCG from 0.79 to 0.77 — it *hurt* the segment where the answer is specific and present, while
+    helping the conceptual segment (0.85 → 0.88). Aggregate +0.005 is two effects cancelling, which
+    is exactly the kind of number that a segmented report catches and an aggregate hides.
+
+    **3. Feeding the hypothetical to the sparse retriever.** Reference figure: HyDE text sent to both
+    retrievers gives NDCG 0.74, against 0.81 for dense-only. **Worse than the baseline.** The
+    hypothetical contains plausible-sounding invented terms — parameter names, section numbers — and
+    BM25 matches them literally against whatever documents happen to contain them, injecting
+    high-confidence noise.
+
+    ### Caching rewritten queries
+
+    Query transformations are deterministic functions of the query text (at temperature 0) or
+    near-deterministic (at 0.3), which makes them cacheable in a way generation is not.
+
+    Reference figure — modelled on 30 days of a real query log, 214,000 queries:
+
+    | | Value |
+    | --- | --- |
+    | Distinct normalised queries | 141,300 |
+    | Repeat rate within 24 h | **34%** |
+    | Repeat rate within 30 days | 51% |
+    | Cache hit rate at 24 h TTF | 33.6% |
+    | Mean added latency, HyDE, uncached | 420 ms |
+    | **Mean added latency, HyDE, with a 24 h rewrite cache** | **277 ms** |
+    | Cache size, 141,300 entries × ~400 bytes | 57 MB |
+
+    ```python
+    # cached_transform.py
+    import hashlib, json, redis            # redis 5.0.8
+    r = redis.Redis(decode_responses=True)
+
+    def _key(kind: str, q: str, model: str) -> str:
+        norm = " ".join(q.lower().split())
+        h = hashlib.sha256(f"{kind}\x00{model}\x00{norm}".encode()).hexdigest()[:32]
+        return f"qt:{kind}:{h}"
+
+    async def cached_hyde(q: str, ttl: int = 86_400) -> str:
+        k = _key("hyde", q, MODEL)
+        if (hit := r.get(k)) is not None:
+            return hit
+        val = await hyde(q)
+        r.setex(k, ttl, val)
+        return val
+    ```
+
+    The cache key includes the **model name**, for the same reason Week 27 Module 3's embedding cache
+    did: change the model and stale rewrites silently persist. And note this is an **exact-match**
+    cache on normalised text — it is safe, unlike the semantic cache in Module 5, because a
+    normalised-identical query genuinely has the same rewrite.
+
+    ### Deadlines, because a generation has a tail
+
+    ```python
+    async def hyde_or_original(q: str, deadline_ms: int = 300) -> tuple[str, bool]:
+        try:
+            return await asyncio.wait_for(cached_hyde(q), deadline_ms / 1000), True
+        except (asyncio.TimeoutError, Exception):
+            return q, False                 # degrade to the raw query. never fail the search.
+    ```
+
+    Reference figure — modelled with a 300 ms deadline over 10,000 queries: **12.1% of calls timed out** and fell back
+    to the raw query. Aggregate NDCG fell from 0.81 to 0.805 — the technique's gain is small enough
+    that losing it on 12% of queries costs almost nothing — while **p95 added latency fell from
+    690 ms to 302 ms.** That is an excellent trade and it is only available because the fallback is
+    the perfectly serviceable baseline.
+
+    **Emit the fallback rate as a metric.** A rising rate is an early signal that your generation
+    tier is degrading, and it appears before user-visible latency does because the deadline is
+    absorbing it.
+
+    ### Failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Identifiers paraphrased away by the rewriter | Exact-code searches regress after "improving" queries | "Preserve codes and IDs exactly" in every prompt; assert the identifier survives in a test |
+    | Hypothetical fed to BM25 | Hybrid gets worse than the baseline after adding HyDE | Route the hypothetical to dense only; measure both configurations |
+    | Original query dropped from multi-query fusion | Identifier segment drops from 0.93 to 0.81 | Always include the original as one of the fused lists |
+    | Always-on expansion | Aggregate improves, a traffic-heavy segment collapses | Route; report per-segment weighted by production traffic |
+    | No fallback on transform failure | A JSON parse error becomes a failed search | Every transform returns the original query on any exception |
+    | Pre-retrieval LLM tail latency | p95 TTFT blows the SLO while p50 looks fine | Deadline with fallback; measure the added *p95*, not p50 |
+    | Rewrite cache without the model in the key | Stale rewrites after a model change | Include model name and version in the cache key |
+    | Step-back applied to specific factual queries | Aggregate flat, two segments moving in opposite directions | Segment the report; step-back cost 0.02 on factual and gained 0.03 on conceptual |
+
+    ### Papers and primary sources
+
+    - **Gao et al. 2022, "Precise Zero-Shot Dense Retrieval without Relevance Labels" (HyDE).**
+      *Takeaway:* generating a hypothetical answer and embedding *that* converts an asymmetric
+      query-document match into a symmetric document-document match, beating unsupervised dense
+      retrieval without any labelled data. **Read §3 and Figure 1** — the framing of the encoder as
+      a "lossy compressor that filters out the hallucinated details" is the sentence that makes the
+      method make sense.
+    - **Zheng et al. 2023, "Take a Step Back: Evoking Reasoning via Abstraction".** *Takeaway:*
+      asking a more general question first and retrieving for both improves multi-step reasoning
+      tasks substantially — and, as our measurement shows, hurts specific factual lookup.
+      **Read §3.1** for the abstraction prompt.
+    - **Ma et al. 2023, "Query Rewriting for Retrieval-Augmented Large Language Models".**
+      *Takeaway:* a small trainable rewriter optimised with the downstream QA reward beats prompting
+      a large model to rewrite, because the objective is retrieval success rather than fluency.
+      **Read §3** — the reinforcement-learning setup is the answer to "our rewrites are grammatical
+      and do not help".
+    - **Wang, Yang & Wei 2023, "Query2doc".** *Takeaway:* few-shot prompting an LLM to write a
+      pseudo-document, then concatenating it with the *original query repeated*, improves both
+      sparse and dense retrieval — the concatenation is what protects the original terms.
+      **Read §2**; it is the fix for HyDE's identifier problem if you must feed sparse retrieval.
+    - **Anthropic and OpenAI structured-output docs (Week 26 M4).** *Takeaway:* multi-query
+      generation needs a parseable list, and constrained decoding removes the JSON failure mode that
+      otherwise sends 4% of queries down the fallback path.
+
+    ### Stretch challenge
+
+    Build the gain-versus-cost scatter plot for six query techniques on your own corpus and choose a
+    production configuration. That is the lab. Include the segment breakdown, because the aggregate
+    will hide at least one technique that is harmful somewhere.
+
+    The stretch is the router's economics, done properly. You have three variables: the router's
+    classification accuracy, the gain each strategy provides on each intent, and the cost of each
+    strategy. Build the decision-theoretic version: for each query, the router outputs a probability
+    distribution over intents rather than a label; compute the expected gain of each strategy under
+    that distribution; and choose the strategy maximising `expected_gain − λ · cost`, with `λ`
+    derived from your actual latency budget.
+
+    Then the open question. This makes the router's *calibration* matter, not just its accuracy — a
+    router that is 88% accurate but wildly overconfident will make worse decisions than one that is
+    84% accurate and calibrated. Measure your LLM router's calibration (reliability diagram, expected
+    calibration error) and find out. My expectation is that a small LLM asked for a single-token
+    label is badly calibrated and that extracting a distribution from its logprobs is better than
+    asking it for a confidence score in words — but that a trained logistic regression is better
+    calibrated than either, and 30× faster. If that holds, the interesting conclusion is that the
+    router should be the *only* non-LLM component in a pipeline made of LLM calls, and defending
+    that is the exercise.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Build the gain-versus-cost scatter plot for six query techniques — rewrite, HyDE, multi-query,
+step-back, decomposition and a router — on your own eval set, and choose a production
+configuration. Required: paired bootstrap CIs on every gain, **added p95** latency (not just p50),
+dollar cost per query, and a per-segment breakdown. Your write-up must name at least one technique
+that made a segment worse; if none did, check whether your eval set contains identifier queries.
+</Card>
+
+## The whiteboard
+
+The T2 flow sketch above, plus the gain-versus-latency scatter as its own figure — six dots, a
+dashed vertical line at your latency budget, and the router circled. Add Module 4's reranking dot to
+the same axes when you get there: seeing `+0.06 at 64 ms` next to `+0.02 at 420 ms` on one plot is
+the single most useful picture in Week 28.
+
+<Tip>
+**Draw it yourself.** From memory: the query fanning into rewrites and a HyDE passage, the parallel
+retrievals converging on RRF, the latency annotation on the LLM box, and the crossed-out panel
+showing an identifier being diluted. Then compare.
+[Blank version](/assets/diagrams/p4-w28-m3-blank.svg) · [Editable source](/assets/diagrams/p4-w28-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    The gain-versus-cost scatter is a more interesting artifact than any single technique, because it
+    demonstrates you evaluate rather than accumulate. The strongest line in the write-up is the one
+    saying a widely-recommended technique measured +0.00 on your corpus. Portfolio: the scatter, the
+    segment table showing HyDE at 0.66 on identifiers, and the router that recovers the gain at a
+    fifth of the cost. Resume line: *"Measured six query-transformation techniques against a hybrid
+    baseline on a 100-query eval; showed HyDE degraded exact-identifier recall from 0.93 to 0.66 and
+    replaced always-on expansion with an intent router achieving the same +0.02 NDCG at 90 ms instead
+    of 420 ms."*
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    1. **If you run any query transformation, check the identifier segment today.** It is the
+       segment most likely to have collapsed and the least likely to be in your eval set — 31% of
+       traffic and 0.32 of recall in the war story.
+    2. **Measure added p95, not added p50.** A pre-retrieval LLM call has generation-shaped tail
+       latency: 420 ms p50 and 690 ms p95 on our setup. SLOs are made of p95.
+    3. **Put a deadline with a raw-query fallback on every pre-retrieval LLM call.** Reference figure:
+       12% of calls time out at 300 ms, costing 0.005 NDCG and saving 388 ms of p95. Emit the
+       fallback rate; it is an early warning that your generation tier is degrading.
+  </Accordion>
+</AccordionGroup>
+
+## Assessment
+
+<AccordionGroup>
+  <Accordion title="8 concept questions">
+  1. Why does HyDE work despite the hypothetical answer being wrong? (It converts an asymmetric query-document match into a symmetric document-document one; only topic and register are used, and the encoder filters the invented specifics.)
+  2. Which retriever should receive the hypothetical, and what happens otherwise? (Dense only; feeding it to BM25 gives NDCG 0.74 — worse than the 0.79 baseline — because invented terms are matched literally.)
+  3. Give the measured effect of HyDE on exact-identifier queries and the mechanism. (0.93 → 0.66; the rare high-IDF token goes from most of the query to 1 of 110 tokens.)
+  4. Why does multi-query damage identifiers less than HyDE? (The original query is one of the fused lists — which is why it must always be included.)
+  5. Why did step-back show +0.005 aggregate? (Two effects cancelling: −0.02 on factual questions, +0.03 on conceptual. The aggregate hides both.)
+  6. What does the router buy over always-on expansion? (The same +0.02 NDCG at 90 ms and $0.00004 instead of 420 ms and $0.00018, because 62% of queries need no expansion.)
+  7. Compare query transformation to reranking on gain per 100 ms. (Router 0.022, HyDE 0.005; reranking 0.094 — reranking is roughly 4–19× better per millisecond.)
+  8. Why is an exact-match rewrite cache safe where a semantic answer cache is not? (A normalised-identical query genuinely has the same rewrite; semantic caching approximates equivalence and can return a wrong answer.)
+  </Accordion>
+  <Accordion title="Coding challenge">
+  Implement `transform(query, technique)` for rewrite, HyDE, multi-query, step-back and a router,
+  each with a deadline, a raw-query fallback and an exact-match cache. Hidden tests check: every
+  technique returns the original query on a simulated LLM exception, timeout and unparseable output;
+  a query containing `ORA-01555` still contains that exact string after rewriting and after
+  multi-query expansion; multi-query output always includes the original as the first list; the
+  cache key changes when the model name changes; HyDE output is routed to the dense retriever only
+  (verified by asserting the sparse retriever received the original text); and the deadline is
+  enforced within 10% of the configured value. The identifier-preservation test is the one that
+  encodes this module's most expensive lesson.
+  </Accordion>
+  <Accordion title="Interview questions (junior / mid / senior)">
+  - **Junior:** "A user's search query is too vague to find anything. What could you do about it?"
+  - **Mid:** "Explain HyDE, why it works, and one situation where you would not use it."
+  - **Senior:** "You have a 300 ms budget for pre-retrieval work and five candidate techniques. How do you decide, and what would you measure that most teams do not?"
+  </Accordion>
+  <Accordion title="Draw it from memory">
+  Reproduce the query-transformation flow with the LLM latency annotated, and the gain-versus-latency
+  scatter with all six techniques placed and the router circled.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Exact-code searches regressed after adding rewriting | Identifiers paraphrased away | "Preserve codes, IDs and versions exactly" in every prompt; test it |
+| Hybrid got worse after adding HyDE | Hypothetical sent to BM25 as well as dense | Dense only; measure both ways |
+| Identifier recall 0.81 instead of 0.93 under multi-query | Original query not included in the fusion | Always fuse the original as one list |
+| Aggregate improved, users unhappy | Always-on expansion; eval distribution ≠ traffic | Route; report per-segment weighted by traffic |
+| One malformed LLM response fails the whole search | No fallback | Return the original query on any exception |
+| p95 TTFT blows the SLO while p50 is fine | Generation-shaped tail on the pre-retrieval call | Deadline plus fallback; measure added p95 |
+| Rewrites stale after a model upgrade | Cache key omits the model | Include model name and version |
+| A technique shows +0.005 and nobody can explain it | Two segments moving in opposite directions | Segment the report before interpreting any small aggregate |
+
+## Sources & further reading
+
+**Primary docs**
+- [LangChain `MultiQueryRetriever`](https://python.langchain.com/docs/how_to/MultiQueryRetriever/) — read the prompt it ships with; note whether it preserves the original query in the fusion, because that is the detail this module measured.
+- [LlamaIndex query transformations](https://docs.llamaindex.ai/en/stable/optimizing/advanced_retrieval/query_transformations/) — read the HyDE and step-back implementations for the prompt shapes, then measure them rather than adopting them.
+- [Redis 5.0.8 `SETEX`](https://redis.io/docs/latest/commands/setex/) — the two-line rewrite cache; note the TTL semantics before you rely on them for invalidation.
+
+**Papers**
+- [Gao et al. 2022 (HyDE)](https://arxiv.org/abs/2212.10496) — *a hypothetical answer converts an asymmetric match into a symmetric one; the encoder filters the hallucinated specifics*; §3, Figure 1.
+- [Zheng et al. 2023 (Step-Back)](https://arxiv.org/abs/2310.06117) — *abstraction before retrieval helps reasoning tasks*; §3.1.
+- [Ma et al. 2023 (Query Rewriting for RAG)](https://arxiv.org/abs/2305.14283) — *train the rewriter on retrieval success, not fluency*; §3.
+- [Wang et al. 2023 (Query2doc)](https://arxiv.org/abs/2303.07678) — *concatenate the pseudo-document with the repeated original query so the original terms survive*; §2.
+
+**Go deeper**
+- [Jason Liu, "Query understanding is the highest-leverage part of RAG"](https://jxnl.co/writing/) — the argument for segmenting your traffic by intent before choosing techniques, with practical guidance on building the segmentation from logs; read it alongside your own segment table.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-28/p4-w28-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

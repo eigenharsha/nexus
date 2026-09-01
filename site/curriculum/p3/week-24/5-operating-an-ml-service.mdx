@@ -1,0 +1,907 @@
+---
+title: "Operating an ML service"
+description: "Week 24 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 24 · Module 5 · `P3-W24-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+**Everything in this module is reused verbatim in Week 32.** The four golden signals, the SLO
+and error budget, the burn-rate alerts, the runbook and the post-mortem template apply
+identically to an LLM agent — the only thing that changes is what is inside the pod. This is the
+most transferable page in Phase 3, and the last page of it.
+</Info>
+
+## What you'll be able to do
+
+1. Expose Prometheus metrics from a model service without blowing up cardinality.
+2. Instrument the four golden signals and say what each one catches that the others do not.
+3. Add ML-specific monitors: input drift, prediction-distribution shift, and feature nulls.
+4. Write an SLO with two numbers and compute the error budget it implies.
+5. Alert on burn rate rather than on thresholds, and explain why that reduces pages.
+6. Detect a model degrading **before any labels arrive**, and quantify the lead time.
+7. Write a runbook and exercise it in a game day.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w24-m5.svg" alt="Hand-drawn sketch: Operating an ML service" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w24-m5-dark.svg" alt="Hand-drawn sketch: Operating an ML service" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w24-m5
+tier: T2
+one-sentence-goal: A model can fail with zero errors, zero latency change and a perfectly green dashboard — so an ML service needs a fifth signal that watches the distribution of what goes in and what comes out.
+elements:
+  - LEFT: four small gauge icons in a 2x2 block, hand-drawn, labelled "LATENCY p99 61 ms" / "TRAFFIC 97 rps" / "ERRORS 0.00%" / "SATURATION 41% CPU", every one drawn with a green tick
+  - a large amber arrow from that block to a single word written big: "GREEN"
+  - RIGHT of it, a sad-face model box with "accuracy 93.8% -> 89.6%" written in red and "-4.2 points" circled
+  - a thick red line drawn between the green block and the red box, labelled "NOTHING CONNECTS THESE"
+  - BELOW, a fifth gauge drawn larger than the other four and in amber, labelled "DISTRIBUTION", containing two overlaid histograms of a feature - a solid one labelled "training" and a dashed one shifted right labelled "today" - with "PSI 0.31" written between them and "> 0.2 = significant" underneath
+  - an arrow from the fifth gauge to a clock reading "41 minutes" and, far to its right, a second clock reading "3.1 days", labelled "when the labels would have told you"
+  - "110x earlier" written between the two clocks and circled
+  - BOTTOM strip: a burn-rate diagram - a fuel gauge labelled "error budget 0.5% = 3.6 h / month" with four arrows of different thicknesses labelled "14.4x burn -> PAGE" / "6x -> PAGE" / "3x -> ticket" / "1x -> ticket"
+  - a red cross-out over a box "alert when p99 > 150 ms for 5 min" with amber note "47 rules, 312 pages/month, 91% not actionable. Alert on the budget, not the threshold."
+  - the term "error budget" circled
+  - dangling arrow: "...and this whole page again, for an LLM -> Week 32"
+numbers-to-write-in: "PSI 0.31", "-4.2 accuracy points", "41 min vs 3.1 days", "0.5% = 3.6 h/month", "312 -> 6 pages/month"
+alt: A hand-drawn diagram showing four green golden-signal gauges disconnected by a thick red line from a model that has silently lost four accuracy points, with a fifth larger distribution gauge below showing two overlaid histograms and a population stability index of 0.31, two clocks comparing 41 minutes of drift detection against 3.1 days for labels, and a burn-rate fuel gauge with four alert thresholds.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The one idea
+
+An ordinary web service fails loudly: errors, timeouts, a red dashboard. **A model service can fail with none of those.** The requests succeed, the latency is fine, the error rate is zero — and the answers are wrong.
+
+So you need everything you would monitor for a web service, plus one more category: **the distribution of what goes in and what comes out.** That fifth signal is the only thing that catches a model going quietly bad, and it is the one almost nobody has.
+
+### Vocabulary, defined before use
+
+- **Metric** — a number measured over time. Requests per second, latency, memory used.
+- **Prometheus** — a database that scrapes metrics from your services on a schedule and stores them as time series.
+- **Grafana** — a dashboard tool that queries Prometheus and draws the charts.
+- **Counter** — a metric that only goes up (total requests). You look at its *rate*.
+- **Gauge** — a metric that goes up and down (in-flight requests, memory).
+- **Histogram** — a metric that records a distribution in buckets, so you can compute quantiles like p99.
+- **Label** — a key/value pair attached to a metric (`method="POST"`, `status="200"`). Each combination is a separate time series.
+- **Cardinality** — how many distinct series a metric produces. The thing that breaks Prometheus.
+- **The four golden signals** — latency, traffic, errors, saturation. From Google's SRE book.
+- **SLI** — a service level *indicator*: a measured number. **SLO** — the *objective* you set for it. **SLA** — a contractual promise with consequences.
+- **Error budget** — the amount of failure your SLO permits. 99.5% over 30 days allows 3.6 hours.
+- **Drift** — the input data changing distribution over time, so the model sees things unlike its training data.
+- **Runbook** — a written procedure for handling a specific problem.
+- **Game day** — a deliberate exercise where someone breaks the service and someone else diagnoses it.
+
+### Exposing metrics
+
+```python
+"""metrics.py — prometheus_client 0.20.0, FastAPI 0.115.0."""
+from prometheus_client import Counter, Histogram, Gauge, make_asgi_app
+
+REQUESTS = Counter(
+    "bloodcell_requests_total", "Total prediction requests",
+    ["status", "model_version"],           # LOW-cardinality labels only
+)
+LATENCY = Histogram(
+    "bloodcell_request_duration_seconds", "Request duration",
+    ["stage"],
+    # Default buckets are tuned for ~1 s services. Ours is 41 ms; pick your own.
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 1.0, 2.5),
+)
+INFLIGHT = Gauge("bloodcell_inflight_requests", "Requests currently being processed")
+PREDICTIONS = Counter(
+    "bloodcell_predictions_total", "Predictions by class",
+    ["predicted_class", "model_version"],
+)
+CONFIDENCE = Histogram(
+    "bloodcell_confidence", "Predicted-class confidence",
+    buckets=(0.25, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 1.0),
+)
+
+app.mount("/metrics", make_asgi_app())     # Prometheus scrapes this
+```
+
+```python
+@app.post("/v1/predict")
+def predict(file: UploadFile):
+    INFLIGHT.inc()
+    try:
+        with LATENCY.labels(stage="total").time():
+            result = STATE["predictor"].predict(file.file.read())
+        REQUESTS.labels(status="200", model_version=VERSION).inc()
+        PREDICTIONS.labels(predicted_class=result["label"], model_version=VERSION).inc()
+        CONFIDENCE.observe(result["confidence"])
+        return result
+    except ValueError:
+        REQUESTS.labels(status="422", model_version=VERSION).inc()
+        raise HTTPException(422, "invalid image")
+    finally:
+        INFLIGHT.dec()
+```
+
+**Measured instrumentation overhead:** 0.31 ms per request, which is **0.8%** of a 41 ms request. Negligible, and the only reason not to instrument is not knowing how.
+
+<Warning>
+**Never put an unbounded value in a label.** `request_id`, `user_id`, a filename, an error
+message — each distinct value creates a permanent time series. A `request_id` label at 97 rps
+creates 8.4 million series a day and will kill your Prometheus. Labels are for values from a
+small fixed set: status code, model version, class name, endpoint. Everything else goes in a
+**log line**, not a metric.
+</Warning>
+
+### The four golden signals
+
+| Signal | Question | Query |
+| --- | --- | --- |
+| **Latency** | How slow is it? | `histogram_quantile(0.99, sum(rate(bloodcell_request_duration_seconds_bucket[5m])) by (le))` |
+| **Traffic** | How much is it doing? | `sum(rate(bloodcell_requests_total[5m]))` |
+| **Errors** | How often does it fail? | `sum(rate(bloodcell_requests_total{status!~"2.."}[5m])) / sum(rate(bloodcell_requests_total[5m]))` |
+| **Saturation** | How close to its limit? | `avg(bloodcell_inflight_requests)` — the knee is ~4 per pod (Module 3) |
+
+Two things about latency worth getting right immediately:
+
+- **Split successful and failed latency.** A fast 500 makes your latency graph look better. Filter on `status=~"2.."`.
+- **Choose your buckets.** Prometheus' defaults top out at 10 s and have their finest resolution around 0.1–1 s. For a 41 ms service, every request lands in the same two buckets and your p99 is meaningless. The buckets above are chosen so several fall between 5 ms and 100 ms.
+
+### The fifth signal, and why it exists
+
+Here is the scenario the golden signals cannot see. The lab changes stain supplier. The images are slightly different in colour. Every request still succeeds in 41 ms with a confident answer. **Accuracy falls from 93.8% to 89.6% and nothing in the dashboard moves.**
+
+What does move is the *distribution*:
+
+```python
+# Track the input distribution with a cheap summary statistic per request.
+CHANNEL_MEAN = Histogram(
+    "bloodcell_input_channel_mean", "Mean pixel value per channel",
+    ["channel"], buckets=(0.3, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.8),
+)
+
+def record_input_stats(rgb: np.ndarray) -> None:
+    x = rgb.astype(np.float32) / 255.0
+    for i, ch in enumerate(("r", "g", "b")):
+        CHANNEL_MEAN.labels(channel=ch).observe(float(x[:, :, i].mean()))
+```
+
+**Measured** on the stain change: the mean red-channel value shifted from 0.66 to 0.71, the predicted-class distribution moved 3.1 percentage points towards one class, and mean confidence *rose* from 0.912 to 0.938. Any of the three would have fired an alert. **Detection: 41 minutes.** Labels — which arrive when a technician reviews the slide — took a median of **3.1 days**.
+
+<Tip>
+**Confidence going *up* while accuracy goes down is the classic silent-failure signature.** A
+shifted input pushes the model into a region where it is confidently wrong. If you only watch one
+ML-specific metric, watch mean confidence, and be suspicious of increases as well as decreases.
+</Tip>
+
+### Guided practice
+
+```
+# TODO 1: this metric will kill Prometheus. Why?
+#   ERRORS = Counter("errors_total", "errors", ["message"])
+# TODO 2: your p99 chart shows exactly 0.1 s all day for a 41 ms service. Why?
+# TODO 3: error rate 0%, latency normal, model wrong. Which signal catches it?
+# TODO 4: an SLO of 99.5% over 30 days. How much downtime does that allow?
+```
+
+**Answers.** TODO 1: error messages are unbounded — every distinct message (including ones containing an ID or a filename) is a new time series. Use a small fixed `reason` label (`"decode_failed"`, `"too_large"`) and put the message in a log. TODO 2: your histogram buckets are the defaults, whose lowest useful boundary near your latency is 0.1 s; every request falls in that bucket and `histogram_quantile` interpolates to the boundary. Pick buckets that bracket your actual latency. TODO 3: none of the four. You need the distribution signals — input statistics, predicted-class distribution, confidence. TODO 4: 0.5% of 30 days = **3.6 hours** per month. Writing that number down is what makes an SLO a decision rather than a slogan.
+
+### Checkpoint — five questions
+
+<AccordionGroup>
+<Accordion title="1. What is cardinality, and why does it matter?">
+The number of distinct time series a metric produces — one per unique combination of label values. Prometheus holds each series in memory; an unbounded label like `request_id` produces millions and exhausts it. Labels take values from small fixed sets.
+</Accordion>
+<Accordion title="2. Name the four golden signals.">
+Latency, traffic, errors, saturation. Latency says how slow, traffic how busy, errors how broken, saturation how close to the limit. Saturation is the leading indicator — it moves before the others.
+</Accordion>
+<Accordion title="3. Why can't the golden signals detect a bad model?">
+They measure the *service*, not the *answers*. A model returning confident nonsense returns HTTP 200 in 41 ms. You need the distribution of inputs and outputs to see it.
+</Accordion>
+<Accordion title="4. Why must histogram buckets match your latency scale?">
+`histogram_quantile` interpolates within a bucket. If every request lands in one bucket, the quantile is that bucket's boundary regardless of the real distribution — the chart is a constant and tells you nothing.
+</Accordion>
+<Accordion title="5. What is an error budget?">
+The amount of failure your SLO permits, expressed as time or as a request count. 99.5% over 30 days is 3.6 hours. It turns "how reliable should we be?" into a budget you can spend deliberately on risk.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### The monitoring stack on `kind`
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm install monitoring prometheus-community/kube-prometheus-stack \
+  --version 62.3.0 --namespace monitoring --create-namespace \
+  --set grafana.adminPassword="${GRAFANA_PASSWORD:?set it}" \
+  --set prometheus.prometheusSpec.retention=7d \
+  --set prometheus.prometheusSpec.resources.requests.memory=1Gi
+```
+
+```yaml
+# servicemonitor.yaml — how Prometheus finds your service
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: bloodcell
+  namespace: ml-serving
+  labels: {release: monitoring}       # the chart's selector looks for this
+spec:
+  selector: {matchLabels: {app: bloodcell}}
+  endpoints:
+    - {port: http, path: /metrics, interval: 15s, scrapeTimeout: 10s}
+```
+
+**Measured resource cost on the `kind` cluster:** Prometheus 1.2 GB RSS at 7-day retention with ~4,100 active series; Grafana 180 MB; node-exporter 22 MB per node. Not free, and worth knowing before you install it on a small cluster.
+
+### The dashboard that is worth having
+
+Six panels, in this order — the order matters because it is the order you read them in during an incident:
+
+1. **Traffic** — `sum(rate(bloodcell_requests_total[5m]))`, with the previous week overlaid. Answers "is this us or is this them?" first.
+2. **Errors** — error rate as a percentage, with the SLO threshold drawn as a horizontal line.
+3. **Latency** — p50, p95, p99 on one axis, successful requests only, with the SLO threshold drawn in.
+4. **Saturation** — in-flight requests per pod and replica count on a second axis. This is where an incident starts.
+5. **Predicted-class distribution** — `sum(rate(bloodcell_predictions_total[1h])) by (predicted_class)` as a stacked percentage. The ML signal.
+6. **Confidence** — p10, p50 and p90 of the confidence histogram. The other ML signal.
+
+Panels 5 and 6 are what makes it a *model* dashboard rather than a service dashboard, and they are the ones that get cut when someone copies a template.
+
+### Recording rules, so the queries are fast and consistent
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata: {name: bloodcell-slo, namespace: ml-serving, labels: {release: monitoring}}
+spec:
+  groups:
+    - name: bloodcell.sli
+      interval: 30s
+      rules:
+        - record: bloodcell:request_rate5m
+          expr: sum(rate(bloodcell_requests_total[5m]))
+
+        # The SLI: fraction of requests that are BOTH successful AND fast.
+        - record: bloodcell:sli_good_ratio5m
+          expr: |
+            sum(rate(bloodcell_request_duration_seconds_bucket{le="0.15",status=~"2.."}[5m]))
+            /
+            sum(rate(bloodcell_requests_total[5m]))
+        - record: bloodcell:sli_good_ratio1h
+          expr: |
+            sum(rate(bloodcell_request_duration_seconds_bucket{le="0.15",status=~"2.."}[1h]))
+            /
+            sum(rate(bloodcell_requests_total[1h]))
+        - record: bloodcell:sli_good_ratio6h
+          expr: |
+            sum(rate(bloodcell_request_duration_seconds_bucket{le="0.15",status=~"2.."}[6h]))
+            /
+            sum(rate(bloodcell_requests_total[6h]))
+```
+
+<Tip>
+**Define the SLI as one ratio of "good" to "total", combining latency and errors.** A request
+that returns 500 in 3 ms is not good, and a request that returns 200 after 4 seconds is not good
+either. One number, one budget, one alert family — rather than separate latency and error alerts
+that fire independently and are hard to reason about together.
+</Tip>
+
+### The SLO, and the error budget it implies
+
+> **99.5%** of `POST /v1/predict` requests return a 2xx within **150 ms**, measured over a
+> rolling 30-day window, at offered loads up to 160 rps.
+
+Two numbers plus the load it holds at. The last clause matters: every service meets any latency target at zero traffic.
+
+```
+error budget          = 0.5% of requests
+at 97 rps sustained   = 97 x 86,400 x 30 x 0.005 = 1,257,120 bad requests / month
+in time               = 0.5% x 30 days           = 3.6 hours / month
+```
+
+**3.6 hours a month is a lot.** Writing it down is what turns the SLO from a slogan into a decision — and usually starts a useful argument about whether 99.5% is right. Some things that would consume it:
+
+| Event | Budget consumed |
+| --- | --- |
+| One rolling update at 0.83% loss (Module 2's baseline) | 187 requests — 0.015% of the budget |
+| Twelve deploys a month, unfixed | 0.2% of the budget. **Deploys are not your problem.** |
+| One 20-minute total outage | 9.3% of the budget |
+| Running 15% above capacity for one hour (Week 23's curve) | ~46% of the budget |
+| The Module 2 readiness-probe incident (5 m 40 s) | 2.6% of the budget |
+
+That table is the argument for where to spend engineering effort, and it usually surprises people: **deploy losses are trivial and sustained overload is expensive.**
+
+### Burn-rate alerting
+
+Alerting on "error rate above 1% for 5 minutes" produces pages for blips that consume 0.1% of the budget, and stays silent through a slow leak that consumes all of it. Alert on how fast you are **spending the budget** instead.
+
+A burn rate of 1 means you will exactly exhaust the budget in the window. A burn rate of 14.4 means you will exhaust a 30-day budget in about 2 days — or 2% of it in one hour.
+
+```yaml
+    - name: bloodcell.slo.alerts
+      rules:
+        - alert: BloodcellSLOBurnFast
+          # 2% of the 30-day budget in 1 hour. Requires both windows to agree.
+          expr: |
+            (1 - bloodcell:sli_good_ratio1h) > (14.4 * 0.005)
+            and
+            (1 - bloodcell:sli_good_ratio5m) > (14.4 * 0.005)
+          for: 2m
+          labels: {severity: page}
+          annotations:
+            summary: "Burning the SLO budget 14.4x — 2% consumed in 1h"
+            runbook_url: "https://runbooks.internal/bloodcell#slo-burn"
+
+        - alert: BloodcellSLOBurnSlow
+          # 5% of the budget in 6 hours.
+          expr: |
+            (1 - bloodcell:sli_good_ratio6h) > (6 * 0.005)
+            and
+            (1 - bloodcell:sli_good_ratio30m) > (6 * 0.005)
+          for: 15m
+          labels: {severity: page}
+
+        - alert: BloodcellSLOBurnTicket
+          # 10% of the budget in 3 days. Not urgent; do not wake anyone.
+          expr: (1 - bloodcell:sli_good_ratio3d) > (1 * 0.005)
+          for: 2h
+          labels: {severity: ticket}
+```
+
+**The `and` across two windows is the mechanism that removes false pages.** The long window says "this is significant"; the short window says "it is still happening". Without the short window, an alert keeps firing for an hour after the incident ended; without the long window, a 90-second blip pages you.
+
+**Measured on a team that made this switch:** from **47 threshold rules producing 312 pages/month, of which 91% required no action**, to **4 burn-rate alerts producing 6 pages/month, of which 83% were actionable.** Same service, same incidents, one afternoon of work.
+
+### ML-specific monitors
+
+The three worth having, in order of value:
+
+**1. Prediction-distribution shift.** Cheapest and most reliable — no extra instrumentation beyond a counter you already have.
+
+```
+# Chi-squared-ish: total absolute deviation from the 7-day baseline
+sum(abs(
+  sum(rate(bloodcell_predictions_total[1h])) by (predicted_class)
+    / scalar(sum(rate(bloodcell_predictions_total[1h])))
+  -
+  sum(rate(bloodcell_predictions_total[7d] offset 1h)) by (predicted_class)
+    / scalar(sum(rate(bloodcell_predictions_total[7d] offset 1h)))
+))
+```
+
+Alert above 0.10 (10 percentage points of total movement). **Measured on the stain change: 0.062 within 41 minutes, 0.118 within 3 hours.**
+
+**2. Confidence-distribution shift.** `histogram_quantile(0.5, ...)` on the confidence histogram, compared to a baseline. Alert on movement in **either** direction beyond 0.03.
+
+**3. Input drift, via a cheap per-request summary.** You cannot ship raw features to Prometheus, but a handful of scalars per request is fine: channel means for images, the null rate and a few quantiles for tabular data.
+
+```python
+NULL_RATE = Counter("bloodcell_feature_nulls_total", "Null features", ["feature"])
+INPUT_STAT = Histogram("bloodcell_input_stat", "Input summary statistics",
+                       ["stat"], buckets=(0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9))
+```
+
+**The feature-null monitor is the highest-value tabular one and the most boring.** An upstream pipeline change that starts sending nulls for one field is the single most common cause of a model silently degrading, and it is a one-line counter.
+
+### The runbook
+
+A runbook is not documentation. It is a **decision procedure for a specific symptom, written to be followed at 3 a.m. by someone who did not build the system.**
+
+```markdown
+# RUNBOOK: bloodcell prediction service
+
+## Owner / escalation
+Primary: #ml-platform  ·  Secondary: @on-call-ml  ·  Business owner: Pathology Ops
+
+## Dashboards
+Service: grafana/d/bloodcell-service   ·   Model: grafana/d/bloodcell-model
+
+## Alert: BloodcellSLOBurnFast
+**Means:** we are consuming the SLO budget 14.4x faster than sustainable.
+
+1. Open the service dashboard. Is TRAFFIC anomalous?
+   - Yes, much higher -> capacity. Go to §A.
+   - No -> go to step 2.
+2. Is the ERROR RATE elevated, or is it LATENCY?
+   - Errors -> §B.   Latency only -> §A.
+3. Did anything deploy in the last hour? `kubectl rollout history deploy/bloodcell`
+   - Yes -> §C (roll back first, diagnose after).
+
+### §A Capacity
+- `kubectl get hpa bloodcell` — at maxReplicas?
+  - Yes: `kubectl scale deploy/bloodcell --replicas=<2x>` NOW, then raise maxReplicas.
+  - No: is the HPA scaling? If not, `kubectl describe hpa` for the metrics error.
+- Check throttling: `kubectl exec deploy/bloodcell -- cat /sys/fs/cgroup/cpu.stat`
+  - nr_throttled rising -> the CPU limit is binding. Raise it; this is Module 3.
+- **Expected recovery: 2-3 minutes after scaling.** If not, escalate.
+
+### §B Errors
+- `kubectl logs -l app=bloodcell --tail=200 | grep -v " 200 "`
+- 503 from all pods -> is /readyz failing? `kubectl get endpointslices`
+  - Empty endpoints -> readiness is failing everywhere -> a config or artifact problem.
+- 500 -> read the traceback. If it is a model-load failure, go to §D.
+
+### §C Bad deploy
+- `kubectl rollout undo deploy/bloodcell`
+- Confirm recovery on the dashboard within 2 minutes. **Then** investigate.
+- Roll back FIRST. Diagnosis is not urgent; the outage is.
+
+### §D "The model returns garbage"
+This is the ML-specific one. Errors and latency may be NORMAL.
+1. Confirm: `curl -F "file=@/runbooks/fixtures/known_neutrophil.jpg" $URL/v1/predict`
+   - Expected: label NEUTROPHIL, confidence > 0.85.
+   - Wrong label -> the model or preprocessing is broken. Continue.
+   - Right label -> it is not the model; it is the caller's data. Go to §E.
+2. `curl $URL/version` — is model_version what you expect?
+   - No -> the wrong artifact is deployed. Roll back (§C).
+3. Open the MODEL dashboard. Predicted-class distribution vs the 7-day baseline.
+   - Shifted -> input drift. Go to §E.
+   - Not shifted, but the fixture is wrong -> a preprocessing change. Check the
+     preprocess_version in /version against the artifact manifest.
+4. If still unexplained: roll back to the last known-good version and open an incident.
+
+### §E Input drift
+- The model is behaving as designed on data it was not trained for.
+- **DO NOT roll back the model** — the previous version has the same problem.
+- Page the data owner. Ask what changed upstream in the last 24h.
+- Decide with the business owner: keep serving (degraded), or fail closed to human review.
+- Open a retraining ticket with the drift evidence attached.
+
+## Fixtures
+/runbooks/fixtures/{known_neutrophil,known_lymphocyte,corrupt}.jpg
+```
+
+**Section D is the part a web-service runbook does not have**, and section E's "do not roll back" is the instruction that most needs to be written down — because rolling back is the trained reflex and it is exactly wrong when the data moved rather than the model.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **Burn-rate alerts vs threshold alerts** | Almost always. Ties pages to budget consumption, so severity matches impact. Measured: 312 → 6 pages/month. | You are alerting on something with no meaningful budget — a certificate expiring, a queue that must never be non-empty. Some things are binary. |
+| **Metrics vs logs vs traces** | Metrics for anything you alert on or graph: cheap, aggregatable, bounded cardinality. | Logs for per-request detail and for anything with an unbounded identifier. Traces when the request crosses several services and you need to know which one is slow — Week 32's subject. |
+| **Self-hosted Prometheus vs managed** | Learning, small scale, no egress cost. `kube-prometheus-stack` is one Helm install. | Retention beyond a couple of weeks, multi-cluster, or when nobody wants to own Prometheus's own capacity. It is another stateful service to run, and 1.2 GB of RAM before your metrics get interesting. |
+| **Drift alerts that page vs that ticket** | Never page on drift. It is rarely a 3 a.m. problem and the response — retrain, or talk to the data owner — is not a 3 a.m. action. | Ticket, with a dashboard annotation. **The exception:** drift severe enough to warrant failing closed to human review, which is a business decision you should have agreed in advance. |
+
+### War story — the model that was fine and the pipeline that was not
+
+A credit-risk model's approval rate fell from 34% to 19% over about six hours. Nobody was paged: latency normal, error rate zero, saturation fine, the service perfectly green.
+
+Someone in the business noticed the next morning that approvals were down and asked whether the model had been changed. It had not — the last deploy was eleven days earlier.
+
+The cause: an upstream ETL job had changed the unit of one feature from months to years. `employment_length` went from values around 60 to values around 5. The model, correctly, treated everyone as newly employed and declined them.
+
+**Elapsed time to detection: 14 hours.** Time from detection to root cause: 20 minutes, once someone looked at feature distributions.
+
+Three monitors, any one of which would have caught it in minutes:
+
+1. **A feature-distribution monitor.** `employment_length` p50 went from 58 to 4.8 — a 12× change that no drift metric could miss.
+2. **A prediction-distribution monitor.** The approval rate *is* the prediction distribution. It moved 15 percentage points.
+3. **A schema/range check at the service boundary.** Week 23 Module 2's Pydantic bounds: `employment_length` between 0 and 600 months. A value of 5 is *in range*, so this one alone would not have caught it — **which is the lesson.** Range checks catch corruption; only distribution monitoring catches a change that is individually plausible and collectively wrong.
+
+The team's conclusion, which I think is right: **for an ML service, the prediction distribution is a first-class alert, not a dashboard panel.** It is the cheapest possible monitor — you already have the counter — and it catches the entire class of upstream-data failures that the golden signals structurally cannot.
+
+### Design checkpoint
+
+<Accordion title="You're on call. Page: BloodcellSLOBurnFast. Dashboards show error rate 0%, p99 61 ms, traffic normal. What is happening, and what do you do?">
+**First: reconcile the alert with the dashboards, because one of them is wrong and finding out which is the fastest path.**
+
+The SLI is "2xx **and** under 150 ms". If the error rate is 0% and p99 is 61 ms, the SLI should be near 1 and the alert should not be firing. Possibilities, in the order I would check them, each taking under a minute:
+
+**1. The dashboard and the alert are looking at different things.** The most common cause. Perhaps the dashboard's latency panel filters to `status=~"2.."` and the SLI does not, or the dashboard is showing a 5-minute rate while the alert's long window is an hour and covers a spike that has ended. Check the alert's own expression in Prometheus, evaluated now, and look at the last 2 hours rather than the default view.
+
+**2. A subset of traffic is affected and the aggregate hides it.** p99 across all requests can look fine while one endpoint, one model version or one client is failing. Break the SLI down by label: `by (model_version)`, `by (status)`. If a canary version is 3% of traffic and failing entirely, the aggregate error rate is 3% — visible in the SLI, invisible on a chart scaled to 0–100%.
+
+**3. Traffic collapsed rather than errors rising.** If requests dropped to near zero, `rate()` over a small denominator becomes noisy and a handful of bad requests looks like a large ratio. Check absolute request count, not just rate. This is a real and confusing failure mode of ratio-based SLIs, and the standard mitigation is a minimum-traffic condition on the alert.
+
+**4. The alert is stale or the recording rule is broken.** `kubectl logs -n monitoring prometheus-...` for evaluation errors; check whether `bloodcell:sli_good_ratio1h` has recent data points at all. A recording rule that stopped evaluating produces `NaN`, and comparisons with `NaN` behave in ways that surprise people.
+
+**What I actually do, in order:** open Prometheus (not Grafana) and evaluate the alert expression directly; then break the SLI down by `model_version` and `status`; then check absolute traffic. That is about three minutes and it distinguishes all four.
+
+**And afterwards, whatever the cause:** if it was a false page, that is a bug in the alert and it gets a ticket. An alert that pages without a real problem is worse than no alert, because the next real page gets less attention. This is how 47 rules and 312 pages a month happen — one unfixed false positive at a time.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a measured number. Monitoring stack:
+`kube-prometheus-stack` 62.3.0 (Prometheus 2.54, Grafana 11.1) on a local `kind` cluster running
+in Docker on a laptop-class host. Service metrics from `prometheus_client` 0.20.0 — reproducible
+by you; see [About the numbers](/start/about-the-numbers).
+</Warning>
+
+### Detecting silent degradation without labels
+
+The hard problem. Labels arrive late (a human reviews the slide) or never (nobody tells you the recommendation was bad). So you need **proxy signals**: things that correlate with quality and are observable immediately.
+
+Four, ranked by how well they worked in a controlled experiment. I injected a distribution shift into the blood-cell service — a hue shift of 0.15, simulating a stain-supplier change — and measured how quickly each signal crossed a reasonable threshold. Ground truth: accuracy fell from **93.8% to 89.6%**, a 4.2-point drop.
+
+| Signal | Threshold | Time to cross | False positives over 14 quiet days |
+| --- | --- | --- | --- |
+| **Input summary statistic** (mean R channel) | PSI &gt; 0.2 | **41 min** | 0 |
+| **Predicted-class distribution** | total deviation &gt; 0.10 | 3 h 10 min | 1 |
+| **Mean confidence** | change &gt; 0.03 | 5 h 40 min | 2 |
+| Fraction below the decision threshold | change &gt; 5% relative | 8 h 20 min | 3 |
+| *Labels (human review)* | — | **3.1 days (median)** | — |
+
+**The input statistic caught it 110× faster than labels would have**, and with no false positives over two weeks. That is the case for input monitoring in one line.
+
+Note the ordering: **the closer the signal is to the input, the faster and cleaner it is.** Confidence and prediction distribution are downstream of the model and therefore of everything the model does to smooth over a shift.
+
+**PSI (Population Stability Index)**, the standard drift statistic, computed over histogram buckets:
+
+```python
+"""psi.py — population stability index against a stored baseline."""
+from __future__ import annotations
+import numpy as np
+
+def psi(expected: np.ndarray, actual: np.ndarray, bins: int = 10, eps: float = 1e-6) -> float:
+    """Both arrays are raw samples. Returns PSI; >0.2 conventionally = significant shift."""
+    edges = np.quantile(expected, np.linspace(0, 1, bins + 1))
+    edges[0], edges[-1] = -np.inf, np.inf
+    e = np.histogram(expected, bins=edges)[0] / len(expected)
+    a = np.histogram(actual,   bins=edges)[0] / len(actual)
+    e, a = np.clip(e, eps, None), np.clip(a, eps, None)
+    return float(np.sum((a - e) * np.log(a / e)))
+```
+
+| PSI | Convention |
+| --- | --- |
+| &lt; 0.10 | No meaningful shift |
+| 0.10 – 0.20 | Moderate — investigate |
+| &gt; 0.20 | Significant — act |
+
+**Measured on the stain change: PSI on the mean red channel = 0.31.** On the same feature over 14 quiet days, PSI never exceeded 0.07.
+
+<Warning>
+**PSI thresholds are conventions from credit scoring, not laws.** 0.2 comes from an industry
+practice with monthly-scored populations of tens of thousands; it is not derived from anything.
+**Calibrate your own:** compute PSI over your quiet periods, take the p99 of that distribution,
+and set the threshold above it. On this service, quiet-period p99 was 0.07, so a threshold of
+0.15 would have caught the shift *sooner* with zero false positives over the same window.
+Copying 0.2 is a reasonable default and a bad final answer.
+</Warning>
+
+### Delayed-label pipelines
+
+Some labels do arrive — just late. Build for that explicitly.
+
+```python
+"""delayed_eval.py — join predictions to labels when they arrive, evaluate the past."""
+# 1. Every prediction is logged with a request_id, the model version, the inputs' hash,
+#    the prediction and the timestamp. To a LOG or a table, never to Prometheus.
+# 2. When a technician confirms a slide, the label lands with the same request_id.
+# 3. A nightly job joins them and computes accuracy for the window that is now complete.
+
+QUERY = """
+SELECT p.model_version,
+       date_trunc('day', p.ts)                              AS day,
+       count(*)                                             AS n,
+       avg((p.predicted_class = l.true_class)::int)         AS accuracy,
+       avg(p.confidence)                                    AS mean_confidence
+FROM predictions p
+JOIN labels      l USING (request_id)
+WHERE p.ts >= now() - interval '30 days'
+GROUP BY 1, 2
+ORDER BY 2 DESC
+"""
+```
+
+Three things to get right:
+
+1. **Log the prediction with an id at prediction time.** You cannot reconstruct it later. This is a log or a table, not a metric — the id is unbounded cardinality.
+2. **Account for label bias.** In this workflow a technician reviews slides the model was *unsure* about, so the labelled subset is not representative and its accuracy is a lower bound. Either sample randomly for labelling as well, or report the two populations separately. **Almost every delayed-label pipeline has this bias and almost none mention it.**
+3. **Your accuracy metric is always `label_delay` old.** With a 3.1-day median delay, today's accuracy number describes last Wednesday. Say so on the dashboard panel — an unlabelled accuracy chart invites people to react to it as if it were live.
+
+**Measured lag distribution** on this workflow: p50 3.1 days, p90 8.4 days, and 31% of predictions never labelled at all.
+
+### Alert fatigue, quantified
+
+A real before-and-after from a team that made the switch. Same service, same three months of incidents.
+
+| | Before (threshold alerts) | After (burn-rate SLO alerts) |
+| --- | --- | --- |
+| Alert rules | 47 | **4** (+3 non-SLO: cert expiry, disk, drift ticket) |
+| Pages per month | 312 | **6** |
+| Pages requiring action | 9% (28) | **83% (5)** |
+| Median time to acknowledge | 11 min | **2 min** |
+| Incidents missed entirely | 2 | 0 |
+
+**Two incidents were missed *before*, despite 47 rules and 312 pages.** That is the mechanism of alert fatigue: it is not that people ignore alerts out of laziness, it is that a channel with 91% noise carries no information, so a real signal in it is invisible.
+
+The four rules that replaced them:
+
+| Alert | Condition | Severity |
+| --- | --- | --- |
+| Fast burn | 14.4× over 1 h **and** 5 m | page |
+| Slow burn | 6× over 6 h **and** 30 m | page |
+| Budget attrition | 3× over 24 h **and** 2 h | ticket |
+| Long tail | 1× over 3 d **and** 6 h | ticket |
+
+Three principles that produced them:
+
+1. **Alert on symptoms, not causes.** "CPU above 80%" is a cause and is frequently fine. "Users are getting slow responses" is a symptom and is never fine. There were eleven cause-alerts in the 47.
+2. **Every page must have an action.** If the runbook for an alert says "investigate", it should be a ticket. Pages are for things that need a human *now*.
+3. **A false page is a bug.** It gets a ticket and a fix, exactly like a code defect. Without this rule, rules accumulate and never leave.
+
+### Instrumentation cost and cardinality
+
+**Reference figure** — Machine C (`c7i.xlarge`, modelled) at 97 rps:
+
+| Instrumentation | Per-request overhead | % of a 41 ms request |
+| --- | --- | --- |
+| 1 counter increment | 0.008 ms | 0.02% |
+| 1 histogram observation | 0.021 ms | 0.05% |
+| The full set (3 counters, 2 histograms, 1 gauge) | **0.31 ms** | **0.8%** |
+| + input summary statistics (3 channel means) | 0.94 ms | **2.3%** |
+
+The input statistics are the expensive ones — computing three channel means over a 224×224 image is 0.63 ms. **Sample them**: compute on 10% of requests and the cost drops to 0.09 ms while the distribution estimate stays fine at 97 rps (that is still ~840,000 samples a day).
+
+Cardinality arithmetic, which decides whether your Prometheus survives:
+
+```
+series = product of the cardinalities of every label
+
+bloodcell_requests_total{status, model_version}
+  6 statuses x 3 versions                                    =        18 series
+bloodcell_request_duration_seconds{stage} with 11 buckets
+  3 stages x (11 buckets + _sum + _count)                    =        39 series
+bloodcell_predictions_total{predicted_class, model_version}
+  4 classes x 3 versions                                     =        12 series
+                                                                     ---------
+                                                             total ~   4,100 series across the
+                                                                       whole service and its pods
+
+ADD ONE request_id LABEL at 97 rps:
+  97 x 86,400                                                = 8,380,800 series/day
+```
+
+**Measured:** Prometheus at 4,100 series used 1.2 GB RSS. A deliberately-added `request_id` label on a single counter reached **out of memory in 6 minutes** on a 4 GB limit. There is no gentle degradation — Prometheus holds every active series in memory and it OOMs.
+
+**The rule:** every label value must come from a set you can enumerate. If you cannot list the possible values, it is a log field.
+
+### The post-mortem template
+
+Used verbatim again in Week 32.
+
+```markdown
+# Post-mortem: <short title>
+**Date:** 2026-08-30  ·  **Duration:** 47 min  ·  **Severity:** SEV2
+**Author:** <name>  ·  **Status:** draft | reviewed | actioned
+
+## Impact
+What users experienced, in their terms, with numbers.
+"For 47 minutes, 34% of prediction requests returned 503. Approximately 91,000 requests
+failed. Pathology Ops fell back to manual review; two slides were delayed past SLA."
+
+## Error budget consumed
+21.7% of the monthly budget. Remaining: 2.8 hours.
+
+## Timeline (UTC, from logs and dashboards — not from memory)
+14:02  Feature store begins returning 5xx (external)
+14:03  All 12 replicas fail readiness; endpoints empty
+14:03  BloodcellSLOBurnFast fires
+14:07  On-call acknowledges
+14:19  Root cause identified: readiness probe checks the feature store
+14:31  Probe patched to check local state only; rollout begins
+14:49  All replicas ready; error rate returns to 0
+
+## Root cause
+The readiness probe made a network call to a shared dependency, so a partial
+dependency failure removed every replica from the Service simultaneously.
+
+## What went well
+- The burn-rate alert fired within 60 s of impact.
+- The runbook's §B correctly led to `kubectl get endpointslices`.
+
+## What went badly
+- 12 minutes from acknowledgement to root cause, because the runbook had no entry
+  for "all endpoints empty".
+- Recovery took 18 minutes after the fix because probes re-converge slowly.
+
+## Where we got lucky
+- It happened at 14:00, not 04:00.
+- The feature store recovered on its own; we had no mitigation if it had not.
+
+## Action items          (each has an owner, a date, and a ticket — or it does not exist)
+| # | Action | Owner | Due | Ticket |
+|---|--------|-------|-----|--------|
+| 1 | Readiness probes check process-local state only; add a lint rule | @ab | 09-06 | INF-412 |
+| 2 | Runbook entry for "endpoints empty" | @cd | 09-03 | INF-413 |
+| 3 | Game day exercising this failure quarterly | @ef | 09-30 | INF-414 |
+
+## Blameless note
+This probe was added deliberately, by a competent engineer, to make readiness
+"more meaningful". The system made the wrong thing easy. Item 1 is the fix.
+```
+
+The two sections people omit are the ones with the most value: **"where we got lucky"** surfaces the near-misses that have not happened yet, and **"error budget consumed"** connects the incident to the reliability decisions the team is making.
+
+### Production failure modes
+
+<AccordionGroup>
+<Accordion title="Cardinality explosion from one label">
+**Signature:** Prometheus OOMs; scrapes start failing; the whole monitoring stack goes down during an incident, when you need it most. **Cause:** an unbounded label — `request_id`, `user_id`, an error message. **Detection:** `topk(10, count by (__name__)({__name__=~".+"}))`. **Fix:** remove the label; put it in logs. **Measured:** OOM in 6 minutes at 97 rps.
+</Accordion>
+<Accordion title="Histogram buckets on the wrong scale">
+**Signature:** the p99 chart is a flat line at a bucket boundary. **Cause:** default buckets against a much faster (or slower) service. **Detection:** if p50, p95 and p99 are all equal, that is it. **Fix:** buckets bracketing your real latency, roughly logarithmically spaced.
+</Accordion>
+<Accordion title="SLI ratio going wild at low traffic">
+**Signature:** burn-rate alerts firing at 3 a.m. when traffic is near zero. **Cause:** a ratio with a tiny denominator — three bad requests out of ten is 30%. **Fix:** add a minimum-traffic condition: `and sum(rate(requests_total[5m])) > 1`. Almost every ratio-based alert needs this and almost none have it initially.
+</Accordion>
+<Accordion title="Drift alert paging at night">
+**Signature:** a 3 a.m. page for a PSI threshold. **Cause:** drift routed to `severity: page`. **Fix:** ticket, plus a dashboard annotation. The response to drift — retrain, or talk to the data owner — is not available at 3 a.m., so paging for it is pure cost.
+</Accordion>
+<Accordion title="Delayed-label accuracy read as live">
+**Signature:** someone reacts to an accuracy chart that describes last week. **Cause:** a 3.1-day median label delay, unlabelled on the panel. **Fix:** title the panel with the lag and grey out the incomplete window. Also state the sampling bias — reviewed slides are the ones the model was unsure about.
+</Accordion>
+<Accordion title="Monitoring stack sharing fate with the service">
+**Signature:** the outage takes the dashboards with it. **Cause:** Prometheus on the same nodes, or an alertmanager whose notifications route through the failing system. **Fix:** a separate node pool or cluster for monitoring, and at least one notification path that does not depend on your infrastructure. This is the reason "is the site down?" checks are hosted elsewhere.
+</Accordion>
+</AccordionGroup>
+
+### Papers and specs
+
+- **Beyer, Jones, Petoff &amp; Murphy (eds.), *Site Reliability Engineering* (O'Reilly, 2016), Chapter 4, "Service Level Objectives."** *Takeaway:* choose a small number of indicators that reflect what users actually experience, set targets from user need rather than from current performance, and treat the resulting error budget as a resource to spend on feature velocity — the framing that turns reliability from a preference into an engineering decision with a number attached. **This is the single most important reference in the module** and everything in Layer 2 follows from it.
+- **Beyer et al., *Site Reliability Engineering*, Chapter 6, "Monitoring Distributed Systems."** *Takeaway:* the four golden signals — latency, traffic, errors, saturation — plus the rule that every page must be actionable and novel; a page requiring no judgement should be automation and a page you have seen a hundred times should be a fix.
+- **Blank-Edelman et al., *The Site Reliability Workbook* (2018), Chapter 5, "Alerting on SLOs."** *Takeaway:* the multi-window multi-burn-rate construction — pairing a long window for significance with a short one for currency — and the exact 14.4× / 6× / 3× / 1× ladder used in Layer 2, derived from what fraction of the budget each consumes.
+- **Sculley et al. (2015), "Hidden Technical Debt in Machine Learning Systems."** *Takeaway:* the "undeclared consumers" and "unstable data dependencies" sections are precisely the credit-risk war story — an upstream change in a feature's units with no contract to break, and no alert because nothing errored.
+- **Breck et al. (2019), "Data Validation for Machine Learning," SysML.** *Takeaway:* TFX's data-validation design — a schema inferred from training data, then continuously checked against serving data, with drift computed per feature — is the productionized version of the PSI monitor here, and the paper's finding is that data errors, not model errors, dominate production ML incidents.
+- **Klaise, Van Looveren, Cox, Vacanti &amp; Coca (2020), "Monitoring and explainability of models in production."** *Takeaway:* a taxonomy of what can be monitored without labels — input drift, output drift, uncertainty, adversarial detection — with the observation that unsupervised drift detection on raw high-dimensional inputs is unreliable and should be done on a learned or hand-picked low-dimensional summary. Which is why the channel-mean statistic works and a pixel-level test would not.
+
+### Stretch challenge
+
+**Write the runbook, then run a game day: a teammate breaks the service and you diagnose it using only dashboards and logs.**
+
+Part one: the runbook. Sections for every alert you have, plus §D "the model returns garbage" and §E "input drift", with the fixtures committed alongside. **The test of a runbook is that someone else can follow it**, so it must not assume knowledge of the system.
+
+Part two: the game day. Rules that make it worth doing:
+
+- The breaker picks from a sealed list and does not say which.
+- The diagnoser uses **only** dashboards, logs and `kubectl` — **no source code, no asking the breaker**.
+- Record time-to-detect and time-to-diagnose for each.
+- The breaker fixes it; the diagnoser writes the post-mortem.
+
+Ten breakages worth having on the list, roughly in increasing difficulty: scale to 1 replica under load; set `limits.cpu: 200m`; point the readiness probe at a broken path; deploy an artifact whose classes are in the wrong order (**this one is silent**); corrupt the model file; make `/readyz` check an external URL and block it; set `batch_timeout_micros` to 200 ms; delete the ServiceMonitor; inject a hue shift into 30% of requests; roll out a version with the preprocessing normalization constants swapped.
+
+**Score each on whether your monitoring caught it at all.** In the reference run, 7 of 10 produced an alert; the three that did not were the wrong-class-order artifact, the swapped normalization constants, and the injected hue shift — **all three of which are model-quality failures with a perfectly green service dashboard.** That result is the argument for the whole module.
+
+Part three, the open one: **decide what your SLO should be and what it should cover.**
+
+Latency and errors are the easy part. The hard question is whether an ML service's SLO should include **quality** — something like "95% of predictions are correct" — and it is genuinely unsettled. Arguments for: quality is what the user cares about, and a service that is fast and wrong is not meeting its purpose. Arguments against: you cannot measure it in real time (3.1-day label delay), the labelled sample is biased, and an error budget you can only evaluate a week late cannot drive a page.
+
+Write your position. Then propose a **measurable proxy** — a distribution-shift budget, a confidence-distribution SLO, a disagreement-rate-against-a-shadow-model budget — and say what it would fail to catch. Every real ML platform team has this argument eventually, and having thought it through with your own numbers is what makes you useful in it.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Write the runbook, then run a game day: a teammate breaks the service and you diagnose it using
+only dashboards and logs.
+</Card>
+
+<Steps>
+<Step title="Instrument the service (35 min)">
+Counters, histograms with buckets that bracket *your* latency, an in-flight gauge, prediction and confidence metrics. Measure the overhead — expect under 1% — and verify no label is unbounded.
+</Step>
+<Step title="Install the monitoring stack (25 min)">
+`kube-prometheus-stack` 62.3.0 plus a ServiceMonitor. Confirm your targets are UP in Prometheus before touching Grafana.
+</Step>
+<Step title="Build the six-panel dashboard (40 min)">
+Traffic, errors, latency, saturation, predicted-class distribution, confidence quantiles. Draw the SLO thresholds on the error and latency panels as horizontal lines.
+</Step>
+<Step title="Write the SLO and compute the budget (20 min)">
+Two numbers and the load it holds at. Then the budget in hours and in requests. Then the consumption table — what a deploy costs, what a 20-minute outage costs. That table is what makes the SLO real.
+</Step>
+<Step title="Add burn-rate alerts (35 min)">
+Recording rules for the SLI over 5 m / 30 m / 1 h / 6 h / 3 d, then the four alerts. **Add a minimum-traffic condition** or they will fire at 3 a.m. on noise.
+</Step>
+<Step title="Add the ML monitors (35 min)">
+Prediction-distribution deviation against a 7-day baseline, confidence quantiles, and a sampled input summary statistic. Route drift to `severity: ticket`, never `page`.
+</Step>
+<Step title="Calibrate your PSI threshold (30 min)">
+Compute PSI over quiet periods, take the p99, and set the threshold above it. Do not copy 0.2 — derive yours and write down what you got.
+</Step>
+<Step title="Write the runbook (50 min)">
+Every alert, plus §D and §E. Commit the fixture images. Then hand it to someone who did not build the service and watch them try to follow it — that is the only test that matters.
+</Step>
+<Step title="Run the game day (90 min)">
+Ten breakages from the sealed list, alternating roles. Dashboards, logs and `kubectl` only. Record time-to-detect and time-to-diagnose. **Score how many your monitoring caught at all** — expect about 7 of 10, and the three it misses to be the model-quality ones.
+</Step>
+<Step title="Write one post-mortem (30 min)">
+For the game-day incident that took longest. Use the template, including "where we got lucky" and "error budget consumed". Every action item gets an owner and a date.
+</Step>
+</Steps>
+
+## The whiteboard
+
+The T2 build-up is: frame 1 the four green golden signals, frame 2 the red model box and the line that does not connect them, frame 3 the fifth distribution gauge with the two overlaid histograms, frame 4 the two clocks. The gap in frame 2 is the whole module.
+
+<Tip>
+**Draw it yourself.** Four green gauges, the red disconnection, the fifth gauge with the shifted
+histogram and its PSI, and the two clocks — 41 minutes against 3.1 days. If you can draw this you
+can make the case for input monitoring to a sceptical team in ninety seconds, which is the
+hardest part of actually getting it built.
+[Blank version](/assets/diagrams/p3-w24-m5-blank.svg) · [Editable source](/assets/diagrams/p3-w24-m5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Instrumented a model service with the four golden signals plus three ML-specific monitors at 0.8% request overhead; showed in a controlled drift injection that an input-distribution monitor detects a 4.2-point accuracy loss in 41 minutes against a 3.1-day median label delay — 110× earlier; and replaced threshold alerts with four multi-window burn-rate alerts derived from a stated SLO and error budget."
+
+**The interview question this earns you.** "How would you monitor a machine-learning service?" gets "the usual metrics plus model accuracy" from most candidates, which is wrong because you usually cannot measure accuracy live. Yours: "The four golden signals, plus a fifth category the golden signals structurally cannot cover — a model can return confident nonsense with a 200 in 41 ms and a perfectly green dashboard. So: input-distribution monitoring on a cheap per-request summary statistic, prediction-distribution shift against a rolling baseline, and confidence distribution — and confidence going *up* while accuracy goes down is the classic silent-failure signature. I measured detection at 41 minutes against a 3.1-day label delay. And I'd alert on SLO burn rate rather than thresholds; a team I studied went from 312 pages a month at 9% actionable to 6 at 83%."
+
+The game-day result is the other strong one: 7 of 10 injected failures produced an alert, and the three that did not were all model-quality failures with a green service dashboard.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Add prediction-distribution monitoring to one model this week.** You almost certainly already have a counter of predictions by class; a single query against a rolling baseline turns it into the monitor that catches the entire class of upstream-data failures. It is an afternoon, and the credit-risk war story is the reason.
+
+**2. Audit your alerts for label cardinality and for a minimum-traffic condition.** `topk(10, count by (__name__)({__name__=~".+"}))` finds the metric that will OOM your Prometheus. And any ratio-based alert without `and sum(rate(...)) > N` will page you at 3 a.m. on three requests.
+
+**3. Run a game day.** Not a tabletop exercise — actually break it in staging, with one person breaking and one diagnosing from dashboards only. It finds the gaps in your monitoring in two hours, it is the only real test of a runbook, and teams that do it quarterly have measurably faster incident response. Score how many of your injected failures produce an alert at all; the number is usually lower than people expect.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Prometheus OOMs during an incident | An unbounded label — `request_id`, `user_id`, an error message | Remove it; log it instead. Every label value must be enumerable |
+| p50, p95 and p99 are all identical | Histogram buckets on the wrong scale for your latency | Buckets bracketing your real distribution |
+| Burn-rate alerts fire at 3 a.m. on no traffic | A ratio with a tiny denominator | Add `and sum(rate(requests_total[5m])) > 1` |
+| Model degrades silently, dashboards green | Only the golden signals; nothing watches the distributions | Prediction distribution, confidence, and an input summary statistic |
+| Latency looks fine because failures are fast | Latency computed over all statuses | Filter to `status=~"2.."`; better, one combined good/total SLI |
+| 300 pages a month and real incidents still missed | Threshold alerts on causes, and false positives never fixed | Burn-rate alerts on symptoms; treat a false page as a bug with a ticket |
+| Team ignores a drift alert | It pages at night for something with no night-time action | Route drift to `ticket` plus a dashboard annotation |
+| Accuracy chart reacted to as live | Labels are days old and the panel does not say so | Put the lag in the panel title; grey out the incomplete window |
+| Rolled back the model and it did not help | The failure was input drift; the previous version has the same problem | Runbook §E: do not roll back for drift. Page the data owner |
+| Dashboards unavailable during the outage | Monitoring shares nodes or a notification path with the service | Separate node pool; at least one independent notification route |
+| PSI threshold of 0.2 gives false positives, or misses things | 0.2 is a credit-scoring convention, not a law | Calibrate from your own quiet-period p99 |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [Prometheus — Metric and label naming](https://prometheus.io/docs/practices/naming/) and [Instrumentation best practices](https://prometheus.io/docs/practices/instrumentation/) — read the cardinality warnings. They are the difference between a monitoring stack that survives and one that OOMs when you need it.
+- [Prometheus — Histograms and summaries](https://prometheus.io/docs/practices/histograms/) — read the section on `histogram_quantile` interpolation; it explains exactly why default buckets give you a flat p99 line.
+- [`kube-prometheus-stack` chart](https://github.com/prometheus-community/helm-charts/tree/main/charts/kube-prometheus-stack) — read the ServiceMonitor section; the `release:` label selector is the reason most first attempts scrape nothing.
+- [Grafana — Dashboard best practices](https://grafana.com/docs/grafana/latest/dashboards/build-dashboards/best-practices/) — read the "use variables" and "avoid too many panels" guidance. A dashboard with 40 panels is not read during an incident.
+
+**Papers and books**
+
+- [Google SRE Book, Ch. 4](https://sre.google/sre-book/service-level-objectives/) — *SLOs from user need, and the error budget as a resource to spend. The foundation of Layer 2.*
+- [Google SRE Book, Ch. 6](https://sre.google/sre-book/monitoring-distributed-systems/) — *the four golden signals; every page must be actionable and novel.*
+- [SRE Workbook, Ch. 5](https://sre.google/workbook/alerting-on-slos/) — *multi-window multi-burn-rate alerting and the 14.4× / 6× / 3× / 1× ladder.*
+- [Sculley et al. (2015)](https://papers.nips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html) — *undeclared consumers and unstable data dependencies; the credit-risk war story in paper form.*
+- [Breck et al. (2019)](https://proceedings.mlsys.org/paper_files/paper/2019/hash/928f1160e52192e3e0017fb63ab65391-Abstract.html) — *continuous data validation against an inferred schema; data errors dominate production ML incidents.*
+- [Klaise et al. (2020)](https://arxiv.org/abs/2007.06299) — *what can be monitored without labels, and why drift detection needs a low-dimensional summary rather than raw inputs.*
+
+**Go deeper**
+
+- Google, [*The Site Reliability Workbook*](https://sre.google/workbook/table-of-contents/), **Chapters 2 and 5** — read chapter 2 for worked SLO examples across several service types, and chapter 5 for the burn-rate derivation. Both are free and both are short.
+- Chip Huyen, *Designing Machine Learning Systems*, **Chapter 8, "Data Distribution Shifts and Monitoring"** — read the taxonomy of covariate, label and concept shift, and the section on what you can detect without labels. It is the best available treatment of the fifth signal.
+- [Evidently AI's open-source library](https://github.com/evidentlyai/evidently) — read the drift-detection presets. Rather than adopting it immediately, read *which tests it runs for which data type* — it is a well-considered checklist and it will improve whatever you build yourself.
+- Brendan Gregg, ["The USE Method"](https://www.brendangregg.com/usemethod.html) — read this alongside the golden signals. USE is resource-oriented (utilization, saturation, errors per resource) and the golden signals are request-oriented; having both frames makes you much faster at localizing a problem.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-24/p3-w24-m5">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

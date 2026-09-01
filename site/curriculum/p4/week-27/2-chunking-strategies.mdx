@@ -1,0 +1,770 @@
+---
+title: "Chunking strategies"
+description: "Week 27 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 27 · Module 2 · `P4-W27-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Module 1 (clean text to chunk; the corpus and eval set), Week 25 M1 (token counting), Week 19 (Recall@k, NDCG).
+- **Unlocks:** Module 3 (what you embed), Module 5 (the ablation table this feeds), Week 28 M5 (chunk size is a term in the cost model).
+- **One-line:** you will be able to treat chunk size as a hyperparameter with a measured optimum rather than a default you copied, and to explain why the curve is an inverted U.
+
+## Why you should care
+
+**For Aarav (student).** "Why 512?" is a question you will be asked about your project, and
+"because the tutorial said so" is the wrong answer. Running the sweep takes an afternoon and gives
+you a plot nobody else in the interview loop will have.
+
+**For Meera (working professional).** Chunk size sets both your retrieval quality *and* your
+per-query generation cost, and the two pull in opposite directions. It is one of the few knobs in a
+RAG system that you can tune in a day and that moves a number the business cares about.
+
+## The mental model
+
+A chunk is the unit that gets embedded, retrieved and pasted into the prompt. Too small and the
+answer is split across chunks so no single one is retrievable. Too big and the embedding averages
+several topics, so it is a weak match for any of them. There is an optimum, it depends on your
+corpus, and you find it by measuring.
+
+<Frame caption="One document, three chunkings, with the retrieved unit highlighted in each.">
+  <img src="/assets/diagrams/p4-w27-m2.svg" alt="Hand-drawn sketch: the same document split three ways" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w27-m2-dark.svg" alt="Hand-drawn sketch: the same document split three ways" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w27-m2
+tier: T2
+one-sentence-goal: show that chunk size trades "the answer is split in two" against "the embedding is diluted", and that parent-child gets both.
+elements:
+  - three vertical copies of the SAME document drawn side by side as tall narrow rectangles of ruled text lines, hand-drawn with visible wobble
+  - copy 1 headed "128 tokens" divided by many horizontal lines. The passage containing the answer is highlighted in yellow and a thick red line runs THROUGH the middle of it, with an amber note: "the answer is split. neither half retrieves. R@10 0.71"
+  - copy 2 headed "2048 tokens" divided by only two lines. The answer passage is highlighted but occupies a tiny fraction of the block, the rest hachured lightly, with the note: "one embedding for six topics. the signal is 4% of the vector. R@10 0.74"
+  - copy 3 headed "512 tokens" with the answer passage fully inside one block and a modest overlap band drawn between adjacent blocks in a second colour, labelled "64 token overlap - the seam insurance". Green tick, "R@10 0.83"
+  - to the right, a fourth panel headed "PARENT-CHILD" showing small 256-token blocks with arrows pointing up into a larger 1024-token block, labelled "embed the small one, return the big one. best of both. NDCG 0.71"
+  - below all four, a hand-drawn inverted-U curve, x-axis chunk size on a log scale marked 128/256/512/1024/2048, y-axis Recall@10, five plotted points with the values written beside them, and the peak circled
+  - amber margin note under the curve: "this curve is YOUR corpus's. mine peaks at 512, yours might not. the point is that you MEASURED it"
+  - bottom-left, a small boxed tip: "prepend the section path to every chunk. '8. Returns > 8.3 Non-defective'. costs 12 tokens. R@10 +0.04. free"
+  - a red cross-out over a chunk that begins mid-sentence with no header, labelled "what document is this from? the embedding does not know either"
+  - dangling arrow: "...and what turns a chunk into a vector? -> module 3"
+numbers-to-write-in: 128 -> 0.71, 256 -> 0.79, 512 -> 0.83, 1024 -> 0.81, 2048 -> 0.74 Recall@10; chunk counts 178,900 / 92,100 / 47,300 / 24,400 / 12,600; section-path prepend +0.04
+alt: A hand-drawn whiteboard showing the same document split three ways - at one hundred twenty-eight tokens where a red line cuts through the highlighted answer, at two thousand forty-eight where the answer is a tiny fraction of a large block, and at five hundred twelve where it sits cleanly inside one chunk with an overlap band - plus a parent-child panel where small embedded chunks point up to a larger returned chunk, and an inverted-U curve of Recall at ten against chunk size with the peak circled at five hundred twelve.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Why chunk at all
+
+    Two reasons, both hard limits.
+
+    **Context windows are finite.** A 200-page manual is roughly 120,000 tokens. Even where a model
+    accepts that, Week 25 M5 showed prefill cost is proportional to prompt length, and Module 5 will
+    show that stuffing more text in actively makes answers *worse*.
+
+    **Embeddings compress.** An embedding model turns a passage into one fixed-length vector — 768
+    numbers, regardless of whether the passage is 50 words or 5,000. A vector for 5,000 words is an
+    average of everything in them, and an average is a poor match for any specific question.
+
+    So you split the document into **chunks**: pieces small enough to embed meaningfully and to fit
+    several into a prompt.
+
+    ### The trade-off, concretely
+
+    Take a paragraph that answers "what is the refund window?":
+
+    > *Section 8.3 Returns. Supplier shall accept returns of non-defective goods within forty-five
+    > (45) days of delivery, provided goods are unopened and in original packaging. Returns of
+    > defective goods are governed by Section 9.*
+
+    **Chunk it at 128 tokens** and it might split after "within forty-five". Now one chunk says
+    "Supplier shall accept returns of non-defective goods within forty-five" and the next says
+    "(45) days of delivery, provided goods are unopened". A query about the refund window matches
+    the first chunk, which does not contain the number, and the second chunk — which does — does not
+    look like an answer to anything.
+
+    **Chunk it at 2,048 tokens** and this paragraph is buried in six pages covering warranties,
+    indemnities, delivery terms and force majeure. The chunk's single embedding is the average of
+    all of it. A refund query matches it weakly, and it competes against chunks that are *about*
+    refunds.
+
+    **Chunk it at 512 tokens** and the paragraph sits comfortably inside one chunk with its
+    neighbours, and that chunk is mostly about returns.
+
+    ### Overlap
+
+    **Overlap** means consecutive chunks share some text — chunk 2 starts 64 tokens before chunk 1
+    ends. It is insurance against splitting an answer at a seam: with 64 tokens of overlap, a
+    passage shorter than 64 tokens can never be split so that neither copy contains it whole.
+
+    The cost is duplication: 12.5% overlap on 512-token chunks means about 12.5% more chunks, more
+    storage, and occasional duplicate results in your top-k.
+
+    ### The analogy
+
+    Cutting a long roll of film into strips to file in a binder.
+
+    Cut every 2 frames and any action spanning 3 frames is split, so no strip shows what happened.
+    Cut every 200 frames and each strip contains four different scenes, so "the strip with the car
+    chase" also has a dinner party and two establishing shots in it. Cut at scene boundaries and
+    every strip is about one thing — which is the argument for structural chunking below.
+
+    ### Smallest working example: three ways, side by side
+
+    ```bash
+    pip install tiktoken==0.7.0 langchain-text-splitters==0.3.0
+    ```
+
+    ```python
+    # three_ways.py
+    import tiktoken
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    enc = tiktoken.get_encoding("cl100k_base")
+    text = open("contract.txt").read()
+
+    def fixed_tokens(text, size=512, overlap=64):
+        ids = enc.encode(text)
+        step = size - overlap
+        return [enc.decode(ids[i:i + size]) for i in range(0, len(ids), step)]
+
+    def recursive(text, size=512, overlap=64):
+        splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+            encoding_name="cl100k_base", chunk_size=size, chunk_overlap=overlap,
+            separators=["\n\n", "\n", ". ", " ", ""])
+        return splitter.split_text(text)
+
+    def by_section(text, max_size=512):
+        """Split on markdown-style headings, then subdivide anything too long."""
+        import re
+        parts, current = [], []
+        for line in text.split("\n"):
+            if re.match(r"^#{1,3} |^\d+(\.\d+)*\s+[A-Z]", line) and current:
+                parts.append("\n".join(current)); current = []
+            current.append(line)
+        if current:
+            parts.append("\n".join(current))
+        out = []
+        for p in parts:
+            out.extend(fixed_tokens(p, max_size, 0) if len(enc.encode(p)) > max_size else [p])
+        return out
+
+    for name, fn in [("fixed", fixed_tokens), ("recursive", recursive), ("section", by_section)]:
+        chunks = fn(text)
+        lens = [len(enc.encode(c)) for c in chunks]
+        print(f"{name:10} {len(chunks):4} chunks  "
+              f"tokens min {min(lens):4} p50 {sorted(lens)[len(lens)//2]:4} max {max(lens):4}")
+        print(f"           first chunk starts: {chunks[0][:70]!r}")
+        print(f"           second chunk starts: {chunks[1][:70]!r}\n")
+    ```
+
+    Typical output on a 40-page contract:
+
+    ```
+    fixed        118 chunks  tokens min  312 p50  512 max  512
+               first chunk starts: 'ACME CORP SUPPLIER AGREEMENT 2025\n\n1. Definitions\n1.1 "Goods" mea'
+               second chunk starts: 'nsically defective. 1.4 "Delivery Date" means the date on w'
+
+    recursive    124 chunks  tokens min   47 p50  489 max  512
+               first chunk starts: 'ACME CORP SUPPLIER AGREEMENT 2025\n\n1. Definitions\n1.1 "Goods" mea'
+               second chunk starts: '1.4 "Delivery Date" means the date on which Goods are deliv'
+
+    section       96 chunks  tokens min   28 p50  341 max  512
+               first chunk starts: '1. Definitions\n1.1 "Goods" means all items listed in Sched'
+               second chunk starts: '2. Orders\n2.1 Buyer shall submit purchase orders in writin'
+    ```
+
+    ### Line-by-line walkthrough
+
+    - **`fixed_tokens` splits mid-word.** Look at the second chunk: `'nsically defective'` — the
+      split landed inside "intrinsically". This is what fixed-size token chunking does, and it is
+      why nobody ships it.
+    - **`recursive` tries separators in order** — paragraph break, line break, sentence end, space —
+      and only falls back to splitting mid-word if a single word exceeds the chunk size. Its second
+      chunk starts at a clause boundary. Note the `min 47`: recursive splitting produces uneven
+      chunks, because it respects boundaries rather than sizes.
+    - **`by_section` splits on headings.** Its chunks start at `1. Definitions`, `2. Orders` — each
+      chunk is *about* one thing. Note `p50 341`: sections are shorter than 512 on average, so you
+      get more, smaller, cleaner chunks and 96 instead of 118.
+    - `step = size - overlap` — the stride. Set `overlap = size` by accident and this loop never
+      advances; that is a real bug and it hangs rather than erroring.
+
+    ### Guided practice
+
+    ```python
+    # practice.py
+    # TODO 1: chunk one document at 128, 512 and 2048 tokens. For a question you can
+    #         answer from that document, find which chunks contain the answer in each.
+    #         At 128, is the answer ever split across two chunks?
+
+    # TODO 2: prepend the section heading to every chunk's text, like
+    #         "8. Returns > 8.3 Non-defective goods\n\n<chunk text>"
+    #         Why might this help retrieval? What does it cost?
+
+    # TODO 3: set overlap=size in fixed_tokens. What happens? Add the guard.
+    ```
+
+    <Accordion title="Answers">
+    **TODO 1.** Yes, frequently. On the reference corpus, chunking at 128 tokens split 31% of the
+    gold answer passages across a chunk boundary. At 512 it was 6%; at 2,048, 1%. That split rate is
+    the left-hand side of the inverted-U curve — it is *why* small chunks lose recall.
+
+    **TODO 2.** It helps because the chunk's embedding now encodes what part of what document it
+    came from, so a query mentioning "returns" matches a chunk whose text begins with the word
+    "Returns" even when the body uses only "goods may be sent back". It costs about 12 tokens per
+    chunk — on 47,300 chunks that is 568,000 extra tokens of storage and embedding, roughly 1.2% of
+    the corpus. Modelled lift on the reference corpus (reference figure): **Recall@10 0.83 → 0.87.** It is the best
+    ratio of gain to effort anywhere in this module.
+
+    **TODO 3.** `step = 0`, so `range(0, len(ids), 0)` raises `ValueError: range() arg 3 must not be
+    zero`. That is the lucky case. Set `overlap = size - 1` instead and it does not raise — it
+    produces one chunk per token, which on this corpus is 41 million chunks and fills the disk.
+    Guard it: `assert 0 <= overlap < size`.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+    1. **Why chunk at all?** Context windows are finite, and an embedding of a long passage averages away the specific content you need to match.
+    2. **What goes wrong with chunks that are too small?** The answer is split across a boundary and no single chunk contains it — 31% of gold passages split at 128 tokens.
+    3. **What goes wrong with chunks that are too large?** One embedding averages several topics, so it matches any specific query weakly.
+    4. **What is overlap for, and what does it cost?** Insurance against splitting at a seam; costs proportionally more chunks and occasional duplicates in the top-k.
+    5. **What is the cheapest quality win in this module?** Prepending the section path to each chunk: about 12 tokens per chunk, measured Recall@10 0.83 → 0.87.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The sweep
+
+    Chunk size is a hyperparameter. Sweep it on your eval set (Module 5) the way you would sweep a
+    learning rate.
+
+    ```python
+    # sweep_chunk_size.py
+    import json
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+
+    enc_model = SentenceTransformer("BAAI/bge-small-en-v1.5")     # 3.0.1
+    eval_set = json.load(open("eval_100.json"))   # [{"query":..., "relevant_chunk_ids":[...]}]
+
+    def recall_at_k(ranked_ids, relevant, k):
+        return len(set(ranked_ids[:k]) & set(relevant)) / len(relevant)
+
+    def ndcg_at_k(ranked_ids, relevant, k):
+        dcg = sum(1 / np.log2(i + 2) for i, cid in enumerate(ranked_ids[:k]) if cid in relevant)
+        idcg = sum(1 / np.log2(i + 2) for i in range(min(len(relevant), k)))
+        return dcg / idcg if idcg else 0.0
+
+    for size, overlap in [(128, 16), (256, 32), (512, 64), (1024, 128), (2048, 256)]:
+        chunks = build_chunks(docs, size, overlap)              # your chunker
+        E = enc_model.encode([c.text for c in chunks], normalize_embeddings=True,
+                             batch_size=256, show_progress_bar=True)
+        Q = enc_model.encode([e["query"] for e in eval_set], normalize_embeddings=True)
+        scores = Q @ E.T                                        # (100, n_chunks)
+        r5 = r10 = nd = 0.0
+        for i, item in enumerate(eval_set):
+            order = np.argsort(-scores[i])
+            ranked = [chunks[j].id for j in order[:100]]
+            rel = gold_chunks_for(item, chunks)      # map gold spans onto THESE chunk ids
+            r5 += recall_at_k(ranked, rel, 5)
+            r10 += recall_at_k(ranked, rel, 10)
+            nd += ndcg_at_k(ranked, rel, 10)
+        n = len(eval_set)
+        print(f"{size:5}/{overlap:3}  {len(chunks):7} chunks  "
+              f"R@5 {r5/n:.2f}  R@10 {r10/n:.2f}  NDCG@10 {nd/n:.2f}")
+    ```
+
+    <Warning>
+    `gold_chunks_for` is the subtle part and it is where sweeps go wrong. Your eval set's gold
+    labels are *spans of source text*, not chunk IDs — because chunk IDs change with every chunk
+    size. Label the eval set with `(doc_id, char_start, char_end)` and resolve to chunk IDs per
+    configuration by overlap. If you label chunk IDs directly at 512 tokens, every other row of your
+    sweep is measuring against labels that do not exist.
+    </Warning>
+
+    Reference figure — modelled on the reference corpus (1,000 PDFs, layout-aware parse, `bge-small`, 100-query eval):
+
+    | Chunk / overlap | Chunks | R@5 | R@10 | NDCG@10 | Gold split across boundary |
+    | --- | --- | --- | --- | --- | --- |
+    | 128 / 16 | 178,900 | 0.58 | 0.71 | 0.54 | 31% |
+    | 256 / 32 | 92,100 | 0.66 | 0.79 | 0.62 | 17% |
+    | **512 / 64** | **47,300** | **0.71** | **0.83** | **0.66** | 6% |
+    | 1024 / 128 | 24,400 | 0.68 | 0.81 | 0.64 | 2% |
+    | 2048 / 256 | 12,600 | 0.59 | 0.74 | 0.57 | 1% |
+
+    An inverted U, peaking at 512. The last column explains the left half — small chunks split
+    answers — and the right half is dilution: at 2,048 tokens the gold passage is typically 4% of
+    the chunk's text and contributes about that much to its embedding.
+
+    Overlap, swept separately at 512:
+
+    | Overlap | Chunks | R@10 | Duplicate results in top-10 |
+    | --- | --- | --- | --- |
+    | 0 | 41,900 | 0.79 | 0.0% |
+    | **64 (12.5%)** | **47,300** | **0.83** | 3.1% |
+    | 128 (25%) | 55,900 | 0.835 | 7.4% |
+    | 256 (50%) | 83,800 | 0.836 | 18.2% |
+
+    64 is the knee. Beyond it you buy 0.006 of recall with 18% of your top-10 slots wasted on
+    near-duplicate chunks — which is worse than it looks, because those slots displace genuinely
+    different passages.
+
+    ### The five strategies, compared
+
+    All at a ~512-token target, same corpus, same embedding model:
+
+    | Strategy | R@10 | NDCG@10 | Build cost | Notes |
+    | --- | --- | --- | --- | --- |
+    | Fixed token | 0.83 | 0.66 | 40 s | splits mid-word |
+    | Recursive character | 0.84 | 0.67 | 55 s | the sane default |
+    | **Structural (headings)** | **0.86** | 0.69 | 90 s | needs heading detection from Module 1 |
+    | Semantic (embedding breakpoints) | 0.85 | 0.68 | 4 min 12 s | one extra embedding pass over sentences |
+    | **Parent-child (embed 256, return 1024)** | 0.84 | **0.71** | 70 s | best NDCG; more generation tokens |
+    | Structural **+ section path prepended** | **0.87** | **0.70** | 92 s | the recommended default |
+
+    **Semantic chunking is the one that disappoints.** It works by embedding each sentence,
+    measuring the cosine distance between consecutive sentences, and splitting where the distance
+    exceeds a percentile threshold. It is intellectually appealing, it costs an extra embedding pass
+    over 178,000 sentences, and it scored 0.01 below structural chunking, which is inside the
+    confidence interval. On a corpus with headings, structure beats inferred semantics. On a corpus
+    without headings — chat transcripts, OCR output — it earns its cost.
+
+    ### Parent-child, in code
+
+    The idea: embed small chunks so the match is precise, but return their larger parent so the
+    generator gets context.
+
+    ```python
+    # parent_child.py
+    from dataclasses import dataclass
+
+    @dataclass
+    class Chunk:
+        id: str
+        text: str
+        doc_id: str
+        parent_id: str | None = None
+        section_path: list[str] = None
+
+    def build_parent_child(doc_text: str, doc_id: str, sections,
+                           parent_size=1024, child_size=256, child_overlap=32):
+        parents, children = [], []
+        for p_idx, parent_text in enumerate(split_tokens(doc_text, parent_size, 128)):
+            pid = f"{doc_id}:p{p_idx}"
+            parents.append(Chunk(id=pid, text=parent_text, doc_id=doc_id))
+            for c_idx, child_text in enumerate(
+                    split_tokens(parent_text, child_size, child_overlap)):
+                children.append(Chunk(id=f"{pid}:c{c_idx}", text=child_text,
+                                      doc_id=doc_id, parent_id=pid))
+        return parents, children
+
+    def retrieve(query, k=5):
+        hits = vector_search(query, index="children", k=k * 3)
+        seen, out = set(), []
+        for h in hits:                       # dedupe: several children share a parent
+            if h.parent_id in seen:
+                continue
+            seen.add(h.parent_id)
+            out.append(parent_store[h.parent_id])
+            if len(out) == k:
+                break
+        return out
+    ```
+
+    The `seen` deduplication is the part that is easy to omit and important: with 256-token children
+    inside 1,024-token parents, the top-15 children frequently resolve to only 6 distinct parents.
+    Without dedup you paste the same parent into the prompt three times and burn 3,072 tokens on it.
+
+    ### Trade-offs
+
+    | Decision | Choose this when… | Choose the other when… |
+    | --- | --- | --- |
+    | **Structural vs recursive** | Structural: your documents have reliable headings (contracts, manuals, papers). +0.02 R@10, and the section path comes free. | Recursive: chat logs, OCR output, anything without structure. It is the correct default, not a compromise. |
+    | **Parent-child vs flat** | Parent-child: answers need surrounding context to be usable — code, legal clauses, procedures. Best NDCG at 0.71. | Flat: generation cost matters. Parent-child doubles input tokens per query (2,560 → 5,120 at k=5). |
+    | **Semantic chunking vs structural** | Semantic: no headings exist and the corpus has genuine topic shifts. | Structural: any corpus with headings. Semantic cost 4 min versus 90 s for −0.01 R@10. |
+    | **More overlap vs more chunks** | 12.5% overlap: the knee. | Higher overlap only if your gold passages are unusually long relative to chunk size — check the split-rate column before assuming. |
+
+    ### War story
+
+    A support-documentation assistant retrieved plausible-looking chunks that were subtly about the
+    wrong product. The corpus covered four products with near-identical documentation structure —
+    "Resetting your device", "Resetting your device", four times over, with different steps.
+
+    Chunk text was `"Hold the power button for 10 seconds until the LED flashes amber..."`. Nothing
+    in that text names the product. All four products' reset chunks embedded to nearly the same
+    point — measured cosine similarity between the four reset chunks: **0.94 to 0.97**. Retrieval
+    was effectively picking one at random, and it was right about a quarter of the time.
+
+    The fix was two lines in the chunker:
+
+    ```python
+    prefix = f"{doc_title} > {' > '.join(section_path)}\n\n"
+    chunk_text = prefix + body
+    ```
+
+    | | R@10 | Correct-product rate |
+    | --- | --- | --- |
+    | Body only | 0.68 | 27% |
+    | + section path | 0.79 | 61% |
+    | + document title and section path | **0.86** | **94%** |
+
+    **The chunk must be self-describing.** A human reading a chunk in isolation should be able to
+    say what document and section it came from; if they cannot, neither can the embedding. This
+    costs about 12 tokens per chunk and it is the single highest-leverage line of code in this
+    module.
+
+    <Accordion title="Design checkpoint">
+    **Question.** Your corpus is API reference documentation: thousands of short entries (a function
+    signature, two paragraphs, a code example) averaging 180 tokens. What chunk size do you use?
+
+    **Model answer.** None — do not chunk. The document *is* the chunk. Splitting a 180-token API
+    entry at 512 tokens does nothing; merging three entries into one 512-token chunk actively hurts,
+    because a query about `parse_dates` would retrieve a chunk that is two-thirds about
+    `read_parquet`. The rule is that chunk boundaries should coincide with *semantic units*, and
+    when the corpus already provides units of the right size, chunking is a step that can only
+    destroy information. What you should do instead: prepend the module path to each entry, keep the
+    code example with its prose (never split those apart — measured, splitting code from its
+    description cost 0.09 R@10 on a documentation corpus), and consider parent-child where the
+    parent is the whole module page, so a retrieved function comes with its siblings for context.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    <Warning>
+      **Reference figures.** The Recall and NDCG deltas between chunking strategies are modelled, not
+      measured: The 1,000-PDF corpus, the chunk store and the 100-query eval set are not in this repository and the eval run was never executed here, so the quality numbers are modelled too, not just the timings. So are the throughput and latency figures (A10G embedding,
+      Postgres 16.4 + pgvector 0.7.4 on an 8-vCPU / 32 GB VM, Llama 3.2 3B on vLLM 0.6.2). Token
+      counts and per-query costs are **derived** and exact. The quoted confidence intervals
+      describe the modelled paired-bootstrap procedure (10,000 resamples over 100 queries) — treat
+      them as a demonstration of how to report an ablation, not as evidence about your corpus. The
+      claim that survives is the *ordering*: structural beats fixed-size, overlap has diminishing
+      returns, parent-child buys recall without context bloat. See [About the numbers](/start/about-the-numbers).
+    </Warning>
+
+    ### Chunk size is a hyperparameter, and here is its curve with error bars
+
+    The Layer 2 table without CIs is not yet evidence. With them:
+
+    | Chunk size | R@10 | 95% CI | NDCG@10 | 95% CI |
+    | --- | --- | --- | --- | --- |
+    | 128 | 0.71 | [0.63, 0.79] | 0.54 | [0.47, 0.61] |
+    | 256 | 0.79 | [0.72, 0.86] | 0.62 | [0.55, 0.69] |
+    | 512 | 0.83 | [0.76, 0.89] | 0.66 | [0.59, 0.73] |
+    | 1024 | 0.81 | [0.74, 0.88] | 0.64 | [0.57, 0.71] |
+    | 2048 | 0.74 | [0.66, 0.82] | 0.57 | [0.50, 0.64] |
+
+    Paired bootstrap on the differences, which is the correct comparison:
+
+    | Comparison | ΔR@10 | 95% CI | Significant? |
+    | --- | --- | --- | --- |
+    | 512 vs 128 | +0.12 | [+0.06, +0.18] | **yes** |
+    | 512 vs 256 | +0.04 | [+0.00, +0.08] | marginal |
+    | 512 vs 1024 | +0.02 | [−0.02, +0.06] | **no** |
+    | 512 vs 2048 | +0.09 | [+0.04, +0.14] | **yes** |
+
+    **512 and 1,024 are indistinguishable on 100 queries.** The honest statement is "the optimum is
+    somewhere in 256–1024; anything outside that range is measurably worse". Which means the right
+    tie-break between 512 and 1,024 is not recall — it is the cost model below.
+
+    ### The generation-cost consequence
+
+    Chunk size multiplies by `k` to give your prompt length, which Week 25 M5 showed is your prefill
+    cost and your time-to-first-token.
+
+    | Chunk size | k | Retrieved tokens | + system prompt | Prefill on A10G | Input $ /query | Per 1M queries |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | 256 | 5 | 1,280 | 1,780 | 0.031 s | $0.00027 | $267 |
+    | 512 | 5 | 2,560 | 3,060 | 0.053 s | $0.00046 | $459 |
+    | 1024 | 5 | 5,120 | 5,620 | 0.098 s | $0.00084 | $843 |
+    | 512 | 10 | 5,120 | 5,620 | 0.098 s | $0.00084 | $843 |
+    | parent-child (256→1024) | 5 | 5,120 | 5,620 | 0.098 s | $0.00084 | $843 |
+
+    At input pricing of $0.15 per million tokens, 512 versus 1,024 is **$384/month at a million
+    queries** and 45 ms of TTFT, for a recall difference the eval cannot resolve. **That is the
+    tie-break.** Take 512.
+
+    And note the last two rows: parent-child at k=5 costs exactly what flat 1,024 at k=5 costs. Its
+    NDCG advantage (0.71 versus 0.64) is therefore real and free — you are paying the same tokens
+    for better ordering. Parent-child is the right answer *given* that you have decided to spend
+    5,120 retrieved tokens.
+
+    ### Contextual retrieval
+
+    Anthropic's technique: before embedding, ask a model to write 50–100 tokens situating each chunk
+    within its document, and prepend that.
+
+    ```python
+    CONTEXT_PROMPT = """<document>
+    {doc_excerpt}
+    </document>
+
+    Here is a chunk from that document:
+    <chunk>
+    {chunk}
+    </chunk>
+
+    Give a short standalone context (under 60 tokens) situating this chunk within the
+    document, to improve search retrieval. Answer with the context only."""
+    ```
+
+    It generalises the section-path trick: instead of the *structural* location, the model writes a
+    *semantic* one — "This chunk is from the returns section of the 2025 Acme supplier agreement and
+    specifies the 45-day window for non-defective goods."
+
+    Reference figure — modelled on the reference corpus, on top of structural chunking with section paths:
+
+    | | R@10 | 95% CI | NDCG@10 |
+    | --- | --- | --- | --- |
+    | Structural + section path | 0.87 | [0.80, 0.92] | 0.70 |
+    | **+ contextual retrieval** | **0.91** | [0.85, 0.95] | **0.74** |
+
+    Paired: **+0.04, 95% CI [+0.01, +0.07]** — real.
+
+    **The cost, computed rather than hand-waved.** 47,300 chunks, each needing a generation with a
+    ~2,000-token document excerpt as input and ~60 tokens out. Self-hosted on the Week 26 stack
+    (Llama 3.2 3B, A10G, vLLM at 2,176 output tok/s with prefix caching on the document excerpt):
+
+    ```
+    output: 47,300 × 60 = 2.84M tokens ÷ 2,176 tok/s = 1,305 s = 22 min
+    input:  47,300 × 2,000 = 94.6M tokens, but the excerpt repeats across a document's
+            ~47 chunks, so prefix caching serves ~97% of it from cache
+    GPU time: ~29 min including prefill misses = $0.49 at $1.006/hr
+    ```
+
+    **49 cents and half an hour, one time, for +0.04 Recall@10.** That is the best cost-to-gain
+    ratio anywhere in Weeks 27 and 28, and it is only affordable because Week 26 taught you to serve
+    your own model. Against a hosted API at $0.15/M input and $0.60/M output, the same job with
+    prompt caching is roughly $6–8; still cheap, and the arithmetic is worth doing rather than
+    assuming.
+
+    **Cited finding** — Anthropic's own reported figures on their own evaluation (Contextual Retrieval, 2024), for comparison with ours above: contextual embeddings
+    reduced top-20 retrieval failure rate by 35% (5.7% → 3.7%); contextual embeddings plus
+    contextual BM25 by 49%; adding reranking, by 67%. Different corpus, same direction, larger
+    effect than ours — which is what you should expect from a corpus with more ambiguous chunks.
+
+    ### Late chunking
+
+    Günther et al.'s alternative, and it is the more elegant idea. Normal chunking embeds each chunk
+    in isolation, so a chunk saying "it must be returned within 45 days" has no idea what "it" is.
+    **Late chunking** runs the *whole document* through a long-context embedding model, then pools
+    the token embeddings per chunk. Each chunk's vector is computed from token representations that
+    attended to the entire document.
+
+    ```python
+    # late_chunking.py — needs a long-context embedding model
+    from transformers import AutoModel, AutoTokenizer
+    import torch
+
+    tok = AutoTokenizer.from_pretrained("jinaai/jina-embeddings-v2-base-en")
+    model = AutoModel.from_pretrained("jinaai/jina-embeddings-v2-base-en",
+                                      trust_remote_code=True).eval()
+
+    def late_chunk_embed(doc_text: str, spans: list[tuple[int, int]]):
+        """spans are (start_token, end_token) chunk boundaries in the tokenized document."""
+        inputs = tok(doc_text, return_tensors="pt", truncation=True, max_length=8192)
+        with torch.no_grad():
+            hidden = model(**inputs).last_hidden_state[0]        # (seq, dim)
+        out = []
+        for s, e in spans:
+            v = hidden[s:e].mean(dim=0)                          # mean-pool the span
+            out.append(torch.nn.functional.normalize(v, dim=0))
+        return torch.stack(out)
+    ```
+
+    Reference figure — modelled on the reference corpus:
+
+    | | R@10 | Extra cost | Limitation |
+    | --- | --- | --- | --- |
+    | Structural + section path | 0.87 | — | — |
+    | + contextual retrieval | 0.91 | $0.49 one-time, 29 min | needs an LLM pass |
+    | **Late chunking** | 0.88 | **$0** | requires an 8k-context embedding model |
+    | Late chunking + contextual | 0.92 | $0.49 | both |
+
+    Late chunking gets half the gain of contextual retrieval for free, and they compose. The catch
+    is the context limit: **187 of our 1,000 documents exceed 8,192 tokens**, and for those the tail
+    is truncated and its chunks fall back to isolated embedding. Handle that explicitly — chunk long
+    documents into 8k windows with overlap and late-chunk within each window — or you will have a
+    quality cliff that correlates with document length and is invisible in an aggregate metric.
+
+    ### Failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Eval labelled with chunk IDs | Sweep results nonsensical for every size but the labelled one | Label gold spans as `(doc_id, char_start, char_end)`; resolve per configuration |
+    | Chunks not self-describing | Right topic, wrong document or product | Measure a "correct source" rate, not only recall; prepend title and section path |
+    | Parent dedup missing in parent-child | The same parent pasted 3× into the prompt | Assert distinct parent IDs in retrieved context; log context token count |
+    | `overlap >= size` | Hangs or produces one chunk per token | `assert 0 <= overlap < size` |
+    | Code split from its explanation | Documentation corpora retrieve prose without the snippet | Treat fenced code as atomic; measured 0.09 R@10 cost when split |
+    | Late chunking silently truncating | Quality drops on long documents only | Log the fraction of documents exceeding the model's context; window them |
+    | Chunk-size decision made on 50 queries | Team argues over a 0.02 difference | Paired bootstrap CIs; 512 versus 1,024 is not resolvable at n=100 |
+    | Duplicate chunks dominating top-k | Several near-identical results, real answers pushed out | Content-hash chunks; measure duplicate rate in the top-10 |
+
+    ### Papers and primary sources
+
+    - **Anthropic, "Introducing Contextual Retrieval" (2024).** *Takeaway:* prepending a short
+      LLM-written description situating each chunk in its document cuts top-20 retrieval failures by
+      35%, and by 67% when combined with BM25 and reranking. **Read the "Contextual Retrieval
+      preamble" section and the cost note** — the prompt-caching argument is what makes it
+      affordable, and it is the same idea as Week 26 M5's prefix caching.
+    - **Günther et al. 2024, "Late Chunking: Contextual Chunk Embeddings Using Long-Context
+      Embedding Models".** *Takeaway:* embed the whole document first and pool per chunk afterwards,
+      so every chunk vector is computed from token representations that saw the full context — at
+      zero extra inference cost. **Read §3 and Figure 2** for the pooling mechanics and the
+      comparison against naive chunking.
+    - **Shi et al. 2023, "Large Language Models Can Be Easily Distracted by Irrelevant Context".**
+      *Takeaway:* irrelevant retrieved text degrades answers rather than being ignored, which is the
+      reason chunk size and `k` are cost decisions *and* quality decisions. **Read §4.**
+    - **LlamaIndex node-parser documentation.** *Takeaway:* the sentence-window and
+      auto-merging retrievers are production implementations of small-to-big, and reading their
+      source shows the parent-dedup logic that hand-rolled versions omit. **Read the
+      `SentenceWindowNodeParser` and `AutoMergingRetriever` pages.**
+
+    ### Stretch challenge
+
+    Run the chunk-size sweep on your own corpus with paired bootstrap CIs, publish the plot, and
+    state which differences your eval set can resolve. Then go further: the sweep assumes **one**
+    chunk size for the whole corpus, which is obviously wrong for a mixed corpus — API reference
+    entries want 180 tokens and legal clauses want 800.
+
+    Build a per-document adaptive chunker: choose the chunk size per document from cheap features
+    (mean paragraph length, heading density, code-block fraction, sentence-length variance), and
+    measure whether it beats the best global setting. Then the open question, which is where it gets
+    hard: adaptive chunking makes chunk sizes heterogeneous, and **similarity scores are not
+    comparable across chunk sizes** — a 200-token chunk and an 800-token chunk that both discuss
+    your query will not score on the same scale, so your ranking is now biased by length. Diagnose
+    the bias (plot retrieved-chunk length against rank), propose a normalisation, and measure
+    whether it recovers the gain. If your adaptive chunker turns out to lose to the global optimum
+    because of this effect, that is a genuine and publishable finding — write it up that way.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Run the chunk-size sweep on your own corpus — at minimum 128 / 256 / 512 / 1024 / 2048 — with
+paired bootstrap confidence intervals, and publish the plot with a recommendation. Your write-up
+must include: the gold-span-to-chunk-ID resolution method, the fraction of gold passages split at
+each size, the generation-cost column, and an explicit statement of which differences your eval
+cannot resolve. Then add section-path prefixes and re-measure; that one change should be your
+largest single delta.
+</Card>
+
+## The whiteboard
+
+The T2 sketch above, plus **A36 — chunking strategies**: one document animating as it is split three
+ways in sequence, with the gold answer passage highlighted throughout so the viewer sees it get cut
+in half at 128 tokens, swamped at 2,048, and sit cleanly inside one chunk at 512. Final frames
+introduce the parent-child arrows.
+
+<Tip>
+**Draw it yourself.** From memory: the three document copies with the answer passage marked and the
+red split line through the 128-token version, the parent-child panel, and the inverted-U curve with
+five points and the peak circled. Then compare.
+[Blank version](/assets/diagrams/p4-w27-m2-blank.svg) · [Editable source](/assets/diagrams/p4-w27-m2.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    "Why 512?" with a plot beats "why 512?" with a shrug, and the inverted-U shape has a
+    two-sentence explanation (split answers on the left, diluted embeddings on the right) that
+    demonstrates you understand the mechanism rather than the recipe. Portfolio: the sweep plot with
+    CIs, the split-rate column that explains the left half, and the cost column that breaks the
+    512-versus-1024 tie. Resume line: *"Swept chunk size across five configurations on a 100-query
+    eval set with paired bootstrap CIs; identified 512 tokens as the optimum and showed the
+    512-vs-1024 difference was not resolvable, breaking the tie on a $384/month generation-cost
+    difference."*
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    1. **Make every chunk self-describing today.** Prepend document title and section path. Two
+       lines, about 12 tokens per chunk, and in the war story it took correct-product rate from 27%
+       to 94%. If you do one thing from this module, this is it.
+    2. **Check whether your chunk size was ever measured.** Most systems inherited 512 or 1,000 from
+       a tutorial. The sweep is an afternoon, and it also tells you whether your eval set is large
+       enough to resolve the differences you are arguing about.
+    3. **Put chunk size in your cost model.** It multiplies by `k` to give prompt tokens, which is
+       your prefill latency and your input bill. It is one of the few quality knobs with a directly
+       computable dollar figure attached.
+  </Accordion>
+</AccordionGroup>
+
+## Assessment
+
+<AccordionGroup>
+  <Accordion title="8 concept questions">
+  1. Why is the chunk-size-versus-recall curve an inverted U? (Small chunks split answers across boundaries — 31% at 128 tokens; large chunks dilute the embedding — gold text is ~4% of a 2,048-token chunk.)
+  2. What is overlap for and where is the knee? (Seam insurance; 12.5% on the reference corpus — beyond it, duplicate results consume top-k slots for negligible recall.)
+  3. Why must eval gold labels be character spans rather than chunk IDs? (Chunk IDs change with every chunk configuration, so every other row of a sweep would score against labels that do not exist.)
+  4. What does parent-child buy and what does it cost? (Precise matching with contextual return — NDCG 0.64 → 0.71 — at the token cost of the parent size, so it is free relative to flat chunking at the parent size.)
+  5. Why did semantic chunking underperform structural chunking? (On a corpus with headings, explicit structure beats inferred topic shifts; it cost 4 min versus 90 s for −0.01 R@10.)
+  6. What is contextual retrieval and what did it cost on the reference corpus? (An LLM-written 60-token situating preamble per chunk; +0.04 R@10 for $0.49 and 29 minutes self-hosted.)
+  7. What is late chunking and what limits it? (Embed the whole document, pool per chunk afterwards; limited by the embedding model's context — 187 of 1,000 documents exceeded 8,192 tokens.)
+  8. Your corpus is short API entries averaging 180 tokens. What chunk size? (None — the document is the chunk; splitting or merging both destroy information.)
+  </Accordion>
+  <Accordion title="Coding challenge">
+  Implement `chunk(doc, strategy, **params) -> list[Chunk]` supporting fixed, recursive, structural
+  and parent-child, plus `resolve_gold(spans, chunks) -> list[chunk_id]` mapping character spans to
+  chunk IDs for any configuration. Hidden tests check: no chunk exceeds `size` tokens; overlap is
+  exactly as specified in token terms, not character terms; `assert 0 <= overlap < size` is
+  enforced; structural chunking never splits a fenced code block; parent-child children are exact
+  substrings of their parent; `resolve_gold` returns every chunk overlapping the span by at least
+  50%; and running the same document through the same configuration twice gives byte-identical chunk
+  IDs. That last one is the sleeper — non-deterministic chunk IDs make incremental re-indexing
+  (Week 28 M5) impossible.
+  </Accordion>
+  <Accordion title="Interview questions (junior / mid / senior)">
+  - **Junior:** "Why do we split documents into chunks instead of embedding the whole thing?"
+  - **Mid:** "Our RAG retrieves passages from the right topic but the wrong product. What is happening and how do you fix it?"
+  - **Senior:** "How would you choose chunk size for a corpus mixing 200-token API entries and 40-page contracts, and what breaks if you chunk them differently?"
+  </Accordion>
+  <Accordion title="Draw it from memory">
+  Reproduce the three-way document split with the gold passage marked in each, and the inverted-U
+  curve with five points, values written in and the peak circled.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Right topic, wrong document or product | Chunks not self-describing | Prepend document title and section path — 27% → 94% correct-source rate |
+| Sweep results are nonsense for most sizes | Gold labelled as chunk IDs from one configuration | Label character spans; resolve to chunk IDs per configuration |
+| Chunker hangs or fills the disk | `overlap >= size`, so the stride is zero or negative | `assert 0 <= overlap < size` |
+| Same parent appears three times in the prompt | Parent-child retrieval without dedup | Deduplicate by `parent_id`; log distinct parents and context tokens |
+| Answers missing the code, prose only | Fenced code split from its explanation | Treat code blocks as atomic during splitting |
+| Long documents perform worse | Late chunking silently truncating at the model's context limit | Log the fraction over the limit; window long documents |
+| Top-10 full of near-identical chunks | Overlap too high, or duplicate documents | 12.5% overlap; content-hash chunks and measure the duplicate rate |
+| Team argues over a 0.02 recall difference | No confidence intervals | Paired bootstrap; state what n=100 cannot resolve |
+
+## Sources & further reading
+
+**Primary docs**
+- [`langchain-text-splitters` 0.3.0](https://python.langchain.com/docs/how_to/recursive_text_splitter/) — read the separator ordering; understanding the fallback chain is what stops recursive splitting surprising you.
+- [LlamaIndex node parsers](https://docs.llamaindex.ai/en/stable/module_guides/loading/node_parsers/) — read `SentenceWindowNodeParser` and `AutoMergingRetriever`; the parent-dedup logic is the part hand-rolled versions miss.
+- [`tiktoken` 0.7.0](https://github.com/openai/tiktoken) — chunk on tokens, not characters; the difference is 3–4× and it varies by language and content type.
+
+**Papers**
+- [Anthropic, "Introducing Contextual Retrieval" (2024)](https://www.anthropic.com/news/contextual-retrieval) — *an LLM-written situating preamble per chunk cuts top-20 retrieval failures by 35%, or 67% with BM25 and reranking*; the preamble prompt and the caching cost note.
+- [Günther et al. 2024 (Late Chunking)](https://arxiv.org/abs/2409.04701) — *embed the document, pool per chunk afterwards, so chunk vectors see full context at no extra inference cost*; §3, Figure 2.
+- [Shi et al. 2023 (irrelevant context)](https://arxiv.org/abs/2302.00093) — *irrelevant retrieved text degrades answers rather than being ignored*; §4.
+
+**Go deeper**
+- [Greg Kamradt, "5 Levels of Text Splitting"](https://github.com/FullStackRetrieval-com/RetrievalTutorials/blob/main/tutorials/LevelsOfTextSplitting/5_Levels_Of_Text_Splitting.ipynb) — the clearest tour of the strategy space including semantic chunking, with runnable notebooks; read it and then run the sweep yourself, because his corpus is not yours and the conclusions do not transfer.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-27/p4-w27-m2">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,754 @@
+---
+title: "Resources, scheduling & autoscaling"
+description: "Week 24 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 24 · Module 3 · `P3-W24-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+**The deliverable of this module is a number you compute rather than observe:** the end-to-end
+lag between load arriving and a new pod serving traffic. Six components, each with a documented
+default. Predicted 27.3 s median; measured 31 s. Once you can compute it you can answer the only
+question that matters about autoscaling — *is it fast enough for the shape of my traffic?*
+</Info>
+
+## What you'll be able to do
+
+1. Explain requests versus limits, and which one the scheduler uses.
+2. Explain why memory limits are hard and CPU limits are soft, and what each failure looks like.
+3. Measure CPU throttling and its effect on p99.
+4. Name the three QoS classes and predict eviction order under node pressure.
+5. Configure an HPA with sensible targets and stabilization windows.
+6. **Compute the end-to-end scaling lag from its component intervals**, and validate it by measurement.
+7. Explain why CPU is a poor autoscaling signal for ML inference, and what to use instead.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w24-m3.svg" alt="Hand-drawn sketch: Resources, scheduling and autoscaling" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w24-m3-dark.svg" alt="Hand-drawn sketch: Resources, scheduling and autoscaling" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w24-m3
+tier: T3
+one-sentence-goal: Between load arriving and a new pod serving it there are six waiting rooms, each with a documented default, and adding them up tells you whether autoscaling can help your traffic shape at all.
+elements:
+  - a long horizontal time axis, hand-drawn, 0 to 60 seconds, ticks every 10
+  - a step-function load curve drawn ABOVE the axis jumping from 10 rps to 200 rps at t=0, drawn thick
+  - SIX consecutive labelled boxes laid end to end along the axis, each drawn as a small waiting-room icon with its interval written inside and its default underneath:
+    - "metrics staleness  mean 12.5 s (metric-resolution 15 s + cAdvisor 10 s)"
+    - "HPA sync  mean 7.5 s (sync-period 15 s)"
+    - "schedule  0.3 s"
+    - "image pull  0 s cached / 14 s cold" drawn with a dashed alternative box
+    - "container start + model warm-up  3.3 s"
+    - "readiness probe  mean 2.5 s (periodSeconds 5)"
+    - "endpoint propagation  1.2 s"
+  - a bracket under all six labelled "predicted median 27.3 s" and beside it "MEASURED 31 s" with a check
+  - a second bracket, thinner, labelled "worst case if every maximum coincides: 53.7 s" in amber
+  - a latency curve drawn below the axis showing p99 spiking at t=0 and recovering only after the last box, with the shaded area labelled "31 seconds of degraded service that autoscaling cannot prevent"
+  - amber margin note: "the HPA does not make you fast. It makes you cheap. If your spike is shorter than 31 s, autoscaling is not your answer - headroom is."
+  - LEFT inset: a small CFS quota diagram - a 100 ms period bar divided into a 50 ms filled section and a 50 ms hatched section labelled "THROTTLED", with "4 threads burn the quota in 12.5 ms, then stall for 87.5" and "p99 61 ms -> 340 ms" written in red
+  - a red cross-out over "limits.cpu: 500m with OMP_NUM_THREADS=4"
+  - RIGHT inset: two small signal curves over the same step - "CPU%" drawn lagging and saturating at 100, "in-flight requests" drawn rising immediately and without a ceiling, with the second circled and labelled "this one leads"
+  - dangling arrow: "...and what if a node has to be created first? -> +60 to 180 s"
+numbers-to-write-in: "27.3 s predicted / 31 s measured / 53.7 s worst", "scale-down stabilization 300 s", "p99 61 -> 340 ms throttled", "quota 50 ms of every 100 ms"
+alt: A hand-drawn timeline showing a step increase in load followed by six consecutive waiting periods — metrics staleness, HPA sync, scheduling, image pull, container start and readiness — summing to a predicted 27.3 seconds against a measured 31, with insets showing CFS CPU throttling burning a quota in 12.5 milliseconds and a comparison of CPU utilization against in-flight requests as autoscaling signals.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The one idea
+
+You tell Kubernetes two numbers for each resource: how much your container **needs** (the request) and how much it may **use** (the limit). The scheduler only looks at the request. The kernel enforces the limit — and it enforces CPU and memory completely differently: too much CPU makes you slow, too much memory kills you.
+
+Autoscaling then adds more copies when the numbers say you are busy. The catch, and the subject of Layer 3, is that it takes about half a minute to do so.
+
+### Vocabulary, defined before use
+
+- **Request** — the amount of a resource a container is guaranteed. The scheduler uses this to decide which node has room.
+- **Limit** — the maximum a container may use. Enforced by the Linux kernel via cgroups.
+- **millicore (`m`)** — one thousandth of a CPU core. `500m` is half a core; `2000m` is two cores.
+- **`Mi` / `Gi`** — mebibytes and gibibytes (1,024-based), not megabytes. `512Mi` = 536,870,912 bytes.
+- **Throttling** — the kernel pausing a container that has used its CPU quota for the current period.
+- **OOMKilled** — the kernel killing a container that exceeded its memory limit. Exit code 137.
+- **QoS class** — `Guaranteed`, `Burstable` or `BestEffort`, derived from your requests and limits. Determines eviction order.
+- **Eviction** — the kubelet removing pods when the node is under resource pressure.
+- **HPA** — HorizontalPodAutoscaler. Changes the number of pods based on a metric.
+- **`metrics-server`** — the component that collects CPU and memory usage and serves it to the HPA.
+- **Stabilization window** — how long the HPA looks back before deciding, to avoid flapping.
+- **PodDisruptionBudget (PDB)** — a rule limiting how many pods may be voluntarily removed at once.
+- **Cluster autoscaler** — adds and removes *nodes* when pods cannot be scheduled.
+
+### Requests and limits
+
+```yaml
+resources:
+  requests:
+    cpu: "500m"        # the scheduler reserves half a core on some node for this pod
+    memory: "512Mi"    # and 512 MiB
+  limits:
+    cpu: "1000m"       # the kernel will throttle above one core
+    memory: "1Gi"      # the kernel will KILL above 1 GiB
+```
+
+Two rules that explain most surprising behaviour:
+
+- **The scheduler only reads requests.** A node with 4 cores can host 8 pods requesting `500m` each, regardless of their limits. Requests are a *booking*; limits are a *ceiling*.
+- **CPU is compressible, memory is not.** If your container wants more CPU than its limit, the kernel slows it down — annoying but survivable. If it wants more memory than its limit, there is nothing to slow down: the kernel kills the process with SIGKILL, immediately, with no chance to log anything.
+
+That asymmetry is why the two failures look so different:
+
+```bash
+# Too much CPU
+kubectl top pod bloodcell-7d4f8-x2k9
+# NAME                    CPU(cores)   MEMORY(bytes)
+# bloodcell-7d4f8-x2k9    1000m        780Mi          <- pinned at the limit, running slowly
+
+# Too much memory
+kubectl describe pod bloodcell-7d4f8-x2k9 | grep -A3 "Last State"
+#     Last State:     Terminated
+#       Reason:       OOMKilled
+#       Exit Code:    137                              <- 128 + 9 (SIGKILL)
+```
+
+### Watch throttling happen
+
+Set the limit deliberately too low and measure.
+
+```bash
+kubectl set resources deploy/bloodcell -c api --limits=cpu=500m
+kubectl rollout status deploy/bloodcell
+
+# The kernel counters, read from inside the container
+kubectl exec deploy/bloodcell -- cat /sys/fs/cgroup/cpu.stat
+# usage_usec 41822193
+# nr_periods 3120
+# nr_throttled 1061            <- 34% of periods were throttled
+# throttled_usec 92718334
+```
+
+**Measured on the `kind` cluster**, 80 rps against 6 replicas:
+
+| `limits.cpu` | `OMP_NUM_THREADS` | p50 | p99 | Throttled periods |
+| --- | --- | --- | --- | --- |
+| (none) | 1 | 41 ms | 61 ms | — |
+| `2000m` | 1 | 41 ms | 63 ms | 0% |
+| `1000m` | 1 | 43 ms | 71 ms | 2.1% |
+| `500m` | 1 | 68 ms | 112 ms | 58% |
+| **`500m`** | **4** | 98 ms | **340 ms** | 34% |
+
+Read the last two rows together. **The same CPU limit with four threads gives a p99 three times worse than with one thread**, even though *fewer* periods are throttled. Layer 2 explains why, and it is the single most useful piece of cgroup knowledge for anyone running CPU-bound services in containers.
+
+### The autoscaler
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: bloodcell, namespace: ml-serving}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: bloodcell}
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 60}   # % of the REQUEST, not the limit
+```
+
+<Warning>
+`averageUtilization: 60` means 60% of the **request**, not the limit. With
+`requests.cpu: 500m` the HPA scales up when average usage exceeds `300m` per pod — which, if
+your limit is `1000m`, is only 30% of what the pod is allowed to use. Confusing these is the
+most common HPA misconfiguration, and it produces an autoscaler that scales far too eagerly or
+not at all depending on which way you got it wrong.
+</Warning>
+
+```bash
+kubectl apply -f hpa.yaml
+kubectl get hpa -w
+# NAME        REFERENCE              TARGETS         MINPODS  MAXPODS  REPLICAS
+# bloodcell   Deployment/bloodcell   18%/60%         3        20       3
+# bloodcell   Deployment/bloodcell   82%/60%         3        20       3
+# bloodcell   Deployment/bloodcell   82%/60%         3        20       5     <- scaled
+# bloodcell   Deployment/bloodcell   51%/60%         3        20       5
+```
+
+The arithmetic the HPA uses:
+
+```
+desiredReplicas = ceil( currentReplicas x (currentMetric / targetMetric) )
+
+3 pods at 82% against a 60% target:  ceil(3 x 82/60) = ceil(4.1) = 5
+```
+
+With a **10% tolerance**: if the ratio is between 0.9 and 1.1, nothing happens. So at 63% against a 60% target the HPA does not act, which is deliberate — it prevents constant one-pod adjustments.
+
+### Guided practice
+
+```yaml
+# TODO 1: requests.cpu 500m, limits.cpu 500m, requests.memory 1Gi, limits.memory 1Gi.
+#         What QoS class is this pod?
+# TODO 2: a node has 4 allocatable cores. How many pods with requests.cpu: 500m fit?
+# TODO 3: your pod is OOMKilled. Would raising the CPU limit help?
+# TODO 4: HPA target 60% utilization, requests.cpu 500m. At what usage does it scale up?
+```
+
+**Answers.** TODO 1: **Guaranteed** — every resource has a limit equal to its request, for every container in the pod. This is the last class to be evicted under node pressure. TODO 2: eight, in principle — but **allocatable is less than capacity**, because the kubelet and system daemons reserve a slice (typically 100–200m of CPU and several hundred MiB). `kubectl describe node` shows both. TODO 3: no. OOMKilled is a memory problem and CPU has nothing to do with it; you need a higher memory limit or a smaller footprint. This confusion is common because both appear as "the pod keeps restarting". TODO 4: at `300m` average usage per pod — 60% of the 500m **request**. Not 60% of the limit.
+
+### Checkpoint — five questions
+
+<AccordionGroup>
+<Accordion title="1. Which does the scheduler use, requests or limits?">
+Requests only. It sums the requests of all pods already on a node and checks whether yours fits in what is allocatable. Limits are irrelevant to placement — which is why a node can be badly over-committed if requests are set far below limits.
+</Accordion>
+<Accordion title="2. Why is memory a hard limit and CPU a soft one?">
+CPU is compressible: the kernel can give you less of it and you go slower. Memory is not: there is no "less memory more slowly", so exceeding the limit means the process is killed with SIGKILL.
+</Accordion>
+<Accordion title="3. What does exit code 137 mean?">
+128 + 9, where 9 is SIGKILL — almost always OOMKilled. Contrast 143 = 128 + 15 (SIGTERM), which is a normal graceful shutdown.
+</Accordion>
+<Accordion title="4. Utilization 60% of what?">
+Of the CPU **request**, not the limit and not the node's capacity. With `requests.cpu: 500m` the HPA acts at 300m average usage per pod.
+</Accordion>
+<Accordion title="5. Why does the HPA have a 10% tolerance?">
+To stop it acting on noise. Without it, a metric oscillating around the target would cause continuous one-pod scale events, each of which costs a pod start and an endpoint change.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### Why four threads under a CPU limit is worse than one
+
+This is the cgroup behaviour that surprises everyone, and it explains a large fraction of "our containerized service has terrible p99" reports.
+
+The Linux CFS bandwidth controller enforces a CPU limit as a **quota per period**. The default period is **100 ms**, and `limits.cpu: 500m` means a quota of **50 ms of CPU time per 100 ms of wall time**.
+
+```
+1 thread,  limit 500m:  the thread runs, accumulating 50 ms of CPU over 100 ms of wall time.
+                        It is throttled steadily. Latency roughly doubles. Predictable.
+
+4 threads, limit 500m:  4 threads x 12.5 ms = 50 ms of quota consumed in 12.5 ms of WALL time.
+                        All four are then frozen for the remaining 87.5 ms of the period.
+                        A request that lands in that window waits up to 87.5 ms for nothing.
+```
+
+Both configurations get the same total CPU. The four-thread one delivers it in **bursts separated by 87.5 ms stalls**, and those stalls land in your tail latency.
+
+**Measured**, 80 rps against 6 replicas, `limits.cpu: 500m`:
+
+| Threads | p50 | p95 | p99 | `nr_throttled / nr_periods` |
+| --- | --- | --- | --- | --- |
+| 1 | 68 ms | 94 ms | 112 ms | 58% |
+| 2 | 79 ms | 156 ms | 218 ms | 44% |
+| **4** | **98 ms** | **241 ms** | **340 ms** | **34%** |
+
+**Throttling *frequency* falls as threads rise while latency gets much worse.** The counter you would naturally watch is misleading; `throttled_usec` (total time frozen) is the better signal, and the p99 is better still.
+
+Three fixes, in order of preference:
+
+1. **One compute thread per container** (`OMP_NUM_THREADS=1`, `intra_op_num_threads=1`) and scale with replicas rather than threads. This is Week 23 Module 2's conclusion arriving again from a different direction, and it is why the manifests in this week set it.
+2. **Set the limit generously**, or omit it. A limit of `2000m` with one thread throttles 0% of periods.
+3. **Shorten the CFS period.** `cpu.cfs_period_us=10000` (10 ms) makes the stalls 8.75 ms instead of 87.5 ms. Measured: p99 340 ms → **149 ms** at four threads. It is a kubelet-level setting (`--cpu-cfs-quota-period`), it costs a little scheduling overhead, and most clusters cannot change it — but knowing it exists explains why some platforms have better container tail latency than others.
+
+<Warning>
+**The strongest version of this advice: consider omitting `limits.cpu` entirely** for
+latency-sensitive services, keeping only `requests.cpu`. The request still guarantees your share
+under contention; the limit only caps you when the node has *spare* capacity, which is exactly
+when you would like to use it. Tim Hockin (a Kubernetes maintainer) has argued this publicly and
+several large platforms do it. The counter-argument is that without limits a runaway pod can
+starve its neighbours and you lose the Guaranteed QoS class. **Decide deliberately;** the common
+practice of copying `limits: cpu: 500m` from a tutorial is the worst of both worlds.
+</Warning>
+
+### QoS classes and eviction
+
+Derived automatically from what you set:
+
+| Class | Condition | Evicted |
+| --- | --- | --- |
+| **Guaranteed** | Every container has `limits == requests` for **both** CPU and memory | Last |
+| **Burstable** | At least one request set, but not all equal to limits | Second, ordered by how far over its request it is |
+| **BestEffort** | No requests or limits at all | **First** |
+
+Under node memory pressure the kubelet evicts in that order. Within Burstable, pods furthest above their memory request go first — so **setting an honest memory request protects you**, and setting it artificially low to "fit more pods" makes you the first casualty.
+
+`Guaranteed` buys one more thing on nodes with the static CPU manager policy enabled: **exclusive CPU cores**, with no sharing and no CFS throttling. For latency-sensitive inference on a dedicated node pool this is a genuine win, and it requires integer CPU requests (`cpu: "2"`, not `"2000m"` — actually the same value, but it must be a whole number of cores).
+
+### Sizing requests from measurement
+
+Guessing produces either wasted capacity or evictions. Measure instead.
+
+```bash
+# Run the service under representative load for 10 minutes, then:
+kubectl top pods -l app=bloodcell --containers
+# POD                    NAME   CPU(cores)   MEMORY(bytes)
+# bloodcell-7d4f8-x2k9   api    412m         721Mi
+
+# Better: the p95 over the window, from Prometheus
+# quantile_over_time(0.95, rate(container_cpu_usage_seconds_total{pod=~"bloodcell.*"}[2m])[10m:])
+# max_over_time(container_memory_working_set_bytes{pod=~"bloodcell.*"}[10m])
+```
+
+The rules I use:
+
+| Resource | Request | Limit |
+| --- | --- | --- |
+| **CPU** | p95 of usage under expected load, rounded up | 2–4× the request, **or none** (see the warning above) |
+| **Memory** | `max` working set × 1.3 | Equal to the request, or at most 1.2× |
+
+**Memory limit close to the request** because memory does not burst usefully — a pod that occasionally needs double its request will eventually be OOMKilled on a busy node anyway, and it is better to find that out during load testing than at 3 a.m. Use `container_memory_working_set_bytes`, not RSS: the working set excludes reclaimable page cache and is what the OOM killer actually looks at.
+
+**Measured for this service** at 4 uvicorn workers: p95 CPU `412m`, max working set `721Mi`. So `requests: {cpu: 500m, memory: 1Gi}`, `limits: {memory: 1Gi}`, and no CPU limit.
+
+<Warning>
+**`kubectl top` shows an instantaneous sample from a 15-second window.** It is fine for a sanity
+check and useless for sizing — you will miss the peak. Use Prometheus with a quantile over a
+window, or run the workload while watching `--containers` output for several minutes. Sizing
+from a single `kubectl top` reading is how pods end up OOMKilled in production having looked fine
+in testing.
+</Warning>
+
+### The HPA, configured properly
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: bloodcell, namespace: ml-serving}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: bloodcell}
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 60}}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0      # react to the highest recent recommendation
+      policies:
+        - {type: Percent, value: 100, periodSeconds: 30}   # at most double every 30 s
+        - {type: Pods,    value: 4,   periodSeconds: 30}   # and at most +4 pods
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300    # look back 5 minutes; use the HIGHEST recommendation
+      policies:
+        - {type: Percent, value: 25, periodSeconds: 60}    # shrink at most 25% per minute
+```
+
+The asymmetry is the design. **Scaling up late costs you an outage; scaling down early costs you an outage too.** So: react immediately on the way up (0 s stabilization), and look back five minutes on the way down, taking the *highest* recommendation in that window. A brief dip in traffic therefore does not remove capacity you are about to need again.
+
+Why `60%` and not `80%`: the target must leave room for the scaling lag. If you scale at 80% and the lag is 31 seconds, load can reach 130% of capacity before help arrives. **Target utilization should be roughly `1 / (peak-to-mean ratio during the lag window)`** — measure your traffic's burstiness rather than copying a number.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **CPU limit set vs omitted** | Multi-tenant clusters where a runaway pod must not starve neighbours, or you need the Guaranteed QoS class. | Latency-sensitive single-tenant workloads. A limit only binds when the node has spare capacity — exactly when using it is free. Measured here: p99 61 ms with no limit versus 340 ms at `500m` with 4 threads. |
+| **HPA on CPU vs a custom metric** | It is built in, needs only `metrics-server`, and works. Start here. | CPU is a lagging, saturating signal for inference. Queue depth or in-flight requests lead it by seconds and do not saturate. Requires Prometheus Adapter or KEDA — worth it once CPU has failed you once. |
+| **Vertical (VPA) vs horizontal (HPA) scaling** | The pod is under-provisioned and load is steady. VPA right-sizes requests from observed usage, which is genuinely useful for the sizing problem above. | Load varies. **Do not run VPA and HPA on the same CPU metric** — VPA changes the request, which changes utilization, which moves the HPA's target underneath it. They fight. VPA in `recommendation` mode alongside an HPA is fine and is the common compromise. |
+| **HPA alone vs HPA + cluster autoscaler** | The cluster has spare node capacity. Scaling is 31 s. | Nodes fill up. Then a Pending pod waits for a node: **+60–180 s** for a cloud node to boot and join (Karpenter ~40 s). Over-provision with low-priority placeholder pods if that lag is unacceptable. |
+
+### War story — the autoscaler that made the outage worse
+
+A team's inference service had an HPA on CPU at 80% utilization, `minReplicas: 2`, `maxReplicas: 30`, and `limits.cpu: 1000m` with four inference threads per pod.
+
+A marketing email went out. Traffic went from 30 rps to 400 rps in about 15 seconds.
+
+What happened, in order:
+
+1. **CPU hit the limit and the pods were throttled.** With four threads against a `1000m` quota, each 100 ms period was consumed in 25 ms and the pods froze for 75 ms. p99 went from 70 ms to 1.4 s.
+2. **Throttled pods failed their liveness probes.** The probe had `timeoutSeconds: 1`, and a probe request landing in a 75 ms stall queued behind real requests and timed out. Three consecutive failures restarted the container.
+3. **Restarting pods removed capacity** from an already-overloaded service, pushing the remaining pods further past their quota — restarting *them*.
+4. **Meanwhile the HPA was working correctly and slowly.** It scaled 2 → 4 → 8 → 16, but each step took about 30 seconds and the new pods took 30 more to become ready. By the time capacity existed, six minutes had passed.
+
+**Total: 6 minutes 20 seconds of near-total unavailability, from a 4× traffic increase on a service whose 30 replicas could have handled 12×.**
+
+Four changes, in the order they mattered:
+
+1. **`OMP_NUM_THREADS=1` and no CPU limit.** Removed the throttling entirely. This alone would have prevented the incident.
+2. **Liveness probe relaxed** to `periodSeconds: 20, timeoutSeconds: 5, failureThreshold: 3` — about 60 s of sustained failure before a restart, rather than 3 s.
+3. **HPA target lowered from 80% to 55%**, giving headroom for the 31-second lag.
+4. **`minReplicas` raised from 2 to 6.** Autoscaling from a very low base is slow in *relative* terms — the percentage policy doubles, so 2 → 4 → 8 takes two full cycles to reach a number that would have been the baseline.
+
+The generalizable lesson: **an autoscaler cannot rescue you from a failure that is faster than it is.** Its job is to make you cheap at the median, not fast at the tail. Tail behaviour comes from headroom, and headroom is `minReplicas` and target utilization.
+
+### Design checkpoint
+
+<Accordion title="Your traffic is flat all day with a 90-second spike to 8x at 09:00 when a batch job runs. Someone proposes an HPA. What do you say?">
+**An HPA will not help with this spike, and I can say so with arithmetic rather than opinion.**
+
+The end-to-end scaling lag is about 31 seconds median and 47 s at p95 (Layer 3 has the components). The spike is 90 seconds. So:
+
+- Seconds 0–31: you are at 1× capacity against 8× load. Fully saturated, queueing, timing out.
+- Seconds 31–60: capacity is arriving in steps, and the percentage policy doubles at most every 30 s, so from a baseline of 3 pods you reach 6, then 12 — you need 24.
+- Seconds 60–90: you finally have enough capacity.
+- Second 90: the spike ends.
+- Seconds 90–390: the scale-down stabilization window keeps 24 pods running for **five more minutes** at 1/8 the load, which is the part nobody budgets for.
+
+**So the HPA gives you 60 seconds of outage followed by 5 minutes of paying for idle pods.** It made things worse on both axes.
+
+**What I would propose instead, in order:**
+
+1. **Ask whether the spike must be synchronous at all.** A batch job hitting an inference endpoint 8× is usually the batch job's scheduling, not a user-facing requirement. Rate-limiting the client to 2× over 6 minutes is a one-line change on their side and solves it completely. **This is the answer roughly half the time and nobody asks the question.**
+2. **If it must be synchronous: scheduled scaling.** A CronJob or a `KEDA` `cron` scaler that raises `minReplicas` to 24 at 08:55 and lowers it at 09:10. Predictable load deserves predictable capacity, and you pay for 15 minutes rather than all day.
+3. **If it is not predictable: raise `minReplicas` and accept the cost.** Compute it: 24 pods at 500m and 1Gi, all day, versus 3. On a cloud cluster that is roughly 21 extra pods × ~$12/month of node share ≈ $250/month for a 90-second daily spike. State the number and let the business decide.
+4. **A queue in front.** If the batch job's work can be asynchronous, put it behind a queue and let a separate consumer Deployment drain it at whatever rate the current capacity supports. The spike becomes a backlog, which is a much better failure mode than a timeout, and now queue depth is the right autoscaling signal.
+
+**The sentence for the meeting:** "The autoscaler takes about 31 seconds to add the first pod and roughly 60 to reach the capacity we'd need — the spike is 90 seconds, so we'd be down for two-thirds of it and then pay for idle pods for five minutes afterwards. Scheduled scaling at 08:55 costs less and works. Better still, can the batch job spread its calls over six minutes?"
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a measured number. Cluster: `kind` v0.23.0,
+`kindest/node:v1.30.2`, 1 control-plane + 3 workers in **local Docker on a laptop-class host**,
+`metrics-server` 0.7.2 at default settings, `k6` 0.53.0 — reproducible by you. The scaling-lag
+budget is **derived** from the components' documented polling intervals; see
+[About the numbers](/start/about-the-numbers).
+</Warning>
+
+### Scaling lag, computed end to end
+
+Six waiting rooms between load arriving and a new pod serving. Each has a documented default.
+
+| # | Component | Default | Mean lag | Max |
+| --- | --- | --- | --- | --- |
+| 1 | **Metric staleness** — kubelet cAdvisor housekeeping (10 s) + `metrics-server --metric-resolution` (15 s) | — | **12.5 s** | 25 s |
+| 2 | **HPA sync period** — `--horizontal-pod-autoscaler-sync-period` | 15 s | **7.5 s** | 15 s |
+| 3 | **Scale-up stabilization** — `behavior.scaleUp.stabilizationWindowSeconds` | 0 s | 0 s | 0 s |
+| 4 | **Scheduling** — filter, score, bind | — | 0.3 s | 2 s |
+| 5 | **Image pull** — 466 MB image | — | **0 s** (cached) | 14 s (cold) |
+| 6 | **Container start + model load + warm-up** | — | **3.3 s** | 5 s |
+| 7 | **Readiness probe** — `periodSeconds: 5` | — | **2.5 s** | 5 s |
+| 8 | **Endpoint propagation** (Module 2) | — | **1.2 s** | 3.4 s |
+| | **Predicted total (warm image)** | | **27.3 s** | **53.7 s** |
+| | **Predicted total (cold image)** | | 41.3 s | 67.7 s |
+
+**Measured**, 30 trials of a step from 10 rps to 200 rps, timing from the load step to the first successful request served by a new pod:
+
+| | Predicted | Measured |
+| --- | --- | --- |
+| Median | 27.3 s | **31.0 s** |
+| p95 | — | **47.2 s** |
+| Worst case (all maxima) | 53.7 s | 51.8 s observed max |
+
+**Predicted median 27.3 s against measured 31.0 s — 13% low.** The gap is kubelet-side latency the model does not include (the pod-status update round trip, and the HPA's own metric-fetch call). The p95 of 47.2 s sits well below the 53.7 s worst case, as expected: the worst case assumes every component simultaneously hits its maximum, which is unlikely.
+
+**The model is good enough to make decisions with**, and that is the point. You can answer "will autoscaling help?" before building anything.
+
+Tuning it, and what each change costs:
+
+| Change | Saves | Cost |
+| --- | --- | --- |
+| `metrics-server --metric-resolution=5s` | ~5 s | 3× the metrics load on kubelets; more API traffic |
+| `--horizontal-pod-autoscaler-sync-period=5s` | ~5 s | Control-plane flag; unavailable on managed clusters |
+| Pre-pull the image (DaemonSet, or a warm node pool) | 14 s on cold nodes | A DaemonSet per image |
+| Smaller image (Week 23 Module 3) | up to 12 s of pull | Free — you already did it |
+| `readinessProbe.periodSeconds: 2` | ~1.5 s | 2.5× the probe load |
+| Faster model load (mmap, smaller artifact) | up to 2 s | Engineering |
+| **Higher `minReplicas` / lower target utilization** | **all of it** | **Money** |
+
+**The last row is the honest one.** Every other change shaves a few seconds off a 31-second floor. If your traffic spikes faster than 31 seconds, no amount of tuning makes autoscaling the answer — you buy headroom instead, and the autoscaler's job becomes reducing cost during the quiet 22 hours rather than saving you during the spike.
+
+### Scale-down, and why it is deliberately slow
+
+`behavior.scaleDown.stabilizationWindowSeconds` defaults to **300 s**, and it works differently from scale-up: the HPA takes the **highest** recommendation from the whole window. So after a spike ends you keep the spike's capacity for five minutes.
+
+**Measured** on a 90-second spike from 20 to 200 rps with `minReplicas: 3`:
+
+```
+t=0     spike starts,  3 pods
+t=31    5 pods serving
+t=62    9 pods
+t=90    12 pods; spike ends
+t=90    load back to 20 rps; 12 pods, utilization 9%
+t=390   scale-down begins (300 s window elapsed)
+t=450   9 pods  (25%/60 s policy)
+t=510   7 pods
+t=630   3 pods
+```
+
+**You pay for 12 pods for 5 minutes and take 9 more minutes to fully shrink.** For a 90-second spike, total over-provisioning is roughly 8 pod-minutes against 1.5 pod-minutes of actual need.
+
+Lowering the window makes you responsive and risks flapping — and flapping is expensive in a way the metric does not show: each removed pod drops its in-flight requests unless Module 2's `preStop` and graceful shutdown are in place (they are not, on most services), and each added pod costs 3.3 s of warm-up during which it serves nothing.
+
+### CPU is the wrong signal for inference
+
+Three reasons, each measurable:
+
+**1. CPU lags the queue.** When arrivals exceed capacity, the queue starts growing *immediately*; CPU is already near its ceiling and cannot rise further to signal it. Measured on a step from 80 to 200 rps: in-flight requests crossed a 2× threshold at **t = 0.4 s**; CPU utilization crossed its 60% threshold at **t = 3.1 s**, and the *metric* reflecting that reached the HPA at t ≈ 15 s. **The signal itself is nearly 3 seconds late before staleness is even counted.**
+
+**2. CPU saturates.** At 100% utilization, 2× overload and 10× overload look identical. Queue depth distinguishes them, which matters because the correct response is different.
+
+**3. CPU does not reflect the SLO.** Your users care about latency. Queue depth relates to latency by Little's Law directly:
+
+```
+concurrency = arrival rate x latency
+
+at the knee:  97 rps x 0.041 s = 3.98 in-flight requests per pod
+```
+
+So **an in-flight target of about 4 per pod puts you at the knee**, and a target of 2–3 keeps you comfortably below it — a threshold derived from the load test rather than guessed.
+
+```yaml
+# KEDA 2.15.1 — scale on in-flight requests from a Prometheus metric
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata: {name: bloodcell, namespace: ml-serving}
+spec:
+  scaleTargetRef: {name: bloodcell}
+  minReplicaCount: 3
+  maxReplicaCount: 20
+  cooldownPeriod: 300
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies: [{type: Percent, value: 100, periodSeconds: 30}]
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring:9090
+        query: sum(bloodcell_inflight_requests) / count(bloodcell_inflight_requests)
+        threshold: "3"                       # in-flight per pod; knee is ~4
+```
+
+**Measured comparison**, same 10 → 200 rps step, same cluster:
+
+| Signal | First scale event | Full capacity | Peak p99 during the ramp |
+| --- | --- | --- | --- |
+| CPU at 60% | 31.0 s | 62 s | 1,840 ms |
+| **In-flight at 3** | **19.4 s** | **48 s** | **910 ms** |
+
+**11.6 seconds earlier and half the peak p99**, because the signal leads instead of lagging. The remaining 19.4 s is the irreducible part — Prometheus scrape interval, KEDA polling, pod start, readiness — and no signal choice removes it.
+
+### PodDisruptionBudgets
+
+A PDB constrains **voluntary** disruptions: node drains, cluster upgrades, `kubectl drain`. It does **not** protect against a node crashing, a pod being OOMKilled, or a rolling update (which the Deployment's own `maxUnavailable` governs).
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: {name: bloodcell, namespace: ml-serving}
+spec:
+  minAvailable: 80%                 # or maxUnavailable: 1
+  selector: {matchLabels: {app: bloodcell}}
+```
+
+<Warning>
+**A PDB with `minAvailable` equal to your replica count blocks node drains forever.**
+`minAvailable: 3` with `replicas: 3` means no pod may ever be voluntarily evicted, so
+`kubectl drain` hangs and a cluster upgrade stalls — often discovered at 2 a.m. during a
+maintenance window. Use a percentage, or `maxUnavailable: 1`, and make sure `replicas` exceeds
+the PDB's floor.
+</Warning>
+
+Interaction worth knowing: with an HPA, `minAvailable` as a **percentage** tracks the current replica count, while an absolute number does not. During a scale-down to `minReplicas: 3`, a PDB of `minAvailable: 5` blocks everything.
+
+### Cluster autoscaling and GPUs
+
+When no node has room, the pod is `Pending` and a **cluster autoscaler** provisions a node. That adds to the lag:
+
+| Provisioner | Node ready | Total lag (HPA + node) |
+| --- | --- | --- |
+| Cluster Autoscaler + a managed node group | 90–180 s | 2–3.5 min |
+| Karpenter (provisions instances directly) | 40–70 s | 1.2–1.7 min |
+| Over-provisioning with low-priority placeholder pods | **0 s** | **31 s** |
+
+The over-provisioning trick is worth knowing: run a Deployment of "pause" pods at a negative `PriorityClass` that request the resources of a real pod. They occupy space; when a real pod needs to schedule, the scheduler preempts them, and the placeholder Deployment then goes Pending and triggers node provisioning *in the background*. You pay for the spare capacity and you get instant scheduling.
+
+**GPU scheduling**, since Phase 4 needs it:
+
+```yaml
+resources:
+  limits:
+    nvidia.com/gpu: 1          # requests are implied; you cannot request a fraction
+```
+
+Three facts that constrain design:
+
+- **GPUs are allocated whole.** `nvidia.com/gpu: 1` gives your container an entire device. There is no `0.5`.
+- **Sharing requires explicit setup.** Time-slicing (configured in the device plugin) lets several pods share one GPU with no memory isolation — one pod's OOM affects the others. MIG (on A100/H100) partitions a GPU into isolated instances with fixed memory splits.
+- **GPU nodes are expensive and slow to provision**, so the over-provisioning trick matters more, and scale-to-zero (KEDA) matters more too. A `g5.xlarge` idle at $1.006/hour is $734/month — derived from the published on-demand price.
+
+### Production failure modes
+
+<AccordionGroup>
+<Accordion title="Throttling-induced restart cascade">
+**Signature:** under a load spike, pods start restarting and the service collapses entirely. **Cause:** a CPU limit plus multiple threads produces 75–90 ms stalls; liveness probes with a 1 s timeout fail; restarts remove capacity from an overloaded service. **Detection:** `nr_throttled` in `cpu.stat`, plus restart counts correlated with load. **Fix:** one compute thread, generous or absent CPU limit, and a liveness probe with `timeoutSeconds: 5, periodSeconds: 20`.
+</Accordion>
+<Accordion title="HPA and VPA fighting on the same metric">
+**Signature:** replica count and pod size both oscillating. **Cause:** VPA raises the CPU request, which lowers utilization (a percentage of the request), which makes the HPA scale down, which raises per-pod load, which makes VPA raise the request again. **Fix:** never run both on CPU. VPA in `recommendation`-only mode, or VPA on memory and HPA on CPU.
+</Accordion>
+<Accordion title="PDB blocking a cluster upgrade">
+**Signature:** `kubectl drain` hangs indefinitely; a managed node-group upgrade stalls. **Cause:** `minAvailable` equals the current replica count, so no eviction is ever allowed. **Detection:** `kubectl get pdb` — `ALLOWED DISRUPTIONS: 0`. **Fix:** a percentage, or `maxUnavailable: 1`, and enough replicas.
+</Accordion>
+<Accordion title="Autoscaler thrashing on a noisy metric">
+**Signature:** replica count oscillating every minute; latency spikes at every scale event. **Cause:** `scaleDown.stabilizationWindowSeconds` too low, or a metric with high variance. **Detection:** plot replica count over an hour. **Fix:** raise the scale-down window; smooth the metric with `avg_over_time`; rely on the 10% tolerance.
+</Accordion>
+<Accordion title="Pods evicted despite plenty of node memory">
+**Signature:** `Evicted` pods with `The node was low on resource: ephemeral-storage`. **Cause:** disk pressure from logs or `/tmp`, not memory. **Detection:** `kubectl describe node` → Conditions → `DiskPressure`. **Fix:** `requests.ephemeral-storage`, log rotation, and an `emptyDir` with a `sizeLimit` for scratch space. This one surprises people because they only ever think about CPU and memory.
+</Accordion>
+<Accordion title="minReplicas too low for the percentage policy">
+**Signature:** scaling from a small base takes several cycles to reach useful capacity. **Cause:** `Percent: 100` doubles, so 2 → 4 → 8 is two full 30-second periods before you have 8. **Fix:** a `Pods`-type policy alongside the percentage one with `selectPolicy: Max`, and a `minReplicas` that is a realistic floor rather than the smallest number that works at 3 a.m.
+</Accordion>
+</AccordionGroup>
+
+### Papers and specs
+
+- **Verma et al. (2015), "Large-scale cluster management at Google with Borg," EuroSys.** *Takeaway:* the sections on resource reclamation and on the gap between requested and used resources — Borg users over-request by a large margin, so Borg reclaims the difference for batch work; the request/limit distinction in Kubernetes is a direct descendant, and so is the observation that honest requests are a social problem as much as a technical one.
+- **Kubernetes, [CPU management policies](https://kubernetes.io/docs/tasks/administer-cluster/cpu-management-policies/) and [Assign CPU Resources](https://kubernetes.io/docs/tasks/configure-pod-container/assign-cpu-resource/).** *Takeaway:* the `static` CPU manager policy gives Guaranteed pods with integer CPU requests exclusive cores, bypassing CFS throttling entirely — the documented escape hatch from the throttling problem for latency-sensitive workloads.
+- **Kubernetes Enhancement Proposal 853, "HPA scale-to-zero"** and the **[HPA algorithm documentation](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#algorithm-details).** *Takeaway:* the exact `ceil(currentReplicas × ratio)` formula, the 10% tolerance, and how `behavior` policies compose — reading it once removes all mystery from "why did it choose that number".
+- **Little (1961), "A Proof for the Queuing Formula L = λW."** *Takeaway:* the average number of items in a system equals the arrival rate times the average time in the system — which is why in-flight requests, arrival rate and latency are three views of one quantity, and why an in-flight target of 4 corresponds to the load-test knee.
+- **Google SRE Book, Chapter 22, "Addressing Cascading Failures."** *Takeaway:* overload produces positive feedback loops — health checks failing under load, retries amplifying, restarts removing capacity — and the mitigations are load shedding, graceful degradation and generous timeouts rather than more autoscaling. The war story in Layer 2 is this chapter happening.
+- **Google SRE Book, Chapter 4, "Service Level Objectives."** *Takeaway:* capacity decisions follow from an SLO, not the other way round — "what target utilization?" is unanswerable until "what latency do we promise, at what load?" is answered.
+
+### Stretch challenge
+
+**Produce a scaling report: apply increasing load, plot replicas, latency and error rate over time, and identify the lag windows.**
+
+Part one: instrument. You need three time series on one chart — offered load, replica count (`kube_state_metrics`' `kube_deployment_status_replicas_available`), and p99 latency. Apply a step from 10 rps to 200 rps and hold for 5 minutes, then drop back and hold for 10 more so you capture the scale-down.
+
+Part two: mark the lag windows on the chart and reconcile them against the predicted components. **Which of the six is largest for you?** For most people on a `kind` cluster it is metric staleness; on a cloud cluster with a big image it is the pull. Then change one component (`--metric-resolution=5s`, or pre-pull the image) and re-measure to confirm your attribution.
+
+Part three, the open one: **switch to a leading signal and quantify what it bought you.**
+
+Expose an in-flight-requests gauge, scrape it with Prometheus, drive a KEDA `ScaledObject` from it, and re-run the same step. Derive the threshold from Little's Law using your own load-test knee rather than guessing. Report first-scale-event time, time-to-full-capacity, and peak p99 for both signals.
+
+Then the question with no settled answer: **what should the autoscaling signal be for an ML service?** Candidates, all defensible: CPU (simple, built in, lagging), in-flight requests (leads, needs custom metrics), queue depth (leads more, needs an actual queue), p99 latency (directly the SLO, but it is an *outcome* — scaling on it risks a control loop chasing its own tail), and predicted load from a forecast (scales *before* the spike, and is wrong sometimes).
+
+Argue for one, with your measurements. Then say what it costs when it is wrong — because every one of them fails differently, and the failure mode is what you will actually live with.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Produce a scaling report: apply increasing load, plot replicas, latency and error rate over time,
+and identify the lag windows.
+</Card>
+
+<Steps>
+<Step title="Install metrics-server on kind (10 min)">
+`kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml`, then patch in `--kubelet-insecure-tls` (kind's kubelet certificates are self-signed). Confirm with `kubectl top nodes`.
+</Step>
+<Step title="Size the requests from measurement (25 min)">
+Run 80 rps for 10 minutes and record p95 CPU and max working-set memory per pod. Set requests from those. Do **not** use a single `kubectl top` reading — you will miss the peak.
+</Step>
+<Step title="Watch throttling (30 min)">
+Set `limits.cpu: 500m` and sweep `OMP_NUM_THREADS` over 1, 2 and 4. Record p50, p99 and `nr_throttled / nr_periods` from `cpu.stat` for each. Reproduce the finding that throttling frequency *falls* while latency gets much worse.
+</Step>
+<Step title="Get OOMKilled on purpose (10 min)">
+`limits.memory: 256Mi`. Watch exit code 137 in `describe` → Last State. Then confirm that raising the CPU limit does nothing for it.
+</Step>
+<Step title="Add the HPA and measure the lag (45 min)">
+CPU at 60%, `minReplicas: 3`, the `behavior` block from Layer 2. Step the load from 10 to 200 rps, thirty times, timing from the step to the first request served by a new pod. Report the median and p95. Expect around 31 s and 47 s.
+</Step>
+<Step title="Reconcile against the predicted components (25 min)">
+Write out the six components with their defaults, sum them, and compare to your measurement. Then change one — `--metric-resolution=5s` is easiest on `kind` — and confirm the total moves by about what you predicted.
+</Step>
+<Step title="Watch the scale-down (25 min)">
+Drop the load and watch nothing happen for five minutes, then shrink in 25% steps. Plot replica count against time and compute the pod-minutes of over-provisioning for a 90-second spike.
+</Step>
+<Step title="Switch to a leading signal (50 min)">
+Expose an in-flight gauge, install KEDA, scale on it with a threshold derived from Little's Law and your load-test knee. Re-run the step. Expect roughly 19 s to the first scale event and about half the peak p99.
+</Step>
+<Step title="Write the scaling report (25 min)">
+One chart with load, replicas and p99 over time; the lag windows marked and attributed; the two signals compared; and one sentence on whether autoscaling is the right tool for your traffic shape.
+</Step>
+</Steps>
+
+## The whiteboard
+
+The T3 animation for this module is A30: load rising, pods spawning, latency recovering — with each of the six lag windows shaded and labelled as it elapses. The static T1 is the same timeline with the predicted-versus-measured brackets underneath.
+
+<Tip>
+**Draw it yourself.** The six waiting rooms with their defaults, the predicted total, and the
+measured one. Then the CFS quota inset: a 100 ms period with 50 ms of quota burned in 12.5 ms.
+If you can reproduce the six components you can answer "will autoscaling help?" with arithmetic
+in a meeting, which is a genuinely differentiating thing to be able to do.
+[Blank version](/assets/diagrams/p3-w24-m3-blank.svg) · [Editable source](/assets/diagrams/p3-w24-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Computed Kubernetes HPA end-to-end scaling lag from its six component intervals — 27.3 s predicted, 31.0 s measured over 30 trials, p95 47.2 s — and showed that switching from CPU to an in-flight-requests signal derived from Little's Law cut time-to-first-scale to 19.4 s and peak p99 from 1,840 ms to 910 ms."
+
+**The interview question this earns you.** "How does the HPA decide how many pods to run?" gets you the formula from a good candidate. The follow-up — "how quickly does it react?" — separates people. "About 31 seconds median on my cluster, and it decomposes: metrics are up to 25 s stale because cAdvisor housekeeping is 10 s and metrics-server's resolution is 15; the HPA syncs every 15; then scheduling, image pull, container start and warm-up, the readiness probe period, and endpoint propagation. I measured 31 s median and 47 at p95 against a predicted 27.3. The consequence is that autoscaling can't help with a spike shorter than about 30 seconds — that needs headroom, and the autoscaler's real job is making you cheap during the quiet hours."
+
+The throttling result is the other one to have ready: "a CPU limit with four threads gives a worse p99 than the same limit with one thread, even though fewer periods are throttled, because four threads burn a 50 ms quota in 12.5 ms and then all stall for 87.5."
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Check `nr_throttled` on your team's latency-sensitive pods.** `kubectl exec -- cat /sys/fs/cgroup/cpu.stat`. If throttling is non-zero on a service with a p99 problem, you have found it — and the fix is usually one thread per container plus a more generous CPU limit, not more replicas.
+
+**2. Compute your scaling lag and write it in the runbook.** Six numbers, all documented defaults. Then the team can answer "should we autoscale this?" with arithmetic instead of a meeting, and knows what traffic shapes the autoscaler cannot handle.
+
+**3. Check your PDBs for `ALLOWED DISRUPTIONS: 0`.** `kubectl get pdb -A`. A PDB whose `minAvailable` equals the replica count blocks every node drain and stalls cluster upgrades, and it is usually discovered in a maintenance window at 2 a.m.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| p99 far worse in a container than on a VM | CFS throttling: a quota burned in a fraction of the period, then a stall | One compute thread per container; generous or no CPU limit |
+| Pods restart under load and the service collapses | Throttling stalls fail an aggressive liveness probe; restarts remove capacity | `timeoutSeconds: 5, periodSeconds: 20`; fix the throttling first |
+| HPA scales far too eagerly, or not at all | `averageUtilization` is a percentage of the **request**, not the limit or the node | Compute the target usage in millicores and check it |
+| Pod OOMKilled; raising the CPU limit does not help | Memory is not compressible; CPU is unrelated | Raise the memory limit or reduce the footprint |
+| Pods evicted with plenty of memory free | Disk pressure from logs or `/tmp`, not memory | `requests.ephemeral-storage`, log rotation, `emptyDir` with `sizeLimit` |
+| Replica count oscillates every minute | Scale-down window too short, or a noisy metric | Raise `scaleDown.stabilizationWindowSeconds`; smooth the metric |
+| Autoscaling did not save you during a spike | The spike was shorter than the ~31 s lag | Headroom (`minReplicas`, lower target), or scheduled scaling |
+| Scaling from 2 replicas takes minutes to reach useful capacity | `Percent: 100` doubles per period; 2 → 4 → 8 is two full cycles | Add a `Pods`-type policy with `selectPolicy: Max`; raise `minReplicas` |
+| `kubectl drain` hangs; a cluster upgrade stalls | PDB `minAvailable` equals the replica count | A percentage, or `maxUnavailable: 1` |
+| Replica count and pod size both oscillating | HPA and VPA both acting on CPU | Never both on CPU; VPA in recommendation mode |
+| Sized requests from `kubectl top` and got OOMKilled in production | `top` is one 15-second sample and misses the peak | Prometheus quantile over a window under representative load |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [Kubernetes — Horizontal Pod Autoscaling, algorithm details](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#algorithm-details) — read this for the exact formula, the 10% tolerance and how `behavior` policies compose. It removes all guesswork from "why that number".
+- [Kubernetes — Resource Management for Pods and Containers](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/) — read the "How Pods with resource limits are run" section, which states that CPU limits are enforced by CFS quota and memory limits by the OOM killer.
+- [Kubernetes — QoS classes](https://kubernetes.io/docs/concepts/workloads/pods/pod-qos/) — read this and then check what class your own pods are in. Most people assume Guaranteed and are Burstable.
+- [`metrics-server` flags](https://github.com/kubernetes-sigs/metrics-server#configuration) — read `--metric-resolution`; it is component 1 of the lag and the largest single term on a default cluster.
+- [KEDA — Prometheus scaler](https://keda.sh/docs/2.15/scalers/prometheus/) — read this for the query-based trigger used in Layer 3, and the `cron` scaler for the scheduled-scaling answer in the design checkpoint.
+
+**Papers**
+
+- [Verma et al. (2015)](https://doi.org/10.1145/2741948.2741964) — *users over-request resources systematically; the request/limit split and resource reclamation are the response.*
+- [Little (1961)](https://doi.org/10.1287/opre.9.3.383) — *`L = λW`; in-flight requests, arrival rate and latency are three views of one quantity, which is where the autoscaling threshold comes from.*
+- [Google SRE Book, Ch. 22](https://sre.google/sre-book/addressing-cascading-failures/) — *overload creates positive feedback via health checks, retries and restarts; the war story in Layer 2 is this chapter.*
+- [Google SRE Book, Ch. 4](https://sre.google/sre-book/service-level-objectives/) — *capacity targets follow from an SLO; "what utilization target?" is unanswerable without one.*
+- [Kubernetes CPU management policies](https://kubernetes.io/docs/tasks/administer-cluster/cpu-management-policies/) — *the `static` policy gives Guaranteed pods exclusive cores and bypasses CFS entirely.*
+
+**Go deeper**
+
+- Dave Chiluk, ["Unthrottled: Fixing CPU Limits in the Cloud"](https://engineering.indeedblog.com/blog/2019/12/unthrottled-fixing-cpu-limits-in-the-cloud/) — read this for the kernel bug in CFS quota accounting that Indeed found and fixed upstream, and for the clearest explanation anywhere of why multi-threaded processes throttle so badly. It changed how a lot of teams configure limits.
+- Tim Hockin's thread on [CPU limits](https://github.com/kubernetes/kubernetes/issues/51135) — read the discussion for the maintainers' own disagreement about whether CPU limits should be used at all. It is a good corrective to treating any of this as settled.
+- [Karpenter documentation](https://karpenter.sh/docs/concepts/) — read the "Provisioning" concept page. It provisions instances directly rather than scaling node groups, which is why it is roughly 2–3× faster and changes the cluster-autoscaling arithmetic in Layer 3.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-24/p3-w24-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

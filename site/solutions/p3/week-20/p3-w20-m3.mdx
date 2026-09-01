@@ -1,0 +1,113 @@
+---
+title: "Feature selection & dimensionality"
+description: "Reference solution — Week 20"
+hidden: true
+icon: "lock"
+---
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+<Info>
+**Provenance.** The reference figures below were produced by running the code on an Apple M3 Pro (11 cores, 18 GB, macOS arm64, no GPU), Python 3.12.9, with the versions pinned in the week index. Arithmetic shown term by term is *derived* and holds anywhere; results attributed to a paper are that paper's. See [About the numbers](/start/about-the-numbers).
+</Info>
+
+
+## Reference solution — `P3-W20-M3`
+
+The task: cut a 200-feature model to 25 with under 1% metric loss, and report the serving-latency win.
+
+## The cut
+
+Ranking by held-out permutation importance, on 40,000 rows with 25 informative, 40 redundant, 10 repeated and 125 noise features:
+
+| Features kept | Test AUC | vs all 200 |
+| --- | --- | --- |
+| 200 | 0.97944 | — |
+| 100 | 0.97980 | **+0.04** |
+| 50 | 0.97930 | **−0.01** |
+| **25** | **0.97051** | **−0.89** |
+| 15 | 0.95181 | −2.76 |
+| 10 | 0.90541 | −7.40 |
+| 5 | 0.80608 | −17.34 |
+
+**200 to 50 is free** — one hundredth of a point, and 100 features actually scored *higher* than 200, which is noise in the other direction. **200 to 25 costs 0.89 points**, comfortably inside the 1% target.
+
+Then a cliff: 25 to 15 costs 1.87, 15 to 10 costs 4.64, 10 to 5 costs 9.93. **Locate the cliff and report it**; a submission that reports only `k=25` has not shown that it found the knee rather than guessing a number.
+
+## Rank with the right method
+
+Four selectors, same budget of 25 features, same downstream model:
+
+| Selector | Selection time | Test AUC | vs 200 |
+| --- | --- | --- | --- |
+| filter (ANOVA F) | **0.0 s** | 0.94471 | −3.47 |
+| wrapper (RFE, logistic) | 0.4 s | 0.95464 | −2.48 |
+| embedded (L1 logistic) | 6.3 s | 0.95339 | −2.60 |
+| **permutation (held-out)** | 38.5 s | **0.97051** | **−0.89** |
+
+**Permutation is 3.9x better than the filter and 96x slower.** Both facts belong in the write-up — the trade is obvious when a fit takes seconds and not obvious when it takes an hour, and the standard two-stage pattern is a filter down to a few hundred followed by permutation on those.
+
+Note that RFE used a *logistic regression* to select features for a *boosted tree*, and scored between the two. If you use a wrapper, wrap the model you are shipping.
+
+## Two things the criterion does not ask for and should
+
+**Selection stability.** Refit the selector on 20 bootstrap resamples:
+
+```
+selected in ALL 20 bootstraps : 18
+selected in >= 80%            : 20
+selected in 20-80% (unstable) :  9
+never selected                : 169
+```
+
+**Only 18 of the 25 are stable.** Nine hover in the 20–80% band, so which ones you ship depends on which rows you happened to draw. Report this, and consider selecting on 80% survival rather than a fixed `k` — it is a data-driven cut instead of a guessed one.
+
+**Grouped permutation.** With 40 redundant and 10 repeated features in this dataset, plain permutation importance will give near-zero to members of correlated groups — permuting one leaves its twin for the model to read. Cluster on `1 - abs(spearman)` and permute each group with a **shared** shuffle index. Without this the ranking is systematically wrong in exactly the places redundancy lives.
+
+## The serving win, reported honestly
+
+This is where most submissions overclaim, and the honest answer is more interesting.
+
+| Features | Test AUC | µs/row batched | ms/row single | Model artifact |
+| --- | --- | --- | --- | --- |
+| 200 | 0.97944 | 1.47 | 4.188 | 773.7 KB |
+| 50 | 0.97930 | 1.43 | 4.073 | 463.1 KB |
+| 25 | 0.97051 | **1.83** | 3.793 | **411.4 KB** |
+| 10 | 0.90541 | 1.20 | 5.785 | 380.3 KB |
+
+**Model inference did not get faster.** 1.47 µs/row at 200 features against 1.83 µs/row at 25 — noise, and pointing the wrong way. Single-row latency is 3.5 to 5.8 ms regardless, dominated by Python call overhead.
+
+The reason is structural: a boosted tree's inference cost is `O(n_trees * depth)` — comparisons down the tree — not `O(n_features)`. All 200 columns are in the input array either way; the model only touches the ones it split on.
+
+**What you actually bought:**
+
+- The artifact shrank **47%**, 773.7 KB to 411.4 KB.
+- **175 upstream dependencies disappeared.** At a modest 0.05 ms of lookup per feature, that is 10 ms per request at 200 features against 1.25 ms at 25 — an 8x cut in the part of the budget that is genuinely large. Module 2 measured a point-in-time aggregate at 1–20 ms; the model at 1.5 µs is four orders of magnitude cheaper.
+
+**Optimise feature computation, not model inference.** Saying that, with the measurement behind it, is the acceptance criterion.
+
+## Why this solution and not the obvious one
+
+**The obvious solution reports "we cut to 25 features and inference got 8x faster".** It is the expected result, it is what everybody assumes, and the measurement says it is false. A submission that claims a latency win without measuring it has reported a belief.
+
+Two more wrong turns:
+
+1. **Using impurity importance to rank.** Week 18 Module 2 measured a random ID column taking 81.8% of it. Use held-out permutation importance, grouped.
+2. **Selecting on all the data, then cross-validating.** Week 19 Module 4's Leak 5, measured at +18.00 accuracy points on pure noise in this module's own experiment. The selector goes in the `Pipeline`.
+
+## Grading notes
+
+**3/3 looks like:** the full `k` sweep with the flat region and the cliff both identified; grouped permutation importance so correlated features are handled; bootstrap stability reported; four latency measurements (batched, single-row, artifact size, upstream dependency count); and an explicit written statement that model inference did **not** improve, with the numbers.
+
+**The three most common ways submissions lose points:**
+
+1. **Claiming an inference speed-up.** Measured, there is none for a tree model.
+2. **Only reporting `k=25`.** Without the sweep there is no evidence you found the knee.
+3. **Plain permutation importance on data with 50 redundant features.** The ranking is wrong in exactly the places that matter and the fix is a shared shuffle index.

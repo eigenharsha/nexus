@@ -1,0 +1,177 @@
+---
+title: "Lab — Automated EDA dashboard"
+description: "Reference solution — Week 16"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `LAB-P2-W16`
+
+The tool is the engineering; **`FINDINGS.md` is what demonstrates judgement.** This page covers the
+three requirements that decide the mark.
+
+### 1. The leakage section
+
+This is what the ticket explicitly asked for. Four checks, cheapest first:
+
+```python
+def leakage_report(df, target: str) -> dict:
+    out = {}
+
+    # 1. Single-feature AUC. A depth-3 tree, so this measures the FEATURE,
+    #    not a model's capacity. Above ~0.95 alone means it contains the answer.
+    out["near_perfect"] = {c: a for c, a in single_feature_auc(df, target).items()
+                           if a > 0.95}
+
+    # 2. Deterministic predictors: every value of this column maps to one class.
+    out["deterministic"] = [c for c in df.columns.drop(target)
+                            if df.groupby(c, observed=True)[target].nunique().max() == 1]
+
+    # 3. Exact duplicate rows. Module 3 measured +0.148 AUC at 30% duplication.
+    out["duplicate_rows"] = int(df.duplicated().sum())
+
+    # 4. Candidate grouping keys — columns where entities repeat.
+    #    If any of these is a real entity id, a random split leaks and you need GroupKFold.
+    out["grouping_candidates"] = {
+        c: 1 - df[c].nunique() / len(df)
+        for c in df.columns
+        if 1 < df[c].nunique() < len(df) * 0.9 and 1 - df[c].nunique() / len(df) > 0.05
+    }
+    return out
+```
+
+**Check 4 is the one people omit and it is worth +0.148 AUC of false confidence.** A random split
+that puts the same entity on both sides inflates your score and nothing about the code looks wrong —
+the duplication is in the data.
+
+### 2. The drift comparison, gated correctly
+
+```python
+drifted = (p_value < 0.01) and (ks_statistic > 0.1)
+```
+
+**Not the p-value alone.** Module 4 measured that at a million rows per side, a KS test flags a shift
+of **0.01 standard deviations 100% of the time**. A report that flags everything gets muted, and then
+it is not there when something real happens.
+
+```python
+def test_drift_ignores_a_tiny_shift_at_large_n():
+    rng = np.random.default_rng(0)
+    ref = pd.DataFrame({"x": rng.standard_normal(200_000)})
+    cur = pd.DataFrame({"x": rng.standard_normal(200_000) + 0.01})
+    assert not drift(ref, cur).drifted.any()
+```
+
+Also **fix the sample size** — draw a fixed 50,000 rows from each period rather than using
+everything. That holds sensitivity constant as traffic grows, which is what you want from a monitor:
+a threshold that means the same thing next year.
+
+### 3. Three dataset shapes
+
+```make
+datasets:
+	python -m eda report data/wide.parquet    --out /tmp/wide.html
+	python -m eda report data/tall.parquet    --out /tmp/tall.html
+	python -m eda report data/categorical.csv --out /tmp/cat.html
+```
+
+A tool written against one dataset encodes assumptions about it — every column is numeric, there is
+always a target, cardinality is always low, there is at least one datetime. **A wide frame, a tall
+frame and a mostly-categorical frame break different assumptions**, and this target finds more real
+bugs than the unit tests do.
+
+The failures to expect: a correlation matrix on a frame with one numeric column; `nunique()` on a
+600-column frame taking minutes; a histogram of a column that is entirely null; `--target` omitted.
+
+### The `hard` track's real requirement
+
+Not the speed or the memory — **the identical-output test.**
+
+```python
+def test_small_file_identical_across_paths():
+    """If the DuckDB path computes the median differently from the pandas path,
+    you have two tools, and which you trust depends on which file you pointed at."""
+    pandas_out = report(small, engine="pandas")
+    duckdb_out = report(small, engine="duckdb")
+    for k in EXACT_STATISTICS:
+        assert pandas_out[k] == duckdb_out[k], k
+    for k in APPROXIMATE_STATISTICS:              # approx_quantile is a t-digest
+        assert abs(pandas_out[k] - duckdb_out[k]) < TOLERANCE[k]
+```
+
+And **every approximated or sampled figure must be labelled in the report.** Mutual information and
+single-feature AUC on 100,000 sampled rows is a fine engineering decision; presenting it as if it
+were computed on all ten million is a lie by omission.
+
+### `FINDINGS.md`
+
+```markdown
+## Recommendation
+This dataset can support a churn model, with three caveats.
+
+## The three things that matter
+1. `credit_score` is 43% missing, and missingness correlates with the target at
+   r = 0.31. This is MNAR: mean imputation will bias the model. Keep the
+   missingness indicator — by single-feature AUC it is more predictive (0.68)
+   than any imputed value would be.
+2. 12% of rows are duplicates on `customer_id`. A random train/test split will
+   put the same customer on both sides and inflate the score — measured at
+   +0.063 AUC at 10% duplication. Use GroupKFold on customer_id.
+3. The positive class is 3.1%. Accuracy is meaningless here; use PR-AUC, and
+   stratify every split.
+
+## Risks
+- `days_since_last_login` may be populated after the churn event. I cannot tell
+  from this file. **This is a question for the platform team**, and if the answer
+  is yes the column must be dropped.
+
+## What this data cannot tell you
+Nothing here explains WHY customers churn — there are no support tickets, no
+product-usage events and no pricing history. A model built on this can rank
+customers by risk; it cannot tell you what to do about them.
+```
+
+**The last section is the most valuable and the one people omit** because it feels like admitting
+failure. It is the opposite: it is the part only someone who understood the data could write.
+
+## Grading notes
+
+**3/3 on Correctness** — the leakage section finds the planted leak *and* reports why; the drift gate
+has both conditions with a test proving the tiny-shift case does not fire; the tool runs on three
+dataset shapes.
+
+**3/3 on Performance** (`hard`) — peak RSS measured with `ru_maxrss` in a subprocess, not
+`tracemalloc`; the identical-output test present with documented tolerances.
+
+**3/3 on Explanation** — `FINDINGS.md` names specific columns as risks, quantifies them, and states
+what the data cannot answer.
+
+**The three most common ways submissions lose points:**
+
+1. **Drift gated on p-value alone.** The single most consequential error in the lab, and it is one
+   `and` clause.
+2. **No leakage section, or a leakage section that flags without explaining.** "`feature_x` has AUC
+   0.98" is a start; "and it is populated at discharge, so it cannot be used at prediction time" is
+   the finding.
+3. **`tracemalloc` for the memory assertion.** It does not see DuckDB's or NumPy's native
+   allocations, so it reports a comfortable number that has nothing to do with whether the job fits.
+
+**A fourth:** unlabelled axes in generated plots. The report makes claims the reader cannot check.
+Assert labels in a test — figure metadata is cheap to test and it is the part that determines whether
+the chart is honest.
+
+**On the pairing with week 15.** A submission that wires this tool onto the week-15 pipeline's output
+— so a scheduled run produces a fresh EDA report and fails on drift — has built the Phase 2 portfolio
+artifact rather than two disconnected exercises, and that is worth saying in the README.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

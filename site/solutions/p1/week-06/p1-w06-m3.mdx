@@ -1,0 +1,140 @@
+---
+title: "Pydantic v2: validation as a contract"
+description: "Reference solution — Week 6"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W06-M3`
+
+### The complete model set
+
+```python
+from decimal import Decimal
+from typing import Annotated, Literal, Self
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic.alias_generators import to_camel
+
+class Money(BaseModel):
+    amount: Decimal = Field(max_digits=12, decimal_places=2)
+    currency: Literal["INR", "USD", "EUR"]
+
+class OrderLine(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    sku: Annotated[str, Field(pattern=r"^SKU-\d{6}$")]
+    qty: Annotated[int, Field(ge=1, le=100)]
+    unit: Money
+
+    @field_validator("sku", mode="before")          # BEFORE, not after
+    @classmethod
+    def upper(cls, v):
+        return v.upper() if isinstance(v, str) else v
+
+class Order(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+    order_id: int
+    lines: list[OrderLine] = Field(min_length=1, max_length=50)
+    discount_cents: int = 0
+
+    @model_validator(mode="after")
+    def discount_not_more_than_total(self) -> Self:
+        total = sum(int(l.unit.amount * 100) * l.qty for l in self.lines)
+        if self.discount_cents > total:
+            raise ValueError(f"discount {self.discount_cents} exceeds total {total}")
+        return self
+```
+
+Verified behaviour:
+
+```
+>>> Order.model_validate({"orderId": 1, "lines": [{"sku": "sku-000123", "qty": 2,
+...   "unit": {"amount": "49.99", "currency": "INR"}}], "discountCents": 100})
+Order(order_id=1, lines=[OrderLine(sku='SKU-000123', ...)], discount_cents=100)
+
+>>> Order.model_validate({"orderId": 2, "lines": [], "extra": 1})
+2 errors:
+  too_short       ('lines',)  List should have at least 1 item after validation, not 0
+  extra_forbidden ('extra',)  Extra inputs are not permitted
+
+>>> # discount 999999 against a 1000-cent order
+ValidationError: Value error, discount 999999 exceeds total 1000
+
+>>> Order(order_id=1, lines=[...]).model_dump(by_alias=True, mode="json")
+{'orderId': 1, 'lines': [{'sku': 'SKU-000123', 'qty': 2,
+                          'unit': {'amount': '49.99', 'currency': 'INR'}}], 'discountCents': 0}
+
+>>> Order.model_json_schema().keys()
+dict_keys(['$defs', 'additionalProperties', 'properties', 'required', 'title', 'type'])
+>>> required: ['orderId', 'lines'] | $defs: ['Money', 'OrderLine']
+```
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1 — and I made it while writing the module.** Writing `@field_validator("sku")` with
+no mode gives you `mode="after"`, which runs *after* the `pattern` constraint. So `"sku-000123"` is
+rejected before the uppercasing ever runs:
+
+```
+ValidationError: sku — String should match pattern '^SKU-\d{6}$'
+```
+
+The one-word fix is `mode="before"`. The rule to remember: **normalisation runs before, business
+rules run after.** And in a `before` validator the value is still raw, so guard with `isinstance`
+or a client sending `{"sku": 42}` gets an `AttributeError` — a 500 where you meant a 422.
+
+**Wrong turn 2: using `float` for money.** `amount: float` accepts `49.99` and stores
+`49.99000000000000198...`. Multiply by quantity across a million orders and reconciliation fails.
+`Decimal` with `max_digits` and `decimal_places` also generates the right JSON Schema constraints
+for clients.
+
+**Wrong turn 3: reusing one model for input, output and update.** The cost is not style: an input
+model used as a response leaks internal fields, and an input model used for `PATCH` makes every
+field required. Three models is three contracts, because you have three contracts.
+
+**Wrong turn 4: `model_construct` for speed.** Measured, it saves 2.70 → 2.46 µs, about 9%, because
+the cost is building the Python object rather than checking it. Using it on untrusted input trades
+a security property for 0.24 µs.
+
+## Measured numbers this solution produces
+
+pydantic 2.10.4 / pydantic-core 2.27.2, 20,000 iterations × 12 interleaved reps, minimum:
+
+| Operation | Per call | Throughput |
+| --- | --- | --- |
+| `model_validate(dict)` | 2.70 µs | 369,901/s |
+| `model_validate_json(bytes)` | 2.74 µs | 364,803/s |
+| `json.loads` + `model_validate` | 5.10 µs | 196,035/s |
+| `json.loads` alone | 1.93 µs | 517,527/s |
+| `model_construct` | 2.46 µs | 406,985/s |
+| `model_dump()` | 1.48 µs | 675,542/s |
+| `model_dump_json()` | 1.29 µs | 775,179/s |
+| failing payload, 3 errors | 2.73 µs | 365,886/s |
+
+Derived: **100,000 payloads in 270 ms** on one core; `model_validate_json` is **1.9× faster** than
+parse-then-validate; the failure path costs the same as the success path, so there is no argument
+for stopping at the first error.
+
+## Grading notes
+
+**A 3/3 on correctness**: normalisation in `mode="before"` with a type guard; `Decimal` for money;
+`extra="forbid"`; separate in/out/update models; a cross-field rule in `model_validator(mode="after")`;
+a custom 422 envelope with a stable `code` per error.
+
+**A 3/3 on performance**: interleaved repetitions with the minimum taken (not a single timed loop),
+the machine stated, and the `model_validate_json` versus parse-then-validate comparison present.
+
+**The three most common ways submissions lose points**
+
+1. A `mode="after"` normaliser that appears to work only because every test input was already normalised.
+2. A single-run benchmark on a loaded machine — my own first attempt showed `model_construct` slower than full validation, which is impossible and was pure noise. Interleave and take the minimum.
+3. `model_json_schema()` presented without checking `additionalProperties: false` and the `required` list, which is exactly what Week 26's structured output needs.

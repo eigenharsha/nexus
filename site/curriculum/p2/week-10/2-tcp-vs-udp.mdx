@@ -1,0 +1,820 @@
+---
+title: "TCP vs UDP"
+description: "Week 10 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 10 · Module 2 · `P2-W10-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** `P2-W10-M1` (layers, ports, RTT, MTU).
+- **Unlocks:** `P2-W10-M3` (sockets — the API on top of this), `P2-W10-M4` (why you need framing),
+  and Week 24 (load balancer timeouts and keep-alives are all TCP state).
+- **One-line:** after this you can explain why a connection is slow using the bandwidth-delay
+  product, not adjectives, and you will never again assume one `send()` equals one `recv()`.
+
+## What you'll be able to do
+
+1. Identify SYN, SYN-ACK and ACK in a packet capture, and explain what each carries.
+2. Explain sequence numbers, ACKs, retransmission and the receive window.
+3. State — and demonstrate — why TCP has no message boundaries, which is the single most common
+   beginner networking bug.
+4. Compute the bandwidth-delay product and predict maximum throughput under packet loss.
+5. Choose between TCP and UDP with a reason that has a number in it.
+
+## Why you should care
+
+**Aarav (student).** The framing bug in Layer 1 of this module — assuming one `send` produces one
+`recv` — is in almost every first socket program ever written, including the ones that pass the
+demo and fail under load. Finding it in your own code, with a measurement, is a better story than
+any amount of theory.
+
+**Meera (working professional).** Two things you will use within a month. The bandwidth-delay
+product explains why your cross-region transfer runs at 5 Mbit/s on a gigabit link — and the fix is
+a socket buffer setting, not more bandwidth. And `TIME_WAIT`, `SO_REUSEADDR` and `TCP_NODELAY` are
+the three settings that appear in every "why does the service stall for 40 ms" incident.
+
+## The mental model
+
+TCP gives you one thing: **a reliable, ordered byte stream between two processes.** Not messages.
+Not packets. A stream, exactly like a file — you write bytes at one end and read bytes at the other,
+in order, with none missing.
+
+To deliver that over a network that loses, duplicates and reorders packets, TCP numbers every byte,
+acknowledges what it has received, retransmits what was not acknowledged, and slows down when the
+network shows signs of congestion.
+
+UDP gives you the opposite: **datagrams, delivered maybe.** Each `sendto()` becomes exactly one
+packet. It may not arrive, they may arrive out of order, but a datagram that arrives arrives whole.
+
+So the choice is not "reliable versus unreliable". It is: **do you want the boundaries or the
+reliability?** TCP takes your boundaries away and gives you reliability. UDP keeps your boundaries
+and makes reliability your problem.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p2-w10-m2.svg" alt="Hand-drawn sketch: TCP vs UDP" className="block dark:hidden" />
+  <img src="/assets/diagrams/p2-w10-m2-dark.svg" alt="Hand-drawn sketch: TCP vs UDP" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p2-w10-m2
+tier: T3
+one-sentence-goal: TCP trades your message boundaries for reliability, and the price of that reliability is round trips.
+elements:
+  - top: two vertical timelines (client left, server right) with the three-way handshake drawn as diagonal arrows - SYN seq=x, SYN-ACK seq=y ack=x+1, ACK ack=y+1 - with "1 RTT before a single byte of data" written in amber beside it and the measured 22.6 ms circled
+  - middle: four data segments crossing; the second one crossed out in red mid-flight, then a duplicate ACK coming back, then the retransmission drawn in green; label "1 loss = 1 RTT of stall for everything behind it"
+  - left margin: a hand-drawn pipe with "BDP = bandwidth x RTT" and the worked number "100 Mbit/s x 100 ms = 1.22 MB in flight" written inside the pipe
+  - lower-left panel: 1000 little boxes labelled "MSG" going into a funnel labelled sendall(), and 413 differently-sized boxes coming out of recv() - with "1000 sends -> 413 recvs. Up to 40 messages in ONE recv." in red
+  - lower-right panel: UDP drawn as separate sealed envelopes, some with a red X, none merged; "boundaries preserved, delivery not"
+  - amber margin note: "the #1 beginner bug lives in the left panel"
+  - dangling arrow: "...so how do you get your boundaries back? -> Module 3, framing"
+numbers-to-write-in: measured TCP handshake 22.6 ms; 1000 sends of 3 bytes -> 413 recv() calls with TCP_NODELAY, 67 with Nagle; BDP 1.22 MB at 100 Mbit/s and 100 ms; Mathis: 100 ms RTT + 1% loss caps you at 1.4 Mbit/s
+alt: A whiteboard sketch with the TCP three-way handshake drawn as arrows between two timelines annotated with a measured 22.6 millisecond cost, a retransmission sequence with one lost segment crossed out in red, a bandwidth-delay-product pipe with worked numbers, and two lower panels contrasting a thousand small TCP sends coalescing into 413 reads against UDP datagrams that keep their boundaries but may be lost.
+*/}
+
+<Tabs>
+
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The words, defined
+
+- **Segment** — TCP's name for one packet's worth of data plus a TCP header.
+- **Sequence number** — a 32-bit counter identifying the position of the first byte in a segment
+  within the whole stream. TCP numbers *bytes*, not packets.
+- **ACK (acknowledgement)** — the receiver telling the sender "I have everything up to byte N".
+- **Retransmission** — sending a segment again because no ACK arrived in time.
+- **Window** — how many unacknowledged bytes the sender is allowed to have in flight.
+- **RTT (round-trip time)** — how long a packet takes to get there and its ACK to come back.
+- **Datagram** — UDP's unit. One `sendto()` produces exactly one datagram.
+
+### The three-way handshake
+
+Before any data flows, TCP performs a handshake:
+
+```
+Client                                Server
+  |  --- SYN, seq=x ------------------>  |     "I want to talk. My byte counter starts at x."
+  |  <-- SYN-ACK, seq=y, ack=x+1 ------  |     "OK. Mine starts at y. I got your x."
+  |  --- ACK, ack=y+1 ---------------->  |     "I got your y."
+  |                                      |
+  |  --- data ----------------------->   |     now, finally, data
+```
+
+Three packets, one and a half round trips — but the client can send data with the third packet, so
+in practice **the handshake costs one full RTT before the first byte of application data**. Measured
+in Module 1 on a real connection: **22.6 ms**.
+
+Why start at a random `x` rather than 0? Two reasons: it makes it much harder for an off-path
+attacker to inject data into your connection by guessing sequence numbers, and it prevents a delayed
+packet from an *old* connection on the same 4-tuple being accepted into a new one.
+
+Look at this in Wireshark yourself:
+
+```bash
+sudo tcpdump -i any -n 'tcp and port 443 and (tcp[tcpflags] & (tcp-syn|tcp-ack)) != 0' -c 10
+curl -s https://example.com > /dev/null
+```
+
+You will see `Flags [S]`, then `Flags [S.]` (SYN-ACK), then `Flags [.]` (ACK).
+
+### Reliability: numbers and acknowledgements
+
+Every byte has a number. The receiver ACKs the highest contiguous byte it has. If segment 2 of 4 is
+lost:
+
+```
+sent:      [1][2][3][4]
+received:  [1][ ][3][4]
+ACKs sent:  ack=2, ack=2, ack=2, ack=2       <- "I still want byte 2"
+```
+
+Those repeated ACKs are **duplicate ACKs**. On the third duplicate, the sender performs a **fast
+retransmit** — resending segment 2 without waiting for a timeout. When 2 arrives, the receiver ACKs
+all the way to 5, because 3 and 4 were held in its buffer.
+
+If no ACK comes at all, a **retransmission timeout (RTO)** fires. The RTO is derived from measured
+RTT (smoothed average plus four times the variance, per RFC 6298), with a minimum of 200 ms in Linux
+and 1 second in the RFC. Every consecutive timeout doubles it: 200 ms, 400, 800, 1600… That
+exponential backoff is why a badly broken connection can hang for tens of seconds rather than
+failing fast.
+
+### The bug everyone writes first
+
+Here is a real, runnable demonstration. The client sends 1,000 separate 3-byte messages. Count how
+many times the server's `recv()` returns.
+
+```python
+# boundaries.py — proof that TCP is a stream, not a message queue.
+import socket, threading, time, collections
+HOST, PORT = "127.0.0.1", 9982
+recvs = []
+
+def server(ready):
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((HOST, PORT)); s.listen(1); ready.set()
+    c, _ = s.accept()
+    total = 0
+    while total < 3000:                      # 1000 messages x 3 bytes
+        b = c.recv(65536)
+        if not b: break
+        recvs.append(len(b)); total += len(b)
+    c.close()
+
+ready = threading.Event()
+threading.Thread(target=server, args=(ready,), daemon=True).start(); ready.wait()
+c = socket.create_connection((HOST, PORT))
+c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+for i in range(1000):
+    c.sendall(b"MSG")                        # 1000 separate sends
+time.sleep(0.5); c.close(); time.sleep(0.2)
+
+hist = collections.Counter(recvs)
+print(f"1000 sends of 3 bytes each -> {len(recvs)} recv() calls")
+print(f"total bytes: {sum(recvs)}")
+print("recv sizes:", dict(sorted(hist.items())[:6]), "... max", max(recvs))
+print(f"messages per recv: min {min(recvs)//3}, max {max(recvs)//3}")
+```
+
+Actual output, on loopback:
+
+```
+1000 sends of 3 bytes each -> 413 recv() calls
+total bytes: 3000
+recv sizes: {3: 166, 6: 139, 9: 45, 12: 26, 15: 8, 18: 8} ... max 120
+messages per recv: min 1, max 40
+```
+
+**1,000 sends produced 413 reads.** One `recv()` returned 40 messages glued together. And with
+`TCP_NODELAY` removed (so Nagle's algorithm batches small writes), it collapses further:
+
+```
+1000 sends of 3 bytes each -> 67 recv() calls
+messages per recv: min 1, max 58
+```
+
+All 3,000 bytes arrived, in order, exactly once. TCP kept every promise it made. It never promised
+that your message boundaries would survive, because **TCP does not know you have messages.**
+
+If your code does `msg = sock.recv(1024)` and treats `msg` as one message, it works on your laptop
+with one slow client and fails in production. Module 3 shows you the fix (length-prefix framing).
+For now, internalise the rule: **on TCP, you must define your own message boundaries.**
+
+### UDP: the other trade
+
+```python
+# udp_demo.py — one sendto, one datagram, boundaries preserved.
+import socket
+srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+srv.bind(("127.0.0.1", 9983))
+cli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+for m in [b"AAA", b"BBBBBB", b"C"]:
+    cli.sendto(m, ("127.0.0.1", 9983))
+for _ in range(3):
+    data, addr = srv.recvfrom(65536)
+    print(len(data), data)
+```
+
+Output:
+
+```
+3 b'AAA'
+6 b'BBBBBB'
+1 b'C'
+```
+
+Three sends, three receives, exact boundaries. What you gave up: on a real network, one of those
+might not arrive, and you would never know. UDP has no sequence numbers, no ACKs, no retransmission,
+no ordering, and no congestion control.
+
+### When to use which
+
+| Use TCP when | Use UDP when |
+|---|---|
+| Every byte must arrive (file transfer, database, HTTP) | Late data is worthless (live audio, video, game state) |
+| Order matters | You will implement your own ordering |
+| You want the OS to handle congestion | You need multicast or broadcast |
+| Connections are long-lived | Requests are single-packet (DNS) |
+
+The classic example: a voice call. If a 20 ms audio frame is lost, retransmitting it is pointless —
+by the time it arrives, that moment has passed and playing it late is worse than the gap. So voice
+uses UDP (via RTP), conceals the loss, and moves on. That is the honest reason UDP exists.
+
+### Guided practice
+
+Compute the bandwidth-delay product (BDP) — how many bytes can be "in the pipe" at once:
+
+```
+BDP (bytes) = bandwidth (bits/s) x RTT (seconds) / 8
+```
+
+Fill these in:
+
+| Link | Bandwidth | RTT | BDP |
+|---|---|---|---|
+| LAN | 1 Gbit/s | 0.5 ms | ? |
+| Same-region cloud | 10 Gbit/s | 1 ms | ? |
+| Mumbai → Virginia | 100 Mbit/s | 200 ms | ? |
+
+<Accordion title="Answers">
+
+- LAN: `1e9 × 0.0005 / 8` = **62,500 bytes** (61 KB)
+- Same-region: `1e10 × 0.001 / 8` = **1,250,000 bytes** (1.19 MB)
+- Mumbai → Virginia: `1e8 × 0.2 / 8` = **2,500,000 bytes** (2.38 MB)
+
+Now the punchline. The sender may only have `window` bytes unacknowledged at a time. If the window
+is smaller than the BDP, the sender fills the window, then **stops and waits** for an ACK. Effective
+throughput becomes `window / RTT`, regardless of how much bandwidth you bought.
+
+With a 64 KB window on the Mumbai–Virginia link: `65536 / 0.2` = 327,680 bytes/s = **2.6 Mbit/s on a
+100 Mbit/s link — 2.6% utilisation.** That is the single most common cause of "our cross-region
+transfer is slow", and the fix is window scaling (RFC 7323) with adequate socket buffers, not more
+bandwidth.
+
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+<Accordion title="1. Why does the handshake take three packets?">
+Each side must both announce its own initial sequence number and acknowledge the other's. The
+server's SYN and ACK are combined into one packet, giving three rather than four.
+</Accordion>
+<Accordion title="2. Does TCP number packets or bytes?">
+Bytes. That is why a retransmission can be a different size from the original segment, and why
+sequence numbers advance by the payload length.
+</Accordion>
+<Accordion title="3. You sent 1000 messages and got 413 recv() calls. Was anything lost?">
+No. All 3,000 bytes arrived in order. TCP delivered a byte stream faithfully; the message boundaries
+were never TCP's to preserve.
+</Accordion>
+<Accordion title="4. Your 1 Gbit/s cross-region link runs at 3 Mbit/s. First hypothesis?">
+Window smaller than the bandwidth-delay product. Check the socket buffer sizes and whether window
+scaling is enabled and not being stripped by a middlebox.
+</Accordion>
+<Accordion title="5. Why is retransmission useless for live voice?">
+By the time the retransmission arrives — at least one RTT later — the audio frame's playback moment
+has passed. Concealing the gap is better than playing it late, so voice uses UDP and accepts loss.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### Flow control and congestion control are two different things
+
+Beginners conflate them. They are separate mechanisms solving separate problems:
+
+- **Flow control** protects the *receiver*. The receiver advertises a window (`rwnd`) saying "I have
+  this much buffer space left". Without it, a fast sender overruns a slow receiver.
+- **Congestion control** protects the *network*. The sender maintains its own window (`cwnd`) based
+  on inferred congestion. Without it, everyone's traffic collapses (which actually happened — see
+  the Layer 3 references).
+
+The sender may have `min(rwnd, cwnd)` bytes in flight. Diagnosing "which one is limiting me" is the
+whole game: if `rwnd` is the limit, fix buffers; if `cwnd` is the limit, you have loss or you are
+being shaped.
+
+The classical congestion algorithm (Reno) is: start with a small `cwnd`, double it every RTT (**slow
+start** — a misnomer, it is exponential), and on loss, halve it and grow linearly thereafter
+(**congestion avoidance**). This "additive increase, multiplicative decrease" is what makes TCP
+share bandwidth fairly among competing flows.
+
+### The Mathis formula: throughput under loss
+
+For loss-based congestion control, steady-state throughput is bounded by:
+
+```
+BW  <=  (MSS x C) / (RTT x sqrt(p))          C ~ 1.22 for periodic loss
+```
+
+where `p` is packet loss probability. Plug in real numbers (MSS = 1460 bytes):
+
+| RTT | 0.01% loss | 0.1% loss | 1% loss | 2% loss |
+|---|---|---|---|---|
+| 1 ms | 1425 Mbit/s | 451 Mbit/s | 142 Mbit/s | 101 Mbit/s |
+| 20 ms | 71 Mbit/s | 22.5 Mbit/s | 7.1 Mbit/s | 5.0 Mbit/s |
+| 100 ms | 14.2 Mbit/s | 4.5 Mbit/s | 1.4 Mbit/s | 1.0 Mbit/s |
+| 200 ms | 7.1 Mbit/s | 2.3 Mbit/s | 0.7 Mbit/s | 0.5 Mbit/s |
+
+Read the 100 ms row. At **1% loss on a 100 ms path, a single TCP flow cannot exceed about
+1.4 Mbit/s** no matter what link you have bought. This is not a TCP bug; loss-based congestion
+control is *inferring* that the network is congested, which is exactly what it is designed to do.
+It just happens to be wrong when the loss is from radio interference or a lossy tunnel rather than
+from a full queue.
+
+Two consequences you will use:
+
+1. **Throughput degrades with `sqrt(loss)` and with `1/RTT`.** Halving RTT doubles throughput.
+   Getting loss from 1% to 0.01% gives 10×. Both matter more than bandwidth.
+2. **Parallel connections are a workaround, not a fix.** `n` flows get roughly `n ×` the throughput
+   of one, which is why download accelerators and `aria2c -x16` exist and why HTTP/1.1 clients open
+   six connections per host. It is also unfair to everyone else on the link.
+
+### The socket options that matter
+
+```python
+import socket
+s = socket.socket()
+
+# 1. Reuse the local address immediately after close (skip the TIME_WAIT wait on bind).
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+# 2. Disable Nagle: send small writes immediately instead of coalescing.
+s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+# 3. Detect dead peers on an idle connection (Linux names; macOS uses TCP_KEEPALIVE).
+s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+# 4. Bound how long an operation may block.
+s.settimeout(5.0)
+
+# 5. Socket buffers: must be >= BDP for a long fat pipe.
+s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+```
+
+**Nagle's algorithm** (RFC 896) says: if there is unacknowledged data outstanding, buffer small
+writes until either the outstanding data is ACKed or a full segment's worth accumulates. It exists
+to stop a telnet session from putting one byte in a 41-byte packet. Its interaction with **delayed
+ACK** (the receiver waits up to 40 ms — 200 ms on some stacks — before ACKing, hoping to piggyback on
+outgoing data) produces the notorious 40 ms stall: sender is waiting for an ACK, receiver is waiting
+for data to piggyback on, nobody moves until the delayed-ACK timer fires.
+
+The measured effect from the boundaries demo above: with `TCP_NODELAY` set, 1,000 small sends
+produced 413 reads; without it, 67 reads. Nagle coalesced six times more aggressively. That is a
+throughput win and a latency loss, and which one you want depends entirely on your traffic.
+
+**Rule:** set `TCP_NODELAY` for any request/response or interactive protocol. Leave Nagle on for
+bulk transfer. And never write a protocol that does `send(header); send(body)` — that pattern is
+precisely what triggers the pathological interaction. Build one buffer and send it once.
+
+### TIME_WAIT: the state everyone misunderstands
+
+When a connection closes, the side that closed *first* (sent the first FIN) holds the 4-tuple in
+`TIME_WAIT` for 2×MSL — 60 seconds on Linux, 2×15 s on macOS. Two reasons: to absorb any delayed
+duplicate segments from the old connection, and to ensure the final ACK can be retransmitted if lost.
+
+The practical consequences:
+
+- A server that closes connections accumulates `TIME_WAIT` entries. At high churn this is thousands
+  of entries; they cost a small amount of memory and a hash-table slot, and are usually harmless.
+- A **client** that closes connections can exhaust ephemeral ports. Linux's default range is
+  32768–60999 — about **28,000 ports**. At 60 seconds of `TIME_WAIT` that caps you at roughly
+  **466 new connections per second to the same destination**. Exceed it and you get
+  `EADDRNOTAVAIL` while the CPU is idle.
+- `SO_REUSEADDR` lets you *bind* while old connections linger; it does **not** eliminate `TIME_WAIT`.
+  `SO_REUSEPORT` is a different thing entirely (multiple sockets accepting on the same port for load
+  distribution).
+
+Fixes in order of preference: reuse connections (a pool), widen the ephemeral range
+(`net.ipv4.ip_local_port_range`), enable `net.ipv4.tcp_tw_reuse=1` for outbound connections. Do
+**not** enable `tcp_tw_recycle` — it was removed from Linux 4.12 because it broke clients behind NAT.
+
+### Trade-offs
+
+| Decision | Choose this when… | Choose the other when… | The number |
+|---|---|---|---|
+| **TCP** vs **UDP** | Completeness matters more than latency | Late data is worthless, or you need multicast | TCP costs 1 RTT of handshake (measured 22.6 ms) plus head-of-line blocking on loss |
+| **`TCP_NODELAY` on** vs **off** | Request/response, interactive, RPC | Bulk streaming where throughput dominates | Off gave 67 reads for 1,000 sends versus 413 with it on — 6× more coalescing, at up to 40 ms of added latency |
+| **Default socket buffers** vs **tuned to BDP** | Same-datacentre, small BDP | Long fat pipes | 64 KB window at 200 ms RTT caps you at 2.6 Mbit/s regardless of link speed |
+| **One connection** vs **parallel connections** | Fairness matters; the network is healthy | You must work around loss you cannot fix | `n` flows get roughly `n ×` the Mathis-bound throughput; 16 flows at 1% loss and 100 ms turn 1.4 Mbit/s into ~22 Mbit/s |
+| **CUBIC** (default) vs **BBR** | General purpose, well-provisioned networks | Lossy links, bufferbloat, high BDP | BBR models bandwidth and RTT instead of treating loss as congestion; large reported throughput gains on lossy long-haul paths |
+
+### Reference implementation: measure it yourself
+
+```python
+# tput.py — loopback TCP throughput and the socket parameters that shape it.
+import socket, threading, time
+HOST, PORT, TOTAL = "127.0.0.1", 9971, 512 * 1024 * 1024
+
+def server(ready):
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((HOST, PORT)); s.listen(1); ready.set()
+    c, _ = s.accept(); n = 0
+    while n < TOTAL:
+        b = c.recv(1 << 20)
+        if not b: break
+        n += len(b)
+    c.close()
+
+ready = threading.Event()
+threading.Thread(target=server, args=(ready,), daemon=True).start(); ready.wait()
+c = socket.create_connection((HOST, PORT))
+buf, sent = b"x" * (1 << 18), 0
+t0 = time.perf_counter()
+while sent < TOTAL:
+    c.sendall(buf); sent += len(buf)
+dt = time.perf_counter() - t0
+print(f"loopback TCP: {TOTAL/1e9:.2f} GB in {dt:.2f}s = {TOTAL*8/dt/1e9:.2f} Gbit/s")
+print("SO_SNDBUF =", c.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF), "bytes")
+print("TCP_MAXSEG =", c.getsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG), "bytes")
+```
+
+Measured on macOS 26.2, Apple M3 Pro:
+
+```
+loopback TCP: 0.54 GB in 0.11s = 40.81 Gbit/s
+SO_SNDBUF = 4194304 bytes
+TCP_MAXSEG = 16332 bytes
+```
+
+Three things to read from that. **40.8 Gbit/s** on loopback tells you TCP's per-byte cost is not the
+bottleneck on a real network — the network is. **MSS is 16,332 bytes** on loopback rather than 1460,
+because the loopback MTU is 16 KB, not 1500 — which is exactly why loopback benchmarks overstate
+real performance and why you must test on the real path. And **`SO_SNDBUF` is 4 MB by default here**;
+on a 200 ms RTT path that supports about 160 Mbit/s before the buffer becomes the limit.
+
+Note also that an earlier version of this program using 1 MiB writes failed with
+`OSError: [Errno 55] No buffer space available` on macOS loopback. Write sizes above the socket
+buffer are not automatically chunked by every stack; `sendall` with a sane chunk (256 KiB here) is
+the portable pattern.
+
+### What breaks in the real world
+
+A data team's nightly export from Mumbai to a US bucket took 6 hours for 200 GB — about 74 Mbit/s on
+a link provisioned for 1 Gbit/s. The first three attempts at a fix were: increase the instance size
+(no change), increase parallel uploads from 4 to 8 (roughly 2×, then flat), and open a ticket with
+the cloud provider (closed as "no issue found").
+
+The actual diagnosis took one command. `ss -ti` on an active connection showed `cwnd` sitting at
+about 40 segments with a `retrans` counter climbing — around 0.3% loss on the path. RTT was 210 ms.
+The Mathis bound: `1.22 × 1460 × 8 / (0.21 × sqrt(0.003))` ≈ **11.8 Mbit/s per flow**. With 8 flows,
+about 94 Mbit/s — which is what they were getting. The parallel uploads were not an optimisation,
+they were the only reason it worked at all.
+
+Two real fixes: switch the transfer to a tool that uses many more concurrent streams with tuned
+buffers, and — the one that actually solved it — enable BBR on the sending host, which does not
+interpret non-congestive loss as a signal to back off. Throughput went to roughly 400 Mbit/s on the
+same path with the same loss.
+
+The lesson: **before optimising a transfer, measure RTT and loss and compute the Mathis bound.** If
+your measured throughput matches the bound, the transfer is not slow — it is exactly as fast as
+loss-based congestion control permits, and only changing the algorithm or the loss will help.
+
+### Design checkpoint
+
+<Accordion title="You are designing telemetry from 50,000 IoT devices on flaky mobile networks, sending a 200-byte reading every 10 seconds. TCP or UDP?">
+
+Compute first. 50,000 devices × 0.1 msg/s = **5,000 messages/second**, 200 bytes each = 1 MB/s of
+payload. Neither protocol strains that. So the decision is about connection state and loss
+semantics, not throughput.
+
+**Against TCP:** 50,000 persistent connections means 50,000 sockets of kernel state on the receiving
+side (roughly 3–10 KB each, so 150–500 MB just in socket structures) plus keep-alive traffic to stop
+NAT mappings expiring after 30–120 seconds. On a flaky mobile network, connections drop and
+reconnect constantly, and each reconnect costs a TCP handshake plus a TLS handshake — around
+100–300 ms of radio-active time, which on a battery-powered device is the dominant energy cost.
+
+**Against UDP:** you must implement your own reliability, and losing readings silently is usually
+unacceptable for telemetry.
+
+**The design that actually ships:** UDP (or QUIC) with an application-level sequence number and a
+cheap acknowledgement, batching several readings per datagram. Concretely — buffer 6 readings
+(60 seconds) into one 1.2 KB datagram, include a monotonic sequence number, and have the server
+ACK the highest contiguous sequence. The device retransmits unacknowledged batches on its next
+wake-up. That gives you: no connection state on the server, one radio wake-up per minute instead of
+six, tolerance of NAT expiry (no mapping to keep alive), and reliability where you actually need it.
+
+QUIC is worth serious consideration here because it gives you exactly this — connection migration
+across IP changes, 0-RTT resumption, and per-stream reliability — without writing it yourself.
+
+The answer that fails the interview is "UDP because it's faster". Faster is not the axis; connection
+state, energy per message, and NAT behaviour are.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim carries a measured or cited number. Loopback measurements are from macOS 26.2 on an
+Apple M3 Pro; the Mathis table is computed from the published formula, not measured, and is labelled
+as such.
+</Warning>
+
+### Congestion control algorithms compared
+
+| Algorithm | Signal it uses | `cwnd` growth | Best for | Weakness |
+|---|---|---|---|---|
+| **Reno** (1990) | Packet loss | +1 MSS/RTT after loss | Historical baseline | Collapses on high-BDP paths |
+| **CUBIC** (2008, Linux default) | Packet loss | Cubic function of time since last loss | General purpose, high BDP | Still treats all loss as congestion |
+| **BBR** (2016, v3 in use) | Bandwidth and RTT estimates | Paces to estimated bottleneck bandwidth | Lossy links, bufferbloat, long-haul | Can be unfair to loss-based flows sharing a queue |
+| **DCTCP** | ECN marks | Proportional to marking rate | Datacentre with ECN-capable switches | Requires switch support |
+
+The intuition that matters: **Reno and CUBIC infer congestion from loss.** That inference was correct
+in 1988, when almost all loss came from full router queues. It is wrong on Wi-Fi, on cellular, and
+on any lossy tunnel, where loss comes from the physical layer. BBR instead builds a model — it
+periodically probes to estimate the bottleneck bandwidth and the minimum RTT, and paces sending to
+that estimate, so random loss does not cause it to back off.
+
+The other thing BBR fixes is **bufferbloat**. Loss-based algorithms grow the window until something
+drops. If the bottleneck router has a large buffer, that means filling the buffer, which adds
+hundreds of milliseconds of queueing delay before any loss occurs. Everyone's latency suffers so
+that one bulk transfer can find its limit. BBR aims to keep the bottleneck busy without filling its
+queue. Documented improvements on lossy long-haul paths are large — Google reported multiple-fold
+throughput gains on YouTube traffic at deployment.
+
+Check and change it on Linux:
+
+```bash
+sysctl net.ipv4.tcp_congestion_control          # what you have
+sysctl net.ipv4.tcp_available_congestion_control
+sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
+ss -ti                                          # per-connection: cwnd, rtt, retrans, algorithm
+```
+
+`ss -ti` is the single most useful TCP diagnostic command that exists. Learn to read `cwnd`, `rtt`,
+`retrans` and `bytes_retrans` from it.
+
+### Head-of-line blocking and why QUIC exists
+
+TCP guarantees ordered delivery of one byte stream. If segment 2 of 4 is lost, segments 3 and 4 are
+in the receiver's buffer but **cannot be delivered to the application** until 2 arrives. The
+application stalls for at least one RTT.
+
+Now stack HTTP/2 on top. HTTP/2 multiplexes many logical streams over one TCP connection to avoid
+opening six connections. But one lost packet blocks *every* stream on that connection, because they
+share one byte stream. HTTP/2 solved application-level head-of-line blocking and inherited
+transport-level head-of-line blocking, which on a lossy network can be worse than HTTP/1.1's six
+independent connections.
+
+**QUIC** (RFC 9000) fixes this by rebuilding the transport on top of UDP:
+
+- Independent streams with independent loss recovery — a loss on stream 3 does not stall stream 7.
+- The handshake and TLS 1.3 are merged: **1 RTT to first byte** for a new connection, **0 RTT** for
+  a resumed one, against TCP+TLS 1.3's 2 RTT. On a 100 ms path that is a 100–200 ms saving on every
+  new connection.
+- Connection IDs rather than 4-tuples, so a connection survives an IP change (Wi-Fi to cellular)
+  without reconnecting.
+- Everything including most of the header is encrypted, so middleboxes cannot ossify it — which is
+  the real reason it is built on UDP rather than as a new IP protocol number.
+
+The costs are real: QUIC runs in userspace, so CPU per byte is higher than kernel TCP (early
+deployments reported roughly 2× the CPU cost, since narrowed by GSO/GRO offload and kernel support),
+and some corporate networks block or throttle UDP.
+
+### At scale: the numbers that decide architecture
+
+**Per-connection kernel memory.** Roughly 3–10 KB of socket structures per idle TCP connection on
+Linux, plus send and receive buffers that grow on demand (default read buffer is often
+4 KB–6 MB autotuned). One million idle connections is on the order of 10 GB before any buffers —
+achievable, and the reason "C10M" architectures exist, but it is a budget line.
+
+**Ephemeral port exhaustion.** ~28,000 ports in the Linux default range, 60 s `TIME_WAIT` ⇒ about
+**466 new outbound connections/second to a single destination IP:port**. Beyond that you need
+connection pooling, more source IPs, or `tcp_tw_reuse`.
+
+**Handshake cost at scale.** Every new TCP+TLS connection is 2 RTT plus roughly 1–4 ms of server CPU
+for the TLS key exchange. At 10,000 new connections/second that is 10–40 CPU-seconds per second of
+handshake work — meaning several cores doing nothing but handshakes. This is why TLS session
+resumption and keep-alive are load-bearing infrastructure, not micro-optimisations.
+
+**Loss sensitivity.** From the Mathis table: on a 100 ms path, going from 0.01% to 1% loss costs you
+**10×** throughput. Which means a flaky link is not "slightly degraded" — it is an order of
+magnitude. Alert on retransmission rate, not just on link status.
+
+### Production failure modes
+
+| Failure | Signature | Detection |
+|---|---|---|
+| **40 ms stalls** | p99 latency clusters at ~40 ms multiples; p50 is fine | Nagle × delayed-ACK. Set `TCP_NODELAY` and never `send()` a header and body separately |
+| **Slow cross-region transfer** | Throughput matches `window/RTT`, not link speed | `ss -ti` shows a small `cwnd` or a limiting `rwnd`; tune buffers, check window scaling is not stripped |
+| **Throughput collapse under mild loss** | Matches the Mathis bound | Measure loss with `ss -ti` `retrans`; consider BBR or parallel streams |
+| **`EADDRNOTAVAIL` under load** | Connection failures with idle CPU | Ephemeral port exhaustion. `ss -s`; pool connections |
+| **Connections hang for 15+ minutes after a peer dies** | Dead peers linger; the pool fills with corpses | No keep-alive and no application timeout. Set `SO_KEEPALIVE` plus explicit socket timeouts |
+| **HTTP/2 slower than HTTP/1.1 on mobile** | Poor performance correlates with loss rate | Transport head-of-line blocking. Use HTTP/3, or fall back to multiple connections |
+| **Silent truncation of large messages** | Works in dev, corrupts under load | Treating one `recv()` as one message. Framing — Module 3 |
+
+### Frontier and further pointers
+
+- **V. Jacobson, "Congestion Avoidance and Control," SIGCOMM 1988.** Takeaway: the 1986 internet
+  congestion collapse — throughput between LBL and UC Berkeley fell from 32 kbit/s to 40 bit/s, a
+  factor of 1000 — was fixed by making senders infer congestion from loss and back off
+  multiplicatively; this is the paper the modern internet runs on.
+- **M. Mathis, J. Semke, J. Mahdavi and T. Ott, "The Macroscopic Behavior of the TCP Congestion
+  Avoidance Algorithm," CCR 1997.** Takeaway: steady-state throughput of a loss-based flow is
+  proportional to `MSS/(RTT·sqrt(p))`, which lets you predict a transfer's ceiling from two
+  measurements instead of guessing.
+- **N. Cardwell, Y. Cheng, C. S. Gunn, S. H. Yeganeh and V. Jacobson, "BBR: Congestion-Based
+  Congestion Control," ACM Queue 14(5), 2016.** Takeaway: modelling bottleneck bandwidth and minimum
+  RTT directly, rather than treating loss as the congestion signal, both raises throughput on lossy
+  paths and reduces queueing delay.
+- **J. Iyengar and M. Thomson (eds.), RFC 9000 (QUIC) and RFC 9114 (HTTP/3).** Takeaway: moving the
+  transport into userspace over UDP permits per-stream loss recovery, a merged 1-RTT/0-RTT
+  cryptographic handshake, and connection migration — the three things TCP cannot be changed to do
+  because middleboxes have ossified it.
+
+### Stretch challenge
+
+Reproduce the Mathis bound experimentally and then beat it.
+
+1. Set up a loss and delay emulator between two hosts. On Linux:
+   `tc qdisc add dev eth0 root netem delay 100ms loss 1%`. On macOS you can use `dnctl`/`pfctl` pipes,
+   or run both endpoints in Linux containers.
+2. Measure single-flow throughput with `iperf3 -c host -t 30` at loss = 0%, 0.1%, 1%, 2% and RTT =
+   1 ms, 20 ms, 100 ms, 200 ms. Build the 16-cell table.
+3. Compare each measured value against the Mathis prediction and plot measured versus predicted.
+   Where does the formula hold and where does it break? (Look especially at very low loss, where the
+   window rather than loss is the limit, and at very high loss, where timeouts rather than fast
+   retransmit dominate.)
+4. Now switch the sender to BBR and repeat. Quantify the improvement per cell.
+5. Finally, run **two** flows — one CUBIC, one BBR — through the same bottleneck and measure how the
+   bandwidth splits. Is it fair? Write up whether you would deploy BBR on a shared link, given your
+   own numbers.
+
+There is no single right answer to (5); the fairness question is actively debated in the research
+literature and your measurement is a legitimate contribution to your own understanding of it.
+
+</Tab>
+
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Inject 2% packet loss and 100 ms of latency with `tc netem` (or a Linux container pair), measure
+throughput collapse with `iperf3`, and explain the result with the bandwidth-delay product and the
+Mathis formula. Predicted ceiling at 2% loss and 100 ms: **about 1.0 Mbit/s per flow.**
+</Card>
+
+Then run the `boundaries.py` demo above on your own machine and report your numbers — how many
+`recv()` calls for 1,000 sends, with and without `TCP_NODELAY`. Reference: 413 and 67.
+
+## The whiteboard
+
+<Tip>
+**Draw it yourself.** Draw the three-way handshake with sequence numbers, then a four-segment
+transfer with the second segment lost, the duplicate ACKs, and the fast retransmit. Then write the
+BDP formula and work one example. Then draw the 1000-sends-413-recvs funnel from memory.
+[Blank version](/assets/diagrams/p2-w10-m2-blank.svg) · [Editable source](/assets/diagrams/p2-w10-m2.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Demonstrated experimentally that TCP does not preserve message boundaries —
+1,000 three-byte sends produced 413 `recv()` calls with `TCP_NODELAY` and 67 with Nagle enabled, one
+read returning 40 messages — and built a length-prefixed framing layer to fix it. Separately,
+measured throughput collapse under emulated loss and matched it to the Mathis bound within 15%."
+
+**Why this specific demo:** every candidate says "TCP is a stream". Very few have the histogram.
+Bringing a measurement to a definitional question is the whole game.
+
+**Interview:** when asked "TCP or UDP for X", never answer "UDP because it's faster". Answer with
+connection state, energy per message, NAT mapping lifetime, and what happens to late data. Those are
+the axes that decide it in practice.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Check `TCP_NODELAY` on your RPC clients.** Any request/response protocol that does not set it
+is exposed to the Nagle × delayed-ACK interaction, and the signature is a p99 that clusters at 40 ms.
+Most mature libraries set it; hand-rolled clients often do not. It is a one-line check.
+
+**2. Compute the Mathis bound before escalating a slow transfer.** Get RTT from `ping` and loss from
+`ss -ti` (`retrans` over `bytes_sent`). If measured throughput matches the bound, the transfer is
+behaving correctly and more bandwidth will not help — the conversation is about loss or about the
+congestion control algorithm.
+
+**3. Audit for ephemeral port exhaustion before your next traffic spike.** `ss -s` on a busy host.
+If `TIME_WAIT` is in the tens of thousands and your service makes outbound calls, you are within
+range of the ~466 connections/second/destination ceiling. Connection pooling is the fix; widening
+the port range is the stopgap.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Messages merge or split under load, fine in dev | Treating one `recv()` as one message | Length-prefix framing (Module 3). There is no socket option that fixes this |
+| p99 latency clusters at 40 ms | Nagle interacting with delayed ACK | `TCP_NODELAY`, and build one buffer instead of `send(header); send(body)` |
+| Cross-region transfer far below link speed | Window smaller than BDP, or loss | `ss -ti`; tune `SO_RCVBUF`/`SO_SNDBUF`; verify window scaling; compute the Mathis bound |
+| `Address already in use` on restart | Old connections in `TIME_WAIT` holding the 4-tuple | `SO_REUSEADDR` before `bind()` |
+| Connections leak until the process dies | No timeouts; the peer vanished without a FIN | `settimeout()` on every socket plus `SO_KEEPALIVE`; TCP alone waits ~2 hours by default |
+| `sendall` fails with ENOBUFS on macOS | Write larger than the socket buffer | Chunk writes to ≤ 256 KiB |
+| Loopback benchmark looks great, production does not | Loopback MSS is 16,332 bytes and RTT is ~0 | Benchmark over the real path, or at minimum with emulated RTT and loss |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="Concept questions (8)">
+1. Why three packets in the handshake, not two or four? *(Each side must announce and acknowledge an ISN; the server combines its SYN and ACK.)*
+2. Does TCP number bytes or packets, and why does it matter? *(Bytes — so a retransmission may be resegmented, and ACKs refer to stream positions.)*
+3. What is the difference between flow control and congestion control? *(`rwnd` protects the receiver's buffer; `cwnd` protects the network. In-flight bytes are limited by the smaller.)*
+4. Compute the BDP for 1 Gbit/s at 50 ms. *(`1e9 × 0.05 / 8` = 6.25 MB. A 64 KB window would cap you at ~10 Mbit/s.)*
+5. At 100 ms RTT and 1% loss, what is a single flow's throughput ceiling? *(About 1.4 Mbit/s, by the Mathis formula.)*
+6. Why do 1,000 sends produce 413 receives? *(TCP is a byte stream; the kernel coalesces writes and the receiver reads whatever has arrived. Boundaries were never preserved.)*
+7. What causes a 40 ms stall and how do you fix it? *(Nagle waiting for an ACK while delayed ACK waits for data to piggyback on; set `TCP_NODELAY` and avoid split header/body writes.)*
+8. Why does QUIC use UDP? *(To implement per-stream loss recovery, a merged 1-RTT/0-RTT handshake and connection migration in userspace, without middleboxes that have ossified TCP interfering.)*
+</Accordion>
+<Accordion title="Coding challenge">
+Write a UDP-based reliable-delivery layer: sequence numbers, cumulative ACKs, retransmission with
+exponential backoff, and a fixed send window. Hidden tests: run it over a channel that drops 5% of
+datagrams, reorders 2% and duplicates 1%; every message must be delivered exactly once, in order,
+and total time must be within 3× the theoretical minimum. Then measure your throughput against plain
+TCP over the same emulated channel and explain the difference.
+</Accordion>
+<Accordion title="Interview questions">
+- **Junior:** "What is the TCP three-way handshake and what does it cost?" *(SYN, SYN-ACK, ACK; one full RTT before application data — measured 22.6 ms on a real connection.)*
+- **Mid:** "A 1 Gbit/s cross-region transfer runs at 3 Mbit/s. Diagnose it." *(Measure RTT and loss; compute BDP and the Mathis bound; check `ss -ti` for `cwnd` versus `rwnd` limiting; then tune buffers, change congestion control, or parallelise — and say which one the numbers point at.)*
+- **Senior:** "When would you choose QUIC over TCP, and what does it cost you?" *(Lossy or mobile networks where transport head-of-line blocking hurts; connection migration across IP changes; 0-RTT resumption. Costs: higher CPU per byte from userspace processing, UDP blocked or throttled on some networks, and 0-RTT data is replayable so it must be restricted to idempotent requests.)*
+</Accordion>
+<Accordion title="Draw it from memory">
+Draw the handshake with sequence numbers, a lost segment with duplicate ACKs and fast retransmit,
+and the BDP pipe with one worked example. Five minutes.
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+
+- [RFC 9293 (TCP, 2022 consolidation of RFC 793 and successors), RFC 768 (UDP), RFC 7323 (window
+  scaling and timestamps), RFC 6298 (RTO computation).](https://www.rfc-editor.org/rfc/rfc9293) **Read this for:** the state machine, the
+  exact `TIME_WAIT` rules, and why the RTO minimum is what it is.
+- [RFC 9000 (QUIC transport) and RFC 9114 (HTTP/3).](https://www.rfc-editor.org/rfc/rfc9000) **Read this for:** stream multiplexing without
+  transport head-of-line blocking, and the precise 0-RTT replay restrictions.
+- [Linux `tcp(7)`, `socket(7)` and `ss(8)` man pages, plus `Documentation/networking/ip-sysctl.txt`.](https://man7.org/linux/man-pages/man7/tcp.7.html)
+  **Read this for:** the actual meaning of every sysctl you will be tempted to change, including why
+  `tcp_tw_recycle` was removed.
+
+**Papers**
+
+- [V. Jacobson, "Congestion Avoidance and Control," ACM SIGCOMM 1988.](https://doi.org/10.1145/52324.52356) **Takeaway:** the 1986
+  congestion collapse (throughput falling by a factor of 1000 on one link) was solved by
+  additive-increase/multiplicative-decrease with loss as the congestion signal — the foundation every
+  later algorithm reacts to.
+- [M. Mathis et al., "The Macroscopic Behavior of the TCP Congestion Avoidance Algorithm," ACM CCR
+  27(3), 1997.](https://doi.org/10.1145/263932.264023) **Takeaway:** throughput of a loss-based flow scales as `MSS/(RTT·sqrt(p))`, turning
+  "the transfer is slow" into an arithmetic check.
+- [N. Cardwell et al., "BBR: Congestion-Based Congestion Control," ACM Queue 14(5), 2016.](https://doi.org/10.1145/3012426.3022184)
+  **Takeaway:** estimating bottleneck bandwidth and minimum RTT, rather than inferring congestion
+  from loss, both increases throughput on lossy paths and avoids filling bloated buffers.
+
+**Go deeper**
+
+- [W. R. Stevens, *TCP/IP Illustrated, Volume 1* (2nd ed., Fall & Stevens, 2011), Chapters 12–17.](https://www.informit.com/store/tcp-ip-illustrated-volume-1-the-protocols-9780321336316)
+  **Why:** the definitive packet-level walkthrough of connection setup, teardown, `TIME_WAIT`,
+  timeouts and congestion control, with the captures that make each mechanism visible.
+- [Ilya Grigorik, *High Performance Browser Networking* (O'Reilly, 2013), Chapters 2 and 3 — free
+  online.](https://hpbn.co/) **Why:** the clearest practical treatment of how handshakes, slow start and window sizing
+  turn into user-visible page-load latency, with the arithmetic worked out.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p2/week-10/p2-w10-m2">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

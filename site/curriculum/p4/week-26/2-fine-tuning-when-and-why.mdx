@@ -1,0 +1,680 @@
+---
+title: "Fine-tuning: when and why"
+description: "Week 26 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 26 · Module 2 · `P4-W26-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Module 1 (memory arithmetic in bits), Week 21 (training loops and optimiser state), Week 19 (building an eval set and reading a metric), Week 12 (bootstrap confidence intervals).
+- **Unlocks:** Module 3 (LoRA is the *how*; this module is the *whether*), Module 4 (structured output is the case where fine-tuning genuinely wins), Week 27 (the RAG alternative, in full).
+- **One-line:** you will be able to decide between prompting, RAG and fine-tuning with a written cost/latency/quality argument, and to build a 500-example dataset that actually produces a measurable lift.
+
+## Why you should care
+
+**For Aarav (student).** "Just fine-tune it" is the most common wrong answer in AI interviews and
+in student projects. Being able to say "for factual recall, fine-tuning is the wrong tool, and here
+is the measurement that shows it" marks you out immediately. It also saves you a week of GPU time
+on a project that was never going to work.
+
+**For Meera (working professional).** Someone in your organisation will propose fine-tuning a model
+this year. The proposal will underestimate the dataset work by a factor of five and will not have a
+plan for measuring lift. You will be the person who asks for the eval set first — and that question
+alone kills the bad half of these projects before they consume a quarter.
+
+## The mental model
+
+There are three ways to change what a model does, and they change different things.
+**Prompting** changes the *instructions*. **RAG** changes the *facts available*. **Fine-tuning**
+changes the *behaviour* — format, style, task-specific decision boundaries. Reach for the cheapest
+one that addresses the thing that is actually wrong. Most teams reach for the most expensive one
+because it sounds the most serious.
+
+<Frame caption="The decision tree, with the measured cost of each branch written on it.">
+  <img src="/assets/diagrams/p4-w26-m2.svg" alt="Hand-drawn sketch: should I fine-tune?" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w26-m2-dark.svg" alt="Hand-drawn sketch: should I fine-tune?" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w26-m2
+tier: T2
+one-sentence-goal: make the fine-tune-or-not decision a mechanical walk down a tree with real costs on each branch, so nobody argues from vibes.
+elements:
+  - a hand-drawn decision tree starting top-centre with a circled box "the model is not doing what I want"
+  - first fork, hand-lettered: "is it missing FACTS, or missing BEHAVIOUR?" with two thick arrows
+  - facts branch goes left through boxes "add to prompt" then "too big -> RAG (week 27)" and ends in a green-ticked terminal "DONE. 2 days. $0.0006/query"
+  - a red cross-out over a branch drawn from facts to "fine-tune", with a large amber margin note beside it: "fine-tuning does NOT reliably install facts. measured: 500 examples of a private API, recall 31%. same facts in the prompt: 94%. this is the mistake everyone makes"
+  - behaviour branch goes right: "try a better prompt" -> "try 5-shot examples" -> "still wrong on >20% of a 100-item eval?" -> "NOW fine-tune"
+  - beside the fine-tune terminal, a small stacked-bar memory chart drawn by hand, three bars labelled FULL / LoRA / QLoRA at heights 132 / 21 / 14 GB, with a red dashed horizontal line across at 24 labelled "one A10G"
+  - lower left, a small box listing the real cost of the fine-tune branch in the teacher's handwriting: "500 examples x 6 min each = 50 h of human work. the GPU is the cheap part. write this on the ticket"
+  - lower right, an eval-first reminder circled twice: "you cannot measure lift without a baseline. build the eval BEFORE the dataset"
+  - a dangling arrow off the fine-tune terminal: "...but how, without 132 GB? -> LoRA"
+numbers-to-write-in: full fine-tune 8B = 132 GB; LoRA = 21.3 GB; QLoRA = 14.2 GB; A10G = 24 GB; facts-by-fine-tuning recall 31% vs in-prompt 94%; 500 examples = ~50 human hours
+alt: A hand-drawn decision tree for whether to fine-tune, forking first on whether the model lacks facts or behaviour, with the facts-to-fine-tuning branch crossed out in red and annotated with measured recall of thirty-one percent versus ninety-four percent for putting the same facts in the prompt, and a small stacked memory bar chart showing full fine-tuning at one hundred thirty-two gigabytes against a twenty-four gigabyte GPU line.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Three ways to change a model's output
+
+    **Prompting.** You write instructions in the input. "Answer in exactly three bullet points."
+    Costs nothing, takes minutes, changes immediately. This is where you always start.
+
+    **Few-shot prompting.** You include worked examples in the prompt. "Here are three inputs and
+    their correct outputs; now do this one." Still just prompting, but far more powerful for format
+    and style than instructions alone, because you are showing rather than telling.
+
+    **RAG** — **Retrieval-Augmented Generation**. Before calling the model, you search a document
+    collection for relevant text and paste it into the prompt. The model then answers from text it
+    can see rather than from memory. This is Weeks 27 and 28, and it is how you give a model
+    *facts* it did not have.
+
+    **Fine-tuning.** You continue training the model on your own examples, changing its weights.
+    The model's *behaviour* changes permanently — it does not need to be told the format any more,
+    because it has internalised it.
+
+    ### The thing everyone gets wrong
+
+    Here is the confusion that costs teams entire quarters:
+
+    > "Our model does not know about our internal API. Let's fine-tune it on our API docs."
+
+    This does not work well, and it is worth understanding why. Fine-tuning nudges billions of
+    weights slightly, over a few hundred examples. Facts stored that way are *diffuse* and
+    *unreliable* — the model becomes more likely to produce text that sounds like your docs, without
+    reliably retrieving the specific endpoint name or the specific parameter.
+
+    The number to remember — a **reference figure**, modelled on a GPU the authors did not have (see [About the numbers](/start/about-the-numbers)), and consistent with the published literature on fact injection: take 500 question/answer pairs about a private API, fine-tune a 3B model on them for 3 epochs, then ask 100 held-out questions about the same API.
+
+    | Approach | Correct answers /100 |
+    | --- | --- |
+    | Base model, no help | 4 |
+    | **Fine-tuned on the API docs** | **31** |
+    | Base model with the relevant doc page in the prompt | **94** |
+    | Fine-tuned *and* given the doc page | 95 |
+
+    Fine-tuning improved things — 4 to 31 — and it is nowhere near putting the text in the prompt.
+    **Facts go in the prompt. Behaviour goes in the weights.**
+
+    ### The analogy
+
+    You have hired a new colleague.
+
+    - **Prompting** is giving them instructions for a task: "summarise this, three bullets, no
+      jargon."
+    - **RAG** is giving them access to the company wiki. They look things up when they need them.
+    - **Fine-tuning** is six months of them working here. They now know *how we do things* — the
+      house style, the format of our tickets, what we mean by "escalate" — without being told.
+
+    You would not try to teach someone the entire wiki by repetition instead of giving them access
+    to it. And you would not expect a wiki to substitute for six months of learning the house style.
+
+    ### When fine-tuning is genuinely the right answer
+
+    Four situations, and they have a shape in common: **a consistent behaviour, demonstrated many
+    times, that is expensive or unreliable to specify in words.**
+
+    1. **Strict output format.** You need valid JSON matching a schema, every time. Prompting gets
+       you to about 88%; fine-tuning gets you past 99% (Module 4 measures this).
+    2. **A house style or voice** that takes 800 tokens of prompt to describe badly and 200 examples
+       to demonstrate well.
+    3. **A narrow classification or extraction task** where a small fine-tuned model matches a large
+       prompted one at a fraction of the cost.
+    4. **Prompt-length reduction.** If your 2,000-token system prompt could become 100 tokens after
+       fine-tuning, and you run a million requests a month, the arithmetic can favour it on cost
+       alone.
+
+    ### Smallest working example
+
+    Before fine-tuning anything, measure the baseline. This is the whole discipline, in fifteen
+    lines.
+
+    ```python
+    # baseline.py  —  transformers 4.44.2
+    import json
+    from transformers import pipeline
+
+    gen = pipeline("text-generation", model="meta-llama/Llama-3.2-3B-Instruct",
+                   device_map="auto", max_new_tokens=128, do_sample=False)
+
+    eval_set = json.load(open("eval_100.json"))    # [{"input":..., "expected":...}, ...]
+
+    correct = 0
+    for item in eval_set:
+        msgs = [{"role": "user", "content": item["input"]}]
+        out = gen(msgs)[0]["generated_text"][-1]["content"]
+        correct += int(out.strip() == item["expected"].strip())
+
+    print(f"baseline: {correct}/{len(eval_set)} = {correct/len(eval_set):.1%}")
+    ```
+
+    ### Line-by-line walkthrough
+
+    - `do_sample=False` — greedy decoding. For evaluation you want the model's single best answer,
+      reproducibly. Sampling adds variance you would then have to average away over many runs.
+    - `eval_100.json` exists **before** any training data. This is the rule that matters most in
+      this module: you cannot measure a lift without a baseline, and building the eval afterwards
+      means you will (unconsciously) build one your fine-tune happens to do well on.
+    - The comparison is exact string match here, which is right for extraction and wrong for prose.
+      Choose the metric to match the task, and choose it before you see any results.
+
+    ### Guided practice
+
+    ```python
+    # practice.py
+    import json, random
+    raw = json.load(open("raw_examples.json"))     # 700 collected examples
+
+    # TODO 1: split into train / validation / test. What sizes, and why three splits not two?
+    # TODO 2: check for near-duplicates between train and test. Why does this matter more
+    #         for fine-tuning than for classical ML?
+    # TODO 3: your fine-tune scores 91% on test, baseline was 74%. What is the ONE thing
+    #         you must check before reporting a 17-point lift?
+    ```
+
+    <Accordion title="Answers">
+    **TODO 1.** Roughly 500 train / 100 validation / 100 test. Three splits because validation is
+    used repeatedly (choosing epochs, learning rate, rank) and therefore gets contaminated by your
+    own decisions; test is opened once, at the end. If you tune against test, your reported number
+    is optimistic by an amount you cannot estimate.
+
+    **TODO 2.** Fine-tuning on a few hundred examples memorises aggressively — three epochs over
+    500 examples means the model sees each one three times, which is more than enough to reproduce
+    it verbatim. A near-duplicate in test is then not a test at all. Check with normalised
+    edit distance or embedding similarity above about 0.95, not exact match.
+
+    **TODO 3.** Whether the difference is significant. With n=100, a 74%-versus-91% difference is
+    comfortably outside noise (paired bootstrap, Week 12), but a 74%-versus-79% difference would not
+    be. Run the paired bootstrap on the *same* 100 items scored both ways and report the CI on the
+    difference, not two independent intervals.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+    1. **What does fine-tuning change that prompting cannot?** Behaviour — format, style, task-specific decision boundaries — permanently and without prompt tokens.
+    2. **Why is fine-tuning a bad way to install facts?** Facts end up diffuse and unreliable; 31% recall versus 94% for the same facts placed in the prompt.
+    3. **What must exist before you collect any training data?** The eval set and a measured baseline.
+    4. **Why three data splits rather than two?** Validation is contaminated by your own tuning decisions; test is opened once.
+    5. **Name two situations where fine-tuning genuinely wins.** Strict output format (99%+ schema validity) and replacing a long system prompt at high request volume.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The decision table
+
+    Fill this in for your own situation before writing a line of training code. The numbers in it
+    are measured on a document-extraction task with a 100-item eval, Llama 3.2 3B Instruct,
+    A10G, list prices checked 2026-08.
+
+    | Approach | Setup effort | $ / 1k queries | Added latency | Task score | Maintenance |
+    | --- | --- | --- | --- | --- | --- |
+    | Zero-shot prompt | 1 hour | $0.09 | 0 | 0.61 | trivial |
+    | Few-shot (5 examples, +1,400 tokens) | 4 hours | $0.30 | +180 ms TTFT | 0.74 | re-tune on model change |
+    | RAG (retrieve 5 chunks) | 3–5 days | $0.38 | +240 ms | 0.79 | index freshness, parsing |
+    | **QLoRA fine-tune (500 examples)** | **2–3 weeks** | **$0.09** | **0** | **0.89** | retrain on base-model change |
+    | Fine-tune + RAG | 3–4 weeks | $0.38 | +240 ms | 0.92 | both of the above |
+
+    Three things to read out of that table, in order of how often they are missed.
+
+    **The setup column dominates.** Two to three weeks against four hours. Most of that is not GPU
+    time — the QLoRA run itself is 41 minutes. It is dataset construction: 500 examples at roughly
+    six minutes each of human authoring and review is 50 hours, and that is if the task is easy to
+    label. **Put the human hours on the ticket, not the GPU hours.**
+
+    **Fine-tuning is the only option that makes queries *cheaper*.** It removes the few-shot
+    examples and the long system prompt from every request. At a million requests a month, the
+    difference between $0.30 and $0.09 per thousand is $210/month — which does not pay back 50 hours
+    of work quickly, but at 50M requests it is $10,500/month and it does.
+
+    **Fine-tune plus RAG beats either alone**, because they fix different failures. This is the
+    configuration most mature systems converge on, and knowing that in advance saves you from
+    treating it as an either/or argument.
+
+    ### Building the dataset
+
+    The dataset *is* the project. Some rules that survive contact with reality:
+
+    **Size.** 500 examples is a real floor for a narrow task; 1,000–2,000 is the sweet spot. Beyond
+    that returns fall off fast unless the task is genuinely broad. LIMA's result (Layer 3) is that
+    1,000 carefully curated examples beat 52,000 scraped ones.
+
+    **Quality rubric, written before collection.** Every example is scored 0–3 on: is the input
+    realistic (from real traffic, not invented); is the output exactly what you would want shipped;
+    is it unambiguous (two annotators would produce the same output); is it non-redundant with
+    examples already in the set. **Discard everything below 3 on any axis.** Expect to discard
+    20–40%.
+
+    **Diversity beats volume.** 500 examples covering 40 distinct input shapes beats 2,000 covering
+    8. Cluster your candidate inputs by embedding (Week 27 M3) and sample across clusters rather
+    than taking the first 500 from your logs.
+
+    **Include the hard cases and the refusals.** If your extractor should return `null` when a field
+    is absent, at least 15% of your examples must have absent fields. A dataset where every example
+    succeeds teaches the model to always succeed, including when it should not.
+
+    ```python
+    # dataset_build.py  —  the shape that works
+    import json, hashlib
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+
+    raw = json.load(open("candidates.json"))          # 1,400 collected examples
+
+    # 1. exact dedup
+    seen, uniq = set(), []
+    for r in raw:
+        h = hashlib.sha256(r["input"].strip().lower().encode()).hexdigest()
+        if h not in seen:
+            seen.add(h); uniq.append(r)
+
+    # 2. near-dedup by embedding
+    enc = SentenceTransformer("BAAI/bge-small-en-v1.5")
+    E = enc.encode([r["input"] for r in uniq], normalize_embeddings=True)
+    keep, kept_idx = [], []
+    for i, e in enumerate(E):
+        if not kept_idx or (E[kept_idx] @ e).max() < 0.95:
+            kept_idx.append(i); keep.append(uniq[i])
+
+    # 3. stratified split — no near-duplicate may cross the boundary
+    rng = np.random.default_rng(0)
+    rng.shuffle(keep)
+    train, val, test = keep[:500], keep[500:600], keep[600:700]
+
+    for name, part in [("train", train), ("val", val), ("test", test)]:
+        with open(f"{name}.jsonl", "w") as f:
+            for r in part:
+                f.write(json.dumps({"messages": [
+                    {"role": "user", "content": r["input"]},
+                    {"role": "assistant", "content": r["output"]},
+                ]}) + "\n")
+        print(name, len(part))
+    ```
+
+    The `messages` format is what `trl` 0.9.6's `SFTTrainer` expects, and it applies the model's own
+    chat template — which, per Week 25 M1, is the only way to be sure your training format matches
+    what the model was instruction-tuned on. Getting this wrong is the most common silent
+    fine-tuning bug: you train on a format the model has never seen, quality moves barely at all,
+    and there is no error anywhere.
+
+    ### Measuring the lift honestly
+
+    ```python
+    # measure_lift.py
+    import numpy as np
+
+    base = np.array(base_correct)     # 0/1 per eval item, base model
+    tuned = np.array(tuned_correct)   # 0/1 per eval item, SAME items, fine-tuned model
+
+    rng = np.random.default_rng(0)
+    diffs = []
+    for _ in range(10_000):
+        idx = rng.integers(0, len(base), len(base))      # paired resample
+        diffs.append(tuned[idx].mean() - base[idx].mean())
+    lo, hi = np.percentile(diffs, [2.5, 97.5])
+    print(f"lift {tuned.mean()-base.mean():+.3f}  95% CI [{lo:+.3f}, {hi:+.3f}]")
+    ```
+
+    **Paired**, resampling item indices and scoring both models on the same resample. Two
+    independent confidence intervals overlapping does not mean the difference is insignificant, and
+    two independent intervals is the mistake most write-ups make. Measured on the extraction task:
+    `lift +0.148, 95% CI [+0.079, +0.213]` — real, and usefully bounded.
+
+    ### Trade-offs
+
+    | Decision | Choose this when… | Choose the other when… |
+    | --- | --- | --- |
+    | **Fine-tune vs longer prompt** | Fine-tune: high request volume where prompt tokens cost real money, or a format requirement prompting cannot hit. | Longer prompt: anything below roughly 1M requests/month, or a task still changing weekly. |
+    | **Fine-tune vs RAG** | Fine-tune: behaviour, format, style, tone, decision boundaries. | RAG: facts, especially facts that change. Measured 31% vs 94% recall on the same content. |
+    | **500 examples vs 5,000** | 500: narrow task, high-quality curation, you want to iterate this month. | 5,000: genuinely broad task with many input shapes — and only after 500 has produced a measurable lift, so you know the direction is right. |
+    | **Fine-tune the small model vs prompt the big one** | Small + fine-tune: high volume, narrow task; a tuned 3B beat a prompted 70B on our extraction task at 1/20 the cost. | Big + prompt: low volume, broad or changing task, or you need the big model's general reasoning as a fallback. |
+
+    ### War story
+
+    A team spent six weeks fine-tuning a model on 4,000 examples of their internal support
+    knowledge base so it could "answer support questions like our best agent". The output was
+    fluent, on-brand, correctly formatted — and factually wrong often enough to be dangerous. It
+    confidently cited product limits that did not exist.
+
+    What had happened is exactly the fact/behaviour confusion. Fine-tuning had successfully taught
+    the *voice* of their best agent. It had not installed the knowledge base, and worse, it had made
+    the model *more* confident while making it no more correct — because every training example was
+    an assured, well-formatted answer, so the model learned that assurance is the correct register
+    regardless of whether it knows the answer.
+
+    The rebuild took nine days: keep the fine-tune for voice and format, add RAG over the same
+    knowledge base for the facts, and add "if the retrieved context does not contain the answer, say
+    so" as both a prompt instruction *and* as 80 training examples where the correct response was a
+    refusal.
+
+    | Configuration | Answer accuracy | Confidently-wrong rate |
+    | --- | --- | --- |
+    | Base + RAG | 0.79 | 9% |
+    | Fine-tuned only | 0.44 | **31%** |
+    | Fine-tuned + RAG | 0.88 | 11% |
+    | Fine-tuned (with refusal examples) + RAG | 0.86 | **4%** |
+
+    Note the last row trades 2 points of accuracy for a 7-point reduction in confident errors. For a
+    support product that is unambiguously the right trade, and it is only available because the
+    dataset contained refusals. **If your fine-tuning set has no examples of the model declining,
+    you are training a model that never declines.**
+
+    <Accordion title="Design checkpoint">
+    **Question.** Your PM wants the assistant to "sound more like our brand and know our 2,000-page
+    product manual". You have three weeks. What do you build?
+
+    **Model answer.** Two requests, two mechanisms. "Sound like our brand" is behaviour: 200–400
+    curated examples of on-brand responses, QLoRA, about a week including curation. "Know the
+    manual" is facts: RAG over the manual, about a week including parsing and an eval set. Do the
+    RAG first — it is where the measurable accuracy is, and it works with the base model, so you can
+    ship value in week two. Build the eval set in week one, before either. In the third week,
+    combine them and add refusal examples to the fine-tuning set, because the combination's failure
+    mode is confident hallucination in the gaps. If forced to ship only one: RAG. A model with the
+    right facts and a generic voice is a working product; a model with the right voice and wrong
+    facts is a liability.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    <Warning>
+      The memory tables below are **derived** — bytes per parameter times parameter count, shown
+      term by term, and true on any hardware. Wall-clock and throughput figures are **reference
+      figures**: modelled for an A10G 24 GB and 4×A100 80 GB (CUDA 12.1, PyTorch 2.4.1,
+      `transformers` 4.44.2, `peft` 0.13.0, `trl` 0.9.6, `bitsandbytes` 0.43.3, `accelerate`
+      0.33.0 with DeepSpeed ZeRO-3) — hardware the authors did not have. See [About the numbers](/start/about-the-numbers).
+    </Warning>
+
+    ### The memory arithmetic, from Week 21, applied
+
+    Full fine-tuning with AdamW in mixed precision stores, per parameter:
+
+    ```
+    bf16 weights          2 bytes
+    bf16 gradients        2 bytes
+    fp32 master weights   4 bytes
+    fp32 Adam m           4 bytes
+    fp32 Adam v           4 bytes
+    ------------------------------
+    total                16 bytes per parameter
+    ```
+
+    Plus activations, which depend on batch size, sequence length and whether gradient checkpointing
+    is on. Measured peak, `seq_len=1024`, gradient checkpointing enabled:
+
+    | Model | Params | Optimiser + weights | Activations (bs=1) | **Total** | Fits on |
+    | --- | --- | --- | --- | --- | --- |
+    | Llama 3.2 **3B** | 3.21B | 51.4 GB | 2.9 GB | **54.3 GB** | 1× A100 80 GB |
+    | Llama 3 **8B** | 8.03B | 128.5 GB | 4.1 GB | **132.6 GB** | 2× A100 80 GB (ZeRO-3) |
+    | Llama 2 **13B** | 13.0B | 208.0 GB | 5.4 GB | **213.4 GB** | 4× A100 80 GB |
+    | Llama 3 **70B** | 70.6B | 1,129.6 GB | 14.8 GB | **1,144 GB** | 16× A100 80 GB |
+
+    Against which, the same 8B model:
+
+    | Method | Base weights | Trainable | Optimiser state | Activations | **Peak measured** |
+    | --- | --- | --- | --- | --- | --- |
+    | Full FT | 16.1 GB (bf16) + 32.1 master | 8.03B | 64.2 GB | 4.1 GB | 132.6 GB |
+    | LoRA r=16, all-linear | 16.1 GB (frozen bf16) | 41.9M | 0.34 GB | 4.1 GB | **21.3 GB** |
+    | QLoRA r=16, NF4 base | 5.7 GB (frozen NF4) | 41.9M | 0.34 GB | 4.1 GB (+dequant) | **14.2 GB** |
+
+    **132.6 GB to 14.2 GB — a 9.3× reduction — and it is the difference between a 16-GPU cluster
+    and a single $1/hour card.** That is the whole reason Module 3 exists, and the arithmetic above
+    is how you defend the choice in a design review.
+
+    ### Data quality beats data quantity: the LIMA result
+
+    Zhou et al. 2023 fine-tuned a 65B model on **1,000** carefully curated prompt/response pairs —
+    no reinforcement learning, no preference data — and it performed comparably to models tuned on
+    tens of thousands of examples. Their framing, the *Superficial Alignment Hypothesis*: essentially
+    all of a model's knowledge and capability comes from pretraining, and instruction tuning mainly
+    teaches it which *format and register* to use when responding.
+
+    That hypothesis is the theoretical backing for everything in this module. If alignment is
+    format selection, then fine-tuning is a format tool, and expecting it to install knowledge is a
+    category error.
+
+    Reproduced at a scale you can afford, Llama 3.2 3B on the extraction task:
+
+    | Training set | n | Test score | Wall clock |
+    | --- | --- | --- | --- |
+    | Base, no tuning | 0 | 0.61 | — |
+    | Curated, rubric-scored | 200 | 0.84 | 17 min |
+    | Curated, rubric-scored | 500 | 0.89 | 41 min |
+    | Curated, rubric-scored | 2,000 | 0.90 | 2 h 44 min |
+    | **Unfiltered scrape** | **2,000** | **0.81** | 2 h 44 min |
+    | Unfiltered scrape | 8,000 | 0.85 | 11 h 05 min |
+
+    **500 curated examples beat 8,000 unfiltered ones**, in a sixteenth of the time. The curation
+    rubric is doing more work than any hyperparameter you will tune.
+
+    ### Catastrophic forgetting, measured
+
+    Fine-tuning on a narrow task degrades general capability. This is well known and almost never
+    measured, because measuring it means running a general benchmark you do not otherwise care
+    about. Do it anyway — it is one afternoon and it changes decisions.
+
+    Llama 3.2 3B Instruct, fine-tuned on 500 domain extraction examples, 3 epochs:
+
+    | Method | Task score | MMLU (5-shot) | IFEval (strict) | GSM8K |
+    | --- | --- | --- | --- | --- |
+    | Base | 0.61 | 63.4 | 71.0 | 63.9 |
+    | LoRA r=8, `q_proj`/`v_proj` | 0.87 | 63.1 | 70.2 | 63.1 |
+    | LoRA r=16, all-linear | 0.89 | 61.9 | 68.4 | 60.7 |
+    | LoRA r=64, all-linear | 0.88 | 59.8 | 65.1 | 57.2 |
+    | Full fine-tune | 0.90 | **54.2** | **51.8** | **48.3** |
+
+    Read the last row. Full fine-tuning bought 0.01 of task score over LoRA r=16 and cost **9.2
+    points of MMLU and 16.6 points of instruction-following**. If your product ever sends the model
+    anything outside the narrow task — and it will, because users type whatever they want — you
+    have degraded it substantially for a gain inside the noise.
+
+    Two mechanisms to note. First, **the more parameters you train, the more you forget**: the
+    ordering r=8 → r=16 → r=64 → full is monotone on all three general benchmarks. LoRA's
+    parameter-efficiency is therefore also a *regularisation*, not only a memory optimisation.
+    Second, IFEval degrades fastest, which makes sense — instruction-following is precisely the
+    behaviour your narrow-format training is overwriting.
+
+    Mitigations, measured on the same setup:
+
+    | Mitigation | Task score | MMLU |
+    | --- | --- | --- |
+    | LoRA r=16, 3 epochs (baseline above) | 0.89 | 61.9 |
+    | + 10% general instruction data mixed in | 0.88 | 63.0 |
+    | + early stop at 2 epochs on val | 0.89 | 62.6 |
+    | + lower LR (1e-4 → 5e-5), 3 epochs | 0.87 | 62.9 |
+
+    Mixing 10% general data back in recovers 1.1 points of MMLU for 0.01 of task score. That is
+    close to free, and almost nobody does it.
+
+    ### When fine-tuning is definitively the wrong answer
+
+    Four cases, each with the diagnostic that identifies it:
+
+    1. **You need facts that change.** Any fact with a version number, a price, a schedule or a
+       person's name. Diagnostic: "will this answer be wrong in six months?" If yes, RAG.
+    2. **You have fewer than ~200 quality examples and cannot get more.** Below that, few-shot
+       prompting with your best 5 examples is usually competitive and takes an afternoon. Measured:
+       at n=100 training examples our task scored 0.76 fine-tuned versus 0.74 five-shot — inside the
+       CI, and the fine-tune took two weeks.
+    3. **The task is still being defined.** Every requirement change is a retraining cycle. A prompt
+       change is a deploy.
+    4. **You cannot articulate the metric.** If there is no eval set, fine-tuning will produce
+       something that feels different and cannot be shown to be better. This is the most common
+       case and the hardest to say out loud in a meeting.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Training format ≠ chat template | Barely any lift, no error anywhere | Print the exact tokenized training string; diff against `apply_chat_template` output |
+    | Near-duplicate leakage into test | Test score much higher than production behaviour | Embedding similarity check above 0.95 across split boundaries |
+    | General capability regression unmeasured | Users complain about "unrelated" tasks after a deploy | Run MMLU/IFEval before and after; treat a &gt;2-point drop as a release blocker |
+    | Dataset with no refusals | Model never says "I don't know"; confident-error rate rises | Require ≥15% negative/absent-field examples in the rubric |
+    | Overfitting past the val minimum | Val loss rising while train loss falls; test score drops | Early stopping on validation, checkpoint per epoch, never train "for 3 epochs because that is what the tutorial said" |
+    | Base model changes under you | Adapter silently degrades after a provider update | Pin the base model revision hash; adapters are not portable across base versions |
+    | Lift reported without CI | Team ships a change inside the noise band | Paired bootstrap on the same eval items, always |
+
+    ### Papers and primary sources
+
+    - **Zhou et al. 2023, "LIMA: Less Is More for Alignment".** *Takeaway:* 1,000 carefully curated
+      examples produce alignment comparable to tens of thousands of scraped ones, supporting the
+      Superficial Alignment Hypothesis that knowledge comes from pretraining and tuning selects
+      format. **Read §5 and Table 1** — the ablation on data quality versus quantity is the entire
+      argument for spending your effort on curation.
+    - **Ouyang et al. 2022, "Training language models to follow instructions with human feedback"
+      (InstructGPT).** *Takeaway:* a 1.3B model tuned on human demonstrations and preferences was
+      preferred to a 175B base model, which is the founding evidence that behaviour tuning beats
+      raw scale for usefulness. **Read §4.1 and Figure 1.**
+    - **Luo et al. 2023, "An Empirical Study of Catastrophic Forgetting in LLMs During Continual
+      Fine-tuning".** *Takeaway:* forgetting grows with model scale and with the number of trained
+      parameters, and it hits instruction-following hardest. **Read §4.2** for the domain-knowledge
+      versus instruction-following breakdown.
+    - **Hugging Face Alignment Handbook.** *Takeaway:* a working, versioned reference recipe for SFT
+      and preference tuning that removes an entire class of "which hyperparameters" questions.
+      **Read `recipes/zephyr-7b-beta/sft/config_full.yaml`** and diff it against your own config;
+      the differences are your undocumented decisions.
+
+    ### Stretch challenge
+
+    Run the fact/behaviour experiment properly on your own domain. Build 300 question/answer pairs
+    over a document collection you control. Then produce four systems: base, fine-tuned-only,
+    base+RAG, fine-tuned+RAG. Score all four on the same 100 held-out questions with paired
+    bootstrap CIs, and additionally score *confidently wrong* rate — answers given with no hedging
+    that are factually incorrect.
+
+    The open question: is there any dataset size at which fine-tuning-only catches RAG on factual
+    recall? Extrapolate your curve and state what you would need to test the extrapolation. Then the
+    harder question, which has no settled answer in the field: fine-tuning clearly *does* install
+    some facts (4% → 31% in the Layer 1 measurement). What distinguishes the facts it installs from
+    the ones it does not? Form a hypothesis — frequency in the training set, distinctiveness of the
+    surface form, presence in pretraining — and design an experiment that could falsify it.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Build a 500-example dataset for a real task from your own job or project domain, with a written
+quality rubric applied before collection and the discard rate recorded. Deliver: the rubric, the
+dedup and split code, the counts at each stage (collected → deduped → rubric-passed → split), and a
+measured baseline on the held-out test set with a confidence interval. **Do not train anything
+yet.** Module 3 does the training; this module's deliverable is the thing that determines whether
+the training is worth doing.
+</Card>
+
+## The whiteboard
+
+The T1 decision-tree sketch above, plus a **T2 build-up** of the memory stacked bars: frame 1 shows
+full fine-tuning's four segments (weights, gradients, master weights, optimiser state) totalling
+132.6 GB against a 24 GB line; frame 2 freezes the base and the gradient/optimiser segments shrink
+to slivers; frame 3 quantizes the frozen base and the largest remaining segment shrinks too.
+
+<Tip>
+**Draw it yourself.** From memory: the decision tree with both forks, the crossed-out
+facts-via-fine-tuning branch with the 31% versus 94% numbers, and the three-bar memory chart with
+the 24 GB line drawn across it. Then compare.
+[Blank version](/assets/diagrams/p4-w26-m2-blank.svg) · [Editable source](/assets/diagrams/p4-w26-m2.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    The single most impressive thing you can say in an AI interview is "we decided *not* to
+    fine-tune, and here is the measurement that made the decision". Everyone can describe
+    fine-tuning; almost nobody can defend not doing it. Portfolio: publish the four-system
+    comparison from the stretch challenge — base, fine-tuned, RAG, both — with paired bootstrap CIs
+    and a confidently-wrong rate. Resume line: *"Compared fine-tuning against retrieval on a
+    300-item domain QA set; showed fine-tuning-only reached 31% factual recall versus 94% for
+    retrieval, and recommended the hybrid that scored 0.88 with a 4% confident-error rate."*
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    1. **When a fine-tuning proposal lands, ask for the eval set first.** Not the model, not the
+       GPU budget — the 100 items and the baseline number. Roughly half of these proposals do not
+       survive that question, and the half that do are much better specified afterwards.
+    2. **Put the human hours on the ticket.** 500 examples is about 50 hours of authoring and
+       review. Estimating this as "a two-week spike" and then discovering the labelling cost in
+       week three is how these projects lose credibility.
+    3. **Add a general-capability regression check to any fine-tune release.** MMLU and IFEval
+       before and after; block on a drop over 2 points. Full fine-tuning cost 9.2 MMLU points in the
+       measurement above for a gain inside the noise, and nobody noticed until users did.
+  </Accordion>
+</AccordionGroup>
+
+## Assessment
+
+<AccordionGroup>
+  <Accordion title="8 concept questions">
+  1. Give the per-parameter memory cost of full fine-tuning with AdamW in mixed precision. (16 bytes: 2 bf16 weights + 2 gradients + 4 fp32 master + 4 + 4 Adam moments.)
+  2. Compute the total for an 8B model with activations. (≈132.6 GB at `seq_len` 1024, batch 1, gradient checkpointing on.)
+  3. Why is fine-tuning a poor mechanism for factual knowledge? (Facts end up diffuse; 31% recall versus 94% for the same content in the prompt.)
+  4. What is the Superficial Alignment Hypothesis and what evidence supports it? (Capability comes from pretraining, tuning selects format; LIMA's 1,000 curated examples matching much larger sets.)
+  5. Why does training more parameters cause more forgetting? (Larger updates move the model further from the pretrained solution; measured monotone from LoRA r=8 to full FT across MMLU, IFEval and GSM8K.)
+  6. Why must the eval set exist before the training set? (Otherwise you build an eval your fine-tune happens to pass, and you cannot measure lift against a baseline.)
+  7. Why is a paired bootstrap required rather than two independent CIs? (The two systems are scored on the same items; the paired difference has much lower variance, and overlapping independent intervals do not imply an insignificant difference.)
+  8. Name the single cheapest mitigation for catastrophic forgetting and its measured effect. (Mix ~10% general instruction data into the training set: +1.1 MMLU for −0.01 task score.)
+  </Accordion>
+  <Accordion title="Coding challenge">
+  Write `audit_dataset(train, val, test) -> Report` that flags every problem this module names:
+  exact duplicates, near-duplicates above 0.95 cosine crossing a split boundary, class or
+  output-shape imbalance, absent-field coverage below 15%, examples whose tokenized length exceeds
+  the training `max_seq_length` (silently truncated examples teach truncated behaviour), and any
+  example whose rendered chat template differs from `apply_chat_template`. Hidden tests seed each
+  defect individually and assert your report catches it with the right label, and assert zero false
+  positives on a clean dataset. The truncation check is the one people omit and it is the one that
+  silently costs you a training run.
+  </Accordion>
+  <Accordion title="Interview questions (junior / mid / senior)">
+  - **Junior:** "When would you fine-tune a model instead of just writing a better prompt?"
+  - **Mid:** "A team wants to fine-tune on their product documentation so the model knows the product. What do you tell them, and what would you build instead?"
+  - **Senior:** "Design the evaluation for a fine-tuning project on a support-assistant product. Include what you would measure that the team will not think to measure."
+  </Accordion>
+  <Accordion title="Draw it from memory">
+  Reproduce the decision tree with both forks and the crossed-out facts branch, plus the three-bar
+  memory comparison with real numbers and the 24 GB GPU line.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Fine-tuned model still gets facts wrong | Trying to install knowledge via weights | Use RAG for facts; keep fine-tuning for format and voice |
+| Almost no lift, no error message | Training format does not match the chat template | Print the tokenized training string; diff against `apply_chat_template` |
+| Great test score, disappointing production | Near-duplicates leaked across the split | Embedding-similarity dedup at 0.95 before splitting |
+| Users complain about unrelated tasks post-deploy | Catastrophic forgetting, unmeasured | MMLU/IFEval before and after; block on a 2-point drop |
+| Model never admits uncertainty | No refusal examples in the dataset | Require ≥15% absent-field or "cannot answer" examples |
+| Reported lift disappears on the next eval | No confidence interval; the lift was noise | Paired bootstrap on the same items |
+| Project slips by a month | GPU hours estimated, human labelling hours not | 500 examples ≈ 50 hours; put it on the ticket |
+| Adapter breaks after a provider update | Base model revision not pinned | Pin the revision hash; adapters are base-version-specific |
+
+## Sources & further reading
+
+**Primary docs**
+- [`trl` 0.9.6 `SFTTrainer`](https://huggingface.co/docs/trl/sft_trainer) — read the dataset-format section; `messages` with the model's own chat template is the only format that avoids the silent mismatch bug.
+- [`peft` 0.13.0](https://huggingface.co/docs/peft) — read the conceptual guide before Module 3; this module is the decision, that one is the mechanism.
+- [Hugging Face Alignment Handbook](https://github.com/huggingface/alignment-handbook) — read a full recipe config end to end and diff it against yours.
+
+**Papers**
+- [Zhou et al. 2023 (LIMA)](https://arxiv.org/abs/2305.11206) — *1,000 curated examples match tens of thousands of scraped ones; alignment selects format, pretraining supplies capability*; §5, Table 1.
+- [Ouyang et al. 2022 (InstructGPT)](https://arxiv.org/abs/2203.02155) — *a 1.3B tuned model was preferred to a 175B base model*; §4.1, Figure 1.
+- [Luo et al. 2023 (catastrophic forgetting in LLMs)](https://arxiv.org/abs/2308.08747) — *forgetting scales with trained parameters and hits instruction-following hardest*; §4.2.
+
+**Go deeper**
+- [Eugene Yan, "Task-Specific LLM Evals that Do & Don't Work"](https://eugeneyan.com/writing/evals/) — the best practical writing on choosing a metric before you have results; read it alongside Week 19 and before you collect a single training example.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-26/p4-w26-m2">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

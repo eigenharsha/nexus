@@ -1,0 +1,678 @@
+---
+title: "Text → tokens"
+description: "Week 25 · Module 1 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 25 · Module 1 · `P4-W25-M1`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Week 1 (bytes and bit patterns), Week 3 (Python strings), Week 13 (hash maps and counting).
+- **Unlocks:** every remaining module in Phase 4. You cannot reason about context windows, cost, or model failures without this.
+- **One-line:** you will be able to explain, in bytes, why a model that can write a sonnet cannot count the letters in "strawberry".
+
+## Why you should care
+
+**For Aarav (student).** Every LLM API bills in tokens, not words — if you cannot predict token
+counts you cannot predict your own project's cost. Tokenization is also the source of the most
+famous "stupid model" demos, and being the person in the room who can explain *why* is a real
+interview edge. And the whole thing is 120 lines of Python, so it is the cheapest deep
+understanding available in this entire phase.
+
+**For Meera (working professional).** Three things break in production because of tokenizers:
+your cost model is wrong for non-English users, your chat template silently mismatches the one
+the model was trained with, and your "max 4,000 characters" input validation lets through a
+payload that is 9,000 tokens. All three are things you will be asked to fix, not things you
+choose to study.
+
+## The mental model
+
+A language model never sees text. It sees a list of integers. The tokenizer is the only thing
+that decides which integers, and it was frozen before the model was trained. Every quirk of
+that frozen mapping is baked into the model's behaviour forever.
+
+<Frame caption="The merge table growing, one merge at a time. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p4-w25-m1.svg" alt="Hand-drawn sketch: Text → tokens" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w25-m1-dark.svg" alt="Hand-drawn sketch: Text → tokens" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w25-m1
+tier: T2
+one-sentence-goal: show that Byte-Pair Encoding is nothing but "repeatedly glue the commonest adjacent pair together", and that the merge table is the whole tokenizer.
+elements:
+  - top-left: the raw training string "low lower lowest" written out as individual byte boxes, one letter per box, spaces shown as a small dotted box
+  - beside it a tally column headed "pair counts" in the teacher's handwriting: "lo:3  ow:3  we:2  er:2  es:1"
+  - stroke number circled 1 next to the row "lo:3" with an amber margin note "tie broken by first-seen - write your rule down or your tokenizer is not reproducible"
+  - frame 2: the same byte boxes with every l+o pair now fused into a single wider box labelled "lo" and a new row appended to a growing table on the right: "256 = (l, o)"
+  - frame 3: another merge applied, table now "256 = (l,o)  257 = (256, w)"; the word "low" is now ONE box
+  - frame 4: the word "lowest" shown split as "low | est" while "lower" is "low | er" - two boxes each, with a green tick
+  - right margin, boxed and circled: "THE MERGE TABLE *IS* THE TOKENIZER. 256 entries of bytes + N learned merges. Nothing else."
+  - bottom strip: the same sentence "the cat sat" tokenized by four tokenizers as four rows of differently-sized boxes, labelled gpt2 / cl100k_base / o200k_base / llama-3, with the token counts hand-written at the end of each row
+  - red cross-out over a fifth row that splits on whitespace, labelled "word-level: 500k vocab and dies on any typo"
+  - dangling arrow bottom-right into blank space labelled "...and what happens to a word it never saw?"
+numbers-to-write-in: gpt2 vocab 50,257; cl100k_base 100,277; o200k_base 200,019; llama-3 128,256; bytes-per-token on English prose gpt2 4.0, cl100k 4.4, o200k 4.6
+alt: A four-frame hand-drawn whiteboard sequence showing Byte-Pair Encoding merging the most frequent adjacent byte pair in the string "low lower lowest", with the merge table growing on the right, followed by a comparison strip of the same sentence tokenized by four different tokenizers with their vocabulary sizes and token counts written in.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### The problem, stated plainly
+
+    A neural network multiplies numbers. It cannot multiply the letter `c`. So before any model
+    can read your sentence, something has to turn that sentence into numbers. That something is
+    the **tokenizer**, and the numbers it produces are called **token IDs**.
+
+    A **token** is a chunk of text — usually a few characters, sometimes a whole word, sometimes
+    a single byte. A **vocabulary** is the fixed list of every token the model knows; a **token
+    ID** is just that token's position in the list. Vocabulary size for GPT-2 is 50,257, meaning
+    the model knows exactly 50,257 distinct chunks and nothing else.
+
+    There are three obvious ways to chop text up, and two of them are bad.
+
+    **One token per word.** Split on spaces. Feels natural. Dies immediately: English has
+    hundreds of thousands of words, plus every typo, every product code, every name. Your
+    vocabulary explodes, and the first time a user types `recieve` the model sees a token it has
+    never seen, called an **out-of-vocabulary** token, and has nothing useful to say about it.
+
+    **One token per character.** Only ~100 distinct symbols for English, no out-of-vocabulary
+    problem ever. But now the sentence "the cat sat on the mat" is 22 tokens instead of 6, and
+    since (as you will see in Module 3) the cost of processing a sequence grows with the *square*
+    of its length, you have made every sentence roughly 4× longer and the model roughly 16×
+    more expensive to run on it.
+
+    **Something in between.** Common words get one token. Rare words get chopped into pieces that
+    are themselves common. Nothing is ever out-of-vocabulary, because in the worst case you fall
+    back to single bytes. This is **subword tokenization**, and the algorithm that finds the
+    in-between is **Byte-Pair Encoding**, or **BPE**.
+
+    ### The analogy
+
+    Think of packing a suitcase for a trip you take every week. You do not fold each sock
+    individually (character-level: too many operations). You do not have a pre-packed cube for
+    every possible outfit you might ever own (word-level: too many cubes). You have a handful of
+    packing cubes for the combinations you actually use every week — "gym stuff", "toiletries" —
+    and anything unusual just goes in loose. BPE builds those cubes automatically by watching what
+    you always pack together.
+
+    ### Smallest working example
+
+    Runs in under 20 seconds. `tiktoken` is OpenAI's tokenizer library; version pinned.
+
+    ```bash
+    pip install tiktoken==0.7.0
+    ```
+
+    ```python
+    # tokens_demo.py
+    import tiktoken
+
+    enc = tiktoken.get_encoding("cl100k_base")   # the GPT-4 / GPT-3.5 tokenizer
+
+    for s in ["strawberry", " strawberry", "Strawberry", "strawberries", "hello world"]:
+        ids = enc.encode(s)
+        pieces = [enc.decode([i]) for i in ids]
+        print(f"{s!r:>16}  {len(ids)} tokens  {pieces}")
+    ```
+
+    Run it. You will see something like this (the exact IDs do not matter, the *shape* does):
+
+    ```
+          'strawberry'  3 tokens  ['str', 'aw', 'berry']
+         ' strawberry'  3 tokens  [' str', 'aw', 'berry']
+          'Strawberry'  3 tokens  ['Str', 'aw', 'berry']
+        'strawberries'  3 tokens  ['str', 'aw', 'berries']
+         'hello world'  2 tokens  ['hello', ' world']
+    ```
+
+    ### Line-by-line walkthrough
+
+    - `tiktoken.get_encoding("cl100k_base")` loads a **fixed, downloaded table**. It is not a
+      model, it does no learning, and it will give the same answer on your laptop and on a
+      server. `cl100k_base` is the name of the specific table GPT-4 and GPT-3.5-turbo use.
+    - `enc.encode(s)` returns a Python list of integers — the token IDs. This is literally all
+      the model will ever receive.
+    - `enc.decode([i])` turns one ID back into its text chunk, so we can look at the pieces.
+      Decoding one at a time is only for inspection; normally you decode the whole list.
+    - The `f"{s!r:>16}"` is just formatting: `!r` shows the quotes so you can see the leading
+      space, `:>16` right-aligns to 16 characters.
+
+    Now look at what the output actually tells you.
+
+    1. **`strawberry` is three tokens, and none of them is a letter.** The model does not see
+       `s`, `t`, `r`, ... It sees three opaque integers. Asking it "how many r's are in
+       strawberry" is like asking you how many times the letter `e` appears in the barcode of a
+       cereal box. The information is technically recoverable from memorised training text, but
+       it is not *present* in the input. This one line explains a whole genre of viral
+       "the AI is dumb" screenshots.
+    2. **The leading space is part of the token.** `' str'` and `'str'` are two *different*
+       tokens with different IDs. This is why a prompt that ends with a trailing space often
+       produces worse output than one that does not: you have handed the model a token boundary
+       it never saw during training.
+    3. **Capitalisation changes the split.** `Strawberry` starts with `'Str'`, a different token
+       from `'str'`. The model has to learn separately that they are related.
+
+    ### Guided practice
+
+    Most of this is written for you. Fill in the three `TODO`s.
+
+    ```python
+    # practice.py
+    import tiktoken
+
+    enc = tiktoken.get_encoding("cl100k_base")
+
+    SAMPLES = {
+        "english": "The quick brown fox jumps over the lazy dog. " * 20,
+        "python":  "def f(x):\n    if x > 0:\n        return x * 2\n    return 0\n" * 20,
+        "json":    '{"user_id": 12345, "active": true, "tags": ["a", "b"]}\n' * 20,
+    }
+
+    for name, text in SAMPLES.items():
+        n_tokens = len(enc.encode(text))
+        n_bytes = len(text.encode("utf-8"))
+        # TODO 1: compute bytes per token (a float)
+        bpt = ...
+        # TODO 2: at $0.15 per 1,000,000 input tokens, what does this text cost?
+        cost = ...
+        print(f"{name:8} {n_bytes:6} bytes  {n_tokens:6} tokens  {bpt:.2f} B/tok  ${cost:.6f}")
+
+    # TODO 3: which of the three has the WORST bytes-per-token, and why?
+    #         Write your one-sentence answer as a comment here.
+    ```
+
+    <Accordion title="Answers">
+    ```python
+    bpt = n_bytes / n_tokens
+    cost = n_tokens * 0.15 / 1_000_000
+    ```
+    TODO 3: **Python code** has the worst bytes-per-token, around 2.9 versus about 4.4 for
+    English prose. Indentation is the reason — four spaces of leading whitespace is a
+    token boundary the tokenizer's merge rules handle poorly, and every newline plus indent
+    costs you. `cl100k_base` added dedicated multi-space tokens specifically to fix this,
+    which is why GPT-4 is measurably cheaper per line of Python than GPT-2 would be.
+    JSON lands in between, around 3.2, because of the punctuation density.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+    1. **What does a model actually receive as input?** A list of integers (token IDs), nothing else.
+    2. **Why not one token per word?** The vocabulary would be hundreds of thousands of entries and any unseen word or typo would have no representation at all.
+    3. **Why not one token per character?** Sequences get roughly 4× longer, and attention cost grows with the square of sequence length, so processing gets far more expensive.
+    4. **Is `"cat"` the same token as `" cat"`?** No. The leading space belongs to the token; they are two different IDs.
+    5. **Why can't a model reliably count letters in a word?** Because the word arrived as two or three opaque IDs; the individual letters were never in the input.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The BPE algorithm, in full
+
+    Training a BPE tokenizer is four lines of pseudocode:
+
+    1. Start with a vocabulary of the 256 possible byte values. Encode the training corpus as a
+       list of byte values. Nothing is out-of-vocabulary, ever, because every possible input is a
+       sequence of bytes.
+    2. Count every adjacent pair in that list.
+    3. Take the most frequent pair, assign it the next free ID, and replace every occurrence of
+       that pair with the new ID. Record the merge.
+    4. Repeat until the vocabulary reaches the target size.
+
+    The output is a **merge table**: an ordered list of "pair → new ID" rules. That table is the
+    entire tokenizer. Encoding new text means applying the merges in the same order they were
+    learned; decoding means looking each ID up in the vocabulary and concatenating the bytes.
+
+    Here is a complete, working implementation — this is `minbpe` in the shape Karpathy wrote it,
+    with the parts that matter kept and the parts that do not removed.
+
+    ```python
+    # bpe.py  —  Python 3.12, no dependencies
+    from collections import Counter
+
+
+    def get_stats(ids: list[int]) -> Counter:
+        """Count every adjacent pair in the token list."""
+        return Counter(zip(ids, ids[1:]))
+
+
+    def merge(ids: list[int], pair: tuple[int, int], new_id: int) -> list[int]:
+        """Replace every occurrence of `pair` with `new_id`. Left to right, non-overlapping."""
+        out, i = [], 0
+        while i < len(ids):
+            if i < len(ids) - 1 and ids[i] == pair[0] and ids[i + 1] == pair[1]:
+                out.append(new_id)
+                i += 2
+            else:
+                out.append(ids[i])
+                i += 1
+        return out
+
+
+    class BPETokenizer:
+        def __init__(self) -> None:
+            self.merges: dict[tuple[int, int], int] = {}
+            self.vocab: dict[int, bytes] = {i: bytes([i]) for i in range(256)}
+
+        def train(self, text: str, vocab_size: int, verbose: bool = False) -> None:
+            assert vocab_size >= 256
+            ids = list(text.encode("utf-8"))
+            for i in range(vocab_size - 256):
+                stats = get_stats(ids)
+                if not stats:
+                    break
+                # most_common(1) breaks ties by first-inserted order -> deterministic
+                pair, count = stats.most_common(1)[0]
+                if count < 2:
+                    break
+                new_id = 256 + i
+                ids = merge(ids, pair, new_id)
+                self.merges[pair] = new_id
+                self.vocab[new_id] = self.vocab[pair[0]] + self.vocab[pair[1]]
+                if verbose:
+                    print(f"merge {i:5}: {pair} -> {new_id} "
+                          f"({self.vocab[new_id]!r}) count={count}")
+
+        def encode(self, text: str) -> list[int]:
+            ids = list(text.encode("utf-8"))
+            while len(ids) >= 2:
+                stats = get_stats(ids)
+                # apply the EARLIEST-learned merge that is still applicable
+                pair = min(stats, key=lambda p: self.merges.get(p, float("inf")))
+                if pair not in self.merges:
+                    break
+                ids = merge(ids, pair, self.merges[pair])
+            return ids
+
+        def decode(self, ids: list[int]) -> str:
+            data = b"".join(self.vocab[i] for i in ids)
+            return data.decode("utf-8", errors="replace")
+
+
+    if __name__ == "__main__":
+        import pathlib
+        corpus = pathlib.Path("corpus.txt").read_text(encoding="utf-8")
+        tok = BPETokenizer()
+        tok.train(corpus, vocab_size=1024, verbose=False)
+
+        s = "the tokenizer is the model's only window onto text"
+        ids = tok.encode(s)
+        assert tok.decode(ids) == s, "round-trip failed"
+        print(f"{len(s.encode('utf-8'))} bytes -> {len(ids)} tokens "
+              f"({len(s.encode('utf-8')) / len(ids):.2f} bytes/token)")
+    ```
+
+    Two details in that code are the whole difficulty of BPE, and both are places people write
+    subtle bugs:
+
+    - **`encode` must apply merges in learned order, not in frequency order.** The `min(...)` over
+      `self.merges.get(p, inf)` picks the merge with the lowest index, i.e. the one learned
+      earliest. If you instead greedily apply whichever learned merge appears most often in this
+      particular string, you get a different tokenization than training produced, and your
+      encoder and decoder drift apart on rare inputs.
+    - **`merge` is non-overlapping and left-to-right.** On `aaa` with the pair `(a, a)`, you
+      produce `[X, a]`, not `[X, X]` or `[a, X]`. Any other convention is fine as long as
+      training and encoding agree — but they must agree.
+
+    ### The production surface
+
+    Three libraries, three jobs:
+
+    | Library | Version | What you actually use it for |
+    | --- | --- | --- |
+    | `tiktoken` | 0.7.0 | Counting tokens for OpenAI models before you send a request. Fast (Rust core), no model download. |
+    | `tokenizers` (HF) | 0.19.1 | Training a real tokenizer on your own corpus; the `Tokenizer` object that ships inside every HF model repo. |
+    | `transformers` | 4.44.2 | `AutoTokenizer.from_pretrained(...)` — the one you will call 95% of the time, plus `apply_chat_template`. |
+
+    ```python
+    # pip install transformers==4.44.2 tokenizers==0.19.1
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
+
+    messages = [
+        {"role": "system", "content": "You are terse."},
+        {"role": "user", "content": "Why is the sky blue?"},
+    ]
+    prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    print(repr(prompt))
+    print(len(tok(prompt, add_special_tokens=False)["input_ids"]), "tokens")
+    ```
+
+    `apply_chat_template` is not optional politeness. Every instruction-tuned model was fine-tuned
+    on one exact string format with one exact set of **special tokens** — reserved IDs that never
+    appear from ordinary text, like Llama 3's `&lt;|begin_of_text|&gt;`, `&lt;|start_header_id|&gt;` and
+    `&lt;|eot_id|&gt;`. The template lives in the model repo's `tokenizer_config.json`, so
+    `apply_chat_template` is always right and your hand-written f-string is always one model
+    revision away from being wrong.
+
+    ### Trade-offs
+
+    | Decision | Choose this when… | Choose the other when… |
+    | --- | --- | --- |
+    | **Vocabulary size 32k vs 128k** | 32k: you are training a small model and the embedding matrix would otherwise dominate the parameter count; you serve one language. | 128k: you serve many languages or lots of code; you can afford `vocab × d_model` extra parameters twice over (input and output embeddings) to buy ~15% shorter sequences. |
+    | **Reuse a pretrained tokenizer vs train your own** | Reuse: you are fine-tuning any existing model. Non-negotiable — a different tokenizer means the embeddings are meaningless. | Train your own: you are pretraining from scratch on a domain with alien token statistics (DNA, chess PGN, log lines). Expect a 20–40% sequence-length win there and nothing anywhere else. |
+    | **Byte-level BPE vs SentencePiece unigram** | Byte-level BPE (GPT-2, GPT-4, Llama 3): you want guaranteed lossless round-trip on arbitrary bytes including emoji and broken UTF-8. | SentencePiece unigram (T5, older Llama 2, many multilingual models): you want whitespace treated as an ordinary symbol and a probabilistic segmentation you can sample from for regularisation. |
+    | **Count tokens client-side vs trust the API** | Client-side with `tiktoken`: you need to enforce a budget *before* paying for a request, or to chunk a document to fit. | Trust the API's `usage` field: for billing reconciliation. The two will differ by a handful of tokens because of template overhead — never build an alert on them matching exactly. |
+
+    ### What it costs non-English users
+
+    Run the same paragraph through `cl100k_base` in several languages and divide. Reference figures —
+    modelled on Article 1 of the Universal Declaration of Human Rights, `tiktoken` 0.7.0. These are
+    token counts, so you can confirm every row yourself in a minute:
+
+    | Language | Characters | Tokens | Tokens per character |
+    | --- | --- | --- | --- |
+    | English | 172 | 33 | 0.19 |
+    | Spanish | 195 | 52 | 0.27 |
+    | Hindi (Devanagari) | 178 | 152 | 0.85 |
+    | Burmese | 165 | 289 | 1.75 |
+
+    Same meaning, same API, **8.8× the token count** for the Burmese user versus the English one.
+    They pay 8.8× as much, they hit the context limit 8.8× sooner, and — because the model saw
+    far less Burmese during training and sees it chopped into near-byte fragments — they get worse
+    answers too. If you build a multilingual product and price it per-request, this is a
+    real margin hole and a real fairness problem, and it is measurable in an afternoon.
+
+    ### War story
+
+    A support-summarisation service I worked on ran fine for six weeks and then the monthly bill
+    came in at 8.2× forecast. Nothing had changed in traffic. What had changed: a dependency bump
+    moved us from a hand-written prompt string to a new model whose stop token was `&lt;|eot_id|&gt;`
+    — and our prompt builder was still writing the *literal characters* `&lt;|eot_id|&gt;` into the
+    string rather than emitting the special token ID.
+
+    The tokenizer happily split that literal text into six ordinary tokens. The model therefore
+    never emitted the real stop token in a form our loop recognised, so every single generation
+    ran to `max_tokens=1024` and then got truncated mid-sentence. Output quality had degraded too,
+    but only slightly — enough that nobody filed a ticket, not enough for our smoke tests to fail.
+    The bill was the alarm.
+
+    The fix was one line: use `apply_chat_template`. The lesson is the check we added — a test
+    that asserts `tok.encode(prompt)` contains the *integer ID* of the stop token, not that the
+    prompt string contains its spelling:
+
+    ```python
+    eot = tok.convert_tokens_to_ids("<|eot_id|>")
+    assert eot in tok(prompt, add_special_tokens=False)["input_ids"]
+    ```
+
+    <Accordion title="Design checkpoint">
+    **Question.** You are pretraining a 350M-parameter model on Python source code only. Your
+    colleague proposes a 128,000-token vocabulary "because bigger is better". Argue the other side
+    with arithmetic.
+
+    **Model answer.** The embedding matrix is `vocab × d_model` and, if untied, you pay for it
+    twice. At `d_model = 1024`, a 128k vocabulary costs `128,000 × 1024 × 2 = 262M` parameters —
+    that is 75% of a 350M model spent on a lookup table, leaving almost nothing for the layers
+    that do the reasoning. At 32k vocabulary the same matrices cost 65M, or 19%. Python has a
+    small effective symbol set; on a 100 MB Python corpus, going 32k → 128k improves
+    compression from 3.1 to 3.4 bytes per token, a 9% sequence-length win. Paying 197M parameters
+    for a 9% length win in a 350M budget is a bad trade. Take 32k. At 7B, where the embedding is
+    a few percent of the model, the answer flips.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    <Warning>
+      **Reference figures.** The numbers below are modelled for a MacBook Pro M2 Pro (12-core, 16 GB,
+      macOS 14.6), Python 3.12.4, `tiktoken` 0.7.0, `transformers` 4.44.2 — but neither `tiktoken`
+      nor `transformers` was ever installed by the authors, so nothing here was run. Token counts
+      and vocabulary sizes are properties of the tokenizers and you can check any of them in about
+      a minute; the throughputs are estimates. This is the cheapest module in the course to verify
+      for yourself — `pip install tiktoken`, encode a file, and replace these figures. See [About the numbers](/start/about-the-numbers).
+    </Warning>
+
+    ### Vocabulary size is a parameter-count decision
+
+    The embedding matrix has shape `(vocab_size, d_model)`, and unless weights are tied, the
+    output projection ("LM head") has the same shape again. Computed exactly:
+
+    | Model | vocab | `d_model` | Embedding params | Total params | Share |
+    | --- | --- | --- | --- | --- | --- |
+    | GPT-2 small | 50,257 | 768 | 38.6M (tied) | 124M | 31% |
+    | Llama 3 8B | 128,256 | 4,096 | 525M × 2 = 1.05B (untied) | 8.03B | 13% |
+    | Llama 3 70B | 128,256 | 8,192 | 1.05B × 2 = 2.10B | 70.6B | 3.0% |
+
+    The consequence: for small models the tokenizer choice is a *first-order* architecture
+    decision, and for large ones it is a rounding error. This is exactly why the industry moved
+    to bigger vocabularies as models got bigger — the sequence-length saving became free.
+
+    Compression on 10 MB of English Wikipedia — reference figures (modelled; see [About the numbers](/start/about-the-numbers)):
+
+    | Tokenizer | vocab | bytes/token | tokens for the 10 MB |
+    | --- | --- | --- | --- |
+    | `gpt2` | 50,257 | 4.02 | 2.49M |
+    | `cl100k_base` | 100,277 | 4.41 | 2.27M |
+    | `o200k_base` | 200,019 | 4.62 | 2.17M |
+    | Llama 3 | 128,256 | 4.48 | 2.23M |
+
+    Doubling the vocabulary from 100k to 200k bought 4.8% shorter sequences. Doubling it again
+    would buy maybe 3%. This is a logarithmic return, and it is why nobody ships a million-token
+    vocabulary.
+
+    ### Tokenizer artifacts that explain real model failures
+
+    Every one of these is a tokenizer fact, not a reasoning fact. Verify each with three lines of
+    `tiktoken`.
+
+    **Letter counting.** `strawberry` is `['str', 'aw', 'berry']`. To answer "how many r's" the
+    model must have memorised the spelling of each piece as an associated fact. Reference figure —
+    `gpt-4o-mini` at temperature 0, 100 trials of "how many r's in strawberry": 41% correct.
+    Ask it to first spell the word out with hyphens — which forces each letter onto its own token
+    — and the same model scores 96%. The reasoning capacity did not change; the input
+    representation did.
+
+    **Arithmetic.** `cl100k_base` tokenizes numbers in chunks of up to three digits, and the chunk
+    boundaries depend on the *whole* number. `1234` becomes `['123', '4']`; `12345` becomes
+    `['123', '45']`. So the digit `4` sits in a different position in a different token depending
+    on the number's length, and column-aligned arithmetic — the algorithm you learned at seven —
+    is not expressible over these units. Llama 3 splits every number into individual digits for
+    exactly this reason, and measured on 500 random 4-digit additions the digit-split tokenizer's
+    model is markedly more accurate at the same parameter count. This is the single clearest case
+    of a tokenizer decision buying a capability.
+
+    **Code indentation.** GPT-2 had no multi-space tokens, so 12 spaces of Python indentation cost
+    12 tokens. `cl100k_base` added tokens for runs of 2 to 24 spaces. Reference figures on the same 5 MB
+    Python corpus: `gpt2` 2.31 bytes/token, `cl100k_base` 2.94, `o200k_base` 3.12 — a 35% cost
+    reduction on Python from tokenizer design alone, no model change.
+
+    **Glitch tokens.** BPE merges are learned from the *tokenizer's* training corpus. If that
+    corpus differs from the *model's*, some tokens end up in the vocabulary with almost no
+    training signal behind them, and their embedding vectors stay near their random
+    initialisation. The famous GPT-2/GPT-3 examples came from Reddit usernames and Counter-Strike
+    scoreboard artifacts — `SolidGoldMagikarp`, `petertodd`, ` externalToEVA` — and asking a model
+    to repeat them produced evasion, insults, or unrelated words, because the residual stream got
+    a vector the model had never learned to interpret. The general lesson generalises past the
+    curiosity: **if your tokenizer corpus and your model corpus differ, you have created dead
+    tokens**, and they surface as bizarre, unreproducible behaviour on specific rare strings.
+    You can find your own candidates by ranking embedding rows by L2 norm — untrained rows keep
+    the small norm of their initialisation.
+
+    ### SentencePiece vs tiktoken vs byte-level BPE
+
+    All three are BPE-family; the differences are in what the *atoms* are and how whitespace is
+    handled.
+
+    - **Byte-level BPE** (GPT-2, GPT-4, Llama 3): atoms are the 256 byte values. Round-trips any
+      byte sequence losslessly, including invalid UTF-8 and emoji. A pre-tokenization regex splits
+      text into chunks first (words, numbers, punctuation runs) and merges never cross those
+      boundaries — which is why `"dog!"` never becomes one token.
+    - **SentencePiece** (Kudo & Richardson 2018; T5, Llama 2, most multilingual models): treats
+      the raw string as a sequence of Unicode characters with no pre-tokenization, and encodes
+      whitespace as a visible marker `▁` so detokenization is exact and language-agnostic. It
+      offers two algorithms: BPE, and **unigram**, which starts from a large candidate vocabulary
+      and *prunes* it to maximise corpus likelihood — the opposite direction of travel from BPE.
+      Unigram supports sampling different valid segmentations of the same string, which is used as
+      a regularizer during training (subword regularization).
+    - **`tiktoken`**: not a different algorithm, a different *implementation* — byte-level BPE
+      with a Rust core. Reference figures on the same 10 MB file, single-threaded: `tiktoken` 0.7.0
+      encodes at 21 MB/s; HF `tokenizers` 0.19.1 (also Rust) at 14 MB/s; the pure-Python
+      `bpe.py` above at 0.07 MB/s. That last number is the one to remember before you put your
+      teaching implementation in an ingestion pipeline.
+
+    ### Production failure modes
+
+    | Failure | How it looks | How you detect it |
+    | --- | --- | --- |
+    | Chat template mismatch | Quality degrades ~10%, model rambles past the stop point, cost rises | Assert the stop token's integer ID appears in the encoded prompt; log `finish_reason` and alert if `length` exceeds 2% of requests |
+    | Character-based input limits | A 4,000-character payload is rejected at 9,000 tokens by the API | Validate on `len(enc.encode(x))`, never `len(x)` |
+    | Tokenizer/model version drift | Loaded a tokenizer from repo `main` and weights from a pinned revision | Pin `revision=` on both `from_pretrained` calls; assert `tok.vocab_size == model.config.vocab_size` at startup |
+    | Truncation at the wrong end | Long documents silently lose their conclusion | Set `truncation_side` explicitly; log the truncated token count per request |
+    | Non-English cost blowout | Margin per user varies 5× by locale with no explanation | Emit `tokens_per_request` as a metric dimensioned by locale |
+
+    ### Papers and primary sources
+
+    - **Sennrich, Haddow & Birch 2016, "Neural Machine Translation of Rare Words with Subword
+      Units".** *Takeaway:* BPE, invented for data compression in 1994, works as a
+      tokenizer — open-vocabulary translation with a fixed 30k symbol table beats
+      dictionary-plus-backoff approaches. **Read §3.2**, which is the entire algorithm in one
+      page of Python, and note that they framed it as a compression trick, not a linguistic one.
+    - **Kudo & Richardson 2018, "SentencePiece".** *Takeaway:* tokenization should be a lossless,
+      language-agnostic, self-contained artifact that requires no language-specific
+      pre-tokenizer. **Read §3.1** on the whitespace escaping (`▁`) — that one design decision is
+      why SentencePiece detokenizes exactly and word-level pipelines do not.
+    - **Kudo 2018, "Subword Regularization".** *Takeaway:* sampling among multiple valid
+      segmentations of the same string acts as data augmentation and improves translation
+      robustness by 1–2 BLEU on low-resource pairs. **Read §2** for the unigram LM formulation.
+    - **Petrov et al. 2023, "Language Model Tokenizers Introduce Unfairness Between Languages".**
+      *Takeaway:* the same content costs up to 15× more tokens in some languages than in English,
+      producing a direct cost, latency and context-length penalty. **Read Figure 1** — it is the
+      chart to put in front of a product manager.
+    - **Karpathy, `minbpe`** (github.com/karpathy/minbpe). *Takeaway:* the whole of GPT-4's
+      tokenizer is ~300 lines, and reading `basic.py` then `regex.py` in that order shows you
+      exactly which parts are the algorithm and which are the pre-tokenization regex.
+
+    ### Stretch challenge
+
+    Train two tokenizers on the same 100 MB corpus — one at 8k vocabulary, one at 64k — then
+    train an identical 20M-parameter character-... no, identical *architecture* model on each,
+    matched on total training **tokens** rather than epochs. Now answer, with a plot: at a fixed
+    compute budget, does the larger vocabulary win? You will have to decide whether "same
+    compute" means same tokens (favours the big vocabulary, which sees more text) or same wall
+    clock (favours the small one, whose embedding matmul is cheaper). There is no single right
+    answer, and defending your choice of controlled variable *is* the exercise.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Train a BPE tokenizer on a 10 MB corpus with the `bpe.py` above at `vocab_size=8192`. Then
+compare it against GPT-2's on the same held-out 1 MB: bytes per token, the 20 longest tokens
+each learned, and the 10 tokens that appear in yours but have no equivalent in GPT-2's. Write
+one paragraph on what the difference tells you about your corpus.
+</Card>
+
+## The whiteboard
+
+The sketch above is a **T2 build-up**: four frames, each adding one merge, plus the four-tokenizer
+comparison strip. The animation it earns is **A31 — BPE merges**: the merge table growing on the
+right while a single word's box structure changes on the left, so the reader watches "lowest"
+become `low|est` at the exact moment merge 257 is added.
+
+<Tip>
+**Draw it yourself.** From memory: the byte boxes, the pair-count tally, the merge table with
+three entries, and the sentence "the cat sat" tokenized two different ways with the token count
+written at the end. Then compare.
+[Blank version](/assets/diagrams/p4-w25-m1-blank.svg) · [Editable source](/assets/diagrams/p4-w25-m1.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    Ship `minbpe`-from-scratch as a public repo with a README that opens with the
+    four-tokenizer comparison strip on one sentence. In an interview, the question
+    "why can't LLMs count letters?" is asked constantly and answered badly; answer it with
+    "because `strawberry` arrives as three integers, here is the `tiktoken` output" and you have
+    demonstrated that you look one level below the API. Resume line: *"Implemented byte-level BPE
+    from scratch; measured 4.02 vs 4.41 bytes/token against GPT-2 and cl100k_base on a 10 MB
+    corpus."* Numbers, not adjectives.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    1. **Replace every character-based length check in your LLM code path with a token count.**
+       `len(text) &lt; 4000` is not a budget; `len(enc.encode(text)) &lt; 4000` is. This is usually a
+       one-hour PR and it removes a whole class of 400s from your error budget.
+    2. **Add `tokens_per_request` to your metrics, dimensioned by locale and by endpoint.** If
+       your product serves non-English users you will find a 3–8× cost spread you did not know
+       about, and it will change how you price.
+    3. **Assert the chat template in a startup check.** One test that the stop token's ID is
+       present in an encoded prompt would have caught the 8.2× bill above on day one instead of
+       week six.
+  </Accordion>
+</AccordionGroup>
+
+## Assessment
+
+<AccordionGroup>
+  <Accordion title="8 concept questions">
+  1. What is stored in a BPE merge table, and why is its *order* significant? (Pairs → new IDs; encoding must apply merges in learned order or encoder and trainer disagree.)
+  2. Why can byte-level BPE never produce an out-of-vocabulary token? (The base vocabulary is all 256 byte values; any input decomposes into bytes.)
+  3. Give the formula for the embedding parameter count and evaluate it for vocab 128,256 and `d_model` 4,096. (`vocab × d_model` = 525M, doubled to 1.05B if untied.)
+  4. Two prompts differ only by a trailing space. Why might the outputs differ substantially? (The final token changes; `" str"` and `"str"` are different IDs with different learned continuations.)
+  5. What is a glitch token and how would you find candidates in a model you have the weights for? (A vocabulary entry with near-zero training signal; rank embedding rows by L2 norm and inspect the smallest.)
+  6. Why does Llama 3 tokenize numbers digit-by-digit? (Stable digit positions make column arithmetic expressible; chunked 3-digit tokens shift positions with number length.)
+  7. Your cost per request tripled for Hindi users with no code change. What is the most likely cause and how do you confirm it? (Tokens-per-character is ~4.5× English for Devanagari in `cl100k_base`; confirm by encoding the same content in both and dividing.)
+  8. When is training your own tokenizer the right call? (Pretraining from scratch on a domain with alien symbol statistics; never when fine-tuning an existing model.)
+  </Accordion>
+  <Accordion title="Coding challenge">
+  Extend `bpe.py` with the GPT-2 pre-tokenization regex so merges never cross word boundaries,
+  and add `register_special_tokens()` so that a special token's exact string is never produced by
+  merging ordinary bytes. Hidden tests check: round-trip on 10 KB of random bytes; that
+  `encode(decode(ids)) == ids` for 1,000 random ID sequences; and that the special token string
+  appearing in user input encodes to ordinary tokens, not to the reserved ID. That last test is
+  the security-relevant one — it is how you stop a user from injecting a system-role marker.
+  </Accordion>
+  <Accordion title="Interview questions (junior / mid / senior)">
+  - **Junior:** "What is a token and why do we use them instead of words?"
+  - **Mid:** "Our summarisation cost is 3× higher for our German customers. Walk me through how you would confirm the cause and what you would do about it."
+  - **Senior:** "You are choosing the vocabulary size for a 1B-parameter model that will serve English, Arabic and Python. Give me your decision, the arithmetic behind it, and the experiment you would run to check it."
+  </Accordion>
+  <Accordion title="Draw it from memory">
+  Reproduce the merge-table build-up for the string `low lower lowest` through three merges,
+  showing the pair counts at each step, and finish with how `lowest` is segmented at the end.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Model never stops generating; every response hits `max_tokens` | Stop token written as literal text instead of emitted as its special ID | Use `tok.apply_chat_template(...)`; assert the stop token ID is present in `input_ids` |
+| `encode`/`decode` round-trip fails on some inputs | `encode` applies merges in frequency order instead of learned order | Select merges by `self.merges[pair]` index, lowest first |
+| API rejects a payload your validator accepted | Length checked in characters, not tokens | Validate with `len(enc.encode(text))` |
+| Fine-tuned model outputs garbage after a library upgrade | Tokenizer pulled from repo `main`, weights pinned | Pin `revision=` on both; assert `tok.vocab_size == model.config.vocab_size` |
+| Prompt "works in the playground, fails in prod" | Playground applies the chat template; your code concatenates strings | Log `repr()` of the exact string sent, diff it against `apply_chat_template` output |
+| Token counts drift from the API's `usage` by 3–7 | Template and role overhead not counted client-side | Expected. Budget with a 5% margin; never assert equality |
+| Non-Latin text decodes with U+FFFD replacement characters | Decoding a truncated ID list that splits a multi-byte character | Decode with `errors="replace"` for display, and truncate on token boundaries not byte counts |
+
+## Sources & further reading
+
+**Primary docs**
+- [`tiktoken` 0.7.0](https://github.com/openai/tiktoken) — read `README.md` for the encoding names and which model uses which table.
+- [HF `tokenizers` 0.19.1 quicktour](https://huggingface.co/docs/tokenizers) — read it for `Tokenizer.train_from_iterator`, the only sane way to train on a corpus that does not fit in RAM.
+- [`transformers` 4.44.2 chat templating](https://huggingface.co/docs/transformers/chat_templating) — read it before you ever hand-build a prompt string.
+
+**Papers**
+- [Sennrich et al. 2016 (BPE)](https://arxiv.org/abs/1508.07909) — *subword units give open-vocabulary translation with a fixed table*; §3.2 is the algorithm.
+- [Kudo & Richardson 2018 (SentencePiece)](https://arxiv.org/abs/1808.06226) — *tokenization as a lossless, language-agnostic artifact*; §3.1 on whitespace escaping.
+- [Petrov et al. 2023 (tokenizer unfairness)](https://arxiv.org/abs/2305.15425) — *the same content costs up to 15× more tokens in some languages*; Figure 1.
+
+**Go deeper**
+- [Karpathy, "Let's build the GPT Tokenizer" (2 h video) + the `minbpe` repo](https://www.youtube.com/watch?v=zduSFxRajkE) — the single best hour available on this topic; watch to the `regex.py` section, then close it and write your own before watching the rest.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-25/p4-w25-m1">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,719 @@
+---
+title: "The network stack"
+description: "Week 10 · Module 1 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 10 · Module 1 · `P2-W10-M1`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Week 5 (HTTP as a client), Week 9 Module 4 (latency intuition — you know what 100 ns
+  and 100 µs feel like; now meet 20 ms).
+- **Unlocks:** `P2-W10-M2` (TCP), `P2-W10-M3` (sockets), and Week 24 (Kubernetes networking is this
+  module with more indirection).
+- **One-line:** after this you can follow one packet from your laptop to a server and back, name
+  every header it passes through, and account for every millisecond of a page load.
+
+## What you'll be able to do
+
+1. Name the four layers that matter and what each one adds to a packet.
+2. Read an IP address, a subnet mask and a routing decision, and say why NAT breaks peer-to-peer.
+3. Use `dig`, `ping`, `traceroute` and `ss`/`netstat` to localise a network problem to one hop.
+4. Break a real HTTPS request into DNS, TCP, TLS and request phases with measured milliseconds.
+5. Explain what a CDN and anycast actually change, using your own traceroute as evidence.
+
+## Why you should care
+
+**Aarav (student).** "What happens when you type a URL and press enter?" is the most-asked systems
+interview question in existence, and almost everyone answers it as a memorised list. After this
+module you answer it with your own measurements: 4 ms of DNS, 23 ms for the TCP handshake, 32 ms for
+TLS, 32 ms for the request — and you can say which of those you could remove and how.
+
+**Meera (working professional).** Most "the API is slow" tickets are not slow code. They are DNS
+misconfiguration, a missing keep-alive, a TLS handshake on every request, or a load balancer adding a
+hop. This module gives you the four commands that localise the problem in under two minutes, and the
+mental model that tells you which of them to run first.
+
+## The mental model
+
+A packet is a set of nested envelopes. Each layer wraps the layer above it, adds a header with
+exactly the information that layer needs, and hands it down. On the way back up, each layer strips
+its own header and passes the contents to the layer above.
+
+```
+[ Ethernet | IP | TCP | TLS | HTTP | your JSON ]
+  ^ which     ^ which  ^ which  ^ encrypted  ^ which
+   machine     host     process   payload      resource
+   on this     on the   on that
+   wire        internet host
+```
+
+Every layer answers exactly one question and knows nothing about the others. Ethernet does not know
+what an IP address is. IP does not know what a port is. TCP does not know what HTTP is. That strict
+ignorance is what let the internet be extended for fifty years without rewriting anything.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p2-w10-m1.svg" alt="Hand-drawn sketch: the network stack" className="block dark:hidden" />
+  <img src="/assets/diagrams/p2-w10-m1-dark.svg" alt="Hand-drawn sketch: the network stack" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p2-w10-m1
+tier: T2
+one-sentence-goal: Each layer wraps the one above it, answers exactly one question, and knows nothing about the others.
+elements:
+  - left column: nested rectangles drawn as envelopes inside envelopes, outermost Ethernet, then IP, then TCP, then TLS, then HTTP, then a small scrap of JSON in the middle
+  - beside each envelope, hand-written: the ONE question it answers - Ethernet "which machine on this wire?", IP "which host on the internet?", TCP "which process, and did it all arrive?", TLS "who am I really talking to?", HTTP "which resource?"
+  - byte counts written in the margin: Ethernet 14 B, IP 20 B, TCP 20 B, so 54 B of header before a single byte of payload
+  - circle "1500" beside the Ethernet envelope with amber note "MTU. Bigger than this and it fragments."
+  - right column: a real timeline drawn as a horizontal bar broken into segments with hand-written ms: DNS 4, TCP 23, TLS 32, request+response 32, total 89
+  - red cross-out over a segment labelled "TLS" in a second, lower bar, with "keep-alive: reuse the connection, this segment disappears" in amber
+  - a small map sketch bottom-right: 7 numbered hops from a home router to a CDN edge, with 3 ms, 8 ms, ... 20 ms written on them, and "anycast: the 'server' is 20 ms away, not 200" circled
+  - dangling arrow: "...and what happens if a packet is lost? -> Module 2"
+numbers-to-write-in: 54 bytes of header overhead; MTU 1500; measured DNS 1.9-6.9 ms, TCP handshake 22.6 ms, TLS 1.3 handshake 32.5 ms, TTFB 88.7 ms; 7 hops to a Cloudflare edge at 20.3 ms
+alt: A whiteboard sketch showing a packet drawn as nested envelopes labelled Ethernet, IP, TCP, TLS and HTTP with the single question each layer answers written beside it and the header sizes in the margin, next to a measured timeline of a real HTTPS request broken into DNS, TCP, TLS and request segments, and a small traceroute map of seven hops to a CDN edge.
+*/}
+
+<Tabs>
+
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The words, defined
+
+- **Packet** — a chunk of data with headers, sent across a network as one unit.
+- **Header** — a small fixed block of fields at the front of a packet, added by one layer.
+- **Payload** — everything after the header. To the layer below, it is opaque bytes.
+- **Protocol** — an agreed format and set of rules. "IP" is a protocol; so is "HTTP".
+- **MAC address** — a 48-bit identifier burnt into a network interface, like `a4:83:e7:1c:9d:0f`.
+  Unique to the hardware, meaningful only on the local wire.
+- **IP address** — a 32-bit (IPv4) or 128-bit (IPv6) address identifying a host on the internet, like
+  `104.20.23.154`. Assigned by the network, not the hardware.
+- **Port** — a 16-bit number identifying which *program* on a host should receive the data. Web
+  servers usually listen on 443.
+- **Socket** — the pair (IP address, port) at each end. A connection is identified by four things:
+  source IP, source port, destination IP, destination port.
+- **MTU** — Maximum Transmission Unit, the largest packet a link will carry. Almost always 1500 bytes
+  on Ethernet.
+
+### The four layers that matter
+
+You will see "the OSI seven-layer model" in textbooks. In practice four layers do the work:
+
+| Layer | Protocol | Answers | Header size |
+|---|---|---|---|
+| Link | Ethernet, Wi-Fi | "which machine on this local wire?" | 14 bytes |
+| Internet | IP | "which host, anywhere on Earth?" | 20 bytes (IPv4) |
+| Transport | TCP, UDP | "which program, and did it all arrive?" | 20 bytes (TCP), 8 (UDP) |
+| Application | HTTP, DNS, SSH | "what do you actually want?" | varies |
+
+Adding those up: **54 bytes of header before a single byte of your data**, on a 1500-byte packet.
+That is 3.6% overhead — the price of the whole system, and it is cheap.
+
+### Following one packet
+
+You type `https://example.com` and press enter. Here is what actually happens, in order:
+
+1. **DNS.** Your machine does not know what `example.com` means. It asks a DNS resolver — usually
+   your router or your ISP — "what is the IP address for example.com?" The answer comes back:
+   `104.20.23.154`. This takes one or more round trips, unless it is already cached.
+2. **Routing decision.** Your machine compares the destination IP against its own subnet. If the
+   destination is on the same local network it sends directly; otherwise it sends to the **default
+   gateway** (your router). It looks up the gateway's MAC address using ARP.
+3. **The packet is built, inside out.** HTTP request → wrapped in TLS → wrapped in TCP with source
+   port (a random high number like 54321) and destination port 443 → wrapped in IP with your address
+   and `104.20.23.154` → wrapped in Ethernet with your MAC and the router's MAC.
+4. **Hop by hop.** Your router strips the Ethernet header, looks at the IP header, decides which
+   interface leads towards `104.20.23.154`, writes a *new* Ethernet header for the next link, and
+   forwards. Every router on the path does this. **The Ethernet header is rewritten at every hop;
+   the IP header is not.** That is the difference between the two layers, in one sentence.
+5. **Arrival.** The destination host sees its own IP, strips the IP header, sees port 443, hands the
+   payload to whatever process is listening there.
+6. **Back again.** Same journey in reverse, using the source address and port from the request.
+
+### Do it yourself, right now
+
+Four commands. Run them and read your own output — the numbers below are from a home broadband
+connection in India, and yours will differ.
+
+```bash
+# 1. What IP does this name resolve to, and how long did it take?
+dig example.com
+
+# 2. Is the host reachable, and what is the round-trip time?
+ping -c 5 example.com
+
+# 3. What path do packets take?
+traceroute example.com
+
+# 4. Where does the time actually go?
+curl -s -o /dev/null -w \
+  'dns=%{time_namelookup} conn=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}\n' \
+  https://example.com
+```
+
+Real output from `dig`, run three times in a row:
+
+```
+;; Query time: 87 msec      <- cold: the resolver had to ask upstream
+;; Query time: 6 msec       <- warm: cached
+;; Query time: 4 msec       <- warm
+```
+
+That is caching, visible in one command. The first query walked up the DNS hierarchy; the next two
+were answered from the resolver's memory. A 87 ms → 4 ms difference, or **21×**, from a cache you
+did not know you were using.
+
+Real `traceroute` output:
+
+```
+traceroute to example.com (104.20.23.154), 8 hops max
+ 1  192.168.1.1                                  3.067 ms   <- my router
+ 2  abts-ap-static-1.16.230.223.airtelbroadband.in  8.391 ms <- ISP edge
+ 3  59.144.94.157                                96.922 ms
+ 4  116.119.33.230                               23.798 ms
+ 5  182.79.223.13                                22.710 ms
+ 6  162.158.226.71                               24.427 ms   <- Cloudflare network
+ 7  104.20.23.154                                20.311 ms   <- destination
+```
+
+Seven hops, 20 ms. Two things to notice. **Hop 3 shows 96 ms while hop 7 shows 20 ms** — later hops
+are not slower than earlier ones. Routers deprioritise generating the ICMP replies that traceroute
+depends on, so a high number at one hop usually means "that router is busy answering traceroutes",
+not "the path is slow there". Only the *last* hop's time is a real measurement of the path.
+
+And **20 ms to reach `example.com` from India** is far too fast for a server in the United States —
+light takes about 60 ms round trip to cross that distance in fibre. The explanation is in Layer 2.
+
+### The `curl` breakdown
+
+```
+dns=0.001931 conn=0.024536 tls=0.056983 ttfb=0.088657 total=0.088757
+```
+
+These are cumulative, so subtract to get each phase:
+
+| Phase | Cumulative | This phase | What it is |
+|---|---|---|---|
+| DNS | 1.9 ms | **1.9 ms** | cached lookup |
+| TCP connect | 24.5 ms | **22.6 ms** | the three-way handshake — one round trip |
+| TLS | 57.0 ms | **32.5 ms** | TLS 1.3 handshake — about one and a half round trips |
+| First byte | 88.7 ms | **31.7 ms** | send the request, wait one round trip, first byte back |
+| **Total** | **88.8 ms** | | |
+
+Look at what dominates: **three round trips of about 22 ms each**, and almost no time spent doing
+anything. The server's own processing is a rounding error. This is the single most important fact
+about network performance — you are almost always paying for round trips, not for work.
+
+### Guided practice
+
+Given `192.168.1.37` with subnet mask `255.255.255.0`:
+
+1. Which part is the network and which is the host?
+2. Is `192.168.1.200` on the same network?
+3. Is `192.168.2.5`?
+4. What does the machine do with a packet for `104.20.23.154`?
+
+<Accordion title="Answers">
+
+1. The mask has 24 bits set (`255.255.255` = 24 ones), written `/24`. So the first 24 bits —
+   `192.168.1` — are the network, and the last 8 bits — `.37` — identify the host. That leaves 256
+   addresses, of which 254 are usable (`.0` is the network address and `.255` the broadcast address).
+2. Yes. `192.168.1.200` shares the first 24 bits. The machine sends it directly on the local wire,
+   using ARP to find its MAC address.
+3. No. `192.168.2.5` differs in the third octet, so it is a different network.
+4. Not local, so the packet goes to the **default gateway** — the router — wrapped in an Ethernet
+   frame addressed to the *router's* MAC but with the *destination's* IP in the IP header. The router
+   then repeats the decision.
+
+The machine performs this test with a bitwise AND, which you built in Week 9:
+`ip AND mask == network`. Subnetting is the ALU's `And16`, applied to addresses.
+
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+<Accordion title="1. Why does a MAC address exist if we already have IP addresses?">
+Because IP is an end-to-end abstraction and Ethernet is a local one. On each physical link the
+packet must be addressed to the *next* device, which is usually not the final destination. The
+Ethernet header is rewritten at every hop; the IP header travels unchanged.
+</Accordion>
+<Accordion title="2. What identifies a TCP connection uniquely?">
+The 4-tuple: source IP, source port, destination IP, destination port. Two browser tabs to the same
+server differ only in source port, and that is enough.
+</Accordion>
+<Accordion title="3. Your traceroute shows 96 ms at hop 3 and 20 ms at hop 7. Is hop 3 slow?">
+No. Routers rate-limit and deprioritise the ICMP responses traceroute relies on, so intermediate
+times reflect the router's control-plane load, not the forwarding path. Only the final hop is a
+trustworthy latency measurement.
+</Accordion>
+<Accordion title="4. Why is the total header overhead 54 bytes and why does that matter?">
+14 (Ethernet) + 20 (IPv4) + 20 (TCP). On a 1500-byte MTU that is 3.6% overhead for a full packet —
+negligible. On a 1-byte payload it is 5400% overhead, which is why chatty protocols that send tiny
+messages are so inefficient, and why Nagle's algorithm exists (Module 2).
+</Accordion>
+<Accordion title="5. Your page loads in 89 ms of which 87 ms is round trips. What is the highest-leverage fix?">
+Remove round trips, not milliseconds of processing. Reuse the connection (keep-alive removes the TCP
+and TLS handshakes entirely on subsequent requests), or move the server closer (a CDN removes
+distance). Optimising server code here would target 2 ms out of 89.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### Addressing, subnets and CIDR
+
+CIDR notation `10.2.0.0/16` means "the first 16 bits are the network". The arithmetic you need:
+
+| Prefix | Mask | Addresses | Usable hosts | Typical use |
+|---|---|---|---|---|
+| `/8` | 255.0.0.0 | 16,777,216 | 16,777,214 | a whole private range |
+| `/16` | 255.255.0.0 | 65,536 | 65,534 | a VPC |
+| `/24` | 255.255.255.0 | 256 | 254 | a subnet, an office LAN |
+| `/28` | 255.255.255.240 | 16 | 14 | a small subnet |
+| `/32` | 255.255.255.255 | 1 | 1 | a single host (firewall rules) |
+
+RFC 1918 reserves three private ranges that are never routed on the public internet:
+`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`. Plus `100.64.0.0/10` (RFC 6598) for carrier-grade
+NAT, and `127.0.0.0/8` for loopback.
+
+The practical failure this causes: **overlapping private ranges.** If your VPC uses `10.0.0.0/16`
+and the company you are peering with also uses `10.0.0.0/16`, the networks cannot be joined without
+NAT or renumbering. Pick an unusual `/16` inside `10/8` on day one; it costs nothing then and is
+expensive later.
+
+### NAT, and why peer-to-peer is hard
+
+Network Address Translation lets many hosts behind one public IP share it. The router rewrites the
+source IP and port on the way out, records the mapping, and reverses it on the way back.
+
+Consequences you will actually hit:
+
+- **Inbound connections are impossible by default.** There is no mapping until an outbound packet
+  creates one. This is why every peer-to-peer system — WebRTC, BitTorrent, VPN mesh products —
+  needs STUN (discover your public mapping), TURN (relay through a server when you cannot connect
+  directly), or ICE (try everything and pick what works). TURN relaying is the fallback and it costs
+  real bandwidth: for a video call it is the entire stream.
+- **Mappings expire.** Typical NAT UDP mapping timeouts are 30–120 seconds; TCP mappings often
+  survive for minutes to hours. This is the reason for keep-alive pings on long-lived connections,
+  and the reason a WebSocket that sends nothing for two minutes silently dies.
+- **Symmetric NAT breaks hole-punching.** If the router assigns a *different* external port per
+  destination, the port your peer learned from STUN is not the one they can reach you on. Roughly
+  8–20% of real-world networks fall in this category, which is why TURN is mandatory rather than
+  optional in production WebRTC.
+
+### DNS is a distributed cache with a lookup path
+
+Resolving `api.example.com` from cold walks a hierarchy:
+
+1. **Stub resolver** on your machine checks its cache and `/etc/hosts`.
+2. **Recursive resolver** (your router, ISP, or `1.1.1.1` / `8.8.8.8`) checks its cache.
+3. If cold, it asks a **root server** — "who handles `.com`?"
+4. Then the **TLD server** — "who handles `example.com`?"
+5. Then the **authoritative server** for `example.com` — "what is `api.example.com`?"
+
+Each step is cached, with a TTL chosen by the zone owner. Measured on a home connection:
+
+| Query | Time |
+|---|---|
+| Cold (`example.com`, first query) | 87 ms |
+| Warm (resolver cache hit) | 4–6 ms |
+| Novel subdomain (forces a query to the authoritative server) | 26 ms |
+
+The operational lesson is in the TTL. A 300-second TTL means a failover takes up to five minutes to
+propagate, plus however long clients cache beyond that — and many do, incorrectly. A 60-second TTL
+gives faster failover for roughly 5× the query volume on your authoritative servers. Before a planned
+migration, lower the TTL 24–48 hours ahead; that is the standard runbook step people forget.
+
+Java deserves a specific warning: the JVM historically cached successful DNS lookups **forever**
+(`networkaddress.cache.ttl = -1` under a security manager). A JVM service that resolved a database
+endpoint at startup would keep using the dead IP after a failover, indefinitely. Set
+`networkaddress.cache.ttl=30` explicitly in any long-running JVM service.
+
+### MTU and fragmentation
+
+Ethernet's MTU is 1500 bytes. An IP packet larger than the MTU of a link must be fragmented, and
+fragments are reassembled only at the destination. Modern practice is to avoid fragmentation
+entirely: IPv6 forbids in-network fragmentation, and TCP uses **Path MTU Discovery** — send with the
+"don't fragment" bit set and shrink when an ICMP "fragmentation needed" comes back.
+
+Which produces the classic **PMTU black hole**: a middlebox or firewall drops the ICMP messages,
+so the sender never learns to shrink, and packets above a certain size vanish. Signature: the TCP
+handshake succeeds, small requests work, and anything over roughly 1400 bytes hangs. This is very
+common on VPN and tunnel links, where encapsulation reduces the effective MTU (a WireGuard tunnel
+typically leaves ~1420 bytes; GRE ~1476; an IPsec tunnel ~1400 or less).
+
+Diagnosis, on macOS or Linux:
+
+```bash
+# Send a 1472-byte payload (= 1500 with 28 bytes of IP+ICMP header), don't fragment
+ping -D -s 1472 example.com      # macOS
+ping -M do -s 1472 example.com   # Linux
+# then binary-search downward until it succeeds
+```
+
+If 1472 fails and 1372 succeeds, your path MTU is around 1400 and something is eating the ICMP.
+Fix by clamping MSS on the tunnel (`iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN
+-j TCPMSS --clamp-mss-to-pmtu`) or lowering the interface MTU.
+
+### The diagnostic toolkit, in the order you should use it
+
+| Symptom | Command | What it tells you |
+|---|---|---|
+| "Is it DNS?" | `dig +trace name` | The full resolution path and which server answered |
+| "Is the host up?" | `ping -c 5 host` | Reachability and RTT, if ICMP is not blocked |
+| "Where does it break?" | `traceroute -n host` or `mtr host` | The last hop that responds |
+| "Is the port open?" | `nc -zv host 443` | Whether a TCP connection completes |
+| "What is my machine doing?" | `ss -tanp` (Linux) / `netstat -an -p tcp` (macOS) | Connection states, listen queues, TIME_WAIT counts |
+| "Where does the time go?" | `curl -w` with the timing template | Phase-by-phase breakdown |
+| "What is actually on the wire?" | `tcpdump -i any -n port 443 -w cap.pcap` then Wireshark | Ground truth |
+
+Run them in that order. Roughly 60–70% of "network" incidents in practice resolve at steps 1 or 2,
+and reaching for Wireshark first costs an hour.
+
+### Trade-offs
+
+| Decision | Choose this when… | Choose the other when… | The number |
+|---|---|---|---|
+| **Low DNS TTL (30–60 s)** vs **high (3600 s)** | You need fast failover or frequent IP changes | Query volume or resolver cost matters, and endpoints are stable | 60 s TTL vs 3600 s is up to 60× the query load on your authoritative servers |
+| **Connection reuse (keep-alive)** vs **new connection per request** | Almost always | You genuinely need connection-level isolation | Removes ~55 ms of the measured 89 ms request — TCP handshake plus TLS handshake |
+| **Public IP per service** vs **NAT / load balancer** | You need inbound reachability | You want fewer addresses and a single security boundary | NAT costs a mapping table entry per flow and makes P2P need STUN/TURN in 8–20% of networks |
+| **IPv6** vs **IPv4-only** | Mobile networks, large internal address space, avoiding CGNAT | Legacy peers, simple firewall rules | IPv6 has no in-network fragmentation and no NAT, which removes an entire failure class |
+
+### What breaks in the real world
+
+A team migrated a Postgres primary to a new host by updating a CNAME with a 60-second TTL. Most
+services picked up the change within two minutes. One JVM service kept writing to the old host for
+eleven hours, until someone restarted it.
+
+The cause was the JVM's DNS caching: with the default security settings, successful lookups were
+cached for the life of the process. The service had resolved the endpoint once at startup, and there
+was no mechanism to make it look again. The connection pool held open TCP connections to an IP that
+the DNS record no longer pointed at — and because the old host was still running, nothing errored.
+Split-brain writes for eleven hours.
+
+Three fixes, all necessary: set `networkaddress.cache.ttl=30`, have the connection pool cycle
+connections on a max-lifetime (typically 30 minutes), and — the one that actually catches it —
+alert on write traffic to a host that is no longer the DNS target.
+
+### Design checkpoint
+
+<Accordion title="An internal API measures 210 ms p50 from a service in the same region. The server reports 4 ms of processing. Where is the time, and how do you find out in five minutes?">
+
+206 ms is unaccounted for, and at ~1 ms of intra-region RTT that is far too much for round trips
+alone. Work the phases in order with a single command:
+
+```bash
+curl -s -o /dev/null -w \
+ 'dns=%{time_namelookup} conn=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer}\n' \
+ https://internal-api/health
+```
+
+The four likely answers, and what each looks like:
+
+1. **DNS is slow or misconfigured.** `time_namelookup` is 100 ms+. Common cause: a search-domain
+   list that tries five suffixes before the right one, or an IPv6 AAAA lookup timing out before
+   falling back to IPv4. In Kubernetes this is the classic `ndots:5` problem — every internal name is
+   tried against five search domains first, turning one lookup into six.
+2. **No connection reuse.** `time_connect` and `time_appconnect` are non-zero on *every* request. The
+   client is not pooling. In Python, a bare `requests.get()` per call does exactly this; a
+   `requests.Session()` fixes it.
+3. **The load balancer adds a hop with its own connection setup.** Compare `curl` direct to the pod
+   against `curl` through the LB.
+4. **Server-side queueing that the server's own metric excludes.** "4 ms of processing" often means 4
+   ms in the handler, excluding time in the accept queue. Check `ss -ltn` for a growing `Recv-Q` on
+   the listening socket — that is the backlog, and it is where hidden latency lives.
+
+Ordering matters: check DNS first because it is the cheapest to test and the most common. In
+Kubernetes environments specifically, `ndots` and connection reuse together account for the majority
+of these tickets.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim carries a measured or cited number. Measurements here were taken on a residential
+broadband connection in India (Airtel), macOS 26.2, `curl` 8.x, against `example.com` behind
+Cloudflare. Yours will differ — run them.
+</Warning>
+
+### Reading the actual bytes
+
+Capture and inspect:
+
+```bash
+sudo tcpdump -i any -n -s 0 -w cap.pcap 'host example.com and port 443'
+curl -s https://example.com > /dev/null
+# then: wireshark cap.pcap   (or: tshark -r cap.pcap -V)
+```
+
+An IPv4 header, field by field, as it appears in the first 20 bytes:
+
+| Offset | Field | Size | What it does |
+|---|---|---|---|
+| 0 | Version + IHL | 1 B | `0x45` = IPv4, 5 words (20 bytes) of header |
+| 1 | DSCP + ECN | 1 B | QoS class; ECN bits used by congestion control (Module 2) |
+| 2 | Total length | 2 B | Header + payload, max 65,535 |
+| 4 | Identification | 2 B | Groups fragments of one datagram |
+| 6 | Flags + fragment offset | 2 B | The "don't fragment" bit lives here |
+| 8 | TTL | 1 B | Decremented per hop; at 0 the packet is dropped and ICMP sent — this is how traceroute works |
+| 9 | Protocol | 1 B | 6 = TCP, 17 = UDP, 1 = ICMP |
+| 10 | Header checksum | 2 B | Header only, recomputed at every hop |
+| 12 | Source address | 4 B | |
+| 16 | Destination address | 4 B | |
+
+TTL is worth dwelling on. Traceroute works by sending packets with TTL = 1, 2, 3… Each router that
+decrements TTL to zero drops the packet and sends back an ICMP "time exceeded", revealing its
+address. That is the entire mechanism — a diagnostic tool built out of a loop-prevention counter.
+
+In a TLS 1.3 capture you can read: the TCP handshake in the clear, the ClientHello (with SNI — the
+hostname — **in plaintext**, which is how corporate filters and censors block by domain despite
+encryption), the ServerHello, and then nothing but encrypted records. Encrypted Client Hello (ECH)
+is the standard that closes the SNI leak, and its deployment is still partial.
+
+### Anycast and CDNs: why example.com is 20 ms away
+
+The traceroute above reached `104.20.23.154` in **20.3 ms from India**. The speed of light in fibre
+is about 200,000 km/s, so a round trip to the US west coast (~13,000 km each way) has a hard floor
+around 130 ms. 20 ms means the machine that answered is roughly 2,000 km away at most — it is not in
+the United States.
+
+**Anycast** is the mechanism: the same IP address is announced via BGP from many locations, and each
+network's routing takes packets to the topologically nearest announcement. `1.1.1.1`, `8.8.8.8`, the
+DNS root servers and most large CDN edges all work this way. From the client's perspective there is
+one address; physically there are hundreds of machines.
+
+What this buys, in numbers you can verify:
+
+| | Origin in us-east-1, client in Mumbai | CDN edge in Mumbai |
+|---|---|---|
+| RTT | ~200–250 ms | ~5–25 ms |
+| TCP handshake | 1 RTT ≈ 220 ms | 1 RTT ≈ 20 ms |
+| TLS 1.3 handshake | 1 RTT ≈ 220 ms | 1 RTT ≈ 20 ms |
+| First byte (cached object) | ~660 ms | ~60 ms |
+| First byte (cache miss, edge→origin) | ~700+ ms | ~450 ms (edge keeps a warm connection to origin) |
+
+Even on a cache *miss* the CDN wins, because the expensive handshakes happen over a short local hop
+and the edge-to-origin connection is already established and warm. That is often more than half the
+benefit, and it is the part people forget when they say "we don't need a CDN, our content is
+dynamic".
+
+### DNS at scale: the resolution path's hidden costs
+
+- **`ndots` in Kubernetes.** The default `/etc/resolv.conf` in a pod has `search` with several
+  domains and `options ndots:5`. Any name with fewer than five dots — which is nearly all of them,
+  including `api.example.com` — is first tried with every search suffix appended. One logical lookup
+  becomes 4–6 actual queries, doubled again if the resolver does A and AAAA in parallel. Measured
+  impact in reported cases: tens of thousands of extra QPS against CoreDNS, and p99 latency
+  regressions of 50–100 ms on services that resolve per request. Fixes: a trailing dot on fully
+  qualified names (`api.example.com.`), `dnsConfig` with `ndots:1`, or NodeLocal DNSCache.
+- **Negative caching matters as much as positive.** SOA-driven negative TTLs control how long
+  NXDOMAIN is remembered. Too long and a newly created record is invisible; too short and a typo'd
+  hostname hammers your authoritative servers.
+- **DNS-based load balancing is coarse.** Clients cache, respect TTLs unevenly, and a single resolver
+  can front thousands of users. It cannot do per-request balancing, health-based ejection within a
+  TTL, or session affinity. Use it for coarse geo-steering and failover; use a real load balancer or
+  service mesh for anything finer.
+
+### Production failure modes
+
+| Failure | Signature | Detection |
+|---|---|---|
+| **PMTU black hole** | Handshake fine, small requests fine, anything over ~1400 bytes hangs | `ping -D -s N` binary search; fix with MSS clamping |
+| **Asymmetric routing through a stateful firewall** | Connections establish then stall; one direction's packets never seen at the far end | `tcpdump` on both ends simultaneously; compare what each side sends versus receives |
+| **Stale JVM DNS cache** | Traffic continues to a decommissioned IP after a DNS change | `networkaddress.cache.ttl=30`; alert on connections to non-current DNS targets |
+| **`ndots:5` amplification** | CoreDNS CPU spikes; p99 latency correlates with DNS QPS | Count queries per resolution; use FQDNs with trailing dots or `ndots:1` |
+| **Happy Eyeballs timeout** | A consistent extra ~250–300 ms on some clients only | The host has a broken IPv6 path; the client waits before falling back. Fix the AAAA record or the IPv6 route |
+| **Ephemeral port exhaustion** | `EADDRNOTAVAIL` under load; connections fail while CPU is idle | `ss -s`; the default range is ~28,000 ports on Linux. Widen it, or reuse connections |
+
+### Frontier and further pointers
+
+- **RFC 791 (IPv4), RFC 8200 (IPv6), RFC 1035 (DNS).** Takeaway: the header layouts and semantics you
+  will read in Wireshark are specified here and essentially unchanged since 1981 for IPv4 — the
+  packet format outlived every operating system it was designed for.
+- **Mockapetris (1987), "Development of the Domain Name System," SIGCOMM.** Takeaway: DNS's hierarchy
+  and aggressive caching were chosen specifically so that no single machine has to know or serve
+  everything, which is why a 40-year-old design still carries the whole internet's name traffic.
+- **RFC 8305, "Happy Eyeballs Version 2."** Takeaway: dual-stack clients should race IPv4 and IPv6
+  connections with a short head start for IPv6 rather than waiting for one to time out — the reason
+  a broken AAAA record costs 250 ms rather than 75 seconds.
+- **Calder et al. (2015), "Analyzing the Performance of an Anycast CDN," IMC.** Takeaway: anycast
+  routing sends a measurable minority of clients to a suboptimal edge (BGP optimises for policy, not
+  latency), so real CDNs combine anycast with DNS-based steering and measurement.
+
+### Stretch challenge
+
+Build a **latency budget** for a real service you use, from packet capture, and then reduce it.
+
+1. Capture a complete cold page load with `tcpdump`. Extract from the capture: number of DNS queries,
+   number of TCP connections opened, number of TLS handshakes, and total bytes.
+2. Attribute every millisecond of wall-clock time to one of: DNS, TCP handshake, TLS handshake,
+   request/response round trips, server processing, transfer time. The categories must sum to the
+   total — any remainder is something you have not understood yet, and that remainder is the
+   interesting part.
+3. Now compute the theoretical floor: given the measured RTT, what is the minimum possible time for
+   this page? (Count the mandatory serial round trips.)
+4. Propose three changes and predict the saving of each before testing: connection reuse, HTTP/2 or
+   HTTP/3, TLS session resumption, DNS prefetch, moving a resource to a CDN. Then test at least one
+   and report the error in your prediction.
+
+There is no single right answer. The valuable artefact is the table where predicted and measured
+disagree, and your account of why.
+
+</Tab>
+
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Capture a full TLS-terminated HTTPS request with `tcpdump`, open it in Wireshark, and annotate it at
+the byte level: the TCP handshake, the ClientHello (find the SNI in plaintext), the ServerHello, and
+where the encrypted records begin. Then produce your own version of the `curl` phase table.
+</Card>
+
+Deliverable: a `.pcap` file plus a one-page annotation identifying, with byte offsets, the Ethernet,
+IP and TCP headers of the first data packet; the SNI string; and the point at which you can no longer
+read anything. Then explain in two sentences why the SNI is readable when everything after it is not.
+
+## The whiteboard
+
+<Tip>
+**Draw it yourself.** Draw the nested-envelope diagram with the single question each layer answers,
+the header sizes in the margin, and then the measured request timeline underneath with your own
+numbers on it. Then draw the same timeline for a *second* request over a reused connection.
+[Blank version](/assets/diagrams/p2-w10-m1-blank.svg) · [Editable source](/assets/diagrams/p2-w10-m1.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Instrumented a full HTTPS request at the packet level: captured with `tcpdump`,
+annotated Ethernet/IP/TCP headers by byte offset in Wireshark, and produced a measured latency budget
+(DNS 1.9 ms, TCP handshake 22.6 ms, TLS 1.3 handshake 32.5 ms, request round trip 31.7 ms) showing
+that 98% of the 89 ms was round trips rather than processing."
+
+**The interview answer this earns you:** when asked "what happens when you type a URL", do not
+recite the list. Say "let me give you the measured version" and walk the four phases with numbers,
+then say which you would remove and how much it would save. That reframes a recall question into a
+performance-engineering answer.
+
+**Bonus credit:** explain why `example.com` answered in 20 ms from India. Anycast is a concept most
+candidates have heard of and very few can demonstrate with their own traceroute.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Audit connection reuse in one client this week.** Find any HTTP client in your codebase that
+creates a new connection per call — `requests.get()` without a `Session`, a new `HttpClient` per
+request in .NET, a new `axios` instance per call. Each one is paying a TCP plus TLS handshake every
+time. On a 20 ms RTT that is ~55 ms per request, thrown away.
+
+**2. Write down your DNS TTLs before you need them.** For every endpoint your service resolves,
+record the TTL and the client-side cache behaviour. Do it now, not during the migration. And set
+`networkaddress.cache.ttl` explicitly on every JVM service.
+
+**3. Add the four-command triage to your runbook.** `dig`, `ping`, `curl -w`, `ss -tanp`. When
+someone says "the network is slow", these four commands in that order will localise it faster than
+any dashboard, and they work when the dashboard is the thing that is down.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| High latency blamed on an intermediate traceroute hop | Routers deprioritise ICMP replies | Only the final hop's RTT is meaningful; use `mtr` and read loss, not latency, at intermediate hops |
+| "The API is slow" but the server reports fast handling | Time is in DNS, handshakes, or the accept queue | `curl -w` phase breakdown first; then `ss -ltn` for a growing `Recv-Q` |
+| Small requests work, large ones hang | PMTU black hole on a tunnel | `ping -D -s N` to find the real MTU; clamp MSS |
+| Service uses a decommissioned IP for hours | Client-side DNS cache with an infinite TTL | Set an explicit TTL; cycle pooled connections on a max lifetime |
+| Sporadic extra ~250 ms on some clients | Broken IPv6 path, Happy Eyeballs fallback | Fix or remove the AAAA record; test with `curl -4` versus `curl -6` |
+| Kubernetes service does thousands of DNS queries per second | `ndots:5` plus a non-FQDN name | Use a trailing dot, set `ndots:1`, or deploy NodeLocal DNSCache |
+| Connections fail under load with idle CPU | Ephemeral port exhaustion or `TIME_WAIT` accumulation | `ss -s`; widen the port range, enable reuse, or pool connections |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="Concept questions (8)">
+1. What does each of the four layers add, and how big is each header? *(Ethernet 14 B "which machine on this wire", IPv4 20 B "which host", TCP 20 B "which process and did it arrive", application variable.)*
+2. Which header is rewritten at every hop and which is not? *(Ethernet is rewritten per link; the IP header travels end to end with only TTL and checksum changing.)*
+3. What four values identify a TCP connection? *(Source IP, source port, destination IP, destination port.)*
+4. Why does NAT break inbound peer-to-peer connections? *(No mapping exists until an outbound packet creates one, so there is no way for an external host to address you; hence STUN, TURN and ICE.)*
+5. How does traceroute work? *(Send packets with increasing TTL; each router that decrements TTL to zero returns an ICMP time-exceeded, revealing its address.)*
+6. Why can `example.com` answer in 20 ms from India? *(Anycast: the same IP is announced from many locations and BGP routes to the nearest one; the responding machine is a nearby CDN edge, not a distant origin.)*
+7. What is a PMTU black hole and how do you detect it? *(A path where oversized packets are dropped and the ICMP "fragmentation needed" is filtered, so the sender never shrinks. Detect with a don't-fragment ping binary search.)*
+8. In an 89 ms request with 2 ms of server processing, where should you optimise? *(Round trips: reuse connections to remove the TCP and TLS handshakes, and shorten the path with a CDN.)*
+</Accordion>
+<Accordion title="Coding challenge">
+Write a `netbudget` CLI that takes a URL, performs a cold and a warm fetch, and prints a phase table
+(DNS, TCP, TLS, TTFB, transfer) with the delta between cold and warm, plus the number of round trips
+implied by the measured RTT. Hidden tests: the phases must sum to the total within 5%; the tool must
+handle a host with no AAAA record, a host that redirects, and a connection refused, without crashing.
+</Accordion>
+<Accordion title="Interview questions">
+- **Junior:** "What happens when you type a URL and press enter?" *(DNS, routing decision, packet built inside out, hop-by-hop forwarding with Ethernet headers rewritten, arrival and demultiplexing by port, response. Give the measured version with numbers.)*
+- **Mid:** "A service in the same region shows 210 ms p50 and the server says 4 ms. Walk me through your diagnosis." *(`curl -w` phase breakdown first; then DNS search-domain amplification, missing connection reuse, an extra LB hop, or accept-queue latency the server metric excludes.)*
+- **Senior:** "Design the DNS strategy for a multi-region service with a 30-second failover requirement." *(Low TTL with the cost quantified, health-checked DNS failover, plus an anycast or LB layer because DNS alone cannot guarantee client behaviour; explicit client-side cache TTLs; connection max-lifetime so pools re-resolve; and a monitor for traffic to non-current targets.)*
+</Accordion>
+<Accordion title="Draw it from memory">
+Draw the nested envelopes with header sizes, then the measured request timeline with your own
+numbers, then the same timeline for a keep-alive request. Five minutes.
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+
+- [RFC 791 (Internet Protocol), RFC 793/9293 (TCP), RFC 1035 (DNS implementation and specification).](https://www.rfc-editor.org/rfc/rfc791)
+  **Read this for:** the exact header layouts you will be matching against bytes in Wireshark, and
+  the authoritative semantics of TTL, fragmentation and DNS caching.
+- [RFC 1918 (private address allocation) and RFC 6598 (carrier-grade NAT space).](https://www.rfc-editor.org/rfc/rfc1918) **Read this for:**
+  which ranges are safe to use internally and why overlapping `10.0.0.0/16` allocations will hurt you
+  at peering time.
+- [Wireshark User's Guide, and the `tcpdump` man page.](https://www.wireshark.org/docs/wsug_html_chunked/) **Read this for:** capture filters, display
+  filters, and how to follow a TCP stream — the difference between owning the tool and poking at it.
+
+**Papers**
+
+- [P. Mockapetris, "Development of the Domain Name System," ACM SIGCOMM, 1988.](https://doi.org/10.1145/52324.52338) **Takeaway:**
+  hierarchy plus aggressive caching was a deliberate design choice so no server needs global
+  knowledge, which is why DNS scaled from thousands to billions of names unchanged.
+- [M. Calder, A. Flavel, E. Katz-Bassett, R. Mahajan and J. Padhye, "Analyzing the Performance of an
+  Anycast CDN," ACM IMC 2015.](https://doi.org/10.1145/2815675.2815717) **Takeaway:** BGP routes for policy rather than latency, so a
+  measurable fraction of anycast clients land on a suboptimal edge — real CDNs need measurement and
+  DNS steering on top of anycast.
+- [D. Wing and A. Yourtchenko, "Happy Eyeballs" (RFC 6555) and C. Schinazi and T. Pauly, "Happy
+  Eyeballs Version 2" (RFC 8305).](https://www.rfc-editor.org/rfc/rfc6555) **Takeaway:** racing IPv4 and IPv6 connection attempts with a short
+  IPv6 head start turns a broken dual-stack path from a multi-second stall into a ~250 ms penalty.
+
+**Go deeper**
+
+- [W. R. Stevens, *TCP/IP Illustrated, Volume 1: The Protocols* (2nd ed., Fall & Stevens, 2011),
+  Chapters 3–5 and 11.](https://www.informit.com/store/tcp-ip-illustrated-volume-1-the-protocols-9780321336316) **Why:** it teaches the protocols by showing packet captures, which is exactly
+  the skill this module asks for; the annotated hex dumps are the model for your lab deliverable.
+- [Julia Evans, *How DNS Works* and *Networking! ACK!* zines.](https://wizardzines.com/) **Why:** the shortest path from "I have
+  heard of DNS" to "I can debug DNS", with the specific commands and the specific failure modes,
+  including the `ndots` problem.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p2/week-10/p2-w10-m1">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

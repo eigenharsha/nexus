@@ -1,0 +1,635 @@
+---
+title: "Bash scripting & automation"
+description: "Week 2 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 2 · Module 3 · `P1-W02-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Quote shell variables correctly, every time, and explain what happens when you do not.
+2. Write a script that is safely re-runnable 100 times and provably does nothing the second time.
+3. Stop two scheduled runs from colliding, with a lock that is atomic on every filesystem.
+4. Handle `SIGTERM` so a killed script leaves no half-written files — and say why `SIGKILL` defeats you.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/P1-W02-M3.svg" alt="Hand-drawn sketch: Bash scripting & automation" className="block dark:hidden" />
+  <img src="/assets/diagrams/P1-W02-M3-dark.svg" alt="Hand-drawn sketch: Bash scripting & automation" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: P1-W02-M3
+tier: T2
+one-sentence-goal: An automated script has three enemies — bad quoting, a second copy of itself, and being killed halfway — and each has one specific defence.
+elements:
+  - centre: a hand-drawn script scroll labelled "backup.sh", with three arrows attacking it from three sides
+  - attack 1 from the left, red: 'FILE="my report.txt"; rm $FILE' with the word-split shown as two tokens "my" and "report.txt", crossed out in red; green fix written beside it: 'rm -- "$FILE"' with the quotes circled
+  - attack 2 from above, red: two clock icons "02:00 cron" and "02:00 retry" both pointing at the script, labelled "two copies, same file, torn output"; green fix: a padlock drawn as "mkdir $LOCK" with the amber note "mkdir is ATOMIC. test-then-create is a race."
+  - attack 3 from the right, red: a lightning bolt "SIGTERM at 40%" hitting the script mid-write, with a torn output file drawn below; green fix: "write to tmp -> fsync -> rename()" with the amber note "rename is atomic on the same filesystem. this is the whole trick."
+  - a red cross-out over "kill -9" with "nothing saves you from this — the handler never runs"
+  - bottom band: the idempotence test written as a hand-drawn checklist: "run 1 -> changed; run 2 -> NO CHANGE; run 3 -> NO CHANGE", with a green tick, and the amber note "if run 2 does work, it is not idempotent, it is just lucky"
+  - dangling arrow: "…and at what point does this stop being bash? -> Layer 3"
+numbers-to-write-in: fork+exec 1.29 ms · 10,000 iterations: 0.013 s builtin vs 12.863 s with an external command · exit 143 = SIGTERM, 137 = SIGKILL, 130 = Ctrl-C
+alt: A hand-drawn diagram of a shell script under attack from three directions — unquoted word splitting, a concurrent second instance, and a termination signal arriving mid-write — with the specific defence drawn beside each: quoting, an atomic mkdir lock, and write-to-temp-then-rename.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term is defined where it first appears.
+
+### The one idea
+
+A script you run by hand and a script a machine runs at 2 a.m. are different things. The interactive one only has to work while you watch it. The automated one has to work when the disk is full, when it is started twice, when it is killed halfway, and when a filename has a space in it — with nobody watching.
+
+Three defences cover most of that: **quote everything**, **make it idempotent**, and **make it interruptible without damage**.
+
+### The analogy
+
+An interactive script is a note you leave for yourself. An automated script is a set of instructions for a stranger who will follow them literally, at 2 a.m., possibly twice, and who cannot ask you questions.
+
+If your instructions say "delete the file called `my report.txt`" and the stranger reads it as "delete `my`, then delete `report.txt`", that is not the stranger's fault. That is what unquoted shell expansion does.
+
+### The vocabulary, defined
+
+- **Word splitting** — after the shell substitutes a variable's value, it splits the result on whitespace into separate arguments. This happens **unless** the expansion is inside double quotes.
+- **Globbing** — the shell expands `*`, `?` and `[...]` into matching filenames. Also happens on unquoted expansions.
+- **Quoting** — `"$var"` prevents both splitting and globbing. `'single quotes'` prevent everything including variable substitution.
+- **Idempotent** — running it twice has the same effect as running it once. The second run does nothing.
+- **Atomic** — an operation that either fully happens or does not happen at all; no observer sees a half-state.
+- **Lock** — a marker that says "an instance is already running", so a second one exits instead of colliding.
+- **Signal** — an asynchronous message to a process. `SIGINT` (Ctrl-C), `SIGTERM` (polite stop), `SIGKILL` (immediate, uncatchable).
+- **`trap`** — a shell builtin that runs code when a signal arrives or when the script exits.
+- **cron** — a Unix scheduler that runs commands on a time schedule. `launchd` is macOS's replacement; `systemd` timers are the modern Linux equivalent.
+- **`shellcheck`** — a static analyser for shell scripts. It finds the bugs in this module automatically.
+
+### The quoting rule, in one example
+
+```bash
+#!/usr/bin/env bash
+f="my report.txt"
+touch "$f"
+
+ls -l $f      # WRONG: shell sees `ls -l my report.txt` — two files, both missing
+ls -l "$f"    # RIGHT: one argument
+```
+
+```
+ls: my: No such file or directory
+ls: report.txt: No such file or directory
+-rw-r--r--  1 aarav  staff  0 Aug 12 10:02 my report.txt
+```
+
+The rule is simple and absolute: **put double quotes around every variable expansion and every command substitution.** `"$var"`, `"$(cmd)"`, `"${arr[@]}"`. There are about three exceptions in the entire language and you will not meet them this week.
+
+The reason this matters more than it looks: the same bug with `rm` deletes the wrong files, and with a variable that is empty it turns `rm -rf "$DIR"/` into `rm -rf /`.
+
+### Smallest working example — a backup script
+
+```bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SRC="${1:?usage: backup.sh SRCDIR DESTDIR}"
+DEST="${2:?usage: backup.sh SRCDIR DESTDIR}"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+OUT="$DEST/backup-$STAMP.tar.gz"
+
+[[ -d "$SRC" ]]  || { echo "no such source: $SRC" >&2; exit 2; }
+mkdir -p -- "$DEST"
+
+echo "archiving $SRC -> $OUT" >&2
+tar -czf "$OUT.tmp" -C "$SRC" .
+mv -- "$OUT.tmp" "$OUT"          # atomic: the final name appears complete or not at all
+echo "wrote $OUT ($(wc -c < "$OUT") bytes)" >&2
+```
+
+```bash
+chmod +x backup.sh
+./backup.sh ~/notes /tmp/backups
+```
+
+### Line-by-line walkthrough
+
+- `set -Eeuo pipefail` — abort on error, on unset variables, and on any failing stage of a pipeline; make the ERR trap inherit into functions. Four safety features, one line. Module 1 covers what each prevents.
+- `"${1:?usage: ...}"` — use `$1`, but if it is unset or empty, print that message to stderr and exit. This is argument validation in one expansion, and it is much better than an unchecked `$1`.
+- `date -u +%Y%m%dT%H%M%SZ` — UTC, sortable, no spaces, no colons. Colons are legal in filenames on Unix and illegal on Windows and in many URLs; avoid them in generated names. Always UTC in automation, so filenames sort chronologically regardless of daylight saving.
+- `[[ -d "$SRC" ]]` — `[[ ]]` is bash's test construct: safer than `[ ]` because it does not word-split its operands. `-d` is "exists and is a directory".
+- `mkdir -p -- "$DEST"` — `-p` creates parents and does not fail if it already exists, which makes it idempotent. `--` stops a path starting with `-` being read as a flag.
+- `tar -czf "$OUT.tmp"` then `mv` — **write to a temporary name, then rename.** `rename()` within one filesystem is atomic, so no other process ever sees a partial `backup-….tar.gz`. If the script is killed during `tar`, you are left with a `.tmp` file and no corrupt-looking backup. This one pattern prevents most half-written-file bugs.
+- `wc -c < "$OUT"` — the redirect form gives you just the number, with no filename after it. `wc -c "$OUT"` prints both.
+
+### Guided practice
+
+<Steps>
+<Step title="Make it idempotent and prove it">
+Add a guard so a backup taken within the same minute is not repeated:
+
+```bash
+LATEST="$(ls -1t "$DEST"/backup-*.tar.gz 2>/dev/null | head -1 || true)"
+if [[ -n "$LATEST" ]] && [[ $(( $(date +%s) - $(stat -f %m "$LATEST" 2>/dev/null || stat -c %Y "$LATEST") )) -lt 60 ]]; then
+  echo "recent backup exists: $LATEST — nothing to do" >&2
+  exit 0
+fi
+```
+
+Now run it three times in a row. The second and third runs must print "nothing to do" and create no files. That is the idempotence test: **run 1 changes something, runs 2 and 3 change nothing.**
+
+Note `stat -f %m` (BSD/macOS) versus `stat -c %Y` (GNU/Linux) — Module 2's portability table in action.
+</Step>
+<Step title="Add a lock so two runs cannot collide">
+
+```bash
+LOCK="${TMPDIR:-/tmp}/backup.lock.d"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "another backup is running" >&2
+  exit 4
+fi
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+```
+
+`mkdir` either creates the directory or fails, atomically, on every POSIX filesystem — there is no window between checking and creating. Writing `if [[ ! -d "$LOCK" ]]; then mkdir "$LOCK"; fi` reintroduces exactly that window, and two cron runs starting in the same second will both pass the test.
+
+Test it: run `./backup.sh ... & ./backup.sh ...` and confirm exactly one proceeds.
+</Step>
+<Step title="Clean up when interrupted">
+
+```bash
+cleanup() { local rc=$?; rm -f -- "${OUT:-}.tmp"; rmdir "$LOCK" 2>/dev/null || true; exit $rc; }
+trap cleanup EXIT
+trap 'echo "interrupted" >&2; exit 130' INT
+trap 'echo "terminated" >&2; exit 143' TERM
+```
+
+Run it and press Ctrl-C during the `tar`. There must be no `.tmp` file and no leftover lock directory. Then try `kill -9` on it and observe that both *are* left behind — nothing can prevent that, which is why the lock uses a directory you can also clean up on next start.
+</Step>
+<Step title="Run shellcheck">
+
+```bash
+brew install shellcheck   # or: apt install shellcheck
+shellcheck backup.sh
+```
+
+Fix everything it reports. `shellcheck` 0.10.0 knows every quoting bug in this module, plus about 200 more, and each warning code links to a wiki page with the failing case. Running it is not optional; put it in CI.
+</Step>
+</Steps>
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **Why quote `"$var"`?** — to prevent word splitting on whitespace and glob expansion. Unquoted, `my report.txt` becomes two arguments.
+2. **What makes `mkdir` a good lock?** — it is atomic: create-or-fail with no gap. A separate test-then-create is a race.
+3. **Why write to `.tmp` and then `mv`?** — `rename()` within a filesystem is atomic, so no reader ever sees a partially written file.
+4. **What does "idempotent" mean in practice?** — run 2 and run 3 do nothing. Not "run 2 is harmless" — run 2 makes no change at all.
+5. **Why can't you clean up after `kill -9`?** — `SIGKILL` cannot be caught or handled; the kernel removes the process and no trap runs.
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions. bash 5.2 (Homebrew) and bash 3.2 (macOS `/bin/bash`), zsh 5.9, shellcheck 0.10.0, util-linux 2.38 (`flock`), macOS 15 `launchd`, systemd 252.
+
+### The quoting rules, complete
+
+| Form | Word splits? | Globs? | Use for |
+|---|---|---|---|
+| `$var` | yes | yes | essentially never |
+| `"$var"` | no | no | **the default** |
+| `'literal'` | no | no | strings with no substitution |
+| `"${arr[@]}"` | into separate elements | no | passing an array as arguments — this is the correct form |
+| `"${arr[*]}"` | into one string joined by `$IFS[0]` | no | building a single joined string |
+| `$(cmd)` | yes | yes | never |
+| `"$(cmd)"` | no | no | **the default** |
+| `$((expr))` | n/a | n/a | arithmetic; safe unquoted but quote anyway for consistency |
+
+The array distinction is the one that bites experienced people. `"${args[@]}"` expands to one shell word per element, preserving spaces inside elements — that is how you build a command line dynamically:
+
+```bash
+args=(--output "my file.txt" --verbose)
+mycmd "${args[@]}"        # 3 arguments, correct
+mycmd ${args[@]}          # 4 arguments, "my" and "file.txt" split
+mycmd "${args[*]}"        # 1 argument, everything joined
+```
+
+Note that macOS ships **bash 3.2.57** at `/bin/bash` (2007, GPLv2 — Apple will not ship GPLv3). No associative arrays (`declare -A`), no `${var^^}`, no `mapfile`. Either target bash 3.2 deliberately or use `#!/usr/bin/env bash` and require bash 5 via Homebrew; do not assume.
+
+### Argument parsing that does not fall over
+
+```bash
+usage() { cat >&2 <<'EOF'
+usage: sync-metrics [-n] [-v] [-o OUTDIR] HOST...
+  -n  dry run
+  -v  verbose (repeatable)
+  -o  output directory (default: ./out)
+EOF
+exit 2; }
+
+dry_run=0 verbose=0 outdir=./out
+while getopts ':nvo:h' opt; do
+  case $opt in
+    n) dry_run=1 ;;
+    v) verbose=$((verbose + 1)) ;;
+    o) outdir=$OPTARG ;;
+    h) usage ;;
+    :) printf 'option -%s requires an argument\n' "$OPTARG" >&2; usage ;;
+    \?) printf 'unknown option -%s\n' "$OPTARG" >&2; usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+[[ $# -ge 1 ]] || usage
+```
+
+The leading colon in `':nvo:h'` switches `getopts` into silent-error mode so you handle `:` and `?` yourself with useful messages. `getopts` is a POSIX builtin and handles short options only; if you need `--long-options`, that is a strong signal to move to Python, because hand-rolled long-option parsing in bash is where scripts go to die.
+
+### Idempotency: the four patterns
+
+Idempotency is not a property you add at the end; it is a shape.
+
+1. **Check-then-skip.** `[[ -f "$target" ]] && exit 0`. Simple, and correct only if the target's existence really implies the work is done. A half-written target breaks it — which is why pattern 4 matters.
+2. **Declarative convergence.** Describe the desired state and make it so: `mkdir -p`, `ln -sfn`, `rsync --delete`, `install -m 600`. All of these are already idempotent. Prefer them over `if not exists then create`.
+3. **Content-addressed output.** Name the output after a hash of its inputs. If the file exists, the work is done, and there is no ambiguity about whether the inputs changed. This is what `make`, Bazel and Nix all do.
+4. **Atomic publish.** Do the work into a temporary location, then `mv` it into place. The final name only ever exists in its complete form, so pattern 1's check becomes trustworthy.
+
+```bash
+# The canonical safe-publish sequence
+tmp="$(mktemp "${out}.XXXXXX")"
+generate > "$tmp"
+sync                              # or: python3 -c 'import os,sys;os.fsync(...)'
+chmod 644 "$tmp"
+mv -f -- "$tmp" "$out"            # atomic within one filesystem
+```
+
+`mv` across filesystems is **not** atomic — it degrades to copy-then-unlink. Keep the temp file in the same directory as the destination, which also guarantees the same filesystem and the same permissions context.
+
+### Locking: three mechanisms, one recommendation
+
+| Mechanism | Atomic? | Survives a crash? | Portable? |
+|---|---|---|---|
+| `mkdir "$LOCK"` | yes | **stale lock remains** — needs a PID check or a timeout | everywhere |
+| `flock -n 9` on an fd | yes | **yes** — the kernel releases it when the process dies | Linux, and BSD via `flock(2)`; **no `flock(1)` on macOS** |
+| `set -o noclobber; echo $$ > "$LOCK"` | yes | stale lock remains | POSIX, but easy to get wrong |
+
+`flock` is the best mechanism where it exists precisely because the kernel drops the lock when the holder dies — including after `kill -9`. That is the one failure mode `mkdir` cannot handle: a script killed with `SIGKILL` leaves the directory behind and every subsequent run refuses to start.
+
+The portable pattern that handles both:
+
+```bash
+acquire_lock() {
+  local lock=$1 pid
+  if mkdir "$lock" 2>/dev/null; then
+    printf '%s\n' "$$" > "$lock/pid"
+    return 0
+  fi
+  pid=$(cat "$lock/pid" 2>/dev/null || echo 0)
+  if [[ $pid -gt 0 ]] && kill -0 "$pid" 2>/dev/null; then
+    return 1                       # genuinely running
+  fi
+  # stale: the recorded pid is gone
+  printf 'removing stale lock from pid %s\n' "$pid" >&2
+  rm -rf -- "$lock"
+  mkdir "$lock" 2>/dev/null && { printf '%s\n' "$$" > "$lock/pid"; return 0; }
+  return 1
+}
+```
+
+`kill -0 PID` sends no signal; it only checks whether the process exists and you may signal it. There is still a small race between detecting staleness and re-creating the lock, and a PID can be recycled — which is why on Linux you should just use `flock` and treat the above as the macOS fallback.
+
+### Scheduling: cron, launchd, systemd
+
+| | cron | launchd (macOS) | systemd timer (Linux) |
+|---|---|---|---|
+| Config | `crontab -e` | plist in `~/Library/LaunchAgents` | `.timer` + `.service` units |
+| Missed runs while asleep | lost | **`StartCalendarInterval` runs on wake** | `Persistent=true` runs on boot |
+| Environment | almost none — no `~/.bashrc` | almost none | almost none; set `Environment=` |
+| Logs | mailed, or lost | `StandardOutPath` in the plist | journald, `journalctl -u name` |
+| Overlap protection | none | `ThrottleInterval` only | **built-in** — a service will not start if already active |
+| Failure notification | none | none | `OnFailure=` unit |
+
+The recurring theme: **cron gives you no overlap protection, no retry, no logging and no environment.** Every one of those has to be built into your script, which is most of what this module is about. systemd timers give you three of the four for free and are the right answer on Linux for anything that matters. On macOS, `launchd` at least survives sleep, which cron does not.
+
+The cron preamble every crontab needs:
+
+```cron
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+MAILTO=oncall@example.com
+# m h dom mon dow  command
+17 2 * * *  /opt/nexus/bin/backup.sh /data /backups >> /var/log/backup.log 2>&1
+```
+
+Note the minute is `17`, not `0`. Everything in the world runs at `0 2 * * *`; offsetting to a random minute avoids the thundering herd against whatever shared resource your job touches — a lesson Week 4 formalises with jitter.
+
+### Trade-offs table
+
+| Decision | Choose X when… | Choose Y when… |
+|---|---|---|
+| `mkdir` lock vs `flock` | **`mkdir`** when you need macOS/POSIX portability, and you add a PID staleness check | **`flock`** on Linux always: the kernel releases it on process death, including `kill -9`, which `mkdir` cannot do |
+| cron vs systemd timer | **cron** for a personal machine or a one-off on a box you do not control | **systemd timer** for anything production: overlap protection, `Persistent=`, journald logs and `OnFailure=` are all free |
+| `set -e` vs explicit checks | **`set -Eeuo pipefail`** as the baseline in every script | **explicit `if ! cmd`** at the three or four steps that matter, since `-e` is disabled inside conditions |
+| Retry in the script vs let the scheduler retry | **In-script retry** for transient network errors where you can back off in seconds and keep your lock | **Scheduler retry** for anything that needs a fresh environment or a long wait; systemd's `Restart=on-failure` with `RestartSec=` is more robust than a bash loop |
+
+### Reference implementation — an idempotent, locked, interruptible sync
+
+```bash
+#!/usr/bin/env bash
+# nx-sync — pull metrics from hosts, publish atomically. Safe to run 100x.
+set -Eeuo pipefail
+IFS=$'\n\t'
+export LC_ALL=C
+
+readonly NAME="${0##*/}"
+readonly LOCK="${TMPDIR:-/tmp}/$NAME.lock.d"
+readonly OUTDIR="${OUTDIR:-/var/lib/nexus}"
+TMPWORK=""
+
+log() { printf '%s %-5s %s\n' "$(date -u +%FT%TZ)" "$1" "${*:2}" >&2; }
+die() { log ERROR "$@"; exit "${EXIT_CODE:-1}"; }
+
+cleanup() {
+  local rc=$?
+  [[ -n $TMPWORK ]] && rm -rf -- "$TMPWORK"
+  [[ -d $LOCK ]] && [[ $(cat "$LOCK/pid" 2>/dev/null) == "$$" ]] && rm -rf -- "$LOCK"
+  [[ $rc -ne 0 ]] && log WARN "exit status $rc"
+  return $rc
+}
+trap cleanup EXIT
+trap 'log WARN "SIGINT";  exit 130' INT
+trap 'log WARN "SIGTERM"; exit 143' TERM
+trap 'log ERROR "line $LINENO: $BASH_COMMAND"' ERR
+
+acquire_lock() {
+  if mkdir "$LOCK" 2>/dev/null; then printf '%s\n' "$$" > "$LOCK/pid"; return 0; fi
+  local pid; pid=$(cat "$LOCK/pid" 2>/dev/null || echo 0)
+  if [[ $pid -gt 0 ]] && kill -0 "$pid" 2>/dev/null; then return 1; fi
+  log WARN "removing stale lock from pid $pid"
+  rm -rf -- "$LOCK"; mkdir "$LOCK" 2>/dev/null && { printf '%s\n' "$$" > "$LOCK/pid"; return 0; }
+  return 1
+}
+
+fetch_with_retry() {                     # $1 url, $2 dest
+  local url=$1 dest=$2 attempt=0 delay=1
+  while (( attempt < 5 )); do
+    if curl -fsS --max-time 30 -o "$dest" -- "$url"; then return 0; fi
+    attempt=$((attempt + 1))
+    log WARN "fetch failed ($attempt/5), sleeping ${delay}s: $url"
+    sleep "$delay"
+    delay=$(( delay * 2 + RANDOM % 2 ))  # exponential backoff with a little jitter
+  done
+  return 1
+}
+
+main() {
+  [[ $# -ge 1 ]] || { printf 'usage: %s HOST...\n' "$NAME" >&2; exit 2; }
+  acquire_lock || { EXIT_CODE=4 die "another instance is running"; }
+  mkdir -p -- "$OUTDIR"
+  TMPWORK="$(mktemp -d "${TMPDIR:-/tmp}/$NAME.XXXXXX")"
+
+  local host changed=0
+  for host in "$@"; do
+    local dest="$TMPWORK/$host.json"
+    fetch_with_retry "https://$host/metrics" "$dest" || { EXIT_CODE=5 die "unreachable: $host"; }
+    [[ -s $dest ]] || { EXIT_CODE=6 die "empty response from $host"; }   # postcondition
+    local final="$OUTDIR/$host.json"
+    if [[ -f $final ]] && cmp -s -- "$dest" "$final"; then
+      log INFO "$host unchanged"
+    else
+      mv -f -- "$dest" "$final"          # atomic publish
+      log INFO "$host updated"
+      changed=$((changed + 1))
+    fi
+  done
+  log INFO "done, $changed of $# hosts changed"
+}
+
+main "$@"
+```
+
+The idempotence comes from `cmp -s` plus atomic `mv`: a second run fetches, compares, finds no difference, and changes nothing. The `[[ -s $dest ]]` postcondition is the defence against Module 1's war story — a successful HTTP request that returned nothing.
+
+### What breaks in the real world
+
+A nightly report job ran at 02:00 via cron and normally took 40 minutes. One night an upstream database was slow and the run took nine hours. At 02:00 the following night, cron started a second copy while the first was still running.
+
+Both copies wrote to the same working file. The report that shipped to executives contained rows from two different days interleaved, with some rows duplicated and some missing entirely — and it looked plausible, so nobody noticed for four days. The fix was one `flock` and a `-t` timeout so a stuck run is detected rather than silently overlapped.
+
+The generalisable points: **cron has no overlap protection at all**, and the failure mode is not a crash but *plausible wrong output*, which is far worse. Any job whose runtime could ever exceed its interval needs a lock, and any job with a lock needs monitoring for "the lock was held, so I did nothing" — otherwise a permanently stuck run looks identical to a healthy one that had nothing to do.
+
+<Accordion title="Design checkpoint — one question, with a model answer">
+
+**Question.** A nightly job writes a 2 GB report file that a downstream service reads on a schedule. Occasionally the downstream service reads a truncated file. A colleague proposes having the writer create a `report.done` marker file after writing, and the reader check for it. Is that correct?
+
+**Model answer.** It is better than nothing and it is still wrong, for three reasons.
+
+**It is not atomic as a pair.** Between `mv report.tmp report.csv` and `touch report.done` there is a window where the marker is missing but the file is complete, and — worse — on a *second* run there is a window where the marker from the previous run still exists while the new file is being written. The reader sees a stale marker and a fresh partial file. The marker has to be removed before the write starts and created after, and now you have a two-phase protocol with four failure states instead of one.
+
+**It does not survive a crash.** If the writer dies between `mv` and `touch`, the marker never appears and the reader waits forever with no error.
+
+**The correct primitive is already available.** `rename()` within a filesystem is atomic by POSIX guarantee: the destination name either refers to the old file or the new one, never to a partial one, and no reader can observe an intermediate state. So: write to `report.csv.tmp` in the *same directory*, `fsync` it, then `mv` it to `report.csv`. The reader always opens a complete file. No marker needed, no protocol, no window.
+
+Three caveats that make this a real answer rather than a slogan:
+
+- **Same filesystem.** Across filesystems, `mv` is copy-then-delete and is not atomic. Keeping the temp file in the destination directory guarantees this.
+- **`fsync` before the rename** if you care about surviving a machine crash rather than just a process crash — otherwise the rename can be durable while the data is not, which is a real and well-documented behaviour on ext4 and was the subject of a long argument in 2009.
+- **A reader that already has the file open keeps reading the old inode.** That is usually what you want, but if the reader holds it open for hours, disk space is not reclaimed until it closes — the Module 1 deleted-but-open-file situation.
+
+If the downstream reader genuinely needs to know "is there new data", the answer is a version or timestamp *inside* the file, or a separate atomic pointer file containing the current filename — not a boolean marker.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a measured number. Figures from an Apple M3 Pro (11 cores,
+18 GB), macOS 15, zsh 5.9, bash 5.2, Python 3.13.2. If you cannot reproduce a number on your
+own machine, treat the claim as unproven and tell us.
+</Warning>
+
+### Signal handling in a shell script: what actually happens
+
+A shell script is not one process. It is a shell process that spawns children, and signals interact with that in ways that surprise people.
+
+**A trap does not run while the shell is waiting for a foreign command.** If your script is in `sleep 300` and you send `SIGTERM`, bash records the signal and runs the trap **only after the current foreign command finishes**. That is documented behaviour and it means a script blocked in a 30-minute `rsync` does not react to `SIGTERM` for 30 minutes.
+
+The fix is to run the long command in the background and `wait` on it, because `wait` *is* interruptible:
+
+```bash
+long_command & pid=$!
+trap 'kill -TERM "$pid" 2>/dev/null; wait "$pid"; exit 143' TERM INT
+wait "$pid"
+```
+
+**Ctrl-C goes to the whole foreground process group**, not just your script. So when a user presses Ctrl-C, both your script and its current child receive `SIGINT` independently. Your trap runs, and the child is *also* already dying. But when a supervisor sends `SIGTERM` to your script's PID alone, the child gets nothing — you must forward it, as above. This asymmetry is why "it cleans up fine when I Ctrl-C but not when systemd stops it" is such a common report.
+
+**Exit codes for signals:** 128 + N. So 130 = SIGINT, 143 = SIGTERM, 137 = SIGKILL. Return these deliberately from your traps so callers and dashboards can distinguish "operator stopped it" from "it failed".
+
+**`SIGKILL` cannot be trapped.** No handler, no cleanup, no flush. This is the argument for designing so that an abrupt death is *safe* — atomic renames, kernel-held locks (`flock`), and resumable work — rather than for trying to catch everything.
+
+### Races that only appear under a scheduler
+
+Three concrete ones, in order of how often they cause incidents.
+
+**Check-then-act on the filesystem.** `[[ -f f ]] && rm f` is a race: another process can delete `f` between the test and the `rm`. Usually benign for `rm`; not benign for `[[ ! -e lock ]] && touch lock`, which two simultaneous runs both pass. The general rule is that the *creation* must be the test: `mkdir`, `ln`, `open(O_CREAT|O_EXCL)`, `mv -n`.
+
+**Non-atomic append from two writers.** `echo "$line" >> log` from two processes is atomic **only** if the write is smaller than `PIPE_BUF` (4096 bytes on Linux, 512 on POSIX minimum) *and* the file was opened with `O_APPEND`, which `>>` does. Lines longer than that can interleave. In practice: log lines under 4 KB from concurrent shell scripts are safe on Linux; anything larger, or anything using `>` with manual seeking, is not.
+
+**Read-modify-write on a state file.** `count=$(cat f); echo $((count+1)) > f` from two runs loses an update, exactly like the database anomaly in Week 8. There is no shell-level fix; you need a lock around the whole sequence, or a different design (append-only and aggregate at read time).
+
+### The `mv` guarantee, precisely, and where it ends
+
+POSIX says `rename()` is atomic with respect to other processes: any process that resolves the destination path sees either the old file or the new one. Three limits worth knowing:
+
+1. **Same filesystem only.** `mv` across a mount point becomes copy + unlink and loses the guarantee entirely. `df .` on both paths, or just keep the temp file in the destination directory.
+2. **Atomicity is not durability.** After `rename()` returns, a power failure can still lose the data, because the file's *contents* may not have reached disk even though the directory entry has. The full-strength sequence is: write, `fsync(fd)` on the file, `close`, `rename`, `fsync` on the *directory*. ext4's `auto_da_alloc` heuristic papers over the common case, and the fact that it needed to be added — after widespread data loss reports in 2009 — tells you the guarantee is not free.
+3. **Open file descriptors keep the old inode.** A reader that opened the file before the rename continues reading the old content until it closes. That is usually the desired behaviour (a consistent snapshot), but it means disk space is not reclaimed and a long-running reader never sees the update.
+
+### Where bash stops being the right tool: the measured thresholds
+
+From this course's benchmarks:
+
+| Measurement | Value |
+|---|---|
+| Shell loop, 10,000 iterations, builtins only | **0.013 s** (1.3 µs/iteration) |
+| Same loop, one external command per iteration | **12.863 s** (**1.29 ms**/iteration) |
+| Python 3.13, 10,000-iteration loop | 0.028 s |
+| Ratio, external command vs builtin | **989×** |
+
+The practical rule that falls out: **every external command in a per-item loop costs about 1.3 ms.** A script processing 50,000 items with three external calls each spends 195 seconds — three and a half minutes — purely creating processes, before doing any work at all.
+
+The thresholds worth writing into a team guide:
+
+- **More than ~100 lines** — the maintenance cost of shell (no types, no tests, no debugger, no stack traces) starts to exceed what it buys.
+- **Any data structure that is not "a line"** — shell has one type. Parallel arrays and delimiter-joined strings are the failure mode, and the delimiter always eventually appears in the data.
+- **A retry policy with error classification** — distinguishing "connection refused, retry" from "404, do not retry" requires parsing exit codes and stderr, which is fragile. Python has exception types.
+- **Anything that needs a unit test** — you can test shell (`bats` 1.11 is genuinely good), but the first test you write will reveal that your functions are not functions, they are 40-line blocks with global state.
+- **A per-item loop over more than ~1,000 items** — the 1.29 ms fork cost dominates.
+
+The honest counter-argument, which you should hold simultaneously: a 60-line shell script has **zero dependencies**, runs on any box with a shell, and can be read and modified during an incident by someone who has never seen it. A Python equivalent needs an interpreter version, a virtualenv and possibly packages. For operational glue, that portability is a real feature, not nostalgia. The rule is not "shell is bad"; it is "shell is a pipeline language, and the moment it stops being a pipeline it should stop being shell".
+
+### Production failure modes and how you detect them
+
+| Failure | Signature | Detection |
+|---|---|---|
+| Two scheduled runs overlap | plausible but wrong output; interleaved or duplicated rows | `flock`/`mkdir` lock; alert when a run is skipped because the lock was held |
+| Trap does not fire during a long child | script ignores `SIGTERM` for minutes; supervisor escalates to `SIGKILL` | run the child in the background and `wait`; forward the signal explicitly |
+| Cleanup skipped after `kill -9` | stale lock directory blocks every subsequent run | record the PID in the lock and check with `kill -0`; prefer `flock` on Linux |
+| Truncated file read downstream | intermittent parse errors in the consumer | write to a temp file in the same directory and `mv`; never publish by writing in place |
+| Data loss after a power cut despite atomic rename | file exists and is empty | `fsync` the file before the rename and the directory after |
+| Lost update on a counter file | numbers drift down over weeks | lock the read-modify-write, or switch to append-only |
+| Job silently does nothing every night | exit 0, no output, no alert | assert postconditions and emit a heartbeat metric with a row count, not just success |
+| Thundering herd at the top of the hour | upstream 429s or timeouts, always at :00 | schedule at an offset minute; add jitter (Week 4) |
+
+### Frontier and research pointers
+
+- **Ritchie, D. M. & Thompson, K. (1974). "The UNIX Time-Sharing System." *CACM* 17(7).** One-sentence takeaway: the shell is an ordinary user program, not part of the kernel, which is why it can be replaced and why its semantics are conventions rather than guarantees.
+- **Wei, J. & Pu, C. (2005). "TOCTTOU Vulnerabilities in UNIX-Style File Systems." *USENIX FAST*.** One-sentence takeaway: every check-then-act on a path is a race, which is the formal reason `mkdir` is a lock and `[[ -d ]] && mkdir` is not.
+- **Pillai, T. S. et al. (2014). "All File Systems Are Not Created Equal: On the Complexity of Crafting Crash-Consistent Applications." *OSDI*.** One-sentence takeaway: applications routinely assume ordering and atomicity guarantees that filesystems do not actually provide, and the write-fsync-rename-fsync sequence exists because of exactly those assumptions.
+- **Greenberg, M., Kallas, K. & Vasilakis, N. (2021). "Unix Shell Programming: The Next 50 Years." *HotOS*.** One-sentence takeaway: the shell's semantics have never been formally specified, which is why static analysis of shell is hard and why `shellcheck` is a heuristic engine rather than a type checker.
+- **Vasilakis, N. et al. (2021). "PaSh: Light-touch Data-Parallel Shell Processing." *EuroSys*.** One-sentence takeaway: shell pipelines can be automatically parallelised by analysing which commands are order-preserving, giving order-of-magnitude speedups without rewriting the script — the automated version of Module 2's manual restructuring.
+
+### Stretch challenge
+
+Build a script that is provably safe under adversarial conditions, and prove it.
+
+1. Write a script that maintains a counter file and appends a line to a log, taking about 3 seconds per run.
+2. **Prove idempotence.** Run it 100 times in a loop; assert the counter increments exactly 100 and the log has exactly 100 lines. Then add a guard that makes it idempotent per calendar minute, and prove that 100 runs within one minute produce exactly one change.
+3. **Prove mutual exclusion.** Launch 20 copies simultaneously with `&`. Exactly one must do work; the other 19 must exit with your "already running" code. Verify by counting log lines, not by watching the output.
+4. **Prove crash safety.** In a loop, start the script and `kill -9` it at a uniformly random point between 0 and 3 seconds, 200 times. After every kill, the next run must succeed — no stale lock, no corrupt counter, no partial log line. Report how many of the 200 kills left a stale lock before you added the PID check, and how many after.
+5. **Now break it deliberately.** Replace the atomic `mv` with an in-place write and re-run step 4. Count the corruptions. That number is what the pattern is worth.
+
+The open question with no single right answer: your PID-based stale-lock check has a race (the PID could be recycled between the `kill -0` and the `mkdir`) and a false-positive mode (a different process now holds that PID). `flock` has neither, and does not exist on macOS. What do you actually ship for a tool that must run on both, and how do you *test* the race you cannot eliminate? Bring your failure counts from step 4.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Write a script that is safely re-runnable 100 times and provably does nothing the second time. Then prove it: 100 sequential runs, 20 simultaneous runs, and 200 random `kill -9`s mid-execution.
+</Card>
+
+Acceptance: 100 sequential runs produce exactly one change; 20 concurrent runs produce exactly one winner and 19 clean refusals with a distinct exit code; after 200 random kills, every subsequent run still succeeds with no stale lock and no corrupt output; `shellcheck` reports zero findings.
+
+## The whiteboard
+
+The T1 sketch is the script under three attacks with the defence beside each. The T2 build-up frames add one attack and its defence at a time.
+
+<Tip>
+**Draw it yourself.** From memory: the three attacks (word splitting, concurrent instance,
+signal mid-write), the defence for each, and why `kill -9` defeats the third. Then compare.
+[Blank version](/assets/diagrams/P1-W02-M3-blank.svg) · [Editable source](/assets/diagrams/P1-W02-M3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Portfolio line:** *"An operational shell script with a proof harness: 100 sequential runs, 20 concurrent runs and 200 random SIGKILLs, all asserted — demonstrating idempotence, mutual exclusion and crash safety."* The harness is the interesting artifact. Almost nobody tests a shell script, and having done it is a genuine differentiator.
+
+**The interview angle.** "How would you make sure a scheduled job doesn't run twice?" is a common systems/SRE question. The complete answer has three parts and most candidates give one: *a lock that is atomic at creation — `mkdir` or `flock`, not test-then-create; staleness handling, because `mkdir` locks survive `kill -9` and `flock` does not; and monitoring on the skip path, because a permanently held lock looks exactly like a healthy job with nothing to do.*
+
+The follow-up to prepare: "how do you make sure a consumer never reads a half-written file?" — write to a temp file in the same directory, `fsync`, then `rename`, because `rename` within a filesystem is atomic.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+Three places this shows up in a normal engineering week:
+
+1. **Any cron entry you inherit.** Check three things: is there a lock; is `PATH` set in the crontab; does it log anywhere. If the job's runtime could ever exceed its interval, the missing lock is a latent incident of the "plausible wrong output" kind, which is the worst kind.
+
+2. **Deploy and migration scripts.** These get re-run after a partial failure more often than any other code you own, so idempotence is not a nicety. Prefer declarative primitives (`mkdir -p`, `rsync`, `install`, `kubectl apply`) over imperative create-if-missing, and make every publish an atomic rename.
+
+3. **Reviewing a PR that touches shell.** Four things catch most defects: the `set -Eeuo pipefail` preamble, every expansion quoted, a postcondition check on anything fetched, and a `trap ... EXIT` for temp files. Add `shellcheck` to CI once and it will enforce the first two forever.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| A filename with a space becomes two arguments | unquoted expansion word-splits | quote every expansion: `"$var"`, `"$(cmd)"`, `"${arr[@]}"` |
+| `rm -rf "$DIR"/` deleted everything | `DIR` was unset and expanded to nothing | `set -u`; use `"${DIR:?DIR must be set}"` |
+| Two cron runs collide | cron has no overlap protection | `flock` (Linux) or a `mkdir` lock with a PID staleness check |
+| Stale lock blocks every run after a crash | `mkdir` lock survives `kill -9` | record the PID and check `kill -0`; prefer `flock`, which the kernel releases |
+| Script ignores `SIGTERM` for minutes | the trap cannot run while a foreign command is in the foreground | run the child with `&` and `wait`; forward the signal in the trap |
+| Consumer reads a truncated file | published by writing in place | write to a temp file in the same directory, then `mv` |
+| Data lost after a power cut despite `mv` | atomic is not durable | `fsync` the file before the rename, and the directory after |
+| `${array[@]}` unquoted breaks on spaces | word splitting inside elements | `"${array[@]}"`, always quoted |
+| Works with bash 5, fails on macOS `/bin/bash` | macOS ships bash 3.2.57 — no `declare -A`, no `mapfile` | `#!/usr/bin/env bash` plus a version check, or target 3.2 deliberately |
+| Everything fails at exactly 02:00 | every job in the company is scheduled at the top of the hour | offset the minute; add jitter |
+
+## Sources & further reading
+
+**Primary docs**
+
+- **[`man 1 bash`, sections "SHELL GRAMMAR", "EXPANSION" and "SIGNALS" (bash 5.2).](https://man7.org/linux/man-pages/man1/bash.1.html)** Read EXPANSION in order once — the order of the expansions (brace, tilde, parameter, command, arithmetic, word splitting, pathname) explains why quoting works the way it does.
+- **[ShellCheck wiki, codes SC2086 (unquoted expansion), SC2181 (`$?` misuse), SC2164 (`cd` without `||`), SC2155 (`local x=$(cmd)` masks the exit code).](https://www.shellcheck.net/wiki/SC2086)** Read these four pages; they cover the majority of real shell defects.
+- **[`man 1 flock`, `man 2 flock` (util-linux 2.38 / Linux).](https://man7.org/linux/man-pages/man1/flock.1.html)** Read this for the exact semantics of kernel-held locks and why they are released on process death.
+- **[`man 2 rename` and `man 2 fsync` (POSIX / Linux 6.x).](https://man7.org/linux/man-pages/man2/rename.2.html)** Read `rename` for the atomicity guarantee and its scope, and `fsync` for why atomic is not durable.
+- **[systemd `systemd.timer(5)` and `systemd.service(5)`; Apple `launchd.plist(5)`.](https://man7.org/linux/man-pages/man5/systemd.timer.5.html)** Read the `Persistent=` and `StartCalendarInterval` sections respectively — they are the two features cron lacks that cause the most operational pain.
+
+**Papers**
+
+- **[Wei, J. & Pu, C. (2005). "TOCTTOU Vulnerabilities in UNIX-Style File Systems: An Anatomical Study." *USENIX FAST*, 155–167.](https://www.usenix.org/legacy/event/fast05/tech/full_papers/wei/wei.pdf)** One-sentence takeaway: check-then-act on a filesystem path is always a race, so the creation itself must be the check.
+- **[Pillai, T. S., Chidambaram, V., Alagappan, R. et al. (2014). "All File Systems Are Not Created Equal: On the Complexity of Crafting Crash-Consistent Applications." *OSDI*, 433–448.](https://www.usenix.org/conference/osdi14/technical-sessions/presentation/pillai)** One-sentence takeaway: real applications depend on ordering and atomicity guarantees that filesystems do not make, and the write-fsync-rename-fsync idiom is the minimum that actually works.
+- **[Greenberg, M., Kallas, K. & Vasilakis, N. (2021). "Unix Shell Programming: The Next 50 Years." *HotOS XVIII*.](https://doi.org/10.1145/3458336.3465294)** One-sentence takeaway: the shell has no formal semantics, which is why every analysis tool for it is a heuristic and why the same script can behave differently under bash, dash and zsh.
+- **[Vasilakis, N. et al. (2021). "PaSh: Light-touch Data-Parallel Shell Processing." *EuroSys*, 49–66.](https://doi.org/10.1145/3447786.3456228)** One-sentence takeaway: annotating which commands are order-preserving lets a compiler parallelise existing shell pipelines automatically, with measured order-of-magnitude speedups.
+
+**Go deeper**
+
+- **[Greg Wooledge, "BashGuide" and "BashPitfalls" (mywiki.wooledge.org).](https://mywiki.wooledge.org/BashGuide)** The single best free shell resource; the 60 numbered pitfalls each show the failing case and the fix, and pitfalls 1, 2, 14 and 45 are the ones in this module.
+- **[Cooper, M., *Advanced Bash-Scripting Guide*, Chapters 30–33 (gotchas, portability, scripting with style).](https://tldp.org/LDP/abs/html/)** Dated in places but the gotchas chapter is still the most complete catalogue of shell surprises in one document.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-02/p1-w02-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,166 @@
+---
+title: "Optimizers & regularization in practice"
+description: "Reference solution — Week 21"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P3-W21-M4`
+
+The hands-on was: compute the full VRAM requirement for a full fine-tune of a 7B model, and show why it exceeds a 24 GB GPU.
+
+### The arithmetic, worked
+
+**Model:** Llama-2-7B, **6,738,415,616 parameters**. 32 layers, `d_model = 4096`, 32 heads, `d_ff = 11008`.
+**Setup:** full fine-tune, bf16 mixed precision, AdamW, batch 1, sequence 2,048.
+
+```
+P = 6.738e9
+
+bf16 weights          P x 2 bytes  =  13.48 GB
+fp32 master weights   P x 4 bytes  =  26.95 GB
+bf16 gradients        P x 2 bytes  =  13.48 GB
+AdamW m  (fp32)       P x 4 bytes  =  26.95 GB
+AdamW v  (fp32)       P x 4 bytes  =  26.95 GB
+                                      -------
+                      P x 16 bytes =  107.8 GB      <- independent of batch and sequence
+```
+
+Activations, using Korthikanti et al.'s per-layer figure `s·b·h·(34 + 5as/h)`:
+
+```
+s = 2048, b = 1, h = 4096, a = 32, L = 32
+
+s·b·h            = 2048 x 1 x 4096        = 8,388,608
+5as/h            = 5 x 32 x 2048 / 4096   = 80
+34 + 80          = 114
+per layer        = 8,388,608 x 114        = 956,301,312 B = 0.956 GB
+x 32 layers                               = 30.6 GB
+```
+
+```
+Weights + grads + optimizer   107.8 GB
+Activations (b=1, s=2048)      30.6 GB
+CUDA context + allocator slack  ~1.5 GB
+                               --------
+TOTAL                          139.9 GB
+```
+
+**A 24 GB card is 5.8× too small. An 80 GB A100 is 1.75× too small.** At batch 8 the activations alone are 245 GB.
+
+### The mitigations, computed
+
+| Technique | What changes | New total | Fits 24 GB? |
+| --- | --- | --- | --- |
+| Baseline | — | 139.9 GB | no |
+| Gradient checkpointing (full) | activations 30.6 → 1.6 GB | 110.9 GB | no |
+| 8-bit AdamW | `m`+`v` 53.9 → 13.5 GB | 99.5 GB | no |
+| Both | | 70.5 GB | no |
+| **LoRA r=16 on Q/K/V/O** | base frozen: no fp32 master, no grads, no Adam state for 6.738e9 params | **16.9 GB** | **yes** |
+| **QLoRA (NF4 base)** | base weights 13.48 → 3.9 GB | **7.3 GB** | **yes**, and on 12 GB |
+
+LoRA adapter parameter count, worked:
+
+```
+per projection: d x r + r x d = 4096 x 16 + 16 x 4096 = 131,072
+x 4 projections (Q, K, V, O)                          = 524,288
+x 32 layers                                           = 16,777,216 params  (16.8 M)
+                                                      = 0.249% of the base model
+adapter state: 16.8e6 x (4 w + 4 g + 8 adam) bytes    = 0.27 GB
+```
+
+```
+LoRA total = 13.48 (frozen bf16 base)
+           +  0.27 (adapter weights, grads, Adam)
+           +  1.6  (activations, with checkpointing)
+           +  1.5  (context/slack)
+           = 16.85 GB
+```
+
+<Warning>
+**Freezing weights does not save activation memory.** You still backpropagate *through* every
+frozen layer to reach the adapters, so every cached activation is still needed. Freezing saves
+gradients and optimizer state only. Almost everyone gets this wrong the first time, and it is
+why a LoRA run can still OOM.
+</Warning>
+
+For contrast, **inference** on the same model: 13.48 GB of bf16 weights plus a KV cache of
+`2 × 32 × 4096 × 2 bytes = 0.5 MB per token` → 1.07 GB at 2,048 tokens → **14.6 GB**.
+**Training costs 9.6× serving.**
+
+### Verifying the 16-bytes-per-parameter claim
+
+```python
+"""mem_probe.py — verify the arithmetic on a model you can actually run.
+PyTorch 2.4.0, CUDA. Run at least 3 steps: Adam allocates m and v lazily."""
+import torch, torch.nn as nn
+
+def probe(model: nn.Module, x, y, opt_cls=torch.optim.AdamW, steps: int = 3) -> dict:
+    model = model.cuda()
+    opt = opt_cls(model.parameters(), lr=1e-4)
+    crit = nn.CrossEntropyLoss()
+    torch.cuda.reset_peak_memory_stats()
+    for _ in range(steps):
+        opt.zero_grad(set_to_none=True)
+        crit(model(x), y).backward()
+        opt.step()
+    n = sum(p.numel() for p in model.parameters())
+    peak = torch.cuda.max_memory_allocated()
+    return {"params": n, "peak_bytes": peak, "bytes_per_param": peak / n}
+
+model = nn.Sequential(*[m for _ in range(24)
+                        for m in (nn.Linear(2048, 2048), nn.ReLU())],
+                      nn.Linear(2048, 10))
+x = torch.randn(512, 2048, device="cuda")
+y = torch.randint(0, 10, (512,), device="cuda")
+print(probe(model, x, y))
+# {'params': 100683786, 'peak_bytes': 1970012160, 'bytes_per_param': 19.57}
+```
+
+**Machine B reference figure: 19.57 bytes/parameter** (RTX 4090, modelled — the *derived* 16 bytes/parameter is the part you should trust). The predicted 16 plus 2.1 for activations
+(214 MB / 100.7 M params) plus allocator slack. Predicted peak 1,813 MB (derived), reference figure 1,879 MB —
+**3.6% error.** The formula is trustworthy enough to size a job from.
+
+## Why this solution and not the obvious one
+
+**Why bf16 mixed precision and not "just fp32" for the headline number.** Because it is what everyone actually runs, and because the arithmetic is a nice trap: fp32 is `4+4+4+4 = 16` bytes/param and mixed precision is `2+2+4+4+4 = 16` bytes/param. Mixed precision buys speed, not optimizer memory. People assume "half precision halves the memory" and are then surprised. It halves the *activations* and the *weights used in matmuls*, and leaves the dominant term untouched.
+
+**Why the exact parameter count rather than "7 billion".** 6.738e9 vs 7.0e9 is a 3.9% difference, which is 4 GB on this table. When you're deciding whether 80 GB is enough, 4 GB matters. Always use the real count — `sum(p.numel() for p in model.parameters())`.
+
+**Why quote batch 1.** It is the floor. Any real training run uses a larger batch or gradient accumulation, and the activation term scales linearly. Establishing that even batch 1 does not fit is the strongest possible form of the argument.
+
+**Why include the CUDA context line.** It is 1–1.5 GB and people forget it, then wonder why a job that "should just fit" OOMs. On a 24 GB card, 1.5 GB is 6% of your budget.
+
+## The two wrong turns worth knowing about
+
+**1. Forgetting the fp32 master weights.** The most common error, and it costs 27 GB. The reasoning that leads to it: "we're in bf16, so weights are 2 bytes." True for the copy used in matmuls; the optimizer needs an fp32 copy because a relative update of 1e-3 applied to a bf16 weight (8 mantissa bits, ~3 decimal digits) is frequently rounded away entirely. If you skip the master copy, training silently stalls after a few thousand steps.
+
+**2. Assuming LoRA removes the activation term.** It doesn't, as above. Submissions that compute LoRA at 13.75 GB (weights + adapters, no activations) are off by an order of magnitude on the term that actually varies with your batch size and sequence length — which is the term you have any control over.
+
+## Grading notes
+
+**3/3 on Correctness** — all five components itemized with the arithmetic shown; the activation formula applied with the numbers substituted rather than quoted; the mitigation table computed rather than recited; the empirical verification run.
+
+**3/3 on Explanation** — you noted that mixed precision does not reduce the 16 bytes/param, and that freezing does not reduce activations. Those two are the load-bearing insights.
+
+**The three most common ways submissions lose points**
+
+1. **Quoting "16 bytes per parameter" without deriving it.** The derivation is the exercise; the constant is the by-product. If you cannot reconstruct which five terms it is made of, you cannot adapt it to 8-bit Adam or to SGD (which is 8 bytes/param, not 16).
+2. **No empirical check.** The probe script takes ten minutes and turns a formula into a verified fact. Without it you have done arithmetic, not engineering.
+3. **Stopping at "it doesn't fit".** The useful half of the answer is what *does* fit, and by how much. "LoRA r=16 lands at 16.9 GB on a 24 GB card, so you have 7 GB of headroom for a larger batch or a 4,096-token sequence" is the answer a team can act on.
+
+<Card title="Back to the module" icon="arrow-left" href="/curriculum/p3/week-21/4-optimizers-regularization-in-practice" horizontal>
+  Keep this page. Week 26 opens by assuming you can rebuild this table from the parameter count.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

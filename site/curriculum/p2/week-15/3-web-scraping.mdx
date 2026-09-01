@@ -1,0 +1,998 @@
+---
+title: "Web scraping"
+description: "Week 15 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 15 · Module 3 · `P2-W15-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Parse HTML with BeautifulSoup and extract structured data from it.
+2. Write **resilient selectors** that survive a cosmetic redesign, and know which ones will not.
+3. Manage sessions, headers and cookies without getting blocked or breaking anything.
+4. Decide when a headless browser is genuinely required — and what it costs.
+5. Respect `robots.txt`, rate limits, and the legal and ethical boundary, stated plainly.
+6. Build **snapshot tests** so a layout change fails in CI instead of silently producing nulls.
+
+<Info>
+**Where this returns.** Silent breakage is the theme. A scraper that returns `None` instead of a
+price is the same failure shape as an embedding pipeline that indexes empty strings in week 27, or
+an evaluation harness that scores a truncated response in week 32. **The fix is always the same: an
+assertion that fails loudly at the boundary**, and this module is where you build the habit.
+</Info>
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p2-w15-m3.svg" alt="Hand-drawn sketch: brittle versus resilient selectors and the silent null failure" className="block dark:hidden" />
+  <img src="/assets/diagrams/p2-w15-m3-dark.svg" alt="Hand-drawn sketch: brittle versus resilient selectors and the silent null failure" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p2-w15-m3
+tier: T2
+one-sentence-goal: A scraper does not break with an exception - it breaks by returning None, and the only thing standing between you and three weeks of silent nulls is an assertion at the extraction boundary.
+elements:
+  - Frame 1 (top-left): a hand-drawn web page with a price element highlighted. Beside it, two selectors written out. The first, "div > div:nth-child(3) > span.css-1x7ab", struck through in RED with the note "one redesign and this is gone". The second, "[data-testid=price]" or "th:contains('Price') + td", circled in GREEN with "anchors to MEANING, not position".
+  - Frame 2 (the silent failure, the centrepiece): the extraction code drawn as a small box, with an arrow out of it. On the arrow write "soup.select_one('.px')" and then, in red, "-> None". Follow the arrow to a database table where the price column fills with "NULL NULL NULL". Big amber margin note: "no exception. no log line. the dashboard just shows fewer products every day."
+  - Frame 3 (the fix): the same box with a green guard drawn in front of the arrow, labelled "if el is None: raise ExtractionError('price missing')". Beside it, a CI pipeline drawn as three boxes with the middle one going red, and "fails at 09:14 on the PR, not in the warehouse three weeks later".
+  - Frame 4 (bottom bar, the measured cost): three horizontal bars hand-lettered - "BeautifulSoup + html.parser: 2.72 s", "BeautifulSoup + lxml: 2.25 s", and a tiny bar "lxml xpath direct: 0.16 s". Circle the tiny one and write "14x". Amber note: "the parser was never the bottleneck. the object model was."
+  - Frame 5 (small, bottom-right): a robots.txt file drawn as a scrap of paper with "Crawl-delay: 10" circled, and a dangling arrow off the page labelled "and read the Terms too. this is not only a technical question." left unfinished.
+numbers-to-write-in: 2.72 s (html.parser), 2.25 s (lxml via BeautifulSoup), 0.159 s (lxml xpath direct), 14x, 20,000 table rows, 2.3 MB page
+alt: A hand-drawn whiteboard sketch contrasting a brittle CSS selector full of generated class names and positional child selectors, struck through in red, with a resilient selector anchored to a test id or a label; then the central failure mode where a missing element returns None rather than raising, filling a database column with nulls that produce no error and no log line; then the fix of an explicit guard that raises at the extraction boundary so CI fails on the pull request; and a measured comparison showing BeautifulSoup with html.parser at 2.72 seconds, BeautifulSoup with lxml at 2.25 seconds, and direct lxml XPath at 0.159 seconds.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+
+    ## The idea in one paragraph
+
+    Scraping is extracting structured data from a page that was designed for a human to look at
+    rather than for a program to read. That mismatch is the entire difficulty. The HTML you are
+    reading is an accident of someone else's front-end framework, it changes without notice, and
+    nobody told you when it did. So the technical work — parse the HTML, find the element, pull the
+    text — is the easy 20%. The other 80% is: pointing at elements in a way that survives a
+    redesign, noticing immediately when it does not, and staying within the rules of a site you do
+    not own.
+
+    ### The analogy
+
+    Reading a price off a supermarket shelf label.
+
+    - **A brittle rule** is "the price is the third number from the left, in the second row". It
+      works perfectly until the store reprints its labels, and then you are confidently reading the
+      unit weight as the price. **You get a number. It is the wrong number.**
+    - **A resilient rule** is "the price is the number next to the £ sign, below the word PRICE". It
+      survives a redesign because it anchors on *meaning*, not on position.
+    - **The failure that matters** is that the brittle rule does not tell you it broke. It returns
+      something. A program reading unit weights as prices produces a full, plausible, entirely wrong
+      dataset — and that is worse than crashing.
+
+    ### Every term, defined
+
+    - **HTML** — the markup describing a page's structure: nested tags like `<div>`, `<span>`, `<table>`.
+    - **DOM** — the tree the browser builds from the HTML. Parsing gives you the same tree.
+    - **Selector** — an expression identifying elements. **CSS selectors** (`div.price > span`) and
+      **XPath** (`//div[@class="price"]/span`) are the two languages.
+    - **Parser** — the library turning HTML text into a tree. `html.parser` is built in; `lxml` is a
+      C library and is faster and more forgiving of malformed markup.
+    - **Static page** — the HTML you receive already contains the data.
+    - **JS-rendered page** — the HTML you receive is nearly empty; the data arrives later via
+      JavaScript. You must either run a browser or find the API the JavaScript calls.
+    - **Headless browser** — a real browser with no window: Playwright, Puppeteer, Selenium.
+    - **Session** — a persistent connection with cookies, so the site treats consecutive requests
+      as one visitor.
+    - **User-Agent** — the header identifying your client. **Set it honestly**, with contact details.
+    - **`robots.txt`** — a file at the site root stating which paths automated clients should not
+      fetch, and often a `Crawl-delay`.
+    - **Rate limiting** — how fast you fetch. Yours to control, and the main way to avoid harm.
+    - **Snapshot test** — a saved copy of a real page, committed to your repo, that your parser runs
+      against in CI. **This is the single most valuable technique in this module.**
+
+    ### The smallest working example
+
+    ```python
+    # scrape_table.py — CPython 3.12, beautifulsoup4 4.12.3, lxml 5.3.0
+    from bs4 import BeautifulSoup
+
+    html = """
+    <html><body>
+      <table id="prices">
+        <thead><tr><th>Symbol</th><th>Price</th><th>Change</th></tr></thead>
+        <tbody>
+          <tr><td class="sym">AAPL</td><td class="px">189.42</td><td class="chg">+1.2%</td></tr>
+          <tr><td class="sym">MSFT</td><td class="px">412.10</td><td class="chg">-0.4%</td></tr>
+          <tr><td class="sym">GOOG</td><td class="px">175.88</td><td class="chg">+0.9%</td></tr>
+        </tbody>
+      </table>
+    </body></html>
+    """
+
+    soup = BeautifulSoup(html, "lxml")
+
+    rows = []
+    for tr in soup.select("#prices tbody tr"):
+        rows.append({
+            "symbol": tr.select_one(".sym").get_text(strip=True),
+            "price": float(tr.select_one(".px").get_text(strip=True)),
+            "change": tr.select_one(".chg").get_text(strip=True),
+        })
+
+    for r in rows:
+        print(r)
+    # {'symbol': 'AAPL', 'price': 189.42, 'change': '+1.2%'}
+    # {'symbol': 'MSFT', 'price': 412.1, 'change': '-0.4%'}
+    # {'symbol': 'GOOG', 'price': 175.88, 'change': '+0.9%'}
+    ```
+
+    ### Line-by-line walkthrough
+
+    - `BeautifulSoup(html, "lxml")` — the second argument is the parser. **Always pass it
+      explicitly.** If you omit it, BeautifulSoup picks the best available, which means your code
+      behaves differently on a machine where `lxml` is not installed — and the difference shows up
+      as slightly different handling of malformed markup, which is exactly the kind of bug that only
+      appears in production.
+    - `soup.select("#prices tbody tr")` — a CSS selector. `#prices` is the id, `tbody tr` is any
+      `tr` inside a `tbody` inside it. Returns a list.
+    - `tr.select_one(".sym")` — selects *within* this row. Scoping to the row is what makes the
+      loop correct; searching the whole document each time would give you the first row every time.
+    - `.get_text(strip=True)` — the text content with surrounding whitespace removed. Without
+      `strip=True` you get `'\n      AAPL\n    '` and every downstream comparison fails.
+    - `float(...)` — and **here is the bug waiting to happen.** If the selector matches nothing,
+      `select_one` returns `None`, and `None.get_text()` raises `AttributeError`. That is the *good*
+      case — it is loud. The bad case is a selector that matches the *wrong* element and returns a
+      plausible number.
+
+    ### The failure that defines this module
+
+    ```python
+    # This looks defensive. It is the bug.
+    el = tr.select_one(".px")
+    price = float(el.get_text(strip=True)) if el else None
+    ```
+
+    That `if el else None` feels like good hygiene. It is the single most damaging line in scraping
+    code. When the site renames `.px` to `.price`, this code does not crash — it writes `None` for
+    every row, forever, silently. Your table fills with nulls, your dashboard shows fewer products
+    each day, and you find out three weeks later from someone in another team.
+
+    ```python
+    # This is what you want.
+    el = tr.select_one(".px")
+    if el is None:
+        raise ExtractionError(f"price element not found in row: {tr}")
+    price = float(el.get_text(strip=True))
+    ```
+
+    **Crash. Loudly. Immediately.** A scraper that fails is an incident that takes an hour. A
+    scraper that returns nulls is a data-quality investigation that takes a week and undermines
+    trust in everything else you have built.
+
+    <Warning>
+    The general principle, and it is much bigger than scraping: **when parsing data from a source
+    you do not control, a missing field must be an error unless you have explicitly decided it is
+    optional.** Null-coalescing at the parse boundary converts a loud failure into a silent one,
+    and you will not choose to look for it.
+    </Warning>
+
+    ### Being a good citizen
+
+    ```python
+    # polite.py — CPython 3.12, requests 2.32.3
+    import time
+    import urllib.robotparser
+    from urllib.parse import urljoin, urlparse
+
+    import requests
+
+    BASE = "https://example.com"
+    UA = "NexusLearner/1.0 (+https://github.com/yourname/project; you@example.com)"
+
+    rp = urllib.robotparser.RobotFileParser()
+    rp.set_url(urljoin(BASE, "/robots.txt"))
+    rp.read()
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": UA})
+
+    def polite_get(url: str, min_interval: float = 1.0):
+        if not rp.can_fetch(UA, url):
+            raise PermissionError(f"robots.txt disallows {url}")
+        delay = rp.crawl_delay(UA)          # None if not specified
+        time.sleep(max(min_interval, delay or 0))
+        r = session.get(url, timeout=(5, 30))
+        r.raise_for_status()
+        return r
+    ```
+
+    Four things this does, and each matters:
+
+    - **An honest `User-Agent` with contact details.** If your scraper causes a problem, the site
+      operator can email you instead of blocking your entire IP range. This has repeatedly been the
+      difference between a conversation and a ban.
+    - **`robots.txt` checked before each fetch**, not once at the start — paths differ.
+    - **`crawl_delay` honoured**, with a floor of your own. If the site asks for 10 seconds, wait 10
+      seconds.
+    - **A `Session`** — connection pooling and persistent cookies, which is both faster and closer
+      to how a browser behaves.
+
+    ### Checkpoint — 5 questions before you continue
+
+    <AccordionGroup>
+      <Accordion title="1. Why is `if el else None` at the extraction boundary a bug?">
+        Because it converts a loud, immediate failure into a silent, permanent one. When the site
+        changes, you want an exception that fails the run — not a column of nulls that nobody
+        notices for three weeks. Handle missing values only where you have *decided* the field is
+        genuinely optional, and say so in a comment.
+      </Accordion>
+      <Accordion title="2. What makes a selector brittle?">
+        Anything that depends on **position** (`div > div:nth-child(3)`) or on **generated class
+        names** (`.css-1x7ab2`, `.jsx-4029384`, Tailwind utility chains). Both change on any
+        redesign, and generated names change on any *rebuild*. Resilient selectors anchor on
+        semantics: `data-testid` attributes, `id`s, ARIA roles, the text of a nearby label, or
+        structured data in the page.
+      </Accordion>
+      <Accordion title="3. When do you actually need a headless browser?">
+        Only when the data is not in the HTML you receive — check by looking at `view-source:` or
+        `curl` output, **not** at DevTools' Elements panel, which shows the DOM *after* JavaScript
+        has run. And before reaching for a browser, open the Network tab: nine times out of ten the
+        JavaScript is calling a JSON API you can call directly, which is faster, cheaper and far
+        more stable than parsing rendered HTML.
+      </Accordion>
+      <Accordion title="4. What is a snapshot test and why is it the most valuable technique here?">
+        A real page saved to your repo, which your parser runs against in CI. It catches parser
+        regressions immediately and — when you refresh the snapshot on a schedule — it catches
+        *site* changes as a failing build rather than as nulls in your warehouse. **It moves the
+        failure from your data to your CI**, which is the whole game.
+      </Accordion>
+      <Accordion title="5. Is `robots.txt` legally binding?">
+        Not by itself — it is a convention, not a contract, and its legal status varies by
+        jurisdiction. But ignoring it is a strong signal of bad faith if a dispute arises, and it is
+        frequently referenced in the site's Terms of Service, which *may* be contractually binding.
+        Layer 2 sets out the boundary properly. The short version: `robots.txt` is the floor, not
+        the ceiling.
+      </Accordion>
+    </AccordionGroup>
+
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+
+    ## Resilient selectors, ranked
+
+    | Strategy | Example | Survives a redesign? |
+    | --- | --- | --- |
+    | **Structured data** (JSON-LD, microdata) | `script[type="application/ld+json"]` | **best** — it exists for machines and changes rarely |
+    | **The underlying API** | the XHR the page's JS calls | **best** — no HTML at all |
+    | `data-testid` / `data-*` attributes | `[data-testid="product-price"]` | **very good** — front-end tests depend on these too |
+    | Semantic HTML + ARIA | `main article h1`, `[role="table"]` | good |
+    | Stable `id` | `#product-price` | good, if not generated |
+    | Label-anchored | the `td` following a `th` whose text is "Price" | good — anchors on meaning |
+    | Semantic class name | `.product-price` | okay |
+    | Generated class name | `.css-1x7ab2`, `.jsx-40293` | **no** — changes on rebuild |
+    | Positional | `div > div:nth-child(3) > span` | **no** — changes on any layout edit |
+
+    **Check for JSON-LD first, always.** A very large fraction of e-commerce, recipe, job-listing
+    and article pages embed schema.org structured data because it drives search-result rich
+    snippets. It is machine-readable, semantically labelled, and far more stable than the visual
+    markup:
+
+    ```python
+    import json
+    from bs4 import BeautifulSoup
+
+    def extract_jsonld(soup: BeautifulSoup) -> list[dict]:
+        out = []
+        for tag in soup.select('script[type="application/ld+json"]'):
+            try:
+                data = json.loads(tag.string or "")
+            except json.JSONDecodeError:
+                continue                       # some sites emit invalid JSON here
+            out.extend(data if isinstance(data, list) else [data])
+        return out
+
+    def price_from_jsonld(soup) -> float | None:
+        for obj in extract_jsonld(soup):
+            if obj.get("@type") == "Product":
+                offers = obj.get("offers") or {}
+                if isinstance(offers, list):
+                    offers = offers[0] if offers else {}
+                if "price" in offers:
+                    return float(offers["price"])
+        return None
+    ```
+
+    **Look for the API second.** Open DevTools, filter the Network tab to XHR/Fetch, and reload.
+    If the page calls `/api/v2/products?page=1`, call that instead. You get JSON with a schema, no
+    parsing, no rendering, and a source that changes far less often than the markup. **This single
+    check has saved more scraping projects than every other technique in this module combined.**
+
+    ## Caching so re-runs do not re-fetch
+
+    ```python
+    # cached_fetch.py — CPython 3.12
+    from __future__ import annotations
+    import hashlib
+    import time
+    from pathlib import Path
+
+    import requests
+
+
+    class CachedFetcher:
+        """Content-addressed HTTP cache on disk.
+
+        Development is edit-parser, re-run, edit-parser, re-run. Without a cache
+        every iteration re-fetches, which is slow, rude, and gets you blocked.
+        """
+
+        def __init__(self, cache_dir: Path, ttl_seconds: float = 86_400,
+                     min_interval: float = 1.0, user_agent: str = "NexusLearner/1.0") -> None:
+            self.dir = cache_dir
+            self.dir.mkdir(parents=True, exist_ok=True)
+            self.ttl = ttl_seconds
+            self.min_interval = min_interval
+            self.session = requests.Session()
+            self.session.headers["User-Agent"] = user_agent
+            self._last_request = 0.0
+            self.hits = 0
+            self.misses = 0
+
+        def _path(self, url: str) -> Path:
+            return self.dir / (hashlib.sha256(url.encode()).hexdigest()[:32] + ".html")
+
+        def get(self, url: str, *, force: bool = False) -> str:
+            p = self._path(url)
+            if not force and p.exists() and (time.time() - p.stat().st_mtime) < self.ttl:
+                self.hits += 1
+                return p.read_text(encoding="utf-8")
+
+            # Rate limit only the requests that actually go out.
+            elapsed = time.monotonic() - self._last_request
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            r = self.session.get(url, timeout=(5, 30))
+            self._last_request = time.monotonic()
+            r.raise_for_status()
+            p.write_text(r.text, encoding="utf-8")
+            self.misses += 1
+            return r.text
+    ```
+
+    <Tip>
+    The rate-limiting sleep is inside the cache-miss branch, which is the detail that makes this
+    worth writing. A cache hit is instant; only real network requests are throttled. During
+    development you iterate at full speed against cached pages, and the site sees nothing.
+    </Tip>
+
+    ## Snapshot tests: the technique that makes scrapers maintainable
+
+    ```python
+    # tests/test_parser_snapshots.py — pytest 8.x
+    import json
+    from pathlib import Path
+
+    import pytest
+    from bs4 import BeautifulSoup
+
+    from scraper import parse_product_page, ExtractionError
+
+    SNAPSHOTS = Path(__file__).parent / "snapshots"
+
+
+    @pytest.mark.parametrize("name", [p.stem for p in SNAPSHOTS.glob("*.html")])
+    def test_parser_matches_expected(name):
+        """Parse a REAL saved page and compare against the recorded expectation.
+
+        Refresh the snapshots on a schedule (a weekly CI job) and this test
+        becomes a change detector for the SITE, not just for the parser.
+        """
+        html = (SNAPSHOTS / f"{name}.html").read_text(encoding="utf-8")
+        expected = json.loads((SNAPSHOTS / f"{name}.json").read_text())
+        assert parse_product_page(BeautifulSoup(html, "lxml")) == expected
+
+
+    def test_missing_price_raises_rather_than_returning_none():
+        """The whole point. A changed layout must FAIL, not produce a null."""
+        html = "<html><body><h1 data-testid='title'>Widget</h1></body></html>"
+        with pytest.raises(ExtractionError, match="price"):
+            parse_product_page(BeautifulSoup(html, "lxml"))
+
+
+    def test_price_with_currency_symbol_and_thousands_separator():
+        html = """<html><body>
+            <h1 data-testid='title'>Widget</h1>
+            <span data-testid='price'>£1,299.00</span></body></html>"""
+        assert parse_product_page(BeautifulSoup(html, "lxml"))["price"] == 1299.00
+
+
+    def test_empty_page_raises():
+        with pytest.raises(ExtractionError):
+            parse_product_page(BeautifulSoup("<html></html>", "lxml"))
+    ```
+
+    Two CI jobs make this work:
+
+    - **On every pull request:** run the parser against the committed snapshots. Fast, offline,
+      deterministic. Catches parser regressions.
+    - **Weekly (or nightly):** re-fetch the live pages into the snapshot directory and run the same
+      tests. **A failure here means the site changed.** You get a red build with a diff of the HTML,
+      not a null column discovered in a month.
+
+    <Check>
+    `test_missing_price_raises_rather_than_returning_none` is the highest-value test in the file. It
+    asserts that your parser is loud. Everything else in this module is downstream of that one
+    property, and it is the assertion people leave out because "it obviously raises" — right up
+    until someone adds a defensive `or None` during a refactor.
+    </Check>
+
+    ## Parser performance, measured
+
+    A 2.3 MB page containing a 20,000-row table, extracting two fields per row:
+
+    | Approach | Time | vs fastest |
+    | --- | --- | --- |
+    | BeautifulSoup + `html.parser` | 2.721 s | 17.1× |
+    | BeautifulSoup + `lxml` | 2.252 s | 14.2× |
+    | **`lxml` XPath directly** | **0.159 s** | **1.0×** |
+
+    <Info>
+    Method: CPython 3.12.9, beautifulsoup4 4.12.3, lxml 5.3.0, M3 Pro, best-of-3, all three verified
+    to extract 20,000 rows. Reproduce with `w15_bench.py scraping`.
+    </Info>
+
+    **The surprising result is that the parser choice barely matters.** Switching BeautifulSoup from
+    `html.parser` to `lxml` gains only 1.21× — far less than the folklore suggests. The 14× win
+    comes from **leaving BeautifulSoup entirely**.
+
+    The reason is where the time goes. BeautifulSoup does not merely parse; it builds a rich Python
+    object graph — a `Tag` object per element, with navigable-string children, parent links and
+    sibling links. For 20,000 rows × 4 cells that is 80,000+ Python objects, each with attribute
+    dictionaries. **The parsing is C; the object model is Python, and the object model is the
+    bottleneck.** `lxml.etree` keeps the tree in C and only materialises Python objects for the
+    nodes you actually touch.
+
+    The practical guidance:
+
+    - **Under ~1,000 elements: use BeautifulSoup.** Its API is vastly more pleasant and 2 seconds
+      versus 0.16 seconds does not matter when both are under 20 ms at that size.
+    - **Over ~10,000 elements, or in a hot loop: use `lxml` directly**, with XPath or `cssselect`.
+    - **Always pass the parser explicitly** to BeautifulSoup regardless, so behaviour does not
+      depend on what happens to be installed.
+
+    ## Trade-offs table
+
+    | Situation | Choose | Instead of | Because |
+    | --- | --- | --- | --- |
+    | The page embeds JSON-LD | parse the JSON-LD | parse the visual markup | it exists for machines and changes far less often |
+    | The page calls a JSON API | call the API | render the page | no parsing, a real schema, and far more stable |
+    | Data is in the initial HTML | `requests` + a parser | a headless browser | ~50–200× cheaper in CPU and memory (Layer 3) |
+    | Data appears only after JS runs | headless browser | `requests` | there is genuinely nothing else in the HTML |
+    | Page has under ~1,000 elements | BeautifulSoup | raw `lxml` | the API is much nicer and the difference is milliseconds |
+    | Page has over ~10,000 elements | `lxml` XPath | BeautifulSoup | measured 14.2× on a 20,000-row table |
+    | Iterating on a parser | a disk cache | re-fetching each run | faster, and it stops you being blocked |
+    | Selecting an element | `data-testid`, JSON-LD, or label-anchored | `nth-child` or generated classes | positional and generated selectors do not survive a rebuild |
+    | A field might be missing | raise, unless you decided it is optional | `or None` | silent nulls are worse than a failed run |
+    | Site publishes a bulk export or API | use it | scrape | faster, legal, and it will not break |
+
+    ## The legal and ethical boundary, plainly
+
+    <Warning>
+    **This is not legal advice.** It is a practitioner's summary of where the lines are generally
+    drawn. If money or personal data is involved, ask a lawyer. The rules also differ substantially
+    between jurisdictions — the US, EU and UK positions are not the same.
+    </Warning>
+
+    **Generally accepted as fine:**
+
+    - Fetching publicly accessible pages at a modest rate, honouring `robots.txt`.
+    - Scraping factual data — prices, listings, public statistics — for analysis.
+    - Identifying yourself honestly in the `User-Agent`.
+    - Caching so you re-fetch as little as possible.
+
+    **Generally a problem:**
+
+    - **Ignoring `robots.txt`** — a strong bad-faith signal in any dispute, and often incorporated
+      into the site's Terms.
+    - **Circumventing authentication or paywalls**, which in the US can implicate the Computer Fraud
+      and Abuse Act.
+    - **Rate that degrades the service** for real users. If your scraper is a load-testing tool, you
+      have crossed a line regardless of intent.
+    - **Republishing copyrighted content.** Facts are generally not copyrightable; their *expression*
+      is. Extracting "the price is £12.99" differs from copying the product description.
+    - **Personal data.** Under GDPR, scraping personal data from public pages is still processing
+      personal data, and you need a lawful basis. "It was public" is not one.
+    - **Defeating anti-bot measures** — solving CAPTCHAs, rotating residential proxies to evade
+      blocks, spoofing browser fingerprints. Technically possible; a clear statement that you know
+      you are unwelcome.
+
+    **Cases worth knowing about:**
+
+    - ***hiQ Labs v. LinkedIn*** (9th Cir., 2019/2022) — scraping *public* pages is generally not
+      CFAA "unauthorized access", because the CFAA concerns circumventing authentication. It did
+      **not** license scraping generally, and the parties settled with hiQ enjoined.
+    - ***Van Buren v. United States*** (SCOTUS, 2021) — narrowed the CFAA: exceeding *authorised
+      use* of data you may access is not the same as unauthorised *access*. Reduces criminal
+      exposure for terms-of-service violations; does not eliminate civil claims.
+    - ***Ryanair v. PR Aviation*** (CJEU, 2015) — in the EU, a site's contractual terms can restrict
+      use even where database rights do not apply.
+
+    **The practical test that keeps you out of trouble:** *would you be comfortable emailing the
+    site operator to say exactly what you are doing?* If yes, you are almost certainly fine — and
+    sending that email is often the best move available, because a startling number of sites will
+    just give you a data feed.
+
+    ## What breaks in the real world
+
+    A competitor-pricing scraper ran nightly across 40 retail sites and fed a pricing dashboard. It
+    used CSS selectors captured from the browser's "Copy selector" context-menu item — which
+    produces positional selectors like:
+
+    ```
+    #__next > div > div.sc-1x7ab2 > main > div:nth-child(2) > section > div > span.sc-9f2b3
+    ```
+
+    One retailer shipped a redesign. The parser was written as:
+
+    ```python
+    price_el = soup.select_one("#__next > div > div.sc-1x7ab2 > main > ... > span.sc-9f2b3")
+    price = parse_price(price_el.get_text()) if price_el else None
+    ```
+
+    **`None`.** No exception. The row was written with a null price. The dashboard's average
+    competitor price simply excluded that retailer, because the SQL was
+    `AVG(price)` and `AVG` ignores nulls.
+
+    The dashboard showed a **4% drop in average competitor pricing**. The pricing team, doing their
+    job, cut prices to stay competitive. **Eleven days at reduced margin across the affected
+    categories before anyone questioned the number** — and it was questioned only because a manager
+    happened to check one competitor's site manually and saw a price that did not match.
+
+    Three failures, and none of them are about scraping technique:
+
+    1. **`if price_el else None` at the parse boundary.** One `raise` instead, and the pipeline
+       fails at 02:00 with a stack trace naming the site.
+    2. **`AVG` silently ignoring nulls.** SQL aggregate functions skip nulls by design, so a column
+       that is 100% null produces a clean average of the *remaining* sites with no warning. **A
+       `count(*) FILTER (WHERE price IS NOT NULL)` assertion alongside every average would have
+       caught it**, and this generalises far beyond scraping.
+    3. **No null-rate monitoring.** The pipeline reported success every night. The one metric that
+       mattered — null rate per source — was not collected.
+
+    The fix was structural rather than clever:
+
+    ```python
+    # 1. Selectors anchored on meaning, with an explicit fallback chain.
+    PRICE_SELECTORS = [
+        'script[type="application/ld+json"]',          # try structured data first
+        '[data-testid="product-price"]',
+        '[itemprop="price"]',
+        '.product-price',
+    ]
+
+    # 2. Raise if nothing matched.
+    def extract_price(soup) -> float:
+        for sel in PRICE_SELECTORS:
+            if (v := try_selector(soup, sel)) is not None:
+                return v
+        raise ExtractionError(f"no price found; tried {PRICE_SELECTORS}")
+
+    # 3. A data-quality assertion that fails the run, not a warning.
+    assert null_rate("price") < 0.02, f"price null rate {null_rate('price'):.1%} exceeds 2%"
+
+    # 4. Weekly snapshot refresh in CI, so a site change is a red build.
+    ```
+
+    **The generalisable lesson is not about scrapers.** It is that a null flowing into an aggregate
+    is invisible, and that the boundary between "data I control" and "data I do not" is exactly
+    where assertions belong. You will make this same decision in week 16 when deciding whether a
+    missing value is dropped, imputed, or fatal.
+
+    ### Design checkpoint
+
+    <Accordion title="You must monitor prices for 500 products across 40 retailers, daily, and the data drives automated repricing. Design it, and say what you would refuse to automate.">
+    **Model answer.**
+
+    **What I would refuse to automate: the repricing itself, initially.** Scraped data breaks
+    silently and the war story above is the standard outcome. A closed loop from a scraper straight
+    to a price change is a system where a CSS class rename costs money. **Put a human approval step
+    or a hard guard rail between the data and the action** — for example, no automatic price change
+    above 3% without review, and no change at all if any source's null rate exceeds 2% that day.
+    That guard rail is the actual deliverable; the scraper is the easy part.
+
+    **The design.**
+
+    1. **Per retailer, in preference order: bulk feed → API → JSON-LD → HTML.** Email all 40 asking
+       for a feed. Perhaps five will say yes, and those five will never break. For the rest, check
+       for an XHR API, then for JSON-LD, and only then parse markup. **Spending a day on this
+       ordering saves months of maintenance**, and it is the step everyone skips.
+    2. **One adapter per retailer, one shared interface.** `fetch(product_id) -> RawPage` and
+       `parse(RawPage) -> PriceRecord`. Retailers break independently; a shared parser is a shared
+       failure.
+    3. **Cache every fetch to object storage, keyed by URL and date.** 500 × 40 = 20,000 pages/day
+       at ~200 KB is 4 GB/day, or 1.5 TB/year — about $35/month on S3. **Cheap, and it means a
+       parser bug is a re-parse rather than a re-scrape.**
+    4. **Snapshot tests per retailer, refreshed weekly in CI.** 40 red-build detectors. When
+       retailer 17 redesigns, you find out on Tuesday morning from a failing build.
+    5. **Null rate per retailer per day as the primary health metric**, with the run failing above a
+       threshold. Not "did the job succeed" — **"did the job produce data"**.
+    6. **Rate: 40 retailers × 500 products = 20,000 requests spread over hours**, one request per
+       second per retailer with jitter. That is 500 seconds per retailer, trivially parallel across
+       retailers since they are independent origins. Honour each site's `crawl_delay`.
+
+    **What breaks first, in order.**
+
+    1. **A retailer redesigns.** Roughly monthly across 40 sites, so expect this every few weeks.
+       Snapshot tests turn it from an incident into a ticket.
+    2. **Anti-bot measures appear.** Cloudflare, rate-based blocking, or a login wall. **My position:
+       if a site actively blocks you, stop scraping it and email them.** Escalating into
+       proxy rotation and fingerprint spoofing is an arms race you lose, and it moves you from "grey
+       area" to "clearly unwelcome" — which matters a great deal if repricing decisions depend on it.
+    3. **Product matching.** This is the genuinely hard problem, and it is not a scraping problem:
+       is retailer A's "Acme Widget 500ml" the same product as retailer B's "Acme Widget, 0.5L"?
+       That is entity resolution — week 16 module 3 — and it will consume more of your time than
+       every scraper combined.
+    4. **Legal.** 40 sites means 40 sets of Terms. Have someone read them, and keep the list of
+       which sites gave explicit permission.
+
+    **The number I would bring to the review:** "we can have this in three weeks, and roughly once a
+    month one retailer will break and take a day to fix. The guard rail costs us nothing and it is
+    the difference between a bad day and eleven days of lost margin."
+    </Accordion>
+
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+
+    ## Headless browser cost, and how to avoid needing one
+
+    | | `requests` + `lxml` | Playwright (Chromium, headless) |
+    | --- | --- | --- |
+    | Memory per worker | ~30 MB | **~300–500 MB** |
+    | Time per page (simple) | 50–200 ms | **1–3 s** |
+    | CPU | negligible | one core, briefly saturated |
+    | Concurrency on a 4 GB container | ~50 | **~8** |
+    | Container image | ~150 MB | **~1.5 GB** with browser deps |
+    | Failure modes | HTTP errors | HTTP errors, plus timeouts, zombie processes, memory leaks, font issues |
+
+    Roughly **10–50× the memory and 10–30× the time per page.** Concretely: 20,000 pages/day at 100
+    ms each is 33 minutes on a small instance; at 2 s each it is 11 hours and needs several.
+
+    **So check three things before reaching for a browser:**
+
+    1. **`curl` the page** (or `view-source:`). If the data is there, you do not need a browser.
+       **Do not check DevTools' Elements panel** — it shows the DOM after JavaScript, which is
+       exactly what you are trying to determine you can skip.
+    2. **Look for `__NEXT_DATA__` or similar hydration payloads.** Next.js, Nuxt and SvelteKit embed
+       the page's data as JSON inside a `<script>` tag so the client can hydrate without a second
+       request. It is right there in the HTML you already have:
+       ```python
+       import json, re
+       m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+                     html, re.S)
+       data = json.loads(m.group(1))["props"]["pageProps"]
+       ```
+       **This is the single highest-value trick in the module** and it works on a very large share of
+       modern sites.
+    3. **Watch the Network tab for XHR/Fetch.** If the page calls `/api/products?page=2`, call that.
+
+    Only if all three fail is a browser warranted — and even then, use it to capture the API
+    response rather than to scrape the DOM:
+
+    ```python
+    # Use the browser as an API sniffer, not as a parser.
+    from playwright.sync_api import sync_playwright   # playwright==1.49.1
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        page = browser.new_page()
+        captured = []
+        page.on("response", lambda r: captured.append(r.url)
+                if "/api/" in r.url else None)
+        page.goto(url, wait_until="networkidle")
+        browser.close()
+    print(captured)      # now call these directly, forever after
+    ```
+
+    ## Detecting silent breakage
+
+    A scraper's characteristic failure is a **shift in the distribution of what you extract**, not
+    an exception. Five signals, in rough order of value:
+
+    | Signal | What it catches | How |
+    | --- | --- | --- |
+    | **Null rate per field per source** | selector stopped matching | fail the run above a threshold; 2% is a reasonable default |
+    | **Row count vs the trailing 7-day median** | pagination broke, or a section moved | alert on a change above ~20% |
+    | **Value distribution shift** | you are extracting the *wrong* element | KS test against last week's distribution; **this is the only signal that catches "the price column now contains weights"** |
+    | **HTML structure hash** | the page changed at all | hash the tag-name skeleton with text and attributes stripped; a change is a warning, not a failure |
+    | **Snapshot test in CI** | site change, before it reaches your data | weekly refresh; a red build is the alert |
+
+    **The distribution check is the one nobody builds and the one that catches the worst failure.**
+    A selector that matches the wrong element produces plausible values with no nulls and a normal
+    row count — every other signal stays green. Comparing this week's price distribution against
+    last week's with a Kolmogorov–Smirnov test catches it, and **you will build exactly this test in
+    week 16 module 4 for data drift.** It is the same statistic for the same reason.
+
+    ## Anti-bot detection, and where to stop
+
+    | Technique | What it does | Response |
+    | --- | --- | --- |
+    | `User-Agent` filtering | blocks obvious bots | set an honest UA with contact details |
+    | Rate-based blocking | 429 or a block after N requests/minute | slow down; this is a reasonable request |
+    | TLS fingerprinting (JA3/JA4) | Python's TLS handshake differs from a browser's | this is a *deliberate* bot signal from the site |
+    | Browser fingerprinting | canvas, WebGL, fonts, `navigator` properties | ditto |
+    | CAPTCHA | requires human interaction | **the site is telling you to stop** |
+    | Honeypot links | invisible links only a bot would follow | respect `display:none`; do not follow every `href` blindly |
+    | Behavioural analysis | mouse movement, timing, scroll patterns | ditto |
+
+    **My position, stated plainly:** the first two are technical conditions and it is entirely
+    reasonable to work within them. Everything from TLS fingerprinting downward is the site
+    explicitly detecting and rejecting automated access. Defeating those is technically achievable
+    — `curl_cffi` impersonates browser TLS fingerprints, `undetected-chromedriver` patches the
+    obvious tells, CAPTCHA-solving services exist — and choosing to use them is a decision that you
+    know you are unwelcome and are proceeding anyway.
+
+    **That is a business and legal decision, not an engineering one, and it should be made by
+    someone who can be accountable for it.** As the engineer, your job is to surface it: "this site
+    is actively blocking automated access; continuing means deliberately evading their controls."
+    Then let the person who owns the risk decide.
+
+    The practical alternative that people forget: **email them.** A surprising number of sites have
+    a data feed, a partner API, or simply no objection once asked. It costs ten minutes and it
+    converts an arms race into a supported integration.
+
+    ## Encoding, the quiet source of corruption
+
+    ```python
+    r = requests.get(url)
+    print(r.encoding)          # requests GUESSES this from headers, and often wrongly
+    print(r.apparent_encoding) # chardet's guess from the bytes themselves
+
+    # The robust order of precedence:
+    #   1. The HTML's own <meta charset>, which requests does NOT look at
+    #   2. The Content-Type header's charset parameter
+    #   3. Detection from the bytes
+    # lxml reads the meta tag itself if you hand it BYTES rather than str:
+    from lxml import html as LH
+    doc = LH.fromstring(r.content)     # r.content (bytes), NOT r.text (str)
+    ```
+
+    **`r.text` applies `requests`' guessed encoding.** If the server sends no charset,
+    `requests` defaults to ISO-8859-1 for `text/*` responses per RFC 2616 — which is wrong for the
+    overwhelming majority of the modern web, and turns `£` into `Â£` and `é` into `Ã©`. Passing
+    `r.content` (bytes) to `lxml` lets it read the document's own `<meta charset>` declaration,
+    which is the authoritative source.
+
+    Then normalize, exactly as in week 13 module 2:
+
+    ```python
+    import unicodedata, re
+    def canonical(s: str) -> str:
+        s = unicodedata.normalize("NFC", s)
+        s = "".join(ch for ch in s if unicodedata.category(ch) != "Cf")   # zero-width, bidi
+        return re.sub(r"[\s ]+", " ", s).strip()
+    ```
+
+    Note ` ` explicitly: **non-breaking spaces are endemic in scraped HTML** (`&nbsp;`), they
+    are not matched by `\s` in some regex flavours, and they break every exact-match comparison and
+    every `float()` you attempt. Dropping category `Cf` removes zero-width joiners and bidirectional
+    overrides — invisible characters that survive copy-paste, break exact matching, and are a
+    phishing vector. **You will meet them again in week 31 as a prompt-injection carrier.**
+
+    ## Production failure modes
+
+    | Failure mode | Signature | Detection |
+    | --- | --- | --- |
+    | Selector stops matching, code returns `None` | null column; no error; aggregates silently exclude the source | raise at the parse boundary; monitor null rate per field per source |
+    | Selector matches the *wrong* element | plausible values, no nulls, normal row count — every signal green | KS test on the value distribution against last week |
+    | Nulls swallowed by `AVG`/`SUM` | metric shifts with no explanation | pair every aggregate with a non-null count assertion |
+    | Positional selectors | breaks on any layout change | anchor on `data-testid`, JSON-LD, or label text |
+    | Generated class names | breaks on any *rebuild*, not just redesign | never select on `.css-*`, `.jsx-*`, or hashed classes |
+    | Wrong encoding | mojibake: `Â£`, `Ã©` | pass `r.content` to `lxml`; normalize with NFC |
+    | Non-breaking spaces | `float()` fails, or exact matches never hit | strip ` ` explicitly in normalization |
+    | Headless browser leaks | memory grows over hours; zombie Chromium processes | always close contexts; run in a supervised process with a hard restart |
+    | Blocked after a redeploy | IP or UA newly flagged | honest UA, sane rate, cache aggressively; if blocked, ask rather than evade |
+    | Scraping in a tight loop with no cache | re-fetch on every dev iteration; you get blocked in an afternoon | content-addressed disk cache with a TTL |
+
+    ## Frontier and research pointers
+
+    - **RFC 9309, "Robots Exclusion Protocol" (2022).** — **Takeaway:** `robots.txt` is finally a
+      standard rather than a 1994 convention; it specifies matching precedence and caching, and
+      `urllib.robotparser` predates it, so check whether your parser handles the modern grammar.
+    - **schema.org and JSON-LD 1.1 (W3C Recommendation).** — **Takeaway:** a very large fraction of
+      commercial pages already publish machine-readable structured data because Google's rich
+      snippets depend on it; **check for it before writing a single CSS selector.**
+    - **Mitchell (2018), *Web Scraping with Python*, 2nd ed., chapters 11–14.** — **Takeaway:** the
+      most complete practitioner treatment of anti-bot measures, form handling and the
+      test-your-scraper discipline; chapters 11 and 12 are the useful ones.
+    - ***hiQ Labs, Inc. v. LinkedIn Corp.*, 938 F.3d 985 (9th Cir. 2019), on remand 2022.** —
+      **Takeaway:** scraping publicly accessible pages is generally not CFAA "unauthorized access",
+      because the statute targets circumventing authentication — but the case settled with hiQ
+      enjoined, so it is far from a licence to scrape.
+    - ***Van Buren v. United States*, 593 U.S. 374 (2021).** — **Takeaway:** the Supreme Court read
+      the CFAA's "exceeds authorized access" narrowly, substantially reducing criminal exposure for
+      terms-of-service violations; civil claims are unaffected.
+    - **Krotov & Silva (2018), "Legality and Ethics of Web Scraping,"** AMCIS. — **Takeaway:** a
+      four-factor framework — the data's nature, the method, the purpose, and the harm — that is
+      more useful for making an actual decision than any single legal test.
+
+    ## Stretch challenge
+
+    **Build a scraper that tells you it is breaking before your data does.**
+
+    The failure this module is really about is silence. So build the alarm.
+
+    Construct a **change-detection harness** around a scraper for 10 real sites:
+
+    1. **Structural hashing.** For each page, compute a hash of the DOM *skeleton* — tag names and
+       hierarchy with all text, attribute values and generated classes stripped. Store it daily.
+       A change means the structure moved.
+    2. **Selector-health tracking.** For every selector in your parser, record daily: did it match?
+       how many elements? Store the time series. **A selector whose match count drops from 50 to 0
+       is the alarm you want**, and it fires before any data lands.
+    3. **Value-distribution monitoring.** For each extracted numeric field, run a two-sample KS test
+       against the previous 7 days. For each categorical field, compare the value-set. **This is the
+       only check that catches extracting the wrong element.**
+    4. **A weekly snapshot-refresh CI job** that re-fetches and re-runs the parser tests.
+    5. **A single health score per source per day**, combining all four, with a dashboard.
+
+    Then — and this is the actual experiment — **run it for four weeks against 10 real sites and
+    record every change it detects.**
+
+    The open questions:
+
+    - **How often do real sites actually change?** Everyone assumes "constantly". Measure it. My
+      guess is that structural hashes change weekly on active commercial sites and monthly on
+      others, but that only a small fraction of those changes break a well-chosen selector.
+    - **Which signal fires first?** Structural hash, selector match count, or value distribution?
+      Build the confusion matrix: for each real breakage, which detectors caught it and how many
+      false positives did each produce?
+    - **What is the false-positive rate of each?** A structural hash changes on any A/B test or ad
+      slot. A detector that cries wolf weekly is a detector people disable, which is worse than not
+      having it. **Find the threshold at which each signal is actually usable.**
+    - **How much does selector strategy matter, measured?** Write two parsers per site — one using
+      "Copy selector" output from the browser, one anchored on JSON-LD and `data-testid` — and
+      count how many breakages each suffers over four weeks. **This turns the advice in Layer 2
+      from an assertion into a result.**
+
+    A four-week empirical study of "how often do websites break scrapers, and which detector catches
+    it first" is a genuinely original piece of work. Nobody has published it, everybody in the field
+    has an opinion about it, and it is entirely within reach of one person and a cron job.
+
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Build a scraper for one real site with a **snapshot test suite**, so that a layout change fails in CI
+instead of silently producing nulls. Commit at least three saved pages plus their expected output.
+Include a test asserting that a missing required field **raises** rather than returning `None`.
+</Card>
+
+<Steps>
+  <Step title="Check for JSON-LD and an API first">
+    Before writing a single selector: `curl` the page and search for `application/ld+json` and
+    `__NEXT_DATA__`, then open DevTools' Network tab and filter to XHR. If either exists, your
+    scraper is a JSON parser and this lab is an hour instead of a day.
+  </Step>
+  <Step title="Save real pages as fixtures immediately">
+    `tests/snapshots/product_a.html` plus `product_a.json`. Do this before writing the parser —
+    then you develop against local files, iterate instantly, and never hammer the site.
+  </Step>
+  <Step title="Make missing fields fatal">
+    `raise ExtractionError(...)`, never `or None`. Write the test that asserts this before you write
+    the parser, because it is the property everything else depends on.
+  </Step>
+  <Step title="Add the weekly refresh job">
+    A CI job that re-fetches the snapshots and runs the tests. That job failing *is* your change
+    detection, and it is 15 lines of YAML.
+  </Step>
+</Steps>
+
+## The whiteboard
+
+The T2 build-up has five frames: the brittle selector crossed out beside the resilient one, the
+silent `None` filling a null column, the guard that raises and the CI build going red, the measured
+parser bar chart, and `robots.txt`.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p2-w15-m3-blank.svg) · [Editable source](/assets/diagrams/p2-w15-m3.excalidraw)
+</Tip>
+
+The thing to get right on redraw: frame 2 must show **no exception and no log line** — just nulls
+arriving in a table. If your sketch shows an error being raised, you have drawn the version that
+works.
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    **Portfolio line:** "Built a scraper with a snapshot-test suite and a weekly CI refresh that
+    turns site changes into failing builds; monitored selector match counts and value distributions
+    to detect silent breakage; measured `lxml` XPath at 14.2× faster than BeautifulSoup on a
+    20,000-row page and documented when each is the right choice."
+
+    **The interview move.** "How would you scrape a site?" is often asked to see whether you think
+    about maintenance. Most candidates describe BeautifulSoup and selectors. Three things stand out:
+
+    1. **"First I'd check for JSON-LD or the underlying API"** — this immediately signals you have
+       maintained a scraper rather than written one.
+    2. **"The failure mode isn't an exception, it's nulls"** — then describe the raise-at-the-boundary
+       rule and the null-rate monitor.
+    3. **"Snapshot tests refreshed weekly in CI"** — this converts an unbounded maintenance burden
+       into a red build, and very few people have thought of it.
+
+    Mentioning the legal boundary unprompted — `robots.txt`, honest UA, and "if they're actively
+    blocking me I'd ask rather than evade" — also marks you out, because it shows you think about
+    the system you are affecting and not only the code you are writing.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **1. Find every `or None` and `if x else None` at a parse boundary and make it raise.** This
+    applies well beyond scraping — JSON responses, CSV columns, config files. Every one of them is
+    a place where a source change becomes a silent null instead of a loud failure. This is a
+    mechanical grep-and-review that takes an afternoon and removes an entire class of week-long
+    data-quality investigations.
+
+    **2. Pair every aggregate in a dashboard with a non-null count.** `AVG(price)` next to
+    `count(price)` and `count(*)`. SQL aggregates skip nulls silently, so a source that stopped
+    reporting simply vanishes from the average with no indication. This is a five-minute change per
+    chart and it is exactly what would have caught the eleven-day pricing incident.
+
+    **3. Add null-rate-per-source monitoring to one pipeline this week.** Not "did the job succeed"
+    — **"did the job produce data"**. Fail the run above a threshold. The distinction between a job
+    completing and a job working is the single most common blind spot in data pipelines, and the
+    fix is one assertion.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Null column, no error, discovered weeks later | `if el else None` at the parse boundary | `raise ExtractionError(...)`; monitor null rate per field per source |
+| Dashboard metric shifts with no explanation | Nulls silently excluded by `AVG`/`SUM` | Pair every aggregate with a non-null count assertion |
+| Scraper breaks on every deploy of the target site | Positional selectors or generated class names | Anchor on JSON-LD, `data-testid`, `itemprop`, or label text |
+| Values look plausible but are wrong | Selector matches the wrong element; no nulls, normal counts | KS test on the value distribution against the previous week |
+| `Â£` and `Ã©` in the output | `requests` guessed ISO-8859-1; `r.text` applied it | Pass `r.content` (bytes) to `lxml`; normalize with NFC |
+| `float()` fails on a price that looks fine | Non-breaking space (` `) from `&nbsp;` | Strip ` ` explicitly during normalization |
+| Blocked after an afternoon of development | Re-fetching on every iteration with no cache | Content-addressed disk cache with a TTL; rate-limit only cache misses |
+| Behaves differently on CI than locally | BeautifulSoup parser not specified; falls back when `lxml` is absent | Always pass the parser explicitly |
+| Scraping is slow on large pages | BeautifulSoup builds a Python object per element | `lxml` XPath directly above ~10,000 elements — measured 14.2× |
+| Headless browser workers leak memory | Contexts not closed; zombie Chromium processes | Close every context; run supervised with a hard restart policy |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [BeautifulSoup 4.12 documentation](https://www.crummy.com/software/BeautifulSoup/bs4/doc/) — read the "Installing a parser" section for the differences between `html.parser`, `lxml` and `html5lib` on malformed markup; the table there is the reason to always pass the parser explicitly.
+- [`lxml` XPath and XSLT](https://lxml.de/xpathxslt.html) (lxml 5.3.0) — read this for XPath axes and `cssselect`; it is the API you drop to when BeautifulSoup's object model becomes the bottleneck.
+- [`urllib.robotparser`](https://docs.python.org/3.12/library/urllib.robotparser.html) — read this for `can_fetch`, `crawl_delay` and `request_rate`; note it predates RFC 9309 and does not implement the newest matching rules.
+- [RFC 9309, Robots Exclusion Protocol](https://www.rfc-editor.org/rfc/rfc9309.html) — read this for the specified matching precedence and caching behaviour, now that `robots.txt` is finally standardised.
+- [schema.org Product / Offer](https://schema.org/Product) — read this for the JSON-LD structure most commerce sites already publish; it is the stable interface hiding inside the unstable one.
+- [Playwright Python](https://playwright.dev/python/docs/intro) (playwright 1.49.1) — read the "Network" section for request interception, which is how you use a browser to find an API rather than to parse a DOM.
+
+**Cases and papers**
+
+- *hiQ Labs, Inc. v. LinkedIn Corp.*, 938 F.3d 985 (9th Cir. 2019); on remand 2022. — **Takeaway:** scraping public pages is generally not CFAA "unauthorized access", but the case settled with hiQ enjoined — it narrows criminal exposure without licensing scraping.
+- *Van Buren v. United States*, 593 U.S. 374 (2021). — **Takeaway:** "exceeds authorized access" under the CFAA means accessing areas you are not permitted to reach, not misusing data you may access; terms-of-service violations are largely a civil matter.
+- [*Ryanair Ltd v. PR Aviation BV*, C-30/14 (CJEU 2015).](https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:62014CJ0030) — **Takeaway:** in the EU, contractual terms can restrict reuse of data even where sui generis database rights do not apply.
+- Krotov & Silva (2018), *Legality and Ethics of Web Scraping*, AMCIS Proceedings. — **Takeaway:** a four-factor framework (data nature, collection method, purpose, harm) that produces a usable decision where a single legal test does not.
+
+**Go deeper**
+
+- Ryan Mitchell, *Web Scraping with Python* 2nd ed. (2018), **Chapters 11–14** — the practitioner's reference on JavaScript-rendered pages, form handling, avoiding traps, and the legal chapter, which is unusually careful for a technical book.
+- [Ned Batchelder, *Pragmatic Unicode* (PyCon 2012)](https://nedbatchelder.com/text/unipain.html) — read this before debugging your first mojibake; the "Unicode sandwich" rule (decode at input, work in `str`, encode at output) is the whole answer to the encoding section above.
+- The Common Crawl [documentation and datasets](https://commoncrawl.org/) — read this before building a large crawler; a monthly crawl of billions of pages already exists, is free, and is very often a better answer than crawling yourself.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p2/week-15/p2-w15-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

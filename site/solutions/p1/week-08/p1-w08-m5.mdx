@@ -1,0 +1,161 @@
+---
+title: "Putting it together: a correct, fast data layer"
+description: "Reference solution — Week 8"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W08-M5`
+
+The exercise: add a cache in front of the hottest query, measure the hit rate and latency,
+demonstrate a stale read, then fix it.
+
+### The measurements
+
+Against a real query joining 3,000,000 `order_items` to `products`:
+
+| Approach | 40 requests | Throughput | Detail |
+| --- | --- | --- | --- |
+| No cache | **2,510 ms** | 15.9 rps | 62.8 ms per query |
+| Cache-aside, 4 distinct keys | **692 ms** | 57.8 rps | **90% hit rate** (36 hits, 4 misses) |
+| **Stampede**: 40 threads, cold key, no coalescing | **1,784 ms** | 22.4 rps | **40 database calls** |
+| **Single-flight**: same 40 threads | **85 ms** | 468.1 rps | **1 database call** |
+
+**21× faster and 40× fewer queries** from coalescing alone.
+
+### The stampede reproduction
+
+```python
+def stampede(n):
+    store, lock, calls = {}, threading.Lock(), [0]
+    def worker():
+        if 0 in store: return              # everyone checks, everyone misses
+        with psycopg.connect(DSN) as c:
+            v = db_call(c, 0)              # everyone queries
+        with lock:
+            calls[0] += 1; store[0] = v
+    ts = [threading.Thread(target=worker) for _ in range(n)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    return f"DB calls made = {calls[0]}"    # 40
+```
+
+### The fix
+
+```python
+def singleflight(n):
+    store, lock, calls, inflight = {}, threading.Lock(), [0], {}
+    def worker():
+        with lock:
+            if 0 in store: return
+            ev = inflight.get(0)
+            if ev is None:
+                ev = inflight[0] = threading.Event(); leader = True
+            else:
+                leader = False
+        if leader:
+            with psycopg.connect(DSN) as c:
+                v = db_call(c, 0)
+            with lock:
+                store[0] = v; calls[0] += 1; inflight.pop(0); ev.set()
+        else:
+            ev.wait(10)                     # 39 threads wait on one load
+    ...                                     # DB calls made = 1
+```
+
+The critical detail: the event is registered **inside the lock, before the load starts**. Register
+it after and two callers both find nothing and both load, which is the bug you were fixing.
+
+### The stale read, demonstrated then fixed
+
+```python
+# 1. warm the cache
+v1 = await repo.get_summary(key)          # cache miss -> DB -> cached, TTL 60s
+
+# 2. write directly to the database
+await session.execute(update(Product).where(...).values(price_cents=9999))
+await session.commit()
+
+# 3. read through the cache
+v2 = await repo.get_summary(key)
+assert v1 == v2                            # STALE - the old value, for up to 60 seconds
+
+# 4. the fix: invalidate on write, through ONE key helper
+class CacheKeys:
+    @staticmethod
+    def for_product(pid: int) -> list[str]:
+        return [f"summary:{pid}", f"summary:{pid}:detail", f"category_summary:{pid}"]
+
+await cache.delete_many(CacheKeys.for_product(pid))
+```
+
+One helper returning **every** key for an entity is the point. The war story in the module is a
+security bug caused by invalidating `perms:{user_id}` while a second code path also cached under
+`perms:{user_id}:{project_id}`.
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: caching before indexing.** A cache on an unindexed query hides the problem and adds
+a second system to operate. Measured: an index gave **1,970×** on a point lookup; a cache gave
+**3.6×** on an already-optimised aggregate. Check the plan first, always.
+
+**Wrong turn 2: measuring the cache with a warm cache.** The interesting number is the cold-key
+behaviour, because that is what happens after every deploy and every cache restart. Warm-cache
+benchmarks make caching look strictly good and hide the stampede entirely.
+
+**Wrong turn 3: single-flight registered after the load.** A race in the fix for a race. Register the
+in-flight marker inside the lock, before awaiting anything.
+
+**Wrong turn 4: assuming single-flight is sufficient.** It is per process. With four workers you get
+four database calls, not one. Say so, and name the options — a distributed lock (adds a failure
+mode) or probabilistic early expiry (needs no coordination and is usually better for read-heavy
+keys).
+
+**Wrong turn 5: uniform TTLs.** Ten thousand keys written at startup with a 60-second TTL all expire
+in the same second. Jitter every TTL by ±20%; it costs one multiplication.
+
+**Wrong turn 6: letting cache errors propagate.** If Redis being down returns 500s, you have
+converted a performance optimisation into an availability dependency. Fail open to the database,
+with a circuit breaker and an alert.
+
+## Measured numbers this solution produces
+
+| Claim | Number |
+| --- | --- |
+| No cache, 40 sequential requests | 2,510 ms (62.8 ms/query, 15.9 rps) |
+| Cache-aside, 4 keys | 692 ms, **90% hit rate**, 57.8 rps (**3.6×**) |
+| Stampede, 40 cold threads | **40 DB calls**, 1,784 ms |
+| Single-flight, same 40 | **1 DB call**, 85 ms (**21×**, 40× fewer queries) |
+| Latency model at 62.8 ms miss / 0.5 ms hit | 90% hit rate ≈ 6.7 ms; 50% ≈ 31.7 ms |
+| Pool `size=5, timeout=1s`, 40 concurrent | 20 of 40 failed with `TimeoutError` |
+| Index versus cache on the same problem | 1,970× versus 3.6× |
+
+## Grading notes
+
+**A 3/3 on correctness**: hit rate measured on a realistic key distribution; the stampede reproduced
+*and* fixed with database-call counts for both; a stale read demonstrated and then fixed; test
+isolation proven by running the suite in parallel and in randomised order.
+
+**A 3/3 on code quality**: the repository never commits; the cache is a decorator over the
+repository so it can be removed entirely by configuration; one key-helper per entity.
+
+**A 3/3 on explanation**: states the TTL as an exposure window rather than a performance setting,
+acknowledges that single-flight is per process, and says what happens when the cache is unavailable.
+
+**The five most common ways submissions lose points**
+
+1. Warm-cache measurements only, so the stampede never appears.
+2. No stale-read demonstration — the correctness half of the exercise skipped.
+3. A cache with no written invalidation rule.
+4. Cache errors propagating, turning a Redis blip into an outage.
+5. A cache added to a query that needed an index, with the plan never examined.

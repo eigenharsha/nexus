@@ -1,0 +1,695 @@
+---
+title: "Transactions & ACID for real"
+description: "Week 8 · Module 1 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 8 · Module 1 · `P1-W08-M1`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Define each letter of ACID precisely enough to say which one a given bug violated.
+2. Place transaction boundaries in a web request correctly, and say why an HTTP call inside a transaction is a bug.
+3. Retry a transaction safely, distinguishing errors that are worth retrying from errors that are not.
+4. Explain how the write-ahead log gives you durability, and kill the database mid-transaction to prove it.
+5. Choose the outbox pattern over a distributed transaction, and justify it.
+
+## Where this sits
+
+| | |
+| --- | --- |
+| **Prereqs** | `P1-W07-M5` (MVCC), `P1-W06-M2` (dependencies own the session lifecycle) |
+| **Unlocks** | `P1-W08-M2` (isolation is a property *of* transactions), the whole Week 8 lab |
+| **One-line** | After this you can guarantee that a multi-step change either fully happens or does not happen at all. |
+
+## Why you should care
+
+### For Aarav (student)
+
+- "What are ACID properties?" is asked in nearly every backend interview. Most candidates recite the four words. Very few can name a bug that violated one.
+- Killing the database mid-transfer and watching the money come back is the most memorable ten minutes in Phase 1. You will not forget durability after doing it.
+- Transaction boundaries are the first thing a senior reviewer checks in a payment or booking endpoint.
+
+### For Meera (working professional)
+
+- This shows up in your job as: "the payment succeeded but the order was never created". That is a transaction boundary in the wrong place, and it is a data-loss bug with a customer attached.
+- An HTTP call inside a transaction holds database locks for the duration of someone else's outage. It is the single most common cause of "the database looked fine but everything was slow".
+- Retry-on-serialization-failure is three lines of code and it is what makes `SERIALIZABLE` usable — which is the difference between a correct checkout and an oversold one.
+
+## The mental model
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p1-w08-m1.svg" alt="Hand-drawn sketch: a transaction as an all-or-nothing boundary, and the WAL that makes it durable" className="block dark:hidden" />
+  <img src="/assets/diagrams/p1-w08-m1-dark.svg" alt="Hand-drawn sketch: a transaction as an all-or-nothing boundary, and the WAL that makes it durable" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p1-w08-m1
+tier: T2
+one-sentence-goal: Show that a transaction is a boundary drawn around several writes so the outside world sees all of them or none, and that the write-ahead log is what makes "none" survive a power cut.
+elements:
+  - centre: a hand-drawn box labelled BEGIN at the top edge and COMMIT at the bottom, containing two write arrows - "debit account 1: -50,000" and "credit account 2: +50,000"
+  - a lightning bolt striking the middle of the box, labelled "kill -9 here"
+  - to the left of the box, the state before - 100,000 / 100,000 - and to the right, the state after the crash - also 100,000 / 100,000 - with an amber note "the money came back. nothing was half-done."
+  - below: a WAL strip drawn as a tape of records, with an arrow labelled "1. write intent to the LOG and fsync" pointing at the tape and a second arrow labelled "2. write the data pages LATER" pointing at a page stack, numbered so the order is unmistakable
+  - a red cross-out over a version where the arrows are reversed, labelled "if pages were written first, a crash between them would leave a half-transfer"
+  - a red-boxed inset: "BEGIN ... call payment API ... COMMIT" crossed out, with the amber note "you now hold locks for the length of SOMEONE ELSE'S outage"
+  - circled key term "write-ahead"
+  - dangling arrow labelled "...and what if the two writes are in two different databases?"
+numbers-to-write-in: crash recovery redo done in 1.26 s; balances restored to 100,000 / 100,000, total 200,000; synchronous_commit=on 1,167 commits/s vs off 1,446 commits/s on this virtualized storage; 3,000 inserts as 3,000 commits 2,571 ms vs one transaction 886 ms (2.9x)
+alt: A hand-drawn diagram of a transaction box containing a debit and a credit, struck by a lightning bolt labelled kill dash nine, with the account balances identical before and after, and below it a write-ahead log tape showing that the log record is flushed before the data pages are written.
+*/}
+
+A **transaction** is a boundary you draw around several changes so that the rest of the world sees
+all of them or none of them — never half. Everything else in this module is either a precise
+definition of "never half" or a mechanism that makes it survive a machine losing power.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Plain English
+
+    Move 500 rupees from account 1 to account 2. That is two changes: subtract from one, add to the
+    other. If the process crashes between them, money has vanished.
+
+    ```sql
+    -- WITHOUT a transaction: two independent statements
+    UPDATE accounts SET balance = balance - 50000 WHERE id = 1;
+    -- <-- crash here and 50,000 has ceased to exist
+    UPDATE accounts SET balance = balance + 50000 WHERE id = 2;
+    ```
+
+    A transaction fixes it:
+
+    ```sql
+    BEGIN;
+      UPDATE accounts SET balance = balance - 50000 WHERE id = 1;
+      UPDATE accounts SET balance = balance + 50000 WHERE id = 2;
+    COMMIT;
+    ```
+
+    Between `BEGIN` and `COMMIT`, your changes are invisible to everyone else. At `COMMIT` they all
+    become visible at once. If anything goes wrong — an error, a crash, an explicit `ROLLBACK` —
+    none of them ever happened.
+
+    **ACID** is four guarantees, and each has a precise meaning:
+
+    - **Atomicity** — all of the changes, or none. There is no half.
+    - **Consistency** — the database moves from one valid state to another; declared constraints
+      (`CHECK`, foreign keys, `NOT NULL`) are never violated by a committed transaction.
+    - **Isolation** — concurrent transactions do not see each other's unfinished work. *How much*
+      they do not see is the isolation level, and that is `P1-W08-M2`.
+    - **Durability** — once `COMMIT` returns, the change survives a power cut.
+
+    ### The analogy
+
+    A bank teller with a paper ledger. Mid-transfer, they do not cross out one balance and then walk
+    away to lunch before writing the other; they complete both entries and only then stamp the page.
+    If they are interrupted, they tear up the working sheet — the ledger still balances. Durability
+    is the extra step: before touching the ledger at all, they write "about to move 500 from A to B"
+    in a bound journal that is never erased. If the building burns down halfway, the journal says
+    what was in progress and whether it was finished.
+
+    ### Smallest working example: break it, then fix it
+
+    ```sql
+    CREATE TABLE accounts (
+      id      int PRIMARY KEY,
+      balance bigint NOT NULL CHECK (balance >= 0)
+    );
+    INSERT INTO accounts VALUES (1, 100000), (2, 100000);
+    ```
+
+    Now break it deliberately, using the `CHECK` constraint as the failure:
+
+    ```sql
+    -- no transaction: the first statement succeeds, the second fails
+    UPDATE accounts SET balance = balance - 150000 WHERE id = 1;
+    -- ERROR: new row for relation "accounts" violates check constraint
+    ```
+
+    Good — the constraint saved you. But swap the order so the *credit* happens first:
+
+    ```sql
+    UPDATE accounts SET balance = balance + 50000 WHERE id = 2;   -- succeeds
+    UPDATE accounts SET balance = balance - 999999 WHERE id = 1;  -- fails
+    SELECT sum(balance) FROM accounts;
+    -- 250000  <-- 50,000 rupees were created from nothing
+    ```
+
+    With a transaction, the failure rolls the whole thing back:
+
+    ```sql
+    BEGIN;
+      UPDATE accounts SET balance = balance + 50000 WHERE id = 2;
+      UPDATE accounts SET balance = balance - 999999 WHERE id = 1;   -- ERROR
+    COMMIT;   -- psql reports ROLLBACK, because the transaction was already aborted
+    SELECT sum(balance) FROM accounts;
+    -- 200000  <-- unchanged
+    ```
+
+    ### Line by line
+
+    - `BEGIN` starts the transaction. In PostgreSQL every statement outside one runs in its own
+      implicit transaction, so there is no such thing as "no transaction" — only "a transaction per
+      statement".
+    - Inside, your changes are visible to *you* and to nobody else.
+    - Once any statement errors, the transaction is **aborted**: every later statement returns
+      `current transaction is aborted, commands ignored until end of transaction block`. A `COMMIT`
+      on an aborted transaction performs a `ROLLBACK` — which is why psql printed `ROLLBACK`.
+    - `SAVEPOINT` gives you partial rollback inside a transaction:
+
+      ```sql
+      BEGIN;
+        INSERT INTO orders ...;
+        SAVEPOINT after_order;
+        INSERT INTO order_items ...;   -- if this fails
+        ROLLBACK TO SAVEPOINT after_order;   -- keep the order, discard the item
+        INSERT INTO order_items ...;         -- try something else
+      COMMIT;
+      ```
+
+    ### Guided practice: prove durability by killing the database
+
+    This is the exercise of the module. Run it.
+
+    ```bash
+    # Terminal 1 — start a transfer and DO NOT commit
+    docker exec -it pg psql -U postgres -d nexus
+    ```
+    ```sql
+    BEGIN;
+    UPDATE accounts SET balance = balance - 50000 WHERE id = 1;
+    UPDATE accounts SET balance = balance + 50000 WHERE id = 2;
+    SELECT id, balance FROM accounts ORDER BY id;
+    --  id | balance
+    -- ----+---------
+    --   1 |   50000
+    --   2 |  150000
+    ```
+
+    ```bash
+    # Terminal 2 — kill the server. Not a graceful stop: SIGKILL.
+    docker kill -s SIGKILL pg && docker start pg
+    ```
+
+    Real recovery log from my run:
+
+    ```
+    LOG:  database system was interrupted; last known up at 2026-08-31 21:47:53 UTC
+    LOG:  database system was not properly shut down; automatic recovery in progress
+    LOG:  redo starts at 0/191F148
+    LOG:  invalid record length at 0/F8B7320: expected at least 24, got 0
+    LOG:  redo done at 0/F8B72F8  system usage: CPU: user: 0.58 s, system: 0.68 s, elapsed: 1.26 s
+    LOG:  checkpoint starting: end-of-recovery immediate wait
+    LOG:  database system is ready to accept connections
+    ```
+
+    And the state afterwards:
+
+    ```
+     id | balance
+    ----+---------
+      1 |  100000
+      2 |  100000
+
+     total
+    --------
+     200000
+    ```
+
+    **The uncommitted transfer vanished completely.** Not half-applied, not partially rolled back —
+    gone. Recovery took 1.26 seconds. That is atomicity and durability, demonstrated rather than
+    described.
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+      **1. Which ACID property does the crash test demonstrate?**
+      Two: atomicity (no half-transfer survived) and durability (committed data before the crash was
+      still there).
+
+      **2. Why did `COMMIT` print `ROLLBACK` after an error?**
+      The transaction was already aborted by the failed statement; `COMMIT` on an aborted
+      transaction rolls back.
+
+      **3. Is a single `UPDATE` a transaction?**
+      Yes. PostgreSQL wraps every standalone statement in an implicit transaction, which is why a
+      single `UPDATE` touching a million rows is all-or-nothing.
+
+      **4. What does `SAVEPOINT` give you?**
+      A point to roll back to without discarding the whole transaction.
+
+      **5. What does `CHECK (balance >= 0)` guarantee?**
+      Consistency: no committed transaction can leave a negative balance, whatever the application
+      code does.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### Transaction boundaries in a web request
+
+    The rule: **one transaction per request, opened as late as possible and closed as early as
+    possible, containing no I/O other than the database.**
+
+    ```python
+    # app/api/deps.py — the session dependency from P1-W06-M2, now with the reasoning
+    async def get_session() -> AsyncIterator[AsyncSession]:
+        async with SessionLocal() as session:
+            try:
+                yield session
+                await session.commit()      # success -> commit once, at the end
+            except Exception:
+                await session.rollback()    # any exception -> nothing happened
+                raise
+    ```
+
+    Three properties this buys. The handler never writes `commit()`, so it cannot forget. Any
+    exception — including one raised by FastAPI's validation of the *response* — rolls back. And
+    there is exactly one commit per request, so partial writes are not expressible.
+
+    Now the rule that matters most:
+
+    ```python
+    # WRONG: an HTTP call inside the transaction
+    async def checkout(session: SessionDep, ...):
+        order = await create_order(session, ...)              # rows now locked
+        result = await payment_gateway.charge(...)            # 200 ms... or 30 s... or a timeout
+        await mark_paid(session, order.id, result.reference)
+        # locks held for the entire duration of someone else's service
+
+    # RIGHT: transaction, then external call, then a second transaction
+    async def checkout(...):
+        async with session.begin():                            # txn 1: reserve
+            order = await create_order_pending(session, ...)
+        result = await payment_gateway.charge(...)             # no locks held
+        async with session.begin():                            # txn 2: record the outcome
+            await mark_paid(session, order.id, result.reference)
+    ```
+
+    Why this matters more than it looks: a transaction holds row locks and, critically, **holds back
+    vacuum** for its entire lifetime — its snapshot may still need old row versions, so dead tuples
+    across the *whole database* cannot be removed while it is open. A 30-second payment timeout
+    inside a transaction is 30 seconds of accumulating bloat, on every request, plus locks that
+    block every other buyer of the same item.
+
+    The cost of splitting is that the state between the two transactions is real and visible: an
+    order that is `pending` while the charge is in flight. That is not a flaw, it is the honest
+    model — the charge genuinely is in flight — and it forces you to design for the crash between
+    them. Which is what the outbox pattern in Layer 3 is for.
+
+    ### Retry, correctly
+
+    Two error classes are worth retrying and nothing else is:
+
+    ```python
+    import asyncio, random
+    from sqlalchemy.exc import DBAPIError
+    from psycopg import errors
+
+    RETRYABLE = (errors.SerializationFailure, errors.DeadlockDetected)
+
+    async def with_retry(op, attempts: int = 5):
+        for attempt in range(attempts):
+            try:
+                return await op()
+            except DBAPIError as exc:
+                if not isinstance(exc.orig, RETRYABLE) or attempt == attempts - 1:
+                    raise
+                backoff = (2 ** attempt) * 0.01
+                await asyncio.sleep(backoff * (0.5 + random.random()))   # jitter
+        raise RuntimeError("unreachable")
+    ```
+
+    Four rules that make this correct rather than dangerous. Retry **only** SQLSTATE `40001`
+    (serialization failure) and `40P01` (deadlock detected) — those mean "your transaction was
+    rolled back through no fault of its own, try again". Never retry a constraint violation or a
+    business error; the second attempt fails identically. The retried unit must be the **whole
+    transaction**, re-reading everything, because its snapshot is gone. And the operation must be
+    externally idempotent: if it charges a card, the retry needs the idempotency key from
+    `P1-W06-M1`.
+
+    Jitter is not decoration. Without it, N transactions that conflict retry in lockstep and
+    conflict again. Measured in `P1-W08-M2`: `SERIALIZABLE` under heavy contention generated
+    **27,261 retries for 2,000 transactions** — a retry storm that a fixed backoff makes worse.
+
+    ### Commit cost, measured
+
+    Every `COMMIT` must flush the write-ahead log to durable storage before returning. That flush is
+    the dominant cost of a small transaction:
+
+    | Pattern | 3,000 inserts | Throughput |
+    | --- | --- | --- |
+    | 3,000 separate commits (`synchronous_commit=on`) | 2,571 ms | 1,167 commits/s |
+    | 3,000 separate commits (`synchronous_commit=off`) | 2,074 ms | 1,446 commits/s |
+    | 3,000 separate commits (`synchronous_commit=local`) | 2,420 ms | 1,240 commits/s |
+    | **One transaction, 3,000 inserts, one commit** | **886 ms** | 3,385 rows/s |
+
+    Batching gives **2.9×** here. But look at the `synchronous_commit` rows: turning off the
+    durability flush bought only 1.24×, which is far less than the 10–50× usually quoted. That is
+    not a mistake — **it is the measurement telling me something about my storage.** These numbers
+    come from Docker Desktop on macOS, where the container filesystem goes through a virtualization
+    layer that does not perform a true hardware `fsync`. The durability dial barely moves because
+    the durability was never really being paid for.
+
+    The lesson generalises past this module: **if a knob that should cost you a lot costs you
+    nothing, find out what is lying.** On bare metal with a real `fsync` to a real disk, that same
+    setting is one of the largest single performance levers PostgreSQL has — and it is also the one
+    that silently trades away the D in ACID.
+
+    ### Trade-offs
+
+    | Decision | Choose the first when… | Choose the second when… |
+    | --- | --- | --- |
+    | **One transaction per request vs several** | The whole request is one atomic unit — the normal case. | The request contains an external call. Then split, and design for the crash between the parts. |
+    | **`synchronous_commit=on` vs `off`** | Anything you cannot lose: payments, orders, user data. | Bulk loads, analytics staging, or data you can regenerate — you risk losing the last ~200 ms of commits on a crash, but **not** corruption. |
+    | **Retry in the application vs surfacing the error** | Serialization failures and deadlocks: they are expected under concurrency and retrying is correct. | Constraint violations and business errors: retrying is a busy-wait that fails identically. |
+    | **Distributed transaction (2PC) vs the outbox pattern** | Almost never. 2PC needs every participant available at commit and blocks in-doubt transactions when the coordinator dies. | Almost always: write the intent to a table in the same transaction as the data, and deliver it asynchronously with at-least-once semantics. |
+    | **Long transaction vs short with reconciliation** | The work is genuinely small and fast. | Anything long-running. A transaction open for minutes blocks vacuum database-wide and is a common cause of unexplained bloat. |
+
+    ### What breaks in the real world
+
+    A ticketing service processed refunds inside a single transaction: mark the ticket refunded,
+    write the ledger entry, then call the payment provider's refund API, then write the provider's
+    reference. Reasonable-looking code, and it worked for a year.
+
+    Then the provider had a bad afternoon: p99 latency went from 400 ms to 25 seconds. The
+    ticketing database, which was nowhere near the provider, became unusable. Three effects
+    compounded. Each refund held row locks for 25 seconds, so any other operation touching those
+    tickets queued. The connection pool filled — every worker was blocked on someone else's network
+    call — so unrelated endpoints started returning pool timeouts. And with dozens of transactions
+    open for tens of seconds continuously, **autovacuum could not remove any dead tuple in the
+    database**, so tables began to bloat and sequential scans got slower, which made everything else
+    slower too.
+
+    The fix was to split into three phases: a transaction that marks the refund `initiated` and
+    writes an outbox row; a worker that reads the outbox and calls the provider outside any
+    transaction; and a transaction that records the outcome. Refunds became eventually consistent —
+    a user might see "refund in progress" for a few seconds — and the database stopped caring
+    whether the provider was healthy.
+
+    The general principle, worth writing on a wall: **a transaction should hold no resource whose
+    availability you do not control.**
+
+    <Accordion title="Design checkpoint — model answer inside">
+      **Question.** Your checkout must decrement inventory, create an order, charge a card, and send
+      a confirmation email. Where do the transaction boundaries go?
+
+      **Model answer.** Three regions. **Transaction 1:** decrement inventory and create the order
+      with status `pending`, both in one atomic unit — these are the only two operations that must
+      be all-or-nothing, and doing them together is what prevents an oversell (which `P1-W08-M2`
+      measures). Write an idempotency-key row here too, in the same transaction, so a retry cannot
+      double-charge. **Outside any transaction:** call the payment gateway, using the idempotency
+      key. **Transaction 2:** record the payment result and move the order to `paid` or
+      `payment_failed`; if it failed, restore the inventory here. **The email is not in any
+      transaction** — it goes to an outbox row written inside transaction 2 and is delivered by a
+      worker, because an SMTP call inside a transaction is the same bug as a payment call, and
+      because you want at-least-once delivery rather than "lost if the process died". The state
+      worth defending in review: a `pending` order with reserved inventory and no charge is
+      recoverable by a reconciliation job that queries the gateway with the idempotency key; a
+      charged card with no order is not. That asymmetry is why the order is created *before* the
+      charge, not after.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    ### The write-ahead log
+
+    The rule that gives you durability is one sentence: **the log record describing a change must
+    reach durable storage before the data page it describes.** Hence *write-ahead*.
+
+    On `COMMIT`, PostgreSQL appends a commit record to the WAL and calls `fsync` on the WAL file.
+    Only then does `COMMIT` return. The data pages themselves are still in memory, dirty, and get
+    written later by the background writer or at a checkpoint. If the machine dies, recovery replays
+    the WAL from the last checkpoint: any transaction with a commit record is redone, any without is
+    discarded.
+
+    My crash test shows exactly this:
+
+    ```
+    LOG:  database system was not properly shut down; automatic recovery in progress
+    LOG:  redo starts at 0/191F148
+    LOG:  invalid record length at 0/F8B7320: expected at least 24, got 0
+    LOG:  redo done at 0/F8B72F8  system usage: elapsed: 1.26 s
+    ```
+
+    `redo starts at` is the last checkpoint's location — recovery only has to replay from there,
+    which is why checkpoint frequency is the dial that trades steady-state I/O against recovery
+    time. The `invalid record length` line is not an error: it is how recovery detects the end of
+    valid WAL, which is precisely where the machine died. And 1.26 seconds is the recovery time for
+    about 229 MB of WAL distance, which is the number you would use to answer "how long is our
+    recovery?".
+
+    The WAL is also the foundation of everything else PostgreSQL does with data: streaming
+    replication ships WAL records to standbys; point-in-time recovery replays archived WAL to a
+    chosen instant; logical replication decodes WAL into row-level changes. One mechanism, four
+    features.
+
+    ### The durability dial, and what it really costs
+
+    `synchronous_commit` controls how much of that flush you wait for:
+
+    | Setting | Waits for | Risk on crash |
+    | --- | --- | --- |
+    | `on` (default) | WAL flushed to local durable storage (and to synchronous standbys, if configured) | none |
+    | `local` | local WAL flush only | committed data may be missing on a standby after failover |
+    | `off` | nothing — the WAL is flushed within `wal_writer_delay` (200 ms) | the last ~200 ms of commits can be **lost**; the database is still consistent, never corrupt |
+
+    Measured on this machine, 3,000 single-row commits:
+
+    | Setting | Time | Commits/s | Ratio |
+    | --- | --- | --- | --- |
+    | `on` | 2,571 ms | 1,167 | 1.00× |
+    | `local` | 2,420 ms | 1,240 | 1.06× |
+    | `off` | 2,074 ms | 1,446 | **1.24×** |
+
+    **1.24× is a suspiciously small number**, and reporting it without explanation would be
+    misleading. On real hardware, `synchronous_commit=off` typically gives 10–50× on small
+    transactions, because a real `fsync` to a real device costs milliseconds while the alternative
+    costs nothing. These measurements come from Docker Desktop on macOS, where the container's
+    filesystem is virtualized and `fsync` does not reach physical media in the way it would on a
+    bare-metal Linux server.
+
+    That is a lesson worth more than the number: **you cannot measure durability cost on storage
+    that is not being honest about durability.** The same caveat applies to every cloud instance
+    with a write-back cache, and to every benchmark you read that does not say what it ran on. If
+    you need this number for capacity planning, measure it on the hardware you will deploy to,
+    and validate that your storage actually honours `fsync` (the `pg_test_fsync` tool ships with
+    PostgreSQL for exactly this).
+
+    The safe framing for the trade-off: `off` risks **losing** recent commits, never **corrupting**
+    the database. So it is legitimate for a bulk load you can rerun and illegitimate for a payment.
+
+    ### Two-phase commit, and why the answer is usually the outbox
+
+    2PC coordinates a commit across systems: a coordinator asks every participant to *prepare*
+    (durably promise it can commit), and if all agree, tells them all to commit. PostgreSQL supports
+    it with `PREPARE TRANSACTION`.
+
+    Three costs make it the wrong default. Every participant must be available at commit time, so
+    availability is the *product* of all participants' availability — three services at 99.9% give
+    99.7%. If the coordinator dies between prepare and commit, participants hold **in-doubt**
+    transactions with their locks held indefinitely, until an operator resolves them by hand; in
+    PostgreSQL a forgotten prepared transaction also blocks vacuum forever, which is a slow-motion
+    outage. And `max_prepared_transactions` defaults to **0**, so it is off unless you deliberately
+    enable it.
+
+    The **outbox pattern** trades atomicity across systems for atomicity within one, plus
+    at-least-once delivery:
+
+    ```sql
+    CREATE TABLE outbox (
+      id           bigserial PRIMARY KEY,
+      aggregate_id bigint      NOT NULL,
+      event_type   text        NOT NULL,
+      payload      jsonb       NOT NULL,
+      created_at   timestamptz NOT NULL DEFAULT now(),
+      published_at timestamptz
+    );
+    CREATE INDEX idx_outbox_unpublished ON outbox (id) WHERE published_at IS NULL;
+    ```
+
+    ```python
+    # ONE transaction: the business change and the intent to publish
+    async with session.begin():
+        order = await create_order(session, ...)
+        session.add(Outbox(aggregate_id=order.id, event_type="order.created",
+                           payload={"order_id": order.id, "total_cents": order.total_cents}))
+
+    # A separate worker, later:
+    async def publish_loop(session):
+        rows = await session.execute(
+            select(Outbox).where(Outbox.published_at.is_(None))
+                          .order_by(Outbox.id).limit(100)
+                          .with_for_update(skip_locked=True))   # many workers, no contention
+        for row in rows.scalars():
+            await broker.publish(row.event_type, row.payload)   # may deliver twice
+            row.published_at = func.now()
+        await session.commit()
+    ```
+
+    Two details that make it work in practice. `FOR UPDATE SKIP LOCKED` lets several workers drain
+    the same table without blocking each other — one of the most useful three words in PostgreSQL.
+    And delivery is **at least once**, never exactly once, because the broker publish and the
+    `published_at` update cannot be atomic — so every consumer must be idempotent. That is not a
+    weakness of the pattern; exactly-once delivery does not exist, and the outbox is honest about
+    it while 2PC pretends otherwise.
+
+    The partial index `WHERE published_at IS NULL` keeps the worker's query fast even when the
+    outbox table holds millions of published rows. Measured in `P1-W08-M3`: a partial index on a
+    similar predicate was 6,704 kB against 6,840 kB for the full index while serving an index-only
+    scan.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | External call inside a transaction | Database-wide slowness during a *third party's* outage | `pg_stat_activity` showing long `xact_start` with `state = 'idle in transaction'` |
+    | `idle in transaction` sessions | Vacuum never removes dead tuples anywhere; bloat grows | `idle_in_transaction_session_timeout` (set it — 60 s is a reasonable default) |
+    | Retrying the wrong errors | Retry loops on a constraint violation, burning CPU | Retry only SQLSTATE `40001` and `40P01` |
+    | Retry without jitter | Conflicting transactions collide again in lockstep | Measured 27,261 retries for 2,000 transactions under contention |
+    | Forgotten prepared transaction | Locks held forever, vacuum blocked, disk filling | `SELECT * FROM pg_prepared_xacts` — should normally be empty |
+    | Commit per row in a loop | Bulk work is orders of magnitude slower than it should be | Measured 2,571 ms versus 886 ms for the same 3,000 inserts |
+    | `synchronous_commit=off` on payment data | Nothing — until a crash silently loses the last 200 ms | Audit per-transaction settings; the risk is loss, not corruption |
+    | Transaction spanning a user's think time | Locks held for minutes | Never hold a transaction across a request boundary; use optimistic version columns instead |
+
+    ### Frontier and primary sources
+
+    - **Gray & Reuter, *Transaction Processing: Concepts and Techniques* (1992).** *Takeaway:* the
+      ACID properties are implementation-independent contracts, and almost every modern system is a
+      rediscovery of a technique catalogued in this book.
+    - **Mohan et al. (1992), "ARIES: A Transaction Recovery Method."** *Takeaway:* write-ahead
+      logging with repeating history and compensation log records is why crash recovery is both
+      correct and fast — the 1.26-second redo above is ARIES working.
+    - **PostgreSQL 16 documentation, "Reliability and the Write-Ahead Log."** *Takeaway:* the
+      durability guarantee is only as good as the storage's honesty about `fsync`, which is why
+      `pg_test_fsync` exists.
+    - **Helland (2007), "Life Beyond Distributed Transactions."** *Takeaway:* at scale you give up
+      cross-system atomicity and design for idempotent, at-least-once messaging instead — the
+      intellectual foundation of the outbox pattern.
+
+    ### Stretch challenge
+
+    Build a crash-consistency test harness and use it to find a real bug. Write a workload that
+    performs multi-row transfers with a known invariant (total money is constant), run it under
+    load, and kill the database process at a random point every few seconds — `SIGKILL`, not a
+    graceful stop. After each restart, assert the invariant and record recovery time.
+
+    Then make it harder in three steps. Add an external call in the middle of a transaction and
+    observe what `pg_stat_activity` and the bloat counters do. Replace it with an outbox and add a
+    consumer that deliberately processes some messages twice, then prove your consumer is
+    idempotent. Finally, run the whole thing with `synchronous_commit=off` and measure how many
+    committed transfers are lost per kill.
+
+    The number you are looking for in that last step is not the throughput gain — it is **how many
+    acknowledged writes disappeared**, because that is the quantity you would have to explain to a
+    customer. Most people have never measured it, and having a real figure changes how the trade-off
+    feels.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Kill the database process mid-transaction with `SIGKILL` and prove recovery leaves no partial write.
+Capture the recovery log, the balances before and after, and the redo time. Then repeat with the
+transaction committed before the kill and confirm the change survived. Two runs, four numbers, and
+you will never be unsure about durability again.
+</Card>
+
+## The whiteboard
+
+T1 is the transaction box with the lightning bolt and the WAL tape. The T2 build-up frames:
+(1) two writes with no boundary and a crash between them, (2) the same writes inside a boundary,
+(3) the WAL record flushed before the pages, (4) recovery replaying and discarding.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p1-w08-m1-blank.svg) · [Editable source](/assets/diagrams/p1-w08-m1.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    Record the crash test — the terminal before, the `SIGKILL`, the recovery log, the balances after
+    — and put it in your README as an asciinema recording. In an interview, "I killed the postmaster
+    mid-transfer and watched WAL recovery roll it back in 1.26 seconds" is a sentence almost no
+    junior candidate can say, and it makes durability something you have seen rather than read.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **One:** grep for HTTP or queue calls between a `begin()` and a `commit()` — each one holds locks
+    and blocks vacuum for the length of someone else's outage. **Two:** set
+    `idle_in_transaction_session_timeout` if it is unset; a leaked transaction blocks vacuum across
+    the entire database. **Three:** check that your retry logic distinguishes `40001`/`40P01` from
+    everything else, and that it has jitter — measured, contention produced 27,261 retries for 2,000
+    transactions.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Payment succeeded, order missing | Two operations in separate transactions with no reconciliation | One transaction for the atomic part; an outbox for the rest |
+| Database slow during a third party's outage | An external call inside a transaction | Split the transaction around the call |
+| Bloat growing with no obvious cause | A long-lived or `idle in transaction` session pinning old row versions | `idle_in_transaction_session_timeout`; find it in `pg_stat_activity` |
+| Retry loop burns CPU | Retrying a constraint violation | Retry only `40001` and `40P01` |
+| Retries all collide again | No jitter in the backoff | Randomise the delay |
+| Bulk insert is far slower than expected | One commit per row | One transaction, or `COPY` — measured 2,571 ms vs 886 ms |
+| Locks held forever, vacuum stuck | An orphaned prepared transaction | `SELECT * FROM pg_prepared_xacts`; roll it back |
+| Recent commits lost after a crash | `synchronous_commit=off` on data that mattered | Set it `on` for anything you cannot regenerate |
+
+## Assessment
+
+**Concept questions**
+
+1. Define each ACID letter and give a bug that violates it. *(Atomicity: half a transfer. Consistency: a negative balance. Isolation: a lost update. Durability: an acknowledged write missing after a crash.)*
+2. Why must the WAL record be flushed before the data page? *(A crash between them would otherwise leave a data page describing a change with no record of whether it committed.)*
+3. What does `redo starts at` in a recovery log tell you? *(The last checkpoint — recovery replays from there, so checkpoint frequency trades steady-state I/O against recovery time.)*
+4. Which errors are worth retrying, and why only those? *(`40001` and `40P01` — the transaction was rolled back through no fault of its own. Everything else fails identically on retry.)*
+5. Why is an HTTP call inside a transaction a bug? *(It holds locks and blocks vacuum for the duration of a service you do not control.)*
+6. What does `synchronous_commit=off` risk, and what does it not risk? *(Losing the last ~200 ms of commits; it never corrupts.)*
+7. Why is the outbox pattern usually better than 2PC? *(No cross-system availability coupling and no in-doubt transactions; the cost is at-least-once delivery, which requires idempotent consumers.)*
+8. What does `FOR UPDATE SKIP LOCKED` enable? *(Several workers draining the same queue table without blocking each other.)*
+
+**Coding challenge.** Implement a transfer endpoint with correct boundaries, a retry wrapper for `40001`/`40P01` with jittered backoff, and an outbox with an idempotent consumer. Hidden tests: killing the process mid-transaction leaves the invariant intact; a serialization failure is retried and eventually succeeds; a constraint violation is *not* retried; the consumer processes a duplicated message without a duplicated effect.
+
+**Interview questions**
+
+- *Junior:* "What is a transaction and why do you need one?"
+- *Mid:* "Where do the transaction boundaries go in a checkout that charges a card?"
+- *Senior:* "We need to update our database and publish an event atomically. Design it and tell me what you are giving up."
+
+**Draw it from memory.** Draw the transaction boundary with the crash, and the WAL tape showing the log record flushed before the data pages, with the recovery arrow.
+
+## Sources & further reading
+
+**Primary docs**
+
+- [PostgreSQL 16: Transactions](https://www.postgresql.org/docs/16/tutorial-transactions.html) and [Reliability and the WAL](https://www.postgresql.org/docs/16/wal.html) — read the second one properly; it is short and it is the whole durability story.
+- [PostgreSQL 16: `SET TRANSACTION` and `synchronous_commit`](https://www.postgresql.org/docs/16/runtime-config-wal.html) — read the settings table so you know exactly what each level waits for.
+- [PostgreSQL 16: `PREPARE TRANSACTION`](https://www.postgresql.org/docs/16/sql-prepare-transaction.html) — read the warnings; they are the argument against 2PC, written by the implementers.
+
+**Papers and their takeaways**
+
+- **[Mohan et al. (1992), "ARIES."](https://doi.org/10.1145/128765.128770)** *Takeaway:* write-ahead logging with repeating history makes recovery both correct and fast — you watched it complete in 1.26 seconds.
+- **Gray & Reuter (1992), *Transaction Processing*.** *Takeaway:* ACID is a set of contracts, and the implementation techniques behind them were catalogued decades before the systems you use adopted them.
+- **[Helland (2007), "Life Beyond Distributed Transactions."](https://www.cidrdb.org/cidr2007/papers/cidr07p15.pdf)** *Takeaway:* give up cross-system atomicity, design for idempotent at-least-once messaging, and the system gets simpler rather than weaker.
+
+**Go deeper**
+
+- [*Designing Data-Intensive Applications*, chapter 7](https://dataintensive.net/) — read it after this module rather than before. It covers the same ground with more systems and less PostgreSQL, and it lands much harder once you have killed a database and watched the money come back.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-08/p1-w08-m1">
+  Attempt the lab first. Seriously.
+</Card>

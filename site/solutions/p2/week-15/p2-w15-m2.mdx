@@ -1,0 +1,141 @@
+---
+title: "Extracting from APIs"
+description: "Reference solution — Week 15"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P2-W15-M2`
+
+Crash the extractor at record 43,000, resume, and prove nothing was lost or refetched.
+
+### The result
+
+```
+crash: simulated crash after 43000 records
+after crash:  rows=43000    saved_cursor=43000   api_calls=43
+after resume: rows=100000   pulled_on_resume=57000   total_api_calls=100
+checksum(sum,count,min,max)=(14999850000, 100000, 0, 99999)
+
+clean run:    rows=100000   api_calls=100
+checksum(sum,count,min,max)=(14999850000, 100000, 0, 99999)
+IDENTICAL RESULT: True
+```
+
+**`total_api_calls=100`, exactly equal to the clean run.** Nothing was re-fetched: 43 calls before
+the crash, 57 after. And the checksums are identical — which is the assertion that matters. Not "it
+finished", but "it finished with the same data".
+
+### The design decision the whole module exists for
+
+```python
+def commit_page(self, rows, cursor):
+    """Rows and cursor commit together, or neither does."""
+    with self.con:                      # BEGIN ... COMMIT / ROLLBACK
+        self.con.executemany(
+            "INSERT OR REPLACE INTO records VALUES (?, ?, datetime('now'))", rows)
+        self.con.execute(
+            "INSERT OR REPLACE INTO _pipeline_state VALUES ('cursor', ?)", (cursor,))
+```
+
+| Ordering | Crash between the two writes | Result |
+| --- | --- | --- |
+| Cursor, then rows | records lost, cursor advanced | **silent permanent data loss** — that page is never fetched again |
+| Rows, then cursor | records written, cursor not advanced | re-fetch the page — harmless if the load is idempotent |
+| **Both in one transaction** | neither happened | re-fetch the page — **harmless, and provably so** |
+
+Option 1 is a data-loss bug producing no error and no visible gap. **In SQLite, DuckDB or Postgres,
+option 3 is a `with connection:` block** — it costs nothing.
+
+### The imperfection to report honestly
+
+```
+re-run of a completed pipeline: pulled=100000 rows=100000 checksum_unchanged=True
+```
+
+Re-running the *finished* pipeline pulled all 100,000 again. The implementation stores `"DONE"` as
+the terminal cursor and maps it back to `None`, which the paginator reads as "start from the
+beginning". **The data is unchanged — the load is idempotent, so correctness holds — but 100 API
+calls were wasted.**
+
+**A real pipeline stores a high-water timestamp, not a sentinel**, so the next run asks for
+`updated_at > last_seen` and pulls nothing. That is the difference between *resumable* and
+*incremental*, and the lab requires both. **A submission that reports this gap honestly is better
+than one that quietly does not test it.**
+
+### The overlapping window
+
+```python
+# Wrong: a knife-edge boundary.
+since = last_watermark
+
+# Right: overlap, and rely on the idempotent load to absorb the duplicates.
+since = last_watermark - timedelta(minutes=15)
+```
+
+A record *written* at 11:59:59 and *committed* at 12:00:01 is invisible to a run that queries at
+12:00:00, and the next run asking for `> 12:00:00` never sees it. **Permanently lost, silently.**
+Source systems commit out of order and replicas lag. Overlapping costs a handful of duplicate rows
+per run, which an upsert absorbs at zero cost.
+
+## Why this solution and not the obvious one
+
+**Why a deterministic fake API, not a real one.** You must crash it at an exact record and re-run it
+a hundred times. A real API gives you neither determinism nor patience, and testing against one
+means your test suite depends on someone else's uptime.
+
+**Why keyset pagination for backfills.** Cursors expire — many APIs invalidate them after minutes or
+hours, and a 17-hour backfill will hit that. An ID never expires. Offset pagination is worse still:
+an insert near the top shifts everything down and you see a record twice; a delete shifts everything
+up and you skip one. **On a table receiving writes while you page — which is every production table
+— offset pagination silently loses and duplicates records.**
+
+**Why full jitter rather than plain exponential backoff.** `sleep = uniform(0, min(cap, base·2ⁿ))`.
+With fixed backoff, fifty workers that failed together retry together at 1 s, 2 s, 4 s — a
+synchronised stampede that re-triggers the limit each time. Jitter decorrelates them. This is Marc
+Brooker's measured result and it is one line.
+
+**Why `timeout=(5, 30)` on every call.** `requests` has **no default timeout**. Without one, a
+half-open connection makes a scheduled job hang forever: it never finishes, never fails, and never
+alerts. This is the most common production bug in Python HTTP code.
+
+## Grading notes
+
+**3/3 on Correctness** — rows and cursor in one transaction; the crash-and-resume checksum matches an
+uninterrupted run; the API call count proves nothing was re-fetched.
+
+**3/3 on Code quality** — pluggable paginators behind one interface; `timeout` on every request;
+retries only on 429 and 5xx, never on other 4xx.
+
+**3/3 on Explanation** — the three-ordering table for crash-during-commit, and an honest account of
+the resumable-versus-incremental gap.
+
+**The three most common ways submissions lose points:**
+
+1. **Asserting "it completed" rather than the checksum.** Completion is not correctness. A resumed
+   run that lost a page still completes.
+2. **Saving the cursor before writing the rows.** Silent permanent data loss on a crash, and the
+   test that would catch it is the one being skipped.
+3. **Retrying on all 4xx.** A 400 or 404 is a statement about your request and will be identical in
+   two seconds; retrying wastes the rate budget and delays the error you need to see.
+
+**A fourth, easy to miss:** parsing `Retry-After` as an integer. RFC 9110 allows an HTTP-date as
+well, and a parser assuming seconds raises `ValueError` on the date form — during a rate-limit event,
+which is exactly when you need the retry to work.
+
+**On the stretch challenge (chaos proxy).** The failure to check they handled is the **mid-response
+connection reset**: a truncated JSON body often parses as a shorter page and looks like the end of
+the data, so the extractor stops early and reports success. If their harness injects it and the
+checksum still matches, they have built something genuinely useful.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

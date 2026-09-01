@@ -1,0 +1,190 @@
+---
+title: "Lab — `scratchml`: regression & classification from NumPy"
+description: "Reference solution — Week 17"
+hidden: true
+icon: "lock"
+---
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `LAB-P3-W17`
+
+## The architecture that survives all three tracks
+
+The single decision that determines whether you pass `hard` is made on day one, in `base.py`: **do not build an augmented design matrix.**
+
+```python
+# scratchml/base.py — scikit-learn 1.9.0-compatible surface, numpy 2.5.2 only
+from __future__ import annotations
+import inspect
+import numpy as np
+
+
+class Estimator:
+    """Minimal BaseEstimator clone: get_params by introspecting __init__."""
+
+    @classmethod
+    def _param_names(cls) -> list[str]:
+        sig = inspect.signature(cls.__init__)
+        return sorted(p for p in sig.parameters if p != "self")
+
+    def get_params(self) -> dict:
+        return {k: getattr(self, k) for k in self._param_names()}
+
+    def set_params(self, **kw):
+        for k, v in kw.items():
+            if k not in self._param_names():
+                raise ValueError(f"unknown parameter {k!r}")
+            setattr(self, k, v)
+        return self
+
+    def __repr__(self) -> str:
+        args = ", ".join(f"{k}={v!r}" for k, v in self.get_params().items())
+        return f"{type(self).__name__}({args})"
+```
+
+And the intercept carried **outside** the matrix, everywhere:
+
+```python
+# scratchml/optim.py
+def linear_forward(X, w, b):          # never allocates an (n, p+1) copy
+    return X @ w + b
+
+def linear_grad(X, resid, w, b, alpha, n_total):
+    gw = X.T @ resid / len(resid) + alpha * w / n_total   # penalty on w only
+    gb = float(resid.mean())                              # intercept NOT penalised
+    return gw, gb
+```
+
+Those six lines are the difference between 1.5 GB and 2.3 GB peak RSS on the `hard` track's 1M x 100 case.
+
+## `basic` — the four exercises
+
+1. The three TODOs:
+
+```python
+dw = 2.0 * np.mean(err * x)
+db = 2.0 * np.mean(err)
+w -= lr * dw
+b -= lr * db
+```
+
+2. **`lr = 1e-2` on the raw feature overflows to `inf` and then `nan` within about 15 iterations.** With `x` ranging over hundreds, `dw` is of order `2 * mean(err * x)`, and a step of `1e-2` times that lands further up the opposite wall of the loss bowl than where it started. Each iteration amplifies. The observable signature is that `history` is monotonically *increasing* before it becomes `nan` — worth printing, because "loss going up" is the diagnostic and "nan" is only the eventual symptom.
+
+3. After standardising `x`, `lr = 1e-2` is stable and reaches the same loss in **roughly 300 iterations instead of 2,000+**, and — more importantly — the intercept actually converges. On the module's 60-point example, unstandardised gradient descent left `b` at `0.1697` after 2,000 iterations when the true value was `27.43`; standardising decoupled the two directions and fixed it.
+
+4. On the log-y plot, the loss falls from 182,817 to 541 in **ten steps** and then improves by less than 1% per 100 steps from about iteration 60 onwards. Almost all of gradient descent's progress is in its first few steps; the rest is polish.
+
+## `standard` — the three details that account for most failures
+
+**1. The regularization convention.** Put this comment at the top of `logistic.py` before writing anything:
+
+```python
+# sklearn minimises:  C * sum_i loss_i + 0.5 * ||w||^2
+# we minimise:        mean_i loss_i + (alpha/2) * ||w||^2
+# same minimiser iff  alpha = 1 / (n * C)
+```
+
+**2. The stable objective.** No `np.log` anywhere in `logistic.py`:
+
+```python
+def binary_objective(z, y, w, alpha):
+    #  -[y log s + (1-y) log(1-s)]  ==  logaddexp(0, z) - y*z
+    return float(np.mean(np.logaddexp(0.0, z) - y * z)) + alpha * float(w @ w) / 2.0
+```
+
+**3. The acceptance test compares objectives, not coefficients.**
+
+```python
+def test_matches_sklearn_objective(dataset):
+    ours = LogisticRegression(C=1.0).fit(Xs, y)
+    skl  = SkLogisticRegression(C=1.0, max_iter=10000, tol=1e-10).fit(Xs, y)
+    assert abs(objective(ours) - objective(skl)) < 1e-6          # PASSES
+    assert np.array_equal(ours.predict(Xs), skl.predict(Xs))     # PASSES
+    # assert np.allclose(ours.coef_, skl.coef_, atol=1e-5)       # FAILS, correctly
+```
+
+Reference numbers on `load_breast_cancer` (569 x 30, standardised): gradient check `1.471e-10`; objective `0.0663602356` versus scikit-learn's `0.0663601862`, a gap of `4.94e-08`; identical predictions; coefficients differing by `2.58e-03`. That last number is not a bug — `mean radius`, `mean perimeter` and `mean area` correlate above 0.99, so the objective is nearly flat along the directions that trade them.
+
+## `hard` — the four constraints
+
+**H1, stable softmax.** Subtract the row max before exponentiating, and use `logsumexp` for the objective:
+
+```python
+def softmax_objective(Z, Y):                 # Z: (n, K) logits, Y: (n, K) one-hot
+    m = Z.max(axis=1, keepdims=True)
+    lse = m[:, 0] + np.log(np.exp(Z - m).sum(axis=1))
+    return float(np.mean(lse - (Z * Y).sum(axis=1)))
+```
+
+With a logit of 800, `np.exp(800)` is `inf` but `np.exp(800 - 800)` is `1.0`. The gradient is `(P - Y) / n` premultiplied by `X^T` — the same expression as the binary case with one more axis.
+
+**H2, early stopping.** Restore the *best* parameters, not the last:
+
+```python
+if val_score > self.best_score_ + self.tol:
+    self.best_score_, self.best_iter_ = val_score, it
+    best_w, best_b = w.copy(), b            # .copy() — this is the bug people ship
+    since_improve = 0
+else:
+    since_improve += 1
+    if since_improve >= self.n_iter_no_change:
+        w, b = best_w, best_b
+        break
+```
+
+Without the `.copy()` you store a reference to the array you are about to mutate in place, and "restore the best" restores the last. The test that catches it: train past a clear overfitting point and assert `final_val_score == best_score_`.
+
+**H3, the diagnostic.** The rule, made numeric:
+
+```python
+def diagnose(train, val, floor, tol_gap=0.05, tol_floor=0.10):
+    gap = val - train
+    if gap > tol_gap * max(abs(val), 1e-9):
+        return "high_variance", {"gap": gap}
+    if train > floor * (1 + tol_floor):
+        return "high_bias", {"train_above_floor": train - floor}
+    return "at_floor", {"train": train, "floor": floor}
+```
+
+`floor` is the honest hard part: on synthetic data you know `sigma^2`; on real data you estimate it from the best published or best-achieved score. State which you did.
+
+**H4, the memory budget.** 1,000,000 x 100 float32 is 400 MB. The naive `np.c_[np.ones(n), X]` produces a float64 `n x 101` array of **808 MB** on top of it, and mini-batching with fancy indexing (`X[idx]`) allocates a fresh copy per batch. The passing approach:
+
+- keep the intercept as a scalar, outside `X`
+- slice contiguously (`X[s:s+bs]`, which is a **view**) rather than index with an array (which copies)
+- shuffle once per epoch by permuting an index array and slicing that, or accept a fixed order with a shuffled starting offset
+- do the accumulation in float32 and the final objective in float64
+
+Reference figures from the module pages, on 10M x 10 float32: normal equation **0.65 s**, SGD to the same optimum in **0.03 s**, peak RSS **0.56 GB** for 400 MB of data.
+
+## Why this solution and not the obvious one
+
+**The obvious solution builds `A = np.c_[np.ones(n), X]` once in `fit` and indexes into it.** It is cleaner to read, it makes the gradient a single expression, and it passes `basic` and `standard` comfortably. It fails `hard` on memory, and the failure is not fixable by tuning — it is architectural, which is exactly why the constraint exists. Deciding this on day one costs nothing; discovering it in hour seven costs a rewrite of every gradient function.
+
+Two more wrong turns worth knowing about:
+
+1. **Using `np.random.seed()` for reproducibility.** scikit-learn 1.9 and modern numpy code use `np.random.Generator` objects, which ignore the legacy global seed entirely. Your runs will not reproduce and you will lose an hour to it. Use `np.random.default_rng(self.random_state)` and store the generator on `self` in `fit`, never in `__init__` (a `Generator` in `__init__` breaks `get_params` round-tripping).
+2. **Treating `ConvergenceWarning` as informational.** Acceptance criterion A5 requires the fit to *raise* when it exhausts `n_iter` without meeting `tol`. This is stricter than scikit-learn, deliberately: in a library you own, a silent non-convergence is a silent wrong answer, and the Module 5 war story is eighteen months of exactly that.
+
+## Grading notes
+
+**3/3 on each rubric row:**
+
+- **Correctness (3):** handles separable data (raises or regularizes, with a message naming the problem), a constant column, a single-class `y`, `n < p`, and a feature scaled by `1e12`. Every gradient in the package has a test.
+- **Code quality (3):** `mypy --strict` clean; the `Estimator` base is genuinely reusable and `get_params` round-trips; no `np.log` in `logistic.py`; the `C`/`alpha` conversion is documented at the top of the file, not buried.
+- **Performance (3):** H4 met with margin, *and* a memory trace showing where the savings came from — a table of peak RSS with and without the design-matrix copy is what a 3 looks like, not just a passing number.
+- **Explanation (3):** the write-up states your own crossover number and defends when your `gd` solver is the right choice over your `normal` solver. "It depends on the data" is a 1. "`8*p^2` exceeds my 18 GB at `p ≈ 47,000`, and separately SGD wins above about 2M rows because statistical error dominates" is a 3.
+
+**The three most common ways submissions lose points:**
+
+1. **Asserting on coefficients in `test_against_sklearn.py`.** Costs a rubric point and usually an hour of debugging a non-bug.
+2. **Building the augmented matrix.** Passes two tracks, fails the third, cannot be patched.
+3. **A README that documents the API instead of the derivation.** The API is discoverable from the code. The derivation is the artifact, and it is the part that gets read in an interview.

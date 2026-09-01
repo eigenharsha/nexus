@@ -1,0 +1,160 @@
+---
+title: "SQL I: querying"
+description: "Reference solution — Week 7"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W07-M3`
+
+The exercise: rewrite five slow queries, showing the plan before and after.
+
+### Rewrite 1 — the fan-out that inflated revenue
+
+```sql
+-- BEFORE: joins to items to filter by category, then sums the ORDER total
+SELECT sum(o.total_cents) AS revenue
+FROM   orders o
+JOIN   order_items i ON i.order_id = o.id
+JOIN   products p    ON p.id = i.product_id
+WHERE  p.category = 'audio' AND o.status = 'paid';
+```
+
+The order total is repeated once per matching item. Measured on the seeded data over a comparable
+range: 5,002 orders became 15,000 rows, and `SUM` went from 507,507,500 to **1,522,492,500** — 3.0×.
+
+```sql
+-- AFTER: filter with a semi-join, so the grain never changes
+SELECT sum(o.total_cents) AS revenue
+FROM   orders o
+WHERE  o.status = 'paid'
+AND    EXISTS (SELECT 1 FROM order_items i JOIN products p ON p.id = i.product_id
+               WHERE i.order_id = o.id AND p.category = 'audio');
+```
+
+The plan changes from `Hash Join` + `Aggregate` to `Hash Semi Join` + `Aggregate`. A semi-join stops
+at the first match per outer row, so no order is counted twice. **The point is correctness; the
+speed is a side effect.**
+
+### Rewrite 2 — `NOT IN` returning nothing
+
+```sql
+-- BEFORE: silently returns zero rows if product_id is ever NULL
+SELECT * FROM products WHERE id NOT IN (SELECT product_id FROM order_items);
+
+-- AFTER: null-safe, and planned as an anti-join
+SELECT p.* FROM products p
+WHERE NOT EXISTS (SELECT 1 FROM order_items i WHERE i.product_id = p.id);
+```
+
+### Rewrite 3 — correlated subquery for top-N per group
+
+Measured: the correlated version was **cancelled after 5 minutes 7 seconds**; the window-function
+version returned in **330 ms**. Full code in `P1-W07-M4`.
+
+### Rewrite 4 — `count(*)` after a `LEFT JOIN`
+
+```sql
+-- BEFORE: customers with no orders are counted as having one
+SELECT c.id, count(*) AS orders FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.id;
+
+-- AFTER
+SELECT c.id, count(o.id) AS orders FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id GROUP BY c.id;
+```
+
+No plan change and no speed change — the bug is purely in the answer, which is what makes it
+dangerous.
+
+### Rewrite 5 — a scan that should be an index seek
+
+```sql
+-- BEFORE
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, total_cents, placed_at FROM orders WHERE customer_id = 123456;
+```
+
+```
+Gather  (cost=1000.00..14980.83 rows=5 width=24) (actual time=11.112..86.760 rows=5 loops=1)
+  Workers Planned: 2
+  Buffers: shared hit=8772
+  ->  Parallel Seq Scan on orders  (actual time=19.669..44.047 rows=2 loops=3)
+        Filter: (customer_id = 123456)
+        Rows Removed by Filter: 333332
+Execution Time: 86.796 ms
+```
+
+```sql
+CREATE INDEX idx_orders_customer ON orders(customer_id);   -- 629 ms to build, 11 MB
+```
+
+```
+Index Scan using idx_orders_customer on orders  (actual time=0.013..0.019 rows=5 loops=1)
+  Index Cond: (customer_id = 123456)
+Execution Time: 0.033 ms
+```
+
+**86.8 ms → 0.033 ms.** The line that told you the index was needed is
+`Rows Removed by Filter: 333332` — each worker examined a third of a million rows to return two.
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: adding `DISTINCT` to fix the fan-out.** It de-duplicates identical output rows,
+which happens to work until you select one more column. And when the query aggregates, `DISTINCT`
+runs *after* the aggregate, so the inflated `SUM` is de-duplicated to one inflated value. Fix the
+grain.
+
+**Wrong turn 2: comparing a cold plan to a warm plan.** My own measurement of the hash join showed
+1,148 ms against a forced merge join at 742 ms, which reads as "merge beats hash". The `Buffers`
+line says otherwise: the hash run had `read=1859` (cold pages from disk) and the merge run did not.
+**Always run `EXPLAIN (ANALYZE, BUFFERS)` and compare warm to warm.** Reporting that comparison
+without the buffer counts would have been a wrong conclusion confidently stated.
+
+**Wrong turn 3: reading `actual time` without `loops`.** In the plan above, the `Parallel Seq Scan`
+shows `actual time=19.669..44.047` with `loops=3`. That is per loop; total work is three times that.
+A `SubPlan` node with `loops=100000` and a 3 ms per-loop time is five minutes of work displayed as a
+small number — which is exactly how correlated-subquery disasters hide in plain sight.
+
+**Wrong turn 4: trusting `EXISTS` over `IN` for performance.** Measured 210 ms and 171 ms, and
+**both produced the identical plan** (`Parallel Hash Semi Join`). PostgreSQL rewrites both into a
+semi-join. Choose between them for null-safety and readability; the performance folklore is wrong
+here.
+
+## Measured numbers this solution produces
+
+| Rewrite | Before | After |
+| --- | --- | --- |
+| Fan-out `SUM` | 1,522,492,500 (wrong) | 507,507,500 (correct) |
+| Rows after the join | 15,000 | 5,002 |
+| Top-N per group | cancelled at 5 min 07 s | 330 ms |
+| Point lookup, no index | 86.8 ms warm (8,772 buffers) | 0.033 ms with an index |
+| Index cost | — | 629 ms to build, 11 MB on a 69 MB heap |
+| `EXISTS` vs `IN` | 210 ms | 171 ms — same plan, difference is noise |
+| Nested loop / hash / merge on the same join | 9.5 ms / 1,148 ms cold / 742 ms warm | — |
+
+## Grading notes
+
+**A 3/3 on correctness**: all five rewritten, with `EXPLAIN (ANALYZE, BUFFERS)` before and after,
+warm-cache timings for both, and the changed plan **node** named — not just the time.
+
+**A 3/3 on explanation**: identifies `Rows Removed by Filter` as the signal for rewrite 5, explains
+why the fan-out fix is about correctness rather than speed, and notes at least one place where the
+expected result did not appear (the `EXISTS`/`IN` equivalence is the usual one).
+
+**The four most common ways submissions lose points**
+
+1. `DISTINCT` used to fix the fan-out.
+2. Cold-versus-warm comparison presented as a plan-quality conclusion, with no `BUFFERS` output.
+3. `actual time` reported without multiplying by `loops`.
+4. "The index made it faster" with no before plan, so there is nothing to compare.

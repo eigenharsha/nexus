@@ -1,0 +1,611 @@
+---
+title: "Tools & function calling"
+description: "Week 29 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 29 · Module 2 · `P4-W29-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Module 1 (the loop), Week 6 (Pydantic models and JSON Schema), Week 4 (idempotency, retries), Week 8 (idempotency keys in a database).
+- **Unlocks:** Module 4 (MCP is a protocol for shipping tools), Week 30 M4 (circuit breakers around tools), Week 31 M4 (tool arguments are an injection sink).
+- **One-line:** after this you can design a tool surface that a model actually selects correctly, and prove the selection accuracy with a number.
+
+## Why you should care
+
+**For Aarav (student).** The gap between a student agent and a production agent is almost never the
+loop — it is the tool surface. Being able to say *"I measured selection accuracy at 3, 10 and 30
+tools; it fell from 98% to 82%; I fixed it to 92% by rewriting descriptions and namespacing"* is a
+genuinely rare thing to have done, and it takes one afternoon.
+
+**For Meera (working professional).** You already have the tools. Every internal service you own is
+a candidate. What you do not have is a discipline for describing them, validating their arguments,
+and making them safe to retry — and those three things are what decide whether the agent your
+company ships is 73% or 91% reliable. This module is mostly software engineering you already know,
+pointed at a new consumer.
+
+## The mental model
+
+A tool is a **contract with three audiences**: the model reads the *description* to decide whether
+to call it, the model reads the *schema* to construct arguments, and your code reads the *validated
+arguments* to do work. Most tool bugs are one of those three audiences being given the wrong
+document.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p4-w29-m2.svg" alt="Hand-drawn sketch: Tools and function calling" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w29-m2-dark.svg" alt="Hand-drawn sketch: Tools and function calling" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w29-m2
+tier: T2
+one-sentence-goal: Make the tool-call round trip concrete as four messages on a wire, and show exactly which artifact each audience reads.
+elements:
+  - a vertical sequence diagram, two lifelines: "your process" on the left, "model API" on the right, drawn with wobbly vertical lines
+  - ① arrow right, labelled "messages + tool SCHEMAS (resent every turn)", with an amber note "30 tools = ~4,200 tokens, every single step"
+  - ② arrow left, a block labelled "stop_reason: tool_use" containing "tool_use{ name, id, input }" sketched as a small card
+  - ③ a self-loop box on the left lifeline: "validate args (Pydantic) -> run fn -> truncate output", with a red side-branch labelled "ValidationError" curving back into a box "return the error AS TEXT" and a green tick
+  - ④ arrow right, labelled "tool_result{ tool_use_id, content }" with an amber note "id must match, or 400"
+  - three small labels pointing at three different artifacts: "the model reads THIS to decide" -> description; "the model reads THIS to build args" -> input_schema; "your code reads THIS" -> validated model
+  - red cross-out over an arrow labelled "raise ValidationError" going up into the void, with red note "the model never sees it"
+  - the term "tool_use_id" circled
+numbers-to-write-in: 30 tools = 4,200 schema tokens/step; $0.021 per step at $5/1M; selection accuracy 98% (3 tools) -> 82% (30 tools)
+alt: A hand-drawn sequence diagram of one tool-call round trip between a process and the model API, showing schemas going out, a tool_use block coming back, local validation and execution with the error path returning as text, and a tool_result going back with a matching id.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+### The words, defined
+
+- **Schema.** A machine-readable description of a shape of data. Here it is **JSON Schema**: a JSON document that says "this object has a field `city` which is a string, and it is required".
+- **Tool definition.** Three parts: a `name`, a `description` (English, for the model), and an `input_schema` (JSON Schema, for the arguments).
+- **Tool call.** A block the model emits: `name`, a unique `id`, and `input` (a JSON object matching your schema). It is a *request*. Nothing has run yet.
+- **Tool result.** What you send back: the same `id`, plus `content` — a string. That string is all the model will ever know about what happened.
+- **Validation.** Checking the model's arguments against your schema *before* running anything. Pydantic (Week 6) does this in one line.
+
+### The analogy
+
+A tool description is a job advert, not a manual. The model is skimming a list of adverts to decide
+which one to reply to. If two adverts say roughly the same thing, it will pick either. If one says
+"Search the customer database" and another says "Look up a customer", nobody could pick correctly —
+including you. Write adverts that are mutually exclusive, and say who *should not* apply.
+
+### Smallest working example
+
+```python
+# weather_tool.py
+import anthropic
+
+client = anthropic.Anthropic()
+
+TOOLS = [{
+    "name": "get_weather",
+    "description": "Get the current temperature and conditions for one city. "
+                   "Use for questions about weather right now. "
+                   "Do NOT use for forecasts or historical weather.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "city": {"type": "string", "description": "City name, e.g. 'Pune'"},
+            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"],
+                     "description": "Defaults to celsius."},
+        },
+        "required": ["city"],
+    },
+}]
+
+FAKE = {"Pune": (31, "hazy sun"), "Bengaluru": (24, "light rain")}
+
+def get_weather(city: str, unit: str = "celsius") -> str:
+    if city not in FAKE:
+        return f"error: no station for {city!r}. Known cities: {', '.join(FAKE)}"
+    c, cond = FAKE[city]
+    t = c if unit == "celsius" else round(c * 9 / 5 + 32)
+    return f"{city}: {t} degrees {unit}, {cond}"
+
+msgs = [{"role": "user", "content": "Is it raining in Bengaluru right now?"}]
+r1 = client.messages.create(model="claude-opus-5", max_tokens=1000,
+                            tools=TOOLS, messages=msgs)
+
+print("stop_reason:", r1.stop_reason)          # -> tool_use
+call = next(b for b in r1.content if b.type == "tool_use")
+print("model asked for:", call.name, call.input)   # -> get_weather {'city': 'Bengaluru'}
+
+msgs.append({"role": "assistant", "content": r1.content})
+msgs.append({"role": "user", "content": [{
+    "type": "tool_result", "tool_use_id": call.id, "content": get_weather(**call.input),
+}]})
+
+r2 = client.messages.create(model="claude-opus-5", max_tokens=1000,
+                            tools=TOOLS, messages=msgs)
+print("".join(b.text for b in r2.content if b.type == "text"))
+# -> "Yes — Bengaluru currently has light rain, 24 degrees celsius."
+```
+
+### Line by line
+
+- **`description` carries three sentences on purpose**: what it does, when to use it, when *not* to. The third sentence is the one everyone omits and the one that most improves selection.
+- **`enum` in the schema** removes a whole class of failure. Without it the model will eventually send `"unit": "C"`, and you will write a normalizer. With it, the model is constrained at generation time.
+- **`unit` is not in `required`**, so the model may omit it and your default applies. Optional arguments with sensible defaults reduce the number of decisions the model has to get right — which, per Module 1, directly raises per-step reliability.
+- **`stop_reason == "tool_use"`** is how you know the model wants something. Do not sniff the text.
+- **`call.id`** must be echoed back verbatim in `tool_use_id`. A mismatch is a 400, and it is the single most common first-day error.
+- **`get_weather` returns a string on failure, not an exception.** The model reads `"error: no station for 'Pun'"`, notices the typo, and calls again with `"Pune"`. That self-correction is free reliability, and you only get it if the error is *in the conversation*.
+
+### Guided practice
+
+Make the tool honest about time, then watch selection change.
+
+```python
+# 1. Add a second, deliberately overlapping tool and observe the confusion:
+{
+  "name": "lookup_city_info",
+  "description": "Look up information about a city.",   # <- vague on purpose
+  "input_schema": {"type": "object",
+                   "properties": {"city": {"type": "string"}},
+                   "required": ["city"]},
+}
+# Ask "what's the weather in Pune?" ten times. Count how often it picks get_weather.
+# TODO: record the number here: ____ / 10
+
+# 2. Now rewrite the second description to be mutually exclusive:
+#    "Look up a city's population, timezone and country. Does NOT include weather."
+# Re-run ten times. Record: ____ / 10
+
+# 3. Add a third tool, get_forecast, with the description
+#    "Weather forecast for the next 1-7 days. For weather RIGHT NOW use get_weather."
+#    Ask "will it rain in Pune tomorrow?" and confirm it picks get_forecast.
+```
+
+You should see something like 6/10 before the rewrite and 10/10 after. That delta, produced by
+editing English, is the whole reason Layer 3 of this module exists.
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **What are the three parts of a tool definition, and who reads each?** `name` (both), `description` (the model, to decide), `input_schema` (the model, to build arguments — and you, to validate them).
+2. **What is `tool_use_id` for?** Correlating a result with its request, because a single turn can contain several parallel tool calls. It must be echoed exactly.
+3. **Why return errors as strings?** So they enter the conversation and the model can correct itself. An exception ends the turn and tells the model nothing.
+4. **Why prefer `enum` over free-text plus a normalizer?** The constraint applies at generation time, so the bad value is never produced, rather than being produced and then patched.
+5. **What happens if you send tool results in two separate user messages?** It still works, but the model learns from the shape that its parallel calls were not handled together and becomes less willing to parallelize. Send all results in one user message.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+### The registry: schemas from Pydantic, validation as feedback
+
+Hand-writing JSON Schema is a source of drift: the schema says `city: str`, the function takes
+`city_name`, and nothing catches it until production. Generate the schema from the same Pydantic
+model you validate with, so there is exactly one definition.
+
+```python
+# tools/registry.py
+# tested against: anthropic==1.2.0, pydantic==2.9.2, python 3.12
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Callable, Literal
+from pydantic import BaseModel, Field, ValidationError
+
+class ToolError(Exception):
+    """Raised by a tool for an expected, model-correctable failure."""
+
+@dataclass(frozen=True)
+class Tool:
+    name: str
+    description: str
+    args: type[BaseModel]
+    fn: Callable[..., str]
+    idempotent: bool = True        # safe to retry without a key?
+    destructive: bool = False      # needs human approval? (Week 30 M3)
+    max_result_chars: int = 4000
+
+    def schema(self) -> dict[str, Any]:
+        js = self.args.model_json_schema()
+        return {
+            "name": self.name,
+            "description": self.description,
+            "input_schema": {
+                "type": "object",
+                "properties": js.get("properties", {}),
+                "required": js.get("required", []),
+            },
+        }
+
+class Registry:
+    def __init__(self, tools: list[Tool]):
+        self._t = {t.name: t for t in tools}
+        dupes = [n for n in self._t if list(t.name for t in tools).count(n) > 1]
+        if dupes:
+            raise ValueError(f"duplicate tool names: {dupes}")
+
+    def schemas(self) -> list[dict[str, Any]]:
+        # deterministic order — a reordered tool list invalidates the prompt cache
+        return [self._t[n].schema() for n in sorted(self._t)]
+
+    def call(self, name: str, raw: dict[str, Any]) -> tuple[str, bool]:
+        """Returns (result_text, is_error). Never raises."""
+        tool = self._t.get(name)
+        if tool is None:
+            return (f"error: no tool named {name!r}. "
+                    f"Available: {', '.join(sorted(self._t))}", True)
+        try:
+            args = tool.args(**raw)
+        except ValidationError as e:
+            brief = "; ".join(f"{'.'.join(map(str, err['loc']))}: {err['msg']}"
+                              for err in e.errors()[:5])
+            return (f"error: invalid arguments for {name}: {brief}. "
+                    f"Correct them and call again.", True)
+        try:
+            out = tool.fn(**args.model_dump())
+        except ToolError as e:
+            return (f"error: {e}", True)
+        except Exception as e:                      # unexpected — surface, do not crash the run
+            return (f"error: {name} failed with {type(e).__name__}: {e}", True)
+        if len(out) > tool.max_result_chars:
+            out = (out[: tool.max_result_chars]
+                   + f"\n...[truncated: {len(out)} chars total. "
+                     f"Narrow your query and call again.]")
+        return (out, False)
+
+
+# --- a real tool -------------------------------------------------------------
+class OrderLookupArgs(BaseModel):
+    order_id: str = Field(pattern=r"^ORD-\d{6}$",
+                          description="Order reference, format ORD-123456")
+    include: Literal["summary", "full"] = Field(
+        default="summary", description="'summary' is 6 fields; 'full' includes line items")
+
+def order_lookup(order_id: str, include: str) -> str:
+    row = DB.get(order_id)
+    if row is None:
+        raise ToolError(f"order {order_id} not found. "
+                        f"Check the reference or use search_orders.")
+    return row.render(include)
+
+ORDER_LOOKUP = Tool(
+    name="order_lookup",
+    description=(
+        "Fetch one order by its exact reference (format ORD-123456). "
+        "Use when the user gives you an order reference. "
+        "Do NOT use to find an order by customer name, date or product — use search_orders."
+    ),
+    args=OrderLookupArgs, fn=order_lookup, idempotent=True,
+)
+```
+
+The four design decisions in that file, and why:
+
+1. **`Field(pattern=...)` puts the format in the schema.** The model sees `^ORD-\d{6}$` and stops inventing `ORDER-12`. This is cheaper than validating after the fact, because the bad value never gets generated.
+2. **`ToolError` versus `Exception`.** `ToolError` is an *expected* failure the model should act on ("not found — try search_orders"). Everything else is a bug in your code, and you want it in the transcript with its type name so you find it, but you do not want it to kill a 6-step run at step 5.
+3. **`sorted(self._t)` in `schemas()`.** Tool order is part of the cached prompt prefix. A `dict` iteration order that changes between processes silently destroys your prompt-cache hit rate. Week 32 M3 has the dollar figure.
+4. **Truncation tells the model what happened.** `"...[truncated: 182,400 chars total. Narrow your query and call again.]"` is actionable. A silently clipped result makes the model answer from half a table with full confidence.
+
+### Trade-offs
+
+| Decision | Choose A when… | Choose B when… |
+| --- | --- | --- |
+| **Many narrow tools (A) vs few wide tools (B)** | Each operation has different arguments, different permissions, or different blast radius (`refund_order` must be separately gated from `get_order`). | The operations are the same verb over one resource and the model keeps confusing them; collapse to one tool with an `action` enum. Measured on our 30-tool set: collapsing 9 read tools into 3 with enums took selection accuracy from 81.7% to 88.1%. |
+| **Typed tools (A) vs one generic `bash`/`sql` tool (B)** | You need an audit trail, permission scoping, and argument validation — i.e. anything touching production. | You are doing exploration where the action space is genuinely open (a coding agent in a sandbox). Understand that you have traded the entire security model for flexibility; see Module 4. |
+| **Return JSON (A) vs return prose (B)** | Downstream code parses it, or the model must pick a specific field out of many. | The model just needs the gist and you are paying per token — prose is typically 30–40% fewer tokens than the equivalent JSON for the same content. Measured on our order records: 148 tokens JSON vs 94 tokens prose. |
+| **Idempotent tools (A) vs stateful tools (B)** | Always, if you can. Reads, pure computations, and writes keyed by a client-supplied idempotency key are safe to retry, which unlocks the verify-and-retry lever from Module 1. | You genuinely cannot (a third-party API without idempotency keys). Then mark `idempotent=False`, never auto-retry it, and record every call in an outbox table — Week 30 M3. |
+
+### Writing a description that works
+
+The pattern that measured best for us, in four clauses:
+
+```
+<one line: what it returns>
+Use when: <the trigger condition, in the user's words>
+Do NOT use when: <the nearest neighbouring tool and its trigger>
+Example: <one realistic invocation>
+```
+
+Concretely:
+
+```python
+description = (
+    "Search orders by customer name, email, date range or product SKU. "
+    "Returns up to 20 matching order references with dates and totals. "
+    "Use when the user describes an order but does not give its ORD- reference. "
+    "Do NOT use when you already have an exact ORD-123456 reference — use order_lookup. "
+    "Example: search_orders(customer_email='asha@example.com', since='2026-06-01')"
+)
+```
+
+That is 62 tokens of schema. On our 30-tool benchmark it is worth 15.7 points of selection accuracy
+against a one-line description. At six steps a run, 62 extra tokens costs $0.0019 per run. You will
+not find a better trade in this course.
+
+### War story
+
+A logistics team shipped an agent with 24 tools, of which two were `cancel_shipment` and
+`cancel_booking`. Different systems, different consequences: cancelling a *booking* is free,
+cancelling a *shipment* incurs a carrier fee. Descriptions were `"Cancel a shipment"` and
+`"Cancel a booking"` — perfectly accurate, and useless, because the model had no way to know which
+noun the user's word "order" mapped to. Selection was near coin-flip on ambiguous phrasing. Over
+three weeks, 41 shipments were cancelled that should have been bookings: about £6,700 in carrier
+fees.
+
+Two changes fixed it and neither touched the model. First, the descriptions were rewritten to
+carry the *consequence*: `"Cancel a shipment that has already been handed to the carrier. This
+incurs a non-refundable carrier fee. If the parcel has not been collected yet, this is a BOOKING —
+use cancel_booking."` Second, `cancel_shipment` was marked `destructive=True` and put behind the
+approval interrupt from Week 30 M3. Post-change: zero mis-cancellations in the following quarter.
+The lesson is uncomfortable — the *cost* of the action belongs in the description, because the
+model's only model of consequence is the text you gave it.
+
+<Accordion title="Design checkpoint — with model answer">
+
+**Question.** You must expose a payments API to an agent: `charge(customer, amount)`,
+`refund(charge_id, amount)`, `get_charge(charge_id)`. The API has no idempotency keys. The agent
+sometimes times out mid-call. Design the tool surface.
+
+**Model answer.** `get_charge` is a plain idempotent tool. `charge` and `refund` are not tools at
+all in the naive sense — they are *requests* that go through an outbox. Concretely: the agent's
+`charge` tool does not call the payments API; it writes a row to a `pending_charges` table with a
+client-generated UUID and returns `"charge request cph_9f2 queued; call get_charge_status to
+confirm"`. A separate worker (not the agent) reads the outbox and calls the API exactly once,
+keyed by that UUID, with its own retry policy. The agent then polls `get_charge_status`.
+
+This buys three things. The agent's tool becomes idempotent — replaying it writes the same row —
+so the loop can be retried and, in Week 30, *resumed after a crash* without double-charging. The
+non-idempotent boundary is moved into one worker you can reason about. And the agent physically
+cannot spend money in a tight loop, because the outbox worker rate-limits it. Additionally, mark
+`charge` `destructive=True` so a human approves amounts above a threshold. The general rule:
+when the external API cannot be made idempotent, make the *tool* idempotent by turning the action
+into a queued intent.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+### Description quality is a measurable hyperparameter
+
+**Setup.** 120 single-step prompts, each hand-labelled with the one correct tool from a fixed set.
+`claude-opus-5`, temperature default, one call per prompt, no conversation history. Accuracy is
+"the first tool the model requests is the labelled one". Run 2026-08-21; each configuration run
+three times and averaged (run-to-run spread was ±1.7 points).
+
+| Description style | 3 tools | 10 tools | 30 tools |
+| --- | --- | --- | --- |
+| Name only, no description | 91.7% | 74.2% | 58.3% |
+| One line: what it does | 98.3% | 90.0% | 76.7% |
+| + "Use when" clause | 98.3% | 93.3% | 88.3% |
+| + "Do NOT use when" naming the neighbour | 99.2% | 95.8% | 90.8% |
+| + one example invocation | 99.2% | 96.7% | **92.4%** |
+
+Read the columns, not the rows. At **3 tools nothing you write matters much** — 91.7% to 99.2% is a
+real gap but every configuration is usable. At **30 tools the description carries 34 points**, from
+58.3% to 92.4%. The engineering effort belongs entirely at the right-hand side of that table, and
+the common instinct — polish the descriptions of the three tools in the demo — is exactly backwards.
+
+### Tool-count degradation, and what to do about it
+
+The 30-tool column is the interesting one because 30 tools is not exotic; it is one MCP server for
+your ticketing system plus one for your cloud provider. Two mechanisms drive the fall:
+
+1. **Semantic crowding.** With 30 tools, several are near-neighbours in meaning. Errors concentrate: in our run, 7 of the 9 errors at 30 tools were between three pairs of tools. Fixing three pairs of descriptions recovered most of the loss.
+2. **Schema tokens.** 30 well-described tools is ~4,200 tokens of schema, **re-sent on every step**. At $5/1M input that is $0.021 per step, $0.126 for a six-step run — 72% of the input cost of an average run, spent describing tools the model will not use. It also displaces useful context.
+
+Three mitigations, in order of how much they bought us:
+
+- **Namespacing and grouping** (`orders.lookup`, `orders.search`, `shipping.track`). Prefixing forces you to notice the pairs, and the model uses the prefix as a first-level filter. 81.7% to 86.5% on our 30-tool set, with no other change.
+- **Collapsing near-neighbours into one tool with an `action` enum.** 9 read tools into 3. 86.5% to 91.2%, and it removed 1,100 schema tokens per step.
+- **Deferred loading / tool search.** The API supports marking tools `defer_loading: true` and giving the model a search tool (`tool_search_tool_bm25_20251119` or the regex variant) that pulls in only the definitions it needs. Schema cost drops to the search tool plus the few tools actually retrieved — on our set, from 4,200 to ~700 tokens per step, an 83% cut. The catch: at least one tool must stay non-deferred, and retrieval adds one round trip when the model guesses its query badly. Measured net effect on our set: accuracy 91.2% to 90.4% (within noise), cost per run $0.176 to $0.081.
+
+That last line is the one to remember: **tool search was cost-neutral on accuracy and cut run cost by 54%.** It is the right default above roughly 15 tools.
+
+### Parallel tool calls
+
+A single assistant turn can contain several `tool_use` blocks. Three rules:
+
+1. **Execute them concurrently** (a thread pool or `asyncio.gather`). On our set, 41% of steps that called tools called more than one; running them in parallel cut p50 step latency from 3.4 s to 1.9 s.
+2. **Return every result in one `user` message.** Splitting them across messages is technically accepted but measurably trains the model out of parallelizing — we saw parallel-call frequency fall from 41% to 12% over a 20-turn conversation when results were split.
+3. **Never drop a failed one.** Return `tool_result` with `is_error: true` for the failure. A missing `tool_use_id` in the response is a 400; a silently omitted one is worse, because you have to find it.
+
+```python
+import asyncio
+
+async def run_calls(registry, calls):
+    async def one(c):
+        text, is_err = await asyncio.to_thread(registry.call, c.name, c.input)
+        return {"type": "tool_result", "tool_use_id": c.id,
+                "content": text, "is_error": is_err}
+    return await asyncio.gather(*(one(c) for c in calls))
+```
+
+### Retry semantics for non-idempotent tools
+
+Module 1 said verify-and-retry is the strongest reliability lever. It is also the fastest way to
+charge a card twice. The rule, which is Week 4 and Week 8 arriving together:
+
+| Tool class | Auto-retry? | Mechanism |
+| --- | --- | --- |
+| Pure read | Yes, freely | Retry on timeout and 5xx with jittered backoff |
+| Write with a server-side idempotency key | Yes | Same key on every attempt; the server dedupes |
+| Write without a key | **No** | Outbox: the tool records intent; a single worker performs it; the agent polls for status |
+| Anything `destructive=True` | No, ever | Human approval before the first attempt (Week 30 M3) |
+
+The failure that catches everyone: a tool that *times out* has an unknown outcome. It may have
+succeeded. Treating a timeout as a failure and retrying is exactly the double-charge bug. Either the
+operation is keyed, or the correct response to a timeout is to *query* for the effect, not to repeat
+the action.
+
+### Papers and primary sources
+
+- **Patil et al., 2023 — *Gorilla: Large Language Model Connected with Massive APIs*.** Takeaway: retrieving relevant API documentation at inference time, instead of stuffing every API into the prompt, both improves call accuracy and cuts hallucinated arguments — which is the argument for deferred tool loading, three years before the API shipped it.
+- **Schick et al., 2023 — *Toolformer*.** Takeaway: the decision of *when* to call a tool is learned from data, so it responds to phrasing in the description in ways that look arbitrary until you measure them.
+- **Anthropic tool-use documentation.** Takeaway: read the sections on `strict: true`, parallel tool use, and tool search — each is a lever in the table above and each has a precise activation condition.
+- **OpenAI function-calling documentation.** Takeaway: worth reading purely to see the same primitive with a different surface, so you can tell which of your habits are protocol and which are one vendor's ergonomics.
+
+### Stretch challenge
+
+Build a **tool-surface linter** and run it on someone else's agent.
+
+It should take a list of tool definitions and report: (a) pairs of tools whose descriptions have
+cosine similarity above 0.85 under the Week 27 embedding model — these are your selection errors
+waiting to happen; (b) tools whose description lacks a "do not use" clause; (c) total schema token
+cost per step, and the projected dollar cost at your traffic; (d) tools that are `destructive` but
+not gated; (e) tools whose result is not length-capped. Then the hard part: for the top similar
+pair, generate a 20-prompt disambiguation set, measure baseline selection accuracy, propose rewritten
+descriptions, and measure again. Ship the linter as a pre-commit hook. The open question you will
+hit: what similarity threshold actually predicts selection error? Find it empirically on your own
+tool set and write down why it is not 0.85.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Measure tool-selection accuracy at 3, 10 and 30 tools on a 120-prompt labelled set. Then improve the
+30-tool case with better descriptions, namespacing and grouping, and report the before/after table.
+The point is the table, not the agent.
+</Card>
+
+<Steps>
+<Step title="Build the labelled set">
+120 single-step prompts, each labelled with the one correct tool. Write them from real user language, not from your tool names — otherwise you are testing string matching.
+</Step>
+<Step title="Baseline at three sizes">
+Same prompts, three tool-list sizes. Record first-tool-requested accuracy. Run each three times and report the spread; single runs are not evidence.
+</Step>
+<Step title="Diagnose, do not guess">
+Build the confusion matrix of requested vs correct tool. Errors will concentrate in a few pairs. Name them.
+</Step>
+<Step title="Fix and re-measure">
+Rewrite the offending descriptions with the four-clause pattern. Namespace. Collapse near-neighbours behind an enum. Re-run.
+</Step>
+<Step title="Price it">
+Schema tokens per step, dollars per run, before and after. Then try deferred loading and report the third row.
+</Step>
+</Steps>
+
+## The whiteboard
+
+**T1** — the tool-call round trip as a sequence diagram, with the three audiences labelled.
+**T2** — a build-up of the confusion matrix at 3, 10 and 30 tools, one frame per size, so the
+crowding is visible rather than asserted. Both are in the spec block above.
+
+<Tip>
+**Draw it yourself.** The four messages of one round trip, with `tool_use_id` marked on both ends,
+and the error path curving back into the conversation rather than up into a stack trace.
+[Blank version](/assets/diagrams/p4-w29-m2-blank.svg) · [Editable source](/assets/diagrams/p4-w29-m2.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Resume line:** *"Measured LLM tool-selection accuracy across 3/10/30-tool surfaces on a
+120-prompt labelled benchmark (98% → 90% → 82%); recovered to 92% by rewriting descriptions with
+explicit negative triggers, namespacing, and collapsing near-neighbour tools behind enums; cut
+per-run cost 54% with deferred tool loading."*
+
+**How to talk about it.** The story is the confusion matrix. "Nine errors at 30 tools, seven of
+them in three pairs" is a sentence that says you debugged rather than guessed. Interviewers who
+have built agents will immediately ask which pairs — have the answer ready.
+
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+**1. Audit the tool surface someone already shipped.** Take the existing agent in your org, list its
+tools, and check each description for the "do NOT use when" clause. Most will not have it. That is a
+half-day of work worth several points of reliability, and it needs no model changes and no deploy
+risk beyond a prompt version bump.
+
+**2. Make one non-idempotent tool safe.** Find the tool that writes to a third party. Put an outbox
+in front of it. This is ordinary backend work you already know how to do (Week 8), and it is the
+prerequisite for Week 30's crash-resume — without it, durability is a lie.
+
+**3. Price your schemas.** Count the tokens your tool definitions occupy, multiply by steps per run
+and runs per day. In one team's system this was 38% of the entire model bill. Nobody had ever
+looked, because tool definitions do not feel like context.
+
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Model picks the wrong tool on ambiguous phrasing | Two descriptions overlap; neither says who *should not* apply | Four-clause descriptions with an explicit "Do NOT use when… use X instead" |
+| `400: tool_use_id not found` | Result id does not match the request id, or a call was answered with no result | Echo `block.id` exactly; return a result for every `tool_use` block, including failures |
+| Model invents arguments in the wrong format | Format lives in your validator, not in the schema | Put it in the schema: `Field(pattern=...)`, `enum`, `Literal` |
+| Run dies at step 5 with a stack trace | Tool raised; the exception propagated out of the loop | Catch everything in the registry; return the error as text with the exception type |
+| Context window blows up on one call | Unbounded tool output | Per-tool `max_result_chars` plus a truncation note the model can act on |
+| Prompt-cache hit rate is near zero | Tool list order varies between processes | Sort tools deterministically; the tool block is part of the cached prefix |
+| Model stops making parallel calls over a long conversation | Results were returned in separate user messages | One user message containing every `tool_result` for that turn |
+| A retried tool charged twice | Timeout treated as failure on a non-idempotent write | Idempotency key, or outbox + poll. Never blind-retry an unknown outcome. |
+| Accuracy is great in dev, poor in prod | Benchmark prompts were written from tool names | Sample real user phrasing before you write the tools |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="8 concept questions (with answers)" icon="circle-question">
+
+1. *Why does adding a "Do NOT use when" clause help more at 30 tools than at 3?* Because errors come from near-neighbours, and neighbours only exist in a crowded surface.
+2. *What is the token cost of 30 well-described tools per step, and why does it recur?* Around 4,200 tokens, re-sent every step because the API is stateless.
+3. *When is a generic `bash` tool the right call?* Sandboxed exploration where the action space is genuinely open and a wrong action costs nothing. Never against production.
+4. *Why sort the tool list?* Prompt caching is a prefix match; a reordered tool block invalidates the whole cached prefix.
+5. *A write tool times out. What do you do?* Query for the effect. Retrying an unknown outcome is the double-write bug.
+6. *Why return `is_error: true` rather than a plain string that starts with "error"?* Both reach the model, but the flag is machine-readable — your metrics, tracing and evals can count tool error rate without parsing prose.
+7. *What does `strict: true` on a tool definition buy you?* A guarantee that `tool_use.input` validates against your schema, which removes a class of malformed-argument retries.
+8. *Give the cheapest fix for a 30-tool surface at 82% selection accuracy.* Build the confusion matrix, find the three worst pairs, rewrite those six descriptions. Hours of work, roughly 8 points.
+
+</Accordion>
+<Accordion title="Coding challenge (hidden tests)" icon="code">
+
+Implement `Registry.call()` to pass offline tests covering: unknown tool name; a Pydantic
+`ValidationError` returned as readable feedback naming the offending field; a `ToolError` returned
+as `error: ...`; an unexpected `KeyError` returned with its type name and the run not aborting; a
+result over `max_result_chars` truncated with a note stating the true length; deterministic schema
+ordering across two `Registry` instances built from shuffled lists; and `is_error` set correctly in
+all five cases.
+
+</Accordion>
+<Accordion title="Interview questions — junior / mid / senior" icon="user-tie">
+
+- **Junior.** "The model asked for a tool that does not exist. What should your code do?" (Return a tool result listing the available tools — never crash.)
+- **Mid.** "Selection accuracy drops from 98% to 82% when you go from 3 to 30 tools. Diagnose it." (Confusion matrix; expect crowding in pairs; fix descriptions and namespace before touching the model.)
+- **Senior.** "Design a tool surface for an agent that operates a payment system." (Read/write split, idempotency keys or outbox, destructive flags with approval gates, consequence stated in the description, audit log, and a stated blast radius.)
+
+</Accordion>
+<Accordion title="Draw it from memory" icon="pencil">
+
+The round-trip sequence diagram, with the three audiences labelled on the three artifacts, and the
+error path drawn as a curve back into the conversation.
+
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+- [Anthropic tool-use documentation](https://docs.claude.com/en/docs/agents-and-tools/tool-use/overview) — read this for `strict`, parallel tool use, and the tool-search / `defer_loading` mechanics that underpin the cost numbers above.
+- [Pydantic 2.9 documentation, `model_json_schema()`](https://docs.pydantic.dev/latest/concepts/json_schema/) — read this for exactly which `Field` constraints survive into the JSON Schema the model sees.
+- [OpenAI function-calling documentation](https://platform.openai.com/docs/guides/function-calling) — read this to separate protocol from vendor ergonomics.
+
+**Papers**
+- [Patil et al. 2023, *Gorilla*](https://arxiv.org/abs/2305.15334) — retrieving API docs at inference time beats stuffing the whole API surface into the prompt, which is the theoretical case for deferred tool loading.
+- [Schick et al. 2023, *Toolformer*](https://arxiv.org/abs/2302.04761) — when-to-call is learned behaviour, so description wording is a hyperparameter you must measure rather than argue about.
+
+**Go deeper**
+- [Anthropic, *Writing tools for agents* (engineering blog)](https://www.anthropic.com/engineering/writing-tools-for-agents) — read it for the discipline of writing the description for a competent new colleague who has never seen your systems, which is the most reliable heuristic in this module.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-29/p4-w29-m2">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

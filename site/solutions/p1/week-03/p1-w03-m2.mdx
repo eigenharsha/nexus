@@ -1,0 +1,168 @@
+---
+title: "Data structures and complexity in practice"
+description: "Reference solution — Week 3"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W03-M2`
+
+Process a 2 GB JSONL file under a 200 MB RSS ceiling, with the ceiling enforced rather than hoped for.
+
+```python
+"""stream.py — bounded-memory aggregation over an arbitrarily large JSONL file."""
+from __future__ import annotations
+
+import json
+import resource
+import sys
+import tracemalloc
+from collections import Counter
+from collections.abc import Iterator
+from typing import Any
+
+CEILING_BYTES = 200 * 1024 * 1024
+
+
+def enforce_ceiling(limit: int = CEILING_BYTES) -> None:
+    """Make exceeding the budget an ERROR, not something noticed afterwards.
+    RLIMIT_AS is address space; on macOS RLIMIT_RSS is not enforced, so AS is the
+    portable choice — note it counts virtual, not resident, memory."""
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
+    except (ValueError, OSError) as exc:
+        print(f"could not set RLIMIT_AS: {exc}", file=sys.stderr)
+
+
+def read_records(path: str) -> Iterator[dict[str, Any]]:
+    """One record at a time. The `with` is INSIDE the generator, so the file stays
+    open for the generator's whole life and is closed when it is exhausted."""
+    with open(path, encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError as exc:
+                print(f"skip line {lineno}: {exc}", file=sys.stderr)
+
+
+def aggregate(records: Iterator[dict[str, Any]]) -> tuple[Counter[str], Counter[int]]:
+    """One pass. Memory is O(distinct endpoints + distinct users), not O(records)."""
+    by_path: Counter[str] = Counter()
+    by_user: Counter[int] = Counter()
+    for r in records:
+        by_path[r["path"]] += 1
+        by_user[r["user_id"]] += 1
+    return by_path, by_user
+
+
+def rss_mb() -> float:
+    r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return r / (1024 * 1024) if sys.platform == "darwin" else r / 1024
+
+
+def main() -> None:
+    enforce_ceiling()
+    tracemalloc.start()
+    by_path, by_user = aggregate(read_records(sys.argv[1]))
+    _, tm_peak = tracemalloc.get_traced_memory()
+    for path, n in by_path.most_common(10):
+        print(f"{n:>10,}  {path}")
+    print(f"top user: {by_user.most_common(1)}", file=sys.stderr)
+    print(f"tracemalloc peak {tm_peak / 1e6:.1f} MB   peak RSS {rss_mb():.1f} MB", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+```bash
+python3 stream.py events.jsonl
+/usr/bin/time -l python3 stream.py events.jsonl 2>&1 | grep 'maximum resident'   # macOS
+/usr/bin/time -v python3 stream.py events.jsonl 2>&1 | grep 'Maximum resident'   # Linux
+```
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: `return (json.loads(l) for l in f)` inside a `with`.**
+
+```python
+def read_records(path):
+    with open(path) as f:
+        return (json.loads(line) for line in f)     # BROKEN
+# ValueError: I/O operation on closed file
+```
+
+`return` exits the `with` block immediately, which closes the file. The generator expression is returned unstarted, and the first `next()` on it tries to read a closed file.
+
+The fix is to make the function itself a generator — use `yield` inside the `with` rather than returning a generator expression. Then the function's frame, and therefore the open file, stays alive across every suspension until the generator is exhausted or collected.
+
+The corollary is worth stating: **a suspended generator owns every resource its frame references.** An abandoned generator holding a file keeps the descriptor until garbage collection, which in a service with error paths that break out of loops presents as `EMFILE: too many open files` after hours of uptime.
+
+**Wrong turn 2: aggregating into a dict keyed by something unbounded.**
+
+The generator bounds *record* memory. It does not bound *aggregate* memory. `Counter` keyed by endpoint is fine — there are twelve. `Counter` keyed by `user_id` is fine at 50,000 users and is 50 million entries at internet scale, which is hundreds of megabytes and blows the ceiling.
+
+The acceptance criterion says "bounded memory", and the honest version of that claim names what it is bounded *by*: **O(distinct keys), not O(records)**. If the key space is unbounded you need a different tool — a heap for top-N (`heapq.nlargest` over a streaming pass), a Count-Min Sketch for approximate frequencies, or HyperLogLog for distinct counts. The stretch challenge measures all three.
+
+This is the failure that actually happens in production: someone streams correctly, feels safe, and then groups by session ID.
+
+**A third thing worth knowing: `RLIMIT_AS` is address space, not resident memory.**
+
+`setrlimit(RLIMIT_AS, ...)` limits *virtual* address space, which includes memory that is mapped but never touched. CPython, and especially anything importing NumPy, reserves considerably more address space than it makes resident, so a 200 MB `RLIMIT_AS` can fail on an empty interpreter. `RLIMIT_RSS` would be the right limit and **the kernel does not enforce it on Linux or macOS**.
+
+The practical answers: set `RLIMIT_AS` generously (say 2–3× your real target) as a crash barrier against runaway allocation, and enforce the actual budget by measuring `ru_maxrss` and failing the test. In a container, the cgroup memory limit is the real enforcement and it is what production will apply.
+
+## The measured numbers this solution produces
+
+CPython 3.13.2, Apple M3 Pro, macOS 15. Input: 2,000,000,101 bytes, **12,212,147 records**.
+
+| Approach | `tracemalloc` peak | `ru_maxrss` peak | Wall time |
+|---|---|---|---|
+| **generator, one record at a time** | **0.03 MB** | **14.3 MB** | **23.5 s** |
+| `f.readlines()` then parse | 2,600.9 MB | 698.5 MB | 36.0 s |
+| `[json.loads(l) for l in f]` | **10,499.0 MB** | 2,070.8 MB | 77.7 s |
+
+**The generator is 3.3× faster as well as bounded** — the eager version spends its time allocating, filling and collecting 12.2 million dicts.
+
+Note the gap between the two memory columns for the eager rows: `tracemalloc` measures what Python allocated; `ru_maxrss` measures what stayed resident, and macOS compressed the highly repetitive JSON text. Report both.
+
+Container-cost measurements that motivate the design:
+
+| Measurement | Value |
+|---|---|
+| `in` list vs `in` set at n = 10⁶ | 4,531,427 ns vs **12.3 ns** — **367,867×** |
+| `list.insert(0)` vs `deque.appendleft` at n = 10⁶ | 311,319 ns vs **16.0 ns** — **19,509×** |
+| `in` set at n = 10 vs n = 10⁶ | 7.8 ns vs 12.3 ns — **flat** |
+| list comprehension vs append loop, 10⁶ items | 27.7 ms vs 26.1 ms — **no difference** |
+| `map(lambda ...)` vs comprehension | 46.9 ms vs 27.7 ms — **1.7× slower** |
+
+## Grading notes
+
+**3/3 on correctness** means the aggregate matches a hand-computed answer on a small sample, malformed lines are skipped and counted rather than crashing the job, and the `with` is inside the generator.
+
+**3/3 on performance** means peak RSS reported under the ceiling, `tracemalloc` also reported, and the discrepancy explained on your platform.
+
+**3/3 on explanation** means the write-up states what the memory is bounded *by* — distinct keys, not records — and says what you would do if the key space were unbounded.
+
+The four most common ways submissions lose points:
+
+1. **`return (genexp)` inside a `with`.** Fails immediately with `ValueError: I/O operation on closed file`, so it is usually caught — but the fix people reach for (moving `open` outside the `with`) leaks the descriptor instead. Use `yield` inside the block.
+2. **"Bounded memory" claimed without naming the bound.** Grouping by an unbounded key defeats streaming entirely, and the write-up should show you know the difference.
+3. **Only wall time reported for the comparison.** The interesting result is that the generator is *both* smaller and faster; without the timing you have only made the boring half of the point.
+4. **A `set` used for distinct users at scale without comment.** Correct at 50,000 users. At 50 million it is the OOM this lab is about. Note it.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

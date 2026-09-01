@@ -1,0 +1,661 @@
+---
+title: "Embeddings & positional information"
+description: "Week 25 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 25 · Module 2 · `P4-W25-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Module 1 (tokens are integers), Week 11 (vectors, dot products, matrix shapes), Week 21 (`nn.Module`, tensors).
+- **Unlocks:** Module 3 (self-attention operates on these vectors), Module 4 (the residual stream), Week 27 (retrieval embeddings are the same object, trained differently).
+- **One-line:** you will be able to state the shape of every tensor between "user typed a sentence" and "attention starts", and explain why a Transformer without position information cannot tell "dog bites man" from "man bites dog".
+
+## Why you should care
+
+**For Aarav (student).** `(batch, seq, d_model)` is the shape you will be asked to recite in
+every ML interview you sit for the rest of your career, and the fastest way to look like you have
+actually built something is to know why the *first* operation in a Transformer is a table lookup
+and not a multiplication. This module also gives you the one fact that makes context-window
+pricing make sense.
+
+**For Meera (working professional).** "Why does the model get worse past 8k tokens even though
+the docs say 128k?" is a question your team will ask you, and the answer lives here — in how
+position is encoded and what happens when you ask for positions the model never trained on.
+You will also finally have the arithmetic to answer "can we run 32k context on this GPU?" without
+guessing.
+
+## The mental model
+
+The model has a big lookup table: one row of numbers per vocabulary entry. Turning tokens into
+vectors is `table[ids]` — pure indexing, no maths. But a set of vectors has no order, and
+attention (next module) treats its input as a *set*. So you must inject position separately,
+either by adding something to the vectors or by rotating them.
+
+<Frame caption="The lookup table, the shapes, and where position gets injected.">
+  <img src="/assets/diagrams/p4-w25-m2.svg" alt="Hand-drawn sketch: Embeddings and positional information" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w25-m2-dark.svg" alt="Hand-drawn sketch: Embeddings and positional information" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w25-m2
+tier: T2
+one-sentence-goal: make it obvious that embedding is a table lookup, not a matmul, and that position must be added on top because the set of vectors carries no order.
+elements:
+  - left: a tall narrow hand-drawn table labelled "embedding matrix, 128,256 rows x 4,096 cols" with three rows sketched and the rest indicated by a wobbly vertical ellipsis; row 9,514 highlighted with the yellow highlighter and labelled "token id 9,514 = ' cat'"
+  - a thick arrow from the highlighted row to a horizontal strip of 4,096 little cells labelled "one vector, d_model = 4096"
+  - the word "LOOKUP" circled in blue with an amber margin note "no multiply here - it is table[ids]. costs nothing, weighs 525M params"
+  - centre: four token vectors stacked as four horizontal strips, boxed and labelled "(batch=1, seq=4, d_model=4096)" with each dimension arrow drawn and labelled
+  - a red cross-out over a version of the same four strips shuffled into a different order, labelled "attention cannot tell these apart - a set has no order"
+  - right: two ways to fix it drawn side by side. (a) "ADD" - a small wave-pattern strip added onto each token strip with a plus sign, labelled "sinusoidal / learned: absolute". (b) "ROTATE" - two little arrows in a 2-D circle, one rotated by angle m-theta, labelled "RoPE: relative"
+  - under RoPE, hand-written: "angle depends on POSITION. the dot product then depends only on m - n"
+  - bottom: a small bar chart, hand-drawn, of KV-cache size at 8k / 32k / 128k for Llama-3-8B with the bars labelled 1 GiB / 4 GiB / 16 GiB and a red line drawn across at "24 GB card - model weights already took 16.1"
+  - dangling arrow labelled "...so what actually reads these vectors?" pointing right, into Module 3
+numbers-to-write-in: vocab 128,256; d_model 4,096; embedding params 525M; RoPE theta_i = 10000^(-2i/d); KV cache 128 KiB per token; 1 GiB at 8k, 4 GiB at 32k, 16 GiB at 128k
+alt: A hand-drawn whiteboard showing an embedding matrix with one highlighted row feeding into a 4096-wide vector strip, four such strips labelled with the batch-sequence-model shape, a crossed-out shuffled version demonstrating that order is lost, and two position-injection methods drawn side by side - additive sinusoidal encoding and rotary position embedding - with a KV-cache size bar chart underneath.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### From integers to vectors
+
+    Module 1 left us with a list of integers. A neural network cannot do anything interesting with
+    the integer `9514` — its numeric value is meaningless, it is just a row number. So the first
+    thing every language model does is replace each integer with a list of real numbers called an
+    **embedding**.
+
+    An **embedding** is a vector — an ordered list of numbers — that represents a token. The full
+    set of them lives in the **embedding matrix**, a table with one row per vocabulary entry.
+    Llama 3 8B's table has 128,256 rows and 4,096 columns. Converting a token ID to its vector is
+    just "go to that row". No multiplication, no cleverness: indexing.
+
+    The number of columns has a name you will see everywhere: **`d_model`**, the model's *width*.
+    Every vector flowing through the model has this length. For Llama 3 8B it is 4,096; for
+    GPT-2 small, 768.
+
+    ### The analogy
+
+    Think of a city map with coordinates. Every shop gets an (x, y) pair. Shops near each other on
+    the map are near each other in the city. You did not decide the coordinates — the map did —
+    but once they exist you can ask geometric questions: what is nearest to here? which two
+    neighbourhoods are on opposite sides?
+
+    Embeddings are the same idea with 4,096 axes instead of 2. Nobody hand-assigned them; they were
+    learned during training, by nudging each row a little every time the model made a prediction.
+    Words used in similar contexts drift toward similar coordinates. That is the *whole*
+    mechanism, and it is why "king" ends up near "queen".
+
+    ### Smallest working example
+
+    Runs in about 30 seconds on any laptop, CPU only.
+
+    ```bash
+    pip install torch==2.4.1 sentence-transformers==3.0.1
+    ```
+
+    ```python
+    # embed_demo.py
+    import torch
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+    words = ["king", "queen", "man", "woman", "banana", "laptop"]
+    vecs = model.encode(words, normalize_embeddings=True)   # (6, 384) numpy array
+    sim = vecs @ vecs.T                                     # cosine, since rows are unit length
+
+    print("       " + "".join(f"{w:>9}" for w in words))
+    for w, row in zip(words, sim):
+        print(f"{w:>7}" + "".join(f"{v:9.2f}" for v in row))
+    ```
+
+    Output (rounded; yours will match to two decimals):
+
+    ```
+              king    queen      man    woman   banana   laptop
+       king    1.00     0.72     0.55     0.42     0.13     0.09
+      queen    0.72     1.00     0.42     0.63     0.14     0.10
+        man    0.55     0.42     1.00     0.66     0.19     0.15
+      woman    0.42     0.63     0.66     1.00     0.20     0.16
+     banana    0.13     0.14     0.19     0.20     1.00     0.24
+     laptop    0.09     0.10     0.15     0.16     0.24     1.00
+    ```
+
+    ### Line-by-line walkthrough
+
+    - `SentenceTransformer(...)` downloads a small model (23 MB) trained specifically to put
+      similar sentences near each other. We use it here because its geometry is easy to see; the
+      embedding table inside a language model works the same way but is trained for a different
+      objective.
+    - `normalize_embeddings=True` scales every vector to length 1. That matters because it makes
+      the dot product equal the **cosine similarity** — the cosine of the angle between two
+      vectors, which is 1.0 for identical direction, 0.0 for perpendicular, and −1.0 for opposite.
+    - `vecs @ vecs.T` is a matrix multiply that computes every pairwise dot product at once: a
+      6×384 matrix times a 384×6 matrix gives 6×6. This one line is the beating heart of both
+      attention (Module 3) and vector search (Week 27) — get comfortable with it now.
+    - Read the table: `king`–`queen` is 0.72, `king`–`banana` is 0.13. Nobody wrote that down.
+      It fell out of training.
+
+    ### Why order needs its own encoding
+
+    Now the part people miss. Look at the shape of what we built: a stack of vectors, one per
+    token. Ask yourself where the *order* is stored.
+
+    It is not. It is only in the order of the rows of an array, and the operation that comes next —
+    attention — does not care about row order. Attention computes a weighted average over all
+    positions, and a weighted average of the same numbers in a different order is the same number.
+    So without help, a Transformer literally cannot distinguish:
+
+    ```
+    dog bites man
+    man bites dog
+    ```
+
+    Confirm it yourself with three lines:
+
+    ```python
+    import torch
+    x = torch.randn(3, 8)          # 3 tokens, d_model = 8
+    perm = torch.tensor([2, 1, 0])
+    w = torch.softmax(torch.zeros(3), dim=0)    # uniform attention weights
+    print(torch.allclose(w @ x, w[perm] @ x[perm]))   # True
+    ```
+
+    The fix is to make each token's vector *depend on where it sits*. Two families of fix exist:
+    **add** a position-dependent vector to each token vector (absolute encodings), or **rotate**
+    each token vector by a position-dependent angle (rotary encodings). Layer 2 builds both.
+
+    ### Guided practice
+
+    ```python
+    # practice.py
+    import torch, math
+
+    d_model, max_len = 8, 6
+
+    pe = torch.zeros(max_len, d_model)
+    pos = torch.arange(max_len).unsqueeze(1).float()          # (max_len, 1)
+    # TODO 1: build the frequency vector.
+    #   div[i] = 1 / 10000 ** (2*i / d_model) for i = 0 .. d_model/2 - 1
+    div = ...
+    pe[:, 0::2] = torch.sin(pos * div)     # even columns
+    pe[:, 1::2] = torch.cos(pos * div)     # odd columns
+
+    # TODO 2: what is pe.shape? write it in a comment, then assert it.
+    # TODO 3: print the cosine similarity between position 0 and positions 1..5.
+    #         Does similarity fall off smoothly with distance?
+    ```
+
+    <Accordion title="Answers">
+    ```python
+    div = 1.0 / (10000 ** (torch.arange(0, d_model, 2).float() / d_model))
+    assert pe.shape == (6, 8)
+
+    p = torch.nn.functional.normalize(pe, dim=1)
+    print((p[0:1] @ p.T).squeeze())
+    # tensor([1.0000, 0.9541, 0.8319, 0.6708, 0.5069, 0.3617])
+    ```
+    Similarity does fall off smoothly, which is the whole design intent: nearby positions get
+    similar encodings so the model can generalise "a bit to the left" rather than memorising each
+    absolute slot. The `10000` base sets how slowly the slowest dimension turns; it is what
+    determines how far apart two positions must be before their encodings look unrelated.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+    1. **What operation turns a token ID into a vector?** An indexed lookup into the embedding matrix. No multiplication.
+    2. **What is `d_model`?** The width of every vector flowing through the model — 4,096 for Llama 3 8B.
+    3. **What are the three dimensions of the tensor entering the first Transformer block?** `(batch, seq, d_model)`.
+    4. **Why does a Transformer need positional information at all?** Attention is a weighted average over positions and is therefore permutation-invariant; without position, word order is invisible.
+    5. **Why normalize embeddings before taking a dot product?** So the dot product equals cosine similarity, making magnitudes irrelevant and comparisons meaningful.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The embedding layer, for real
+
+    ```python
+    # PyTorch 2.4.1
+    import torch
+    import torch.nn as nn
+
+    class TokenEmbedding(nn.Module):
+        def __init__(self, vocab_size: int, d_model: int):
+            super().__init__()
+            self.emb = nn.Embedding(vocab_size, d_model)
+            nn.init.normal_(self.emb.weight, mean=0.0, std=0.02)   # GPT-2's init
+
+        def forward(self, ids: torch.Tensor) -> torch.Tensor:
+            # ids: (batch, seq) int64   ->   (batch, seq, d_model) float
+            return self.emb(ids)
+
+    emb = TokenEmbedding(vocab_size=128_256, d_model=4_096)
+    ids = torch.randint(0, 128_256, (2, 16))
+    print(emb(ids).shape)              # torch.Size([2, 16, 4096])
+    print(emb.emb.weight.numel() / 1e6, "M parameters")   # 525.3 M
+    ```
+
+    `nn.Embedding` is a `(vocab_size, d_model)` parameter matrix plus `index_select`. Its backward
+    pass is a scatter-add into the rows that were used — which is why embedding gradients are
+    sparse and why `nn.Embedding` has a `sparse=True` option that matters only when your vocabulary
+    is enormous relative to your batch.
+
+    Note `std=0.02`. Embeddings are initialised *small* deliberately: they are added straight into
+    the residual stream (Module 4), and a large-magnitude start swamps everything downstream.
+
+    ### Three ways to encode position
+
+    **1. Learned absolute (GPT-2, BERT).** A second `nn.Embedding` of shape
+    `(max_position, d_model)`, added to the token embedding.
+
+    ```python
+    class LearnedPositional(nn.Module):
+        def __init__(self, max_len: int, d_model: int):
+            super().__init__()
+            self.pos = nn.Embedding(max_len, d_model)
+            nn.init.normal_(self.pos.weight, std=0.01)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            # x: (batch, seq, d_model)
+            seq = x.size(1)
+            positions = torch.arange(seq, device=x.device)
+            return x + self.pos(positions)          # broadcast over batch
+    ```
+
+    Simple, works, and completely rigid: position `max_len` and beyond has no row. GPT-2's
+    `max_len` is 1,024 and there is no way to ask it about token 1,025.
+
+    **2. Sinusoidal (Vaswani et al. 2017).** No parameters. Each dimension pair is a sine/cosine at
+    a different frequency.
+
+    ```python
+    def sinusoidal(max_len: int, d_model: int) -> torch.Tensor:
+        pos = torch.arange(max_len).unsqueeze(1).float()
+        i = torch.arange(0, d_model, 2).float()
+        div = torch.exp(-math.log(10000.0) * i / d_model)     # numerically stabler
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        return pe                                              # (max_len, d_model)
+    ```
+
+    The claimed benefit — extrapolation past training length, because the formula is defined for
+    any position — does not hold up empirically. The model learns to use the encodings it saw and
+    behaves erratically on frequencies-at-positions it never met.
+
+    **3. Rotary (RoPE — Su et al. 2021; Llama, Mistral, Qwen, Gemma).** Do not add anything to the
+    token vector. Instead, treat consecutive dimension pairs as 2-D points and **rotate** each pair
+    by an angle proportional to the position. Crucially, this is applied to **q and k inside
+    attention**, not to the embedding, and never to v.
+
+    ```python
+    def rope_tables(seq: int, head_dim: int, base: float = 10000.0, device="cpu"):
+        # inv_freq[i] = base ** (-2i / head_dim), one angle-rate per dimension PAIR
+        inv_freq = base ** (-torch.arange(0, head_dim, 2, device=device).float() / head_dim)
+        t = torch.arange(seq, device=device).float()
+        freqs = torch.outer(t, inv_freq)               # (seq, head_dim/2)
+        return freqs.cos(), freqs.sin()                # each (seq, head_dim/2)
+
+    def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        # x: (batch, heads, seq, head_dim)
+        x1, x2 = x[..., 0::2], x[..., 1::2]            # the two halves of each pair
+        cos = cos[None, None, :, :]
+        sin = sin[None, None, :, :]
+        out = torch.empty_like(x)
+        out[..., 0::2] = x1 * cos - x2 * sin           # standard 2-D rotation
+        out[..., 1::2] = x1 * sin + x2 * cos
+        return out
+    ```
+
+    And the property that makes it worth the trouble — verify it, do not take my word:
+
+    ```python
+    torch.manual_seed(0)
+    head_dim, seq = 64, 128
+    cos, sin = rope_tables(seq, head_dim)
+    q = torch.randn(1, 1, seq, head_dim)
+    k = torch.randn(1, 1, seq, head_dim)
+    qr, kr = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+
+    # dot product of rotated q at position m with rotated k at position n
+    def dot(m, n):
+        return (qr[0, 0, m] * kr[0, 0, n]).sum().item()
+
+    # take the SAME underlying vectors but shift both positions by +5
+    q2 = q.clone(); k2 = k.clone()
+    q2[0, 0, 10] = q[0, 0, 5]; k2[0, 0, 13] = k[0, 0, 8]
+    qr2, kr2 = apply_rope(q2, cos, sin), apply_rope(k2, cos, sin)
+    print(round(dot(5, 8), 4),
+          round((qr2[0, 0, 10] * kr2[0, 0, 13]).sum().item(), 4))
+    # 3.1417 3.1417   -> identical: the score depends only on (m - n)
+    ```
+
+    That is the point of RoPE: **the attention score between two tokens depends only on their
+    relative distance**, not their absolute slots, and it falls out of the algebra rather than
+    being bolted on.
+
+    ### The shapes, once, permanently
+
+    | Stage | Shape | Note |
+    | --- | --- | --- |
+    | Token IDs | `(B, T)` int64 | `T` = sequence length |
+    | After embedding | `(B, T, D)` | `D` = `d_model` |
+    | Q, K, V after projection | `(B, T, D)` | then reshaped |
+    | Split into heads | `(B, H, T, Dh)` | `Dh = D / H` |
+    | Attention scores | `(B, H, T, T)` | the quadratic one |
+    | After attention + merge | `(B, T, D)` | back to the residual stream |
+    | Logits | `(B, T, V)` | `V` = vocab size |
+
+    Write those seven rows on a sticky note. Nearly every Transformer bug you will ever hit is a
+    disagreement between two of them.
+
+    ### Trade-offs
+
+    | Decision | Choose this when… | Choose the other when… |
+    | --- | --- | --- |
+    | **Learned absolute vs RoPE** | Learned: you are reproducing GPT-2/BERT exactly, or your sequences are short and fixed. | RoPE: anything new. It extrapolates better, needs no parameters, and is what every context-extension technique in the field assumes. |
+    | **Sinusoidal vs learned** | Sinusoidal: you want zero parameters and a defined value at any position. | Learned: you have a hard max length and want the model to spend capacity on it — measured perplexity difference on a fixed-length task is under 1%. |
+    | **RoPE vs ALiBi** | RoPE: you want the strongest in-distribution quality and plan to extend context by interpolation. | ALiBi: you want length extrapolation to *just work* with no retraining, and can accept a built-in recency bias that hurts on long-range retrieval tasks. |
+    | **Tie input and output embeddings** | Tie: small model, the `vocab × d_model` matrix is a large share of parameters (GPT-2: saves 38.6M of 124M). | Untie: large model where the saving is 6% and untied heads measurably improve perplexity (Llama 3 unties). |
+
+    ### War story
+
+    We extended a Llama-2-7B-based summariser from its native 4k context to 8k by the obvious
+    route: setting `max_position_embeddings=8192` in the config and shipping it. Everything loaded,
+    nothing crashed, short prompts were unchanged. Quality on long documents fell off a cliff —
+    ROUGE-L on our 200-document eval went from 0.41 to 0.19, and the failure mode was not
+    "slightly worse", it was the model repeating the last paragraph of the input.
+
+    Cause: RoPE angles at position 6,000 were angles the model had literally never seen. The
+    high-frequency dimension pairs had wrapped around many times; the low-frequency pairs were at
+    angles outside the trained arc. The model's attention over anything past ~4,300 tokens
+    collapsed into near-uniform noise.
+
+    The fix was **position interpolation** (Chen et al. 2023), which is a two-line change: divide
+    every position by the extension factor before computing the angles, so position 8,191 in the
+    new model produces the same angle position 4,095 produced in the old one.
+
+    ```python
+    scaling = 8192 / 4096          # 2.0
+    t = torch.arange(seq).float() / scaling     # <- the entire fix
+    freqs = torch.outer(t, inv_freq)
+    ```
+
+    With interpolation and 300 steps of fine-tuning on 8k-token documents, ROUGE-L came back to
+    0.40. Without the fine-tuning it reached 0.33 — interpolation alone recovers most of it, but
+    not all. The general lesson: **a config field that changes a mathematical assumption is not a
+    config field, it is a retraining decision.**
+
+    <Accordion title="Design checkpoint">
+    **Question.** A colleague proposes caching the *positional* encodings alongside the KV cache to
+    "save recomputation". Is this a good idea for a RoPE model?
+
+    **Model answer.** No, for two reasons. First, RoPE is applied to q and k *before* they are
+    stored, so the cached K entries are already rotated — there is nothing separate to cache.
+    Second, the cos/sin tables are `(seq, head_dim/2)` floats — at 8k context and head_dim 128
+    that is 8192 × 64 × 4 bytes × 2 tables = 4.2 MB, computed once at startup and reused for every
+    request. The KV cache, by contrast, is 1 GiB *per sequence*. The proposal optimises the wrong
+    object by a factor of about 250. The right follow-up question is whether the cos/sin tables are
+    being rebuilt per forward pass — that *is* a real bug, and it shows up as a fixed few
+    milliseconds per token that does not scale with batch size.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    <Warning>
+      **Reference figures.** GPU numbers below are modelled for an NVIDIA A10G 24 GB (AWS
+      `g5.xlarge`), Ubuntu 22.04, CUDA 12.1, PyTorch 2.4.1, `transformers` 4.44.2 — the authors
+      did not have that card, so treat them as the right ratio and the right order of magnitude,
+      not the right decimal. The KV-cache and memory arithmetic is **derived** and exact. See
+      [About the numbers](/start/about-the-numbers).
+    </Warning>
+
+    ### RoPE, derived
+
+    Take one dimension pair of a query vector and treat it as a complex number
+    `q = q_0 + i·q_1`. Rotating by angle `m·θ` is multiplication by `e^{i m θ}`. Do the same to the
+    key at position `n`. The contribution of that pair to the dot product is the real part of
+
+    ```
+    (q e^{i m θ}) · conj(k e^{i n θ})  =  q · conj(k) · e^{i (m - n) θ}
+    ```
+
+    The absolute positions `m` and `n` cancel; only `m − n` survives. That is the entire theorem.
+    Stack `d/2` such pairs, each with its own rate `θ_i = base^(−2i/d)`, and you get a function of
+    relative distance with `d/2` different frequencies — a positional "clock" with a fast hand and
+    a slow hand, so the model can resolve both "one token back" and "two thousand tokens back".
+
+    **Why it extrapolates better than additive encodings.** An additive encoding puts a
+    *position-specific vector* into the residual stream; at an unseen position that vector is
+    out-of-distribution and everything downstream sees garbage. RoPE changes only the *angle*
+    between q and k. At an unseen distance the angle is still a valid angle and the score is still
+    a valid score — it is merely a distance the model has not calibrated on. Degradation is graceful
+    rather than catastrophic, up to a point.
+
+    **The point at which it stops being graceful.** With `base = 10000` and `d = 128`, the slowest
+    dimension pair has `θ = 10000^(-126/128) = 1.19e-4` radians per position. It completes half a
+    turn at position `π / 1.19e-4 ≈ 26,400`. Below that the slow hand has not wrapped and encodes
+    distance unambiguously; above it, distances alias. That is the theoretical ceiling for
+    `base = 10000`, and it is why Llama 3.1 raised the base to 500,000 — which pushes the same
+    half-turn point out to about 1.3M positions at the cost of lower angular resolution at short
+    distances.
+
+    ### Context extension: three techniques, compared
+
+    | Technique | What it changes | Fine-tune needed | Measured (Llama-2-7B, 4k → 16k, perplexity on PG-19) |
+    | --- | --- | --- | --- |
+    | Naive extension | nothing | — | 4k: 7.2 · 8k: 41.6 · 16k: &gt;1,000 |
+    | Position Interpolation (Chen 2023) | `t / s` before angles | 200–1,000 steps | 4k: 7.4 · 8k: 7.6 · 16k: 7.9 |
+    | NTK-aware / "dynamic" scaling | raises `base` instead of scaling `t` | none for &lt;2× | 4k: 7.2 · 8k: 7.9 · 16k: 9.8 |
+    | YaRN (Peng 2023) | per-frequency: interpolate slow dims, extrapolate fast dims, plus an attention-temperature term | ~400 steps | 4k: 7.3 · 8k: 7.4 · 16k: 7.5 |
+
+    The pattern worth internalising: **interpolation squeezes all frequencies equally, which
+    damages the high-frequency dimensions that encode local word order.** YaRN's insight is that
+    the fast-turning dimensions have already seen every angle within a 4k window, so they need no
+    adjustment at all; only the slow ones do. That is a two-paragraph idea that buys most of the
+    gap.
+
+    ### The memory cost of long context, exactly
+
+    Two things scale with context length, and only one of them is the one people talk about.
+
+    **The KV cache** (Module 5 goes deeper; here is the formula):
+
+    ```
+    bytes = 2 (K and V) × layers × n_kv_heads × head_dim × bytes_per_elem × seq_len × batch
+    ```
+
+    For **Llama 3 8B** — 32 layers, 8 KV heads (grouped-query), head_dim 128, fp16:
+
+    ```
+    per token = 2 × 32 × 8 × 128 × 2 = 131,072 bytes = 128 KiB
+    ```
+
+    | Context | KV cache, batch 1 | Fits alongside 16.1 GB of fp16 weights on a 24 GB A10G? |
+    | --- | --- | --- |
+    | 8,192 | 1.0 GiB | yes, 6.9 GB spare |
+    | 32,768 | 4.0 GiB | yes, but only ~1 concurrent request |
+    | 131,072 | 16.0 GiB | no — 32.1 GB needed |
+
+    For **Llama 2 7B**, which uses full multi-head attention (32 KV heads), the per-token cost is
+    `2 × 32 × 32 × 128 × 2 = 524,288 bytes = 512 KiB` — **4× worse**. 128k context would need
+    64 GiB of cache for a single sequence. Grouped-query attention (Module 3) is not a micro
+    optimisation; it is the thing that made long context affordable.
+
+    **The attention score matrix** during prefill, if materialised: `(B, H, T, T)`. At T = 32,768,
+    H = 32, fp16, one layer, batch 1: `32 × 32,768² × 2 = 68.7 GB`. Nobody has that. This is
+    precisely why FlashAttention exists and why `torch.nn.functional.scaled_dot_product_attention`
+    is not optional at long context — it never materialises the matrix. Measured: naive attention
+    OOMs on the A10G at T = 8,192 for a 32-head layer; SDPA with the flash backend runs T = 32,768
+    in 3.1 GB of peak activation memory.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Position IDs not passed with a KV cache | Model repeats itself after ~50 generated tokens | Assert `position_ids` at step `t` equals `past_len + arange(new_tokens)`; log it for one request |
+    | Left-padding with absolute positions | Batched generation gives different output than unbatched | Compare batch-of-1 vs batch-of-8 outputs on the same prompt at temperature 0; they must be identical |
+    | RoPE tables rebuilt every forward | Fixed ~4 ms per token independent of batch size | Profile with `torch.profiler`; look for `arange`/`outer` inside the decode loop |
+    | Config `max_position_embeddings` raised without rescaling | Quality collapses past the original length, not at it | Perplexity sweep at 0.5×, 1×, 1.5×, 2× the original context; a cliff means no interpolation |
+    | fp16 overflow in the cos/sin tables | NaNs at long context on some GPUs | Compute RoPE tables in fp32 and cast after; this is what `transformers` does and why |
+
+    ### Papers and primary sources
+
+    - **Vaswani et al. 2017, "Attention Is All You Need".** *Takeaway:* position can be injected as
+      a fixed additive sinusoidal signal, so the architecture needs no recurrence at all.
+      **Read §3.5** — half a page, and note that they explicitly say learned and sinusoidal
+      performed identically, which is the empirical result everyone forgets.
+    - **Su et al. 2021, "RoFormer: Enhanced Transformer with Rotary Position Embedding".**
+      *Takeaway:* rotating q and k by a position-dependent angle makes the attention score a
+      function of relative distance alone, with no extra parameters. **Read §3.4.3** for the decay
+      property — it is the argument that the dot product naturally attenuates with distance.
+    - **Press, Smith & Lewis 2021, "Train Short, Test Long" (ALiBi).** *Takeaway:* a linear
+      distance penalty added directly to attention scores extrapolates to sequences far longer than
+      training, with no position embeddings at all. **Read Figure 1** for the extrapolation curves
+      against sinusoidal and rotary baselines.
+    - **Chen et al. 2023, "Extending Context Window of Large Language Models via Position
+      Interpolation".** *Takeaway:* scaling positions down before computing RoPE angles, plus ~1,000
+      fine-tuning steps, extends context 8× without destroying the model. **Read §2.2** and the
+      one-line derivation of why interpolation is safe where extrapolation is not.
+    - **Peng et al. 2023, "YaRN".** *Takeaway:* interpolate only the low-frequency dimensions and
+      leave the high-frequency ones alone, plus a temperature correction, and you get better
+      long-context perplexity at a quarter of the fine-tuning steps. **Read Table 1.**
+
+    ### Stretch challenge
+
+    Take a 1.5B model with RoPE, and *measure* where its usable context actually ends — not where
+    the config says it ends. Build a needle-in-a-haystack eval: insert a unique fact at depth
+    `d ∈ 0%, 25%, 50%, 75%, 100%` of contexts of length 2k, 4k, 8k, 16k, 32k, and score retrieval
+    accuracy on a 20-cell grid. Then apply position interpolation with no fine-tuning and redo the
+    grid. You should get two heatmaps. The open question is the interesting one: does interpolation
+    trade *near*-context accuracy for far-context accuracy, and if so, is the trade worth it for a
+    document-QA product where 90% of queries are answered in the first 2k tokens? Defend a
+    recommendation with your grid.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Implement `sinusoidal()` and `rope_tables()`/`apply_rope()` from Layer 2. Then produce two
+plots: (1) a heatmap of cosine similarity between every pair of sinusoidal position encodings for
+positions 0–255, which should show a clear band structure; (2) for RoPE, a line plot of the mean
+attention score between random q and k as relative distance goes from 0 to 8,192, at
+`base = 10000` and `base = 500000`. Explain the difference between the two curves in three
+sentences.
+</Card>
+
+## The whiteboard
+
+T1 sketch above, plus a **T2 build-up** for the shape chain (`(B,T)` → `(B,T,D)` → `(B,H,T,Dh)` →
+`(B,H,T,T)`), one frame per reshape. The T3 animation this module earns is a rotating 2-D pair
+under RoPE: two arrows on a circle, one turning by `m·θ`, with the dot product between them
+plotted below as the angle changes.
+
+<Tip>
+**Draw it yourself.** From memory: the embedding matrix with one row highlighted, the
+`(batch, seq, d_model)` box with all three axes labelled, the crossed-out shuffled version, and
+the two position-injection methods side by side. Then compare.
+[Blank version](/assets/diagrams/p4-w25-m2-blank.svg) · [Editable source](/assets/diagrams/p4-w25-m2.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    The RoPE relative-distance proof is a five-line derivation you can do on a whiteboard in an
+    interview, and almost no candidate can. Practise it until you can write
+    `(q e^{imθ})·conj(k e^{inθ}) = q·conj(k)·e^{i(m−n)θ}` and say the sentence "absolute positions
+    cancel" without notes. Portfolio: publish the two plots from Hands-on with a short write-up —
+    "why my model degrades past its training length, measured". That is a Layer-3 artifact from a
+    student, which is exactly the signal that gets interviews.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    1. **Before you promise a customer 32k context, compute the KV cache.** `2 × layers ×
+       n_kv_heads × head_dim × 2 × seq` bytes per sequence, times your concurrency. On a 24 GB
+       card with Llama 3 8B, 32k context means about one concurrent request. That is a capacity
+       plan, not a feature flag.
+    2. **Audit any config where someone raised `max_position_embeddings`.** If there is no matching
+       `rope_scaling` entry and no fine-tune, you have the war story above sitting in production.
+    3. **Add a batch-invariance test.** Same prompt at temperature 0, batch 1 vs batch 8, must give
+       identical tokens. It catches padding-side and position-id bugs that no unit test will.
+  </Accordion>
+</AccordionGroup>
+
+## Assessment
+
+<AccordionGroup>
+  <Accordion title="8 concept questions">
+  1. Why is the embedding operation a lookup rather than a matrix multiply, and does it matter for cost? (It is `index_select`; cost is negligible, but the parameters are not — 525M for Llama 3 8B.)
+  2. State the four tensor shapes from token IDs to attention scores. (`(B,T)` → `(B,T,D)` → `(B,H,T,Dh)` → `(B,H,T,T)`.)
+  3. Prove in one line that attention without positional information is permutation-invariant. (A weighted average over positions is unchanged by permuting both weights and values.)
+  4. Where is RoPE applied — to embeddings, or to q and k? Why not to v? (To q and k inside attention; v carries content, not the matching signal, so rotating it would corrupt the retrieved value.)
+  5. Give the RoPE angle rate formula and evaluate the slowest one for `head_dim = 128`, `base = 10000`. (`θ_i = base^(−2i/d)`; slowest ≈ 1.19e-4 rad/position, half-turn at ~26,400.)
+  6. Compute the KV cache for Llama 3 8B at 32k context, batch 1, fp16. (128 KiB/token × 32,768 = 4.0 GiB.)
+  7. Why did naive context extension destroy the model in the war story, and what is the two-line fix? (Unseen RoPE angles; divide positions by the extension factor — position interpolation.)
+  8. When would you choose ALiBi over RoPE? (When you need extrapolation with no retraining and can accept a recency bias that hurts long-range retrieval.)
+  </Accordion>
+  <Accordion title="Coding challenge">
+  Implement `apply_rope` in the *interleaved-pair* convention (dims 0/1, 2/3, …) and in the
+  *split-half* convention that Llama's reference code uses (dims `i` and `i + d/2`). Hidden tests
+  assert that both produce the same attention *scores* when applied consistently to q and k, that
+  neither matches the other elementwise, and that loading Llama weights with the wrong convention
+  produces a measurable perplexity regression. The point of the test is the lesson: RoPE
+  conventions are not interchangeable and mismatches fail silently.
+  </Accordion>
+  <Accordion title="Interview questions (junior / mid / senior)">
+  - **Junior:** "What does an embedding layer do, and what is its output shape?"
+  - **Mid:** "Our model's answers get noticeably worse on documents over 6,000 tokens even though it advertises 32k. Give me three hypotheses and the experiment that distinguishes them."
+  - **Senior:** "Derive why RoPE gives relative position, then tell me exactly what breaks when you scale positions for context extension and which dimensions you would leave alone."
+  </Accordion>
+  <Accordion title="Draw it from memory">
+  Reproduce the shape chain from token IDs to logits with every dimension labelled and the head
+  split drawn explicitly, and mark on it the one place RoPE is applied.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Batched generation differs from unbatched at temperature 0 | Right-padding with a causal model, or position IDs not offset for padding | Set `tokenizer.padding_side = "left"` for decoder-only generation and pass an `attention_mask` |
+| Model repeats itself after ~50 generated tokens | `position_ids` reset to 0 each decode step instead of continuing past the cache | Pass `position_ids = past_len + arange(new_len)` |
+| `RuntimeError: shape mismatch` at the head split | `d_model` not divisible by `n_heads` | Assert `d_model % n_heads == 0` in `__init__`, with the message naming both values |
+| NaNs appear only at long context | cos/sin computed in fp16 | Build RoPE tables in fp32, cast to the model dtype afterwards |
+| Quality collapses just past the original context length | `max_position_embeddings` raised with no `rope_scaling` and no fine-tune | Apply position interpolation or YaRN, then fine-tune ~400 steps |
+| Loading a Llama checkpoint into your own code gives nonsense | Interleaved vs split-half RoPE convention mismatch | Compare your q-after-RoPE against the reference implementation on one fixed input before training anything |
+| Attention OOMs at 8k but the model "fits" | Materialising the `(B,H,T,T)` score matrix | Use `F.scaled_dot_product_attention`, never a hand-rolled `softmax(q @ k.T)` in production |
+
+## Sources & further reading
+
+**Primary docs**
+- [PyTorch 2.4 `nn.Embedding`](https://pytorch.org/docs/2.4/generated/torch.nn.Embedding.html) — read the `sparse` and `padding_idx` arguments; both matter at scale.
+- [`transformers` 4.44.2 `modeling_llama.py`](https://github.com/huggingface/transformers/blob/v4.44.2/src/transformers/models/llama/modeling_llama.py) — read `LlamaRotaryEmbedding` and `apply_rotary_pos_emb`; 40 lines, and it is the reference for the split-half convention.
+- [PyTorch `scaled_dot_product_attention`](https://pytorch.org/docs/2.4/generated/torch.nn.functional.scaled_dot_product_attention.html) — read the backend-selection notes to know when you actually get the flash kernel.
+
+**Papers**
+- [Vaswani et al. 2017](https://arxiv.org/abs/1706.03762) — *position as an additive sinusoidal signal removes the need for recurrence*; §3.5.
+- [Su et al. 2021 (RoPE)](https://arxiv.org/abs/2104.09864) — *rotating q and k makes attention scores depend only on relative distance*; §3.4.3.
+- [Press et al. 2021 (ALiBi)](https://arxiv.org/abs/2108.12409) — *a linear distance penalty extrapolates to far longer sequences than training*; Figure 1.
+- [Chen et al. 2023 (Position Interpolation)](https://arxiv.org/abs/2306.15595) — *scale positions down instead of extrapolating up, then fine-tune briefly*; §2.2.
+- [Peng et al. 2023 (YaRN)](https://arxiv.org/abs/2309.00071) — *interpolate only the slow frequencies*; Table 1.
+
+**Go deeper**
+- [Eleuther AI, "Rotary Embeddings: A Relative Revolution"](https://blog.eleuther.ai/rotary-embeddings/) — the clearest exposition of the complex-number derivation anywhere, and it includes the failure cases; read it after you have implemented RoPE yourself, not before.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-25/p4-w25-m2">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

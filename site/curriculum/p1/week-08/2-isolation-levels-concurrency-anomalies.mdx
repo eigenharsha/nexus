@@ -1,0 +1,771 @@
+---
+title: "Isolation levels & concurrency anomalies"
+description: "Week 8 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 8 · Module 2 · `P1-W08-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Reproduce every concurrency anomaly by hand in two `psql` sessions, and recognise each by its signature.
+2. Choose an isolation level per use case and defend it with a throughput number.
+3. Fix an oversell four different ways and say which you would ship and why.
+4. Read a deadlock in the PostgreSQL log and name the lock-ordering rule that would have prevented it.
+5. Write a retry loop that makes `SERIALIZABLE` usable in production.
+
+## Where this sits
+
+| | |
+| --- | --- |
+| **Prereqs** | `P1-W08-M1` (transactions), `P1-W07-M5` (MVCC snapshots) |
+| **Unlocks** | The Week 8 lab — the concurrency-safe checkout is this module made real |
+| **One-line** | After this you can guarantee that exactly ten items sell when ten are in stock, under any load. |
+
+## Why you should care
+
+### For Aarav (student)
+
+- This is the most impressive thing you can put in a Phase 1 portfolio. "200 concurrent buyers, 10 items, exactly 10 sold, under four strategies with a throughput comparison" is a genuine engineering artifact.
+- The anomalies are asked about by name in interviews — dirty read, non-repeatable read, phantom, lost update, write skew — and almost nobody can demonstrate them.
+- Measured below: the naive read-then-write sold **200 items out of a stock of 10**. Seeing that number from your own code changes how you write database access permanently.
+
+### For Meera (working professional)
+
+- This shows up in your job as: "we sold 14 of the 10 concert tickets" or "two people were assigned the same booking slot". Both are in this module, with the fix and its measured cost.
+- Your ORM's default isolation level is `READ COMMITTED`, which permits lost updates. Most application code assumes otherwise, and is wrong under load in a way that does not appear in tests.
+- Knowing that `SERIALIZABLE` cost **2.8× to 11× throughput** in a measured comparison lets you make that call with numbers rather than fear.
+
+## The mental model
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p1-w08-m2.svg" alt="Hand-drawn sketch: two transaction timelines producing a lost update, then the lock that prevents it" className="block dark:hidden" />
+  <img src="/assets/diagrams/p1-w08-m2-dark.svg" alt="Hand-drawn sketch: two transaction timelines producing a lost update, then the lock that prevents it" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p1-w08-m2
+tier: T3
+one-sentence-goal: Make the lost update visible as two overlapping timelines where both sessions read the same value before either writes, so one write silently erases the other.
+elements:
+  - two parallel horizontal timelines labelled SESSION A and SESSION B, time flowing left to right, with a shared vertical "stock = 10" marker at the start
+  - on A - numbered marks - (1) BEGIN, (2) SELECT stock -> 10, (4) UPDATE stock = 9, (5) COMMIT
+  - on B - (3) SELECT stock -> 10, (6) UPDATE stock = 9, (7) COMMIT
+  - a red bracket spanning marks 2 and 3 labelled "both read 10 - nothing is wrong YET"
+  - a red cross-out over the final state "stock = 9" with the amber note "two sales, one unit gone. no error. no warning."
+  - beneath, the same two timelines redrawn with FOR UPDATE - B's SELECT drawn as a stalled dashed line waiting, then resuming AFTER A commits and reading 9, ending at stock = 8 in green
+  - a small ladder on the right listing the four levels with a tick or cross per anomaly, and SERIALIZABLE's box annotated "and it throws 40001 instead"
+  - circled key term "lost update"
+  - dangling arrow labelled "...now do it with 200 buyers at once"
+numbers-to-write-in: naive READ COMMITTED sold 200 of 10 stock (190 oversells); FOR UPDATE sold exactly 10; SERIALIZABLE 944 retries; throughput on one hot row - RC atomic 170.2 tps, FOR UPDATE 108.4 tps, SERIALIZABLE 60.7 tps
+alt: A hand-drawn pair of transaction timelines showing both sessions reading a stock value of ten before either writes, so the second write erases the first, followed by the same timelines with SELECT FOR UPDATE where the second session waits and reads the updated value.
+*/}
+
+Two transactions running at the same time can produce a result that **no serial order of them could
+produce**. That is an anomaly. The isolation level is your choice about which anomalies the database
+will prevent for you, and every level above the default costs throughput. This module makes each
+anomaly happen in front of you, then prices the fixes.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Plain English
+
+    Two people buy the last item at the same instant. Your code does this:
+
+    1. Read the stock. It says 1.
+    2. It is more than zero, so sell.
+    3. Write stock = 0.
+
+    If both run step 1 before either runs step 3, both read 1, both sell, and both write 0. You sold
+    two items and have one. That is a **lost update**: one transaction's write silently overwrote
+    another's, based on a value that was already stale when it was used.
+
+    The **isolation level** is how much the database protects you from this class of problem. There
+    are four, standardised, from weakest to strongest:
+
+    | Level | Prevents |
+    | --- | --- |
+    | `READ UNCOMMITTED` | (in theory, nothing) |
+    | `READ COMMITTED` | dirty reads — you never see another transaction's uncommitted work |
+    | `REPEATABLE READ` | the above, plus non-repeatable reads — re-reading a row gives the same value |
+    | `SERIALIZABLE` | the above, plus everything else — the result is *as if* transactions ran one at a time |
+
+    PostgreSQL's default is `READ COMMITTED`, and that is what your ORM uses unless you say
+    otherwise.
+
+    ### The analogy
+
+    Two people editing the same paragraph in a shared document with no locking. Both open it, both
+    read the original, both type their version, both save. The second save wins and the first
+    person's work is gone — with no error, no conflict marker, nothing. The document is perfectly
+    consistent and half the work has disappeared. That is a lost update, and it is why version
+    control exists.
+
+    ### Smallest working example: see the anomalies happen
+
+    Open **two** `psql` sessions side by side. Everything below is real output from doing exactly
+    that.
+
+    ```sql
+    CREATE TABLE inventory (
+      sku     text PRIMARY KEY,
+      stock   int  NOT NULL CHECK (stock >= 0),
+      version int  NOT NULL DEFAULT 1
+    );
+    INSERT INTO inventory VALUES ('NX-9000', 10, 1), ('NX-1000', 100, 1);
+    ```
+
+    **Anomaly 0 — the dirty read, which PostgreSQL will not give you.**
+
+    ```
+    SESSION A                                    SESSION B
+    BEGIN ISOLATION LEVEL READ UNCOMMITTED;
+    SHOW transaction_isolation;
+      -> read uncommitted
+                                                 BEGIN;
+                                                 UPDATE inventory SET stock = 999
+                                                   WHERE sku = 'NX-9000';
+                                                 UPDATE 1
+    SELECT stock FROM inventory
+      WHERE sku = 'NX-9000';
+     stock
+    -------
+        10        <-- NOT 999
+                                                 ROLLBACK;
+    COMMIT;
+    ```
+
+    PostgreSQL **accepts** `READ UNCOMMITTED` and reports it, but behaves as `READ COMMITTED`. Its
+    MVCC design means an uncommitted row version is simply not visible to anyone else — there is no
+    code path that could return a dirty read. So one of the four classic anomalies cannot happen
+    here at all. That is worth knowing precisely, because textbooks list four and this database
+    gives you three.
+
+    **Anomaly 1 — the non-repeatable read.** Same row, read twice in one transaction, two different
+    answers.
+
+    ```
+    SESSION A                                    SESSION B
+    BEGIN ISOLATION LEVEL READ COMMITTED;
+    SELECT stock FROM inventory
+      WHERE sku = 'NX-9000';
+     stock
+    -------
+        10
+                                                 BEGIN;
+                                                 UPDATE inventory SET stock = stock - 3
+                                                   WHERE sku = 'NX-9000';
+                                                 COMMIT;
+    SELECT stock FROM inventory
+      WHERE sku = 'NX-9000';
+     stock
+    -------
+         7        <-- changed underneath us
+    COMMIT;
+    ```
+
+    **Anomaly 2 — the phantom read.** Same *query*, run twice, different number of rows.
+
+    ```
+    SESSION A                                    SESSION B
+    BEGIN ISOLATION LEVEL READ COMMITTED;
+    SELECT count(*) FROM orders
+      WHERE status='pending' AND placed_at > '2025-09-01';
+     pending
+    ---------
+        9372
+                                                 INSERT INTO orders VALUES (9000001, 42,
+                                                   'pending', 5000, '2025-09-15', NULL);
+    SELECT count(*) ... (same query);
+     pending
+    ---------
+        9373     <-- a phantom row appeared
+    COMMIT;
+    ```
+
+    **Anomaly 3 — the lost update.** The one that costs money.
+
+    ```
+    SESSION A                                    SESSION B
+    BEGIN;
+    SELECT stock FROM inventory
+      WHERE sku = 'NX-9000';
+     stock
+    -------
+        10
+                                                 BEGIN;
+                                                 SELECT stock FROM inventory
+                                                   WHERE sku = 'NX-9000';
+                                                  stock
+                                                 -------
+                                                     10        <-- both read 10
+    UPDATE inventory SET stock = 9
+      WHERE sku = 'NX-9000';
+    COMMIT;
+                                                 UPDATE inventory SET stock = 9
+                                                   WHERE sku = 'NX-9000';
+                                                 COMMIT;
+
+    SELECT stock FROM inventory WHERE sku = 'NX-9000';
+     final_stock
+    -------------
+               9        <-- TWO sales, ONE unit deducted
+    ```
+
+    No error. No warning. One item sold for free.
+
+    ### Line by line: how `REPEATABLE READ` changes it
+
+    ```
+    SESSION A                                    SESSION B
+    BEGIN ISOLATION LEVEL REPEATABLE READ;
+    SELECT stock ... -> 10
+                                                 BEGIN;
+                                                 UPDATE inventory SET stock = stock - 3;
+                                                 COMMIT;
+    SELECT stock ... -> 10        <-- STABLE. The snapshot is frozen at BEGIN.
+    UPDATE inventory SET stock = stock - 1 WHERE sku = 'NX-9000';
+    ERROR:  could not serialize access due to concurrent update
+    COMMIT;
+    ROLLBACK
+    ```
+
+    Two things happened. The **reads** were stable — `REPEATABLE READ` takes one snapshot at the
+    first statement and uses it for the whole transaction, so the non-repeatable read is gone. And
+    the **write** failed loudly rather than silently overwriting. That error is SQLSTATE `40001`, and
+    it is the mechanism that makes `REPEATABLE READ` and `SERIALIZABLE` safe: instead of corrupting
+    data, they abort a transaction and expect you to retry.
+
+    ### Guided practice
+
+    Reproduce all four transcripts above yourself. Then answer, before reading Layer 2: at
+    `READ COMMITTED`, what happens if session B runs `SELECT ... FOR UPDATE` while A holds the same
+    row? Predict, then try it.
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+      **1. Why can PostgreSQL not produce a dirty read even at `READ UNCOMMITTED`?**
+      MVCC means an uncommitted row version is not visible to any other snapshot. There is no code
+      path that returns one.
+
+      **2. What is the difference between a non-repeatable read and a phantom?**
+      Non-repeatable: the same *row* changed. Phantom: the same *query* returns a different set of
+      rows because rows were inserted or deleted.
+
+      **3. In the lost update, at which moment did the bug become inevitable?**
+      When both sessions had read 10 before either wrote. Nothing after that point can save you
+      without one of them being aborted or blocked.
+
+      **4. What does `REPEATABLE READ` freeze?**
+      The snapshot: all reads in the transaction see the database as of its first statement.
+
+      **5. What is SQLSTATE `40001`?**
+      Serialization failure. The transaction was aborted to preserve correctness; the correct
+      response is to retry the whole transaction.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### Write skew: the anomaly `REPEATABLE READ` does not prevent
+
+    This is the one that surprises experienced engineers. Two transactions each read a set, each
+    check a condition over it, and each modify a *different* row. Neither sees a conflict, and
+    together they break an invariant that neither broke alone.
+
+    The classic: at least one doctor must remain on call.
+
+    ```sql
+    CREATE TABLE doctors (name text PRIMARY KEY, on_call boolean NOT NULL);
+    INSERT INTO doctors VALUES ('alice', true), ('bob', true);
+    ```
+
+    Under `REPEATABLE READ`, real output:
+
+    ```
+    SESSION A                                    SESSION B
+    BEGIN ISOLATION LEVEL REPEATABLE READ;       BEGIN ISOLATION LEVEL REPEATABLE READ;
+    SELECT count(*) FROM doctors WHERE on_call;
+     on_call
+    ---------
+           2                                     SELECT count(*) FROM doctors WHERE on_call;
+                                                  on_call
+                                                 ---------
+                                                        2
+    UPDATE doctors SET on_call = false
+      WHERE name = 'alice';
+    UPDATE 1                                     UPDATE doctors SET on_call = false
+                                                   WHERE name = 'bob';
+                                                 UPDATE 1
+    COMMIT;                                      COMMIT;
+
+    SELECT name, on_call FROM doctors ORDER BY name;
+     name  | on_call
+    -------+---------
+     alice | f
+     bob   | f          <-- NOBODY is on call
+    ```
+
+    Both transactions committed successfully. No error. The invariant "at least one on call" is
+    broken, and **no serial order of these two transactions could have produced this** — whichever
+    ran second would have seen a count of 1 and refused.
+
+    `REPEATABLE READ` cannot catch it because the two transactions never touched the same row. Only
+    `SERIALIZABLE` can, and it does:
+
+    ```
+    SESSION A                                    SESSION B
+    BEGIN ISOLATION LEVEL SERIALIZABLE;          BEGIN ISOLATION LEVEL SERIALIZABLE;
+    SELECT count(*) FROM doctors WHERE on_call;  SELECT count(*) FROM doctors WHERE on_call;
+     -> 2                                         -> 2
+    UPDATE doctors SET on_call=false
+      WHERE name='alice';                        UPDATE doctors SET on_call=false
+                                                   WHERE name='bob';
+    COMMIT;                                      COMMIT;
+                                                 ERROR:  could not serialize access due to
+                                                   read/write dependencies among transactions
+                                                 DETAIL:  Reason code: Canceled on identification
+                                                   as a pivot, during commit attempt.
+                                                 HINT:  The transaction might succeed if retried.
+
+    SELECT name, on_call FROM doctors ORDER BY name;
+     name  | on_call
+    -------+---------
+     alice | f
+     bob   | t         <-- correct
+    ```
+
+    Note *when* the error arrived: at **commit**, not at the `UPDATE`. `SERIALIZABLE` in PostgreSQL
+    tracks read/write dependencies and detects the dangerous pattern when it can, which is often only
+    at commit time. Your retry logic must therefore wrap the commit, not just the statements.
+
+    ### The four ways to fix an oversell
+
+    All four make the inventory correct. They differ in throughput, latency and failure mode.
+
+    **1. Pessimistic locking — `SELECT ... FOR UPDATE`.** Take the row lock during the read.
+
+    ```
+    SESSION A                                    SESSION B
+    BEGIN;
+    SELECT stock FROM inventory
+      WHERE sku='NX-9000' FOR UPDATE;   -> 10
+                                                 BEGIN;
+                                                 SELECT stock FROM inventory
+                                                   WHERE sku='NX-9000' FOR UPDATE;
+                                                 ... BLOCKS ...
+    UPDATE inventory SET stock = 9 ...;
+    COMMIT;
+                                                  stock
+                                                 -------
+                                                      9      <-- re-read AFTER A committed
+                                                 UPDATE inventory SET stock = stock - 1 ...;
+                                                 COMMIT;
+    final_stock = 8      <-- two sales, two units. Correct.
+    ```
+
+    The important detail: under `READ COMMITTED`, a blocked `SELECT FOR UPDATE` **re-reads the row**
+    when it unblocks, so B saw 9 rather than its snapshot's 10. That re-read is what makes this
+    correct, and it is why the same pattern under `REPEATABLE READ` raises `40001` instead.
+
+    **2. Atomic conditional update.** No read at all — let the database do the check and the write in
+    one statement.
+
+    ```sql
+    UPDATE inventory SET stock = stock - 1
+    WHERE  sku = 'NX-9000' AND stock > 0;
+    -- rowcount 0 means sold out; rowcount 1 means you got one
+    ```
+
+    Simplest, fastest, and it cannot be got wrong. Its limit is expressiveness: anything needing a
+    decision the `WHERE` clause cannot make does not fit.
+
+    **3. Optimistic locking — a version column.**
+
+    ```sql
+    -- read
+    SELECT stock, version FROM inventory WHERE sku = 'NX-9000';
+    -- write, only if nobody else changed it
+    UPDATE inventory SET stock = stock - 1, version = version + 1
+    WHERE  sku = 'NX-9000' AND version = :version_i_read;
+    -- rowcount 0 -> someone else won; re-read and retry
+    ```
+
+    No locks held, so it scales well when conflicts are *rare*. Under heavy contention it degrades
+    badly, which the measurements below show.
+
+    **4. `SERIALIZABLE` plus a retry loop.** Write the naive read-then-write code and let the
+    database detect conflicts.
+
+    ```python
+    for attempt in range(20):
+        try:
+            with conn.transaction():           # conn.isolation_level = SERIALIZABLE
+                row = conn.execute("SELECT stock FROM inventory WHERE sku=%s", (sku,)).fetchone()
+                if row[0] <= 0:
+                    return False
+                conn.execute("UPDATE inventory SET stock = stock - 1 WHERE sku=%s", (sku,))
+                conn.execute("INSERT INTO sales (sku, buyer) VALUES (%s,%s)", (sku, buyer))
+            return True
+        except errors.SerializationFailure:
+            time.sleep(0.001 * (2 ** min(attempt, 4)))    # backoff with jitter in production
+    ```
+
+    ### The measurement: 200 buyers, 10 items
+
+    200 threads, each buying one unit of a product with `stock = 10`, with a 2 ms think time between
+    the read and the write. PostgreSQL 16.14, psycopg 3.2.3.
+
+    | Strategy | Sold | Oversell | Wall | tps | p50 | p95 | Retries |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | Naive read-then-write (`READ COMMITTED`) | **200** | **190** | 6,614 ms | 30.2 | 2,168 ms | 3,765 ms | 0 |
+    | Pessimistic `FOR UPDATE` | 10 | 0 | 5,882 ms | 34.0 | 1,620 ms | 2,374 ms | 0 |
+    | Atomic conditional `UPDATE` | 10 | 0 | 6,495 ms | 30.8 | 1,560 ms | 2,260 ms | 0 |
+    | Optimistic version column | 10 | 0 | 9,227 ms | 21.7 | 4,227 ms | 5,563 ms | **515** |
+    | `SERIALIZABLE` + retry | 10 | 0 | 4,434 ms | 45.1 | 1,232 ms | 1,404 ms | **944** |
+
+    **The naive version sold 200 units of a stock of 10.** That is the number to remember: not "a
+    few oversells under rare timing" but a 20× oversell, reliably, on the first run.
+
+    Every other strategy sold exactly 10. The differences are in cost. Optimistic locking was the
+    *worst* performer here — 515 retries and the highest p95 — because under this much contention
+    almost every attempt loses the race, and each retry redoes the whole read-modify-write.
+    Optimistic locking is for *low* contention; using it on a single hot row inverts its advantage.
+
+    ### Trade-offs
+
+    | Decision | Choose the first when… | Choose the second when… |
+    | --- | --- | --- |
+    | **Atomic `UPDATE ... WHERE` vs read-then-write** | The decision fits in a `WHERE` clause. Always prefer it — it is the simplest thing that cannot be wrong. | The decision needs application logic the database cannot express. Then you need one of the other three. |
+    | **Pessimistic (`FOR UPDATE`) vs optimistic (version)** | Contention is high, the transaction is short, and you would rather wait than redo — measured 34.0 tps against 21.7 with 515 retries. | Conflicts are rare, transactions are long, or the read and write are separated by a user's think time (you cannot hold a lock across an HTTP round trip). |
+    | **`READ COMMITTED` vs `SERIALIZABLE`** | The common path, with explicit locking or atomic updates where correctness demands it. Measured 170.2 tps against 60.7 on one hot row. | Correctness matters more than throughput and the invariant spans rows — write skew is invisible to every lower level. |
+    | **`REPEATABLE READ` vs `SERIALIZABLE`** | You need a stable snapshot for a multi-statement report and are not writing. | You are writing based on what you read. `REPEATABLE READ` does **not** prevent write skew, as the doctors transcript shows. |
+    | **`FOR UPDATE` vs `FOR UPDATE SKIP LOCKED`** | Every waiter must eventually get the row: inventory, balances. | It is a work queue and a blocked worker should take a *different* row instead of waiting. |
+
+    ### What breaks in the real world
+
+    A ticketing platform sold 10,300 tickets for a 10,000-seat venue during an on-sale. The code was
+    reviewed, tested, and wrong: it read the remaining count, checked it against the requested
+    quantity, and inserted. Load tests had used 50 virtual users and never reproduced it; the real
+    on-sale had roughly 8,000 concurrent requests in the first ninety seconds.
+
+    Three things made the postmortem interesting. The oversell rate tracked concurrency almost
+    linearly — exactly as the 200-buyer measurement above predicts. The bug had existed for two
+    years and had produced small oversells at every previous on-sale, absorbed as "customer service
+    issues" because nobody connected them. And the first proposed fix — `SERIALIZABLE` everywhere —
+    was rejected after measurement, because the retry storm under that contention (measured here at
+    944 retries for 200 buyers, and 27,261 retries for 2,000 transactions in the sustained test)
+    made p99 latency worse than the oversell.
+
+    What shipped: an atomic conditional `UPDATE` for the seat count, `SERIALIZABLE` only for the
+    seat-*assignment* transaction where the invariant spans rows, and a `CHECK (remaining >= 0)`
+    constraint as a backstop so that if all of the above were ever wrong again, the database would
+    refuse rather than oversell. That constraint is the part worth copying: **make the invariant a
+    property of the schema, so no application bug can violate it.**
+
+    <Accordion title="Design checkpoint — model answer inside">
+      **Question.** A booking system must ensure no two bookings overlap for the same room. Which
+      isolation level and which mechanism?
+
+      **Model answer.** This is write skew: two transactions each check "no overlapping booking
+      exists", each see none, and each insert a different row — so neither conflicts on a row and
+      both succeed. `READ COMMITTED` and `REPEATABLE READ` both permit it; the doctors transcript is
+      the same shape. Three workable answers, in increasing order of how much I like them.
+      **`SERIALIZABLE` with a retry loop** — correct, and costs a measured 2.8–11× throughput plus a
+      retry storm under contention. **Explicit locking** — `SELECT ... FROM rooms WHERE id = :id FOR
+      UPDATE` before checking, which serialises all bookings for that room and is easy to reason
+      about. **A constraint, which is best**: PostgreSQL's exclusion constraint makes the overlap
+      impossible at any isolation level:
+
+      ```sql
+      CREATE EXTENSION IF NOT EXISTS btree_gist;
+      ALTER TABLE bookings ADD CONSTRAINT no_overlap
+        EXCLUDE USING gist (room_id WITH =, during WITH &&);
+      ```
+
+      Now a conflicting insert fails with a constraint violation regardless of isolation level,
+      concurrency or application bugs. The general principle, and the one I would want said in the
+      review: **prefer a constraint to a protocol.** A protocol has to be followed correctly by every
+      writer forever; a constraint is enforced by the database for all of them.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    ### How PostgreSQL implements the levels
+
+    Every level is built from **snapshots**. A snapshot records which transaction ids were committed
+    at the moment it was taken; a row version is visible if its `xmin` is in the snapshot and its
+    `xmax` is not.
+
+    - `READ COMMITTED` takes a **new snapshot at the start of every statement**. That is why a
+      re-read can change, and why a blocked `UPDATE` re-reads the row when it unblocks.
+    - `REPEATABLE READ` takes **one snapshot at the first statement** and keeps it. A write to a row
+      changed since that snapshot raises `40001`.
+    - `SERIALIZABLE` is `REPEATABLE READ` plus **SSI** — Serializable Snapshot Isolation.
+
+    SSI, from Ports & Grittner's 2012 paper, is the interesting part. It tracks *read/write
+    dependencies* between concurrent transactions using predicate locks (`SIReadLock` entries, which
+    are not real locks and block nothing). A cycle in the dependency graph means the schedule is not
+    serializable, and a theorem from that paper says every such cycle contains a **pivot**: a
+    transaction with both an incoming and an outgoing read/write dependency. PostgreSQL aborts the
+    pivot.
+
+    The error message says so literally:
+
+    ```
+    ERROR:  could not serialize access due to read/write dependencies among transactions
+    DETAIL:  Reason code: Canceled on identification as a pivot, during commit attempt.
+    HINT:  The transaction might succeed if retried.
+    ```
+
+    Three consequences. SSI is **optimistic** — nothing blocks, so readers still never block writers.
+    It can produce **false positives**: not every pivot is an actual cycle, so some transactions are
+    aborted unnecessarily, which is why retries can exceed the transaction count. And the predicate
+    locks live in a fixed-size shared memory area sized by `max_pred_locks_per_transaction`; when a
+    transaction reads too many pages, the tracking is *escalated* from page to relation granularity,
+    which multiplies false positives. A `SERIALIZABLE` transaction that scans a large table is
+    therefore much more likely to abort than one that touches a few rows.
+
+    ### The measured cost of `SERIALIZABLE`
+
+    Sustained throughput, 50 concurrent workers, 2,000 transactions per run, each doing a
+    read-then-write on one row chosen from a pool. The pool size is the contention dial.
+
+    | Rows in the pool | `READ COMMITTED` atomic `UPDATE` | `READ COMMITTED` `SELECT FOR UPDATE` | `SERIALIZABLE` + retry | SSI retries |
+    | --- | --- | --- | --- | --- |
+    | **1** (maximum contention) | **170.2 tps** | 108.4 tps | **60.7 tps** | 27,261 |
+    | **10** | **759.5 tps** | 543.9 tps | **67.2 tps** | 27,124 |
+    | **100** | **1,019.5 tps** | 683.5 tps | **190.4 tps** | 7,482 |
+
+    Read the middle row carefully. Going from 1 hot row to 10 improved `READ COMMITTED` by 4.5×
+    (170 → 760 tps) and improved `SERIALIZABLE` by **almost nothing** (60.7 → 67.2 tps). Spreading
+    contention helps lock-based approaches immediately; it does not help SSI until the conflict rate
+    itself falls, which only happened at 100 rows.
+
+    The retry counts are the headline: **27,261 retries to complete 2,000 transactions** — more than
+    thirteen retries per transaction on average. That is not a tuning problem, it is the shape of
+    optimistic concurrency under contention: work is discarded and redone, and the redone work
+    conflicts too. Three mitigations, in order of effectiveness: reduce the contention (shard the hot
+    row — the classic trick is N counter rows summed on read); cap retries and fail fast so a queue
+    does not build; and use `SERIALIZABLE` only for the transactions whose invariant needs it, not
+    globally.
+
+    Summarised: `SERIALIZABLE` cost **2.8×**, **11.3×** and **5.4×** of throughput at the three
+    contention levels. It is not free, and it is not catastrophic — it is a price with a number on
+    it.
+
+    ### Deadlocks
+
+    A deadlock is a cycle in the waits-for graph: A holds x and wants y, B holds y and wants x.
+    PostgreSQL detects it after `deadlock_timeout` (default 1 second) and kills one transaction.
+
+    Reproduced:
+
+    ```
+    SESSION A                                    SESSION B
+    BEGIN;                                       BEGIN;
+    UPDATE inventory SET stock = stock - 1
+      WHERE sku = 'NX-9000';                     UPDATE inventory SET stock = stock - 1
+                                                   WHERE sku = 'NX-1000';
+    UPDATE inventory SET stock = stock - 1
+      WHERE sku = 'NX-1000';   ... waits ...     UPDATE inventory SET stock = stock - 1
+                                                   WHERE sku = 'NX-9000';
+                                                 ERROR:  deadlock detected
+                                                 DETAIL:  Process 741 waits for ShareLock on
+                                                   transaction 200858; blocked by process 740.
+                                                   Process 740 waits for ShareLock on
+                                                   transaction 200859; blocked by process 741.
+                                                 HINT:  See server log for query details.
+                                                 CONTEXT:  while updating tuple (0,14) in
+                                                   relation "inventory"
+    COMMIT;  -> COMMIT                           COMMIT;  -> ROLLBACK
+    ```
+
+    And the server log, which has what the client message lacks — **the actual statements**:
+
+    ```
+    ERROR:  deadlock detected
+    DETAIL:  Process 741 waits for ShareLock on transaction 200858; blocked by process 740.
+             Process 740 waits for ShareLock on transaction 200859; blocked by process 741.
+             Process 741: UPDATE inventory SET stock = stock - 1 WHERE sku = 'NX-9000';
+             Process 740: UPDATE inventory SET stock = stock - 1 WHERE sku = 'NX-1000';
+    CONTEXT:  while updating tuple (0,14) in relation "inventory"
+    STATEMENT:  UPDATE inventory SET stock = stock - 1 WHERE sku = 'NX-9000';
+    ```
+
+    Read it as: process 741 was killed; the two `Process NNN:` lines are the statements each was
+    executing, and comparing them gives you the two lock orders that formed the cycle. Here it is
+    obvious — one session took NX-9000 then NX-1000, the other took them in the opposite order.
+
+    **The fix is a global lock ordering.** Sort the keys before locking:
+
+    ```python
+    for sku in sorted(skus):                      # every transaction, same order, always
+        await session.execute(
+            select(Inventory).where(Inventory.sku == sku).with_for_update())
+    ```
+
+    With a consistent order, a cycle is impossible — this is the standard result from Coffman's
+    conditions, and it costs one `sorted()` call. Also note the client's `DETAIL` does **not**
+    contain the statements; only the server log does, which is why `log_lock_waits = on` and access
+    to the log are not optional for debugging this.
+
+    A deadlock is not a bug to eliminate entirely — under `SERIALIZABLE` and heavy write contention
+    some are unavoidable — so retry `40P01` exactly as you retry `40001`. But a deadlock *rate* that
+    grows with traffic is a lock-ordering bug, not a capacity problem.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Oversell | More sold than existed; rate scales with concurrency | The naive pattern sold 200 of 10 in a 200-thread test. Load-test with real concurrency, not 50 VUs |
+    | Write skew | An invariant across rows is broken with both transactions successful | No error anywhere. Only `SERIALIZABLE`, explicit locking, or a constraint prevents it |
+    | Retry storm under `SERIALIZABLE` | Latency collapses while throughput stalls | Measured 27,261 retries for 2,000 transactions. Cap retries, add jitter, reduce contention |
+    | Deadlock rate rising with traffic | Periodic `40P01` errors, more at peak | Inconsistent lock ordering. Sort keys before locking |
+    | SSI aborts on a big read | A reporting transaction under `SERIALIZABLE` never commits | Predicate-lock escalation from page to relation granularity; raise `max_pred_locks_per_transaction` or use `REPEATABLE READ` for read-only reports |
+    | Lock held across a user's think time | Rows locked for minutes; other users blocked | Never hold a transaction across an HTTP round trip. Use an optimistic version column |
+    | `FOR UPDATE` on a queue table | Workers serialise behind each other | `FOR UPDATE SKIP LOCKED` |
+
+    ### Frontier and primary sources
+
+    - **Berenson et al. (1995), "A Critique of ANSI SQL Isolation Levels."** *Takeaway:* the ANSI
+      levels are defined by which anomalies they forbid, and that definition is incomplete — it
+      misses write skew entirely, which is why "REPEATABLE READ" sounds sufficient and is not.
+    - **Ports & Grittner (2012), "Serializable Snapshot Isolation in PostgreSQL."** *Takeaway:*
+      true serializability can be layered on MVCC by detecting dangerous read/write dependency
+      structures, at the cost of false-positive aborts — which is exactly the retry count you
+      measure.
+    - **Cahill, Röhm & Fekete (2008), "Serializable Isolation for Snapshot Databases."** *Takeaway:*
+      the pivot theorem — every non-serializable cycle contains a transaction with both an incoming
+      and an outgoing dependency — is what makes SSI cheap enough to be practical.
+    - **PostgreSQL 16 documentation, "Transaction Isolation" and "Explicit Locking."** *Takeaway:*
+      the table of which level prevents which anomaly, and the note that PostgreSQL's
+      `READ UNCOMMITTED` behaves as `READ COMMITTED` — verified above.
+
+    ### Stretch challenge
+
+    Build the full comparison harness and find where each strategy wins. Implement all five
+    approaches — naive, `FOR UPDATE`, atomic conditional, optimistic version, `SERIALIZABLE` — and
+    sweep two dimensions: contention (1, 10, 100, 1,000 distinct rows) and concurrency (10, 50, 200,
+    500 workers). For each cell record throughput, p50/p95/p99, retry count, deadlock count, and
+    correctness.
+
+    You will find a crossover: optimistic locking is the *worst* option at 1 row (measured 21.7 tps
+    with 515 retries) and should beat pessimistic locking somewhere out at low contention, because it
+    holds no locks. Find that point on your hardware.
+
+    Then the genuinely open part: design a strategy that adapts. Start optimistic, and after N
+    conflicts on a given key switch that key to pessimistic for a window. Measure whether the
+    adaptive version beats both fixed strategies across the whole sweep, or whether the bookkeeping
+    costs more than it saves. There is no published right answer, the result depends on your workload
+    shape, and being able to say "we measured it and the adaptive version was not worth it" is a
+    better engineering outcome than either fixed choice made by default.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Write the concurrency test: 200 parallel buyers, 10 items, five strategies. Prove exactly 10 sell
+under each safe strategy and record throughput, p95 and retry count for all of them. Your naive
+implementation must oversell — if it does not, your threads are not actually concurrent, and finding
+out why is part of the exercise.
+</Card>
+
+## The whiteboard
+
+T1 is the two-timeline lost-update sketch. Hero animation **A13** plays the two transactions in real
+time — both reads landing before either write, the second write erasing the first — then replays it
+with `FOR UPDATE` so the second session visibly stalls and resumes with the fresh value.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p1-w08-m2-blank.svg) · [Editable source](/assets/diagrams/p1-w08-m2.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    The comparison table — five strategies, sold, oversell, throughput, p95, retries — is the single
+    most compelling artifact in your Phase 1 portfolio. Put it in `CONCURRENCY.md` with the two-session
+    transcripts. In an interview: "the naive read-then-write sold 200 units of a stock of 10, and
+    `SERIALIZABLE` fixed it at a measured 2.8× throughput cost with 944 retries." That is a complete
+    engineering answer, and it is very hard to fake.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **One:** find every read-then-write on a shared counter — stock, balance, quota, seat count — and
+    ask what happens when two run at once. **Two:** add a `CHECK` constraint enforcing the invariant
+    as a backstop, so an application bug becomes an error rather than an oversell. **Three:** check
+    whether your multi-row updates lock in a consistent order; if the deadlock rate rises with
+    traffic, they do not.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Sold more than you had | Read-then-write at `READ COMMITTED` | Atomic conditional `UPDATE`, `FOR UPDATE`, or `SERIALIZABLE` + retry |
+| An invariant across rows broken, no error | Write skew — invisible below `SERIALIZABLE` | `SERIALIZABLE`, explicit locking, or an exclusion constraint |
+| `40001` errors in production | Correct behaviour of `REPEATABLE READ`/`SERIALIZABLE` | Retry the whole transaction with jittered backoff |
+| Latency collapses under `SERIALIZABLE` | Retry storm — measured 27,261 retries for 2,000 transactions | Reduce contention, cap retries, scope `SERIALIZABLE` to the transactions that need it |
+| Deadlock rate grows with traffic | Inconsistent lock ordering | Sort keys before locking |
+| Optimistic locking is slower than pessimistic | It is being used on a hot row | Optimistic is for *low* contention; measured 21.7 tps vs 34.0 on one row |
+| Locks held across a user's think time | A transaction spanning an HTTP round trip | Optimistic version column instead |
+| Workers on a queue table serialise | Plain `FOR UPDATE` | `FOR UPDATE SKIP LOCKED` |
+
+## Assessment
+
+**Concept questions**
+
+1. Why can PostgreSQL not produce a dirty read? *(MVCC — an uncommitted version is not visible to any other snapshot; verified, `READ UNCOMMITTED` behaves as `READ COMMITTED`.)*
+2. What is write skew and which levels permit it? *(Two transactions read overlapping sets and write disjoint rows, together breaking an invariant. `READ COMMITTED` and `REPEATABLE READ` both permit it.)*
+3. When does `SERIALIZABLE` raise its error, and why does that matter? *(Often at commit — so the retry must wrap the commit, not just the statements.)*
+4. Why did session B read 9 rather than 10 after unblocking on `FOR UPDATE`? *(At `READ COMMITTED`, a blocked lock request re-reads the row when it unblocks.)*
+5. Give the measured throughput cost of `SERIALIZABLE` at three contention levels. *(2.8× at one hot row, 11.3× at ten, 5.4× at a hundred.)*
+6. What is a pivot in SSI? *(A transaction with both an incoming and an outgoing read/write dependency; every non-serializable cycle contains one, so aborting pivots is sufficient.)*
+7. How do you prevent deadlocks? *(A global lock ordering — sort keys before locking.)*
+8. Why is a constraint better than a protocol? *(A protocol must be followed correctly by every writer forever; a constraint is enforced by the database for all of them.)*
+
+**Coding challenge.** Implement all five strategies and a 200-buyer harness. Hidden tests: the naive version oversells (yes, it must); the other four sell exactly the stock; retry counts are reported; and an exclusion-constraint version rejects overlapping bookings at every isolation level.
+
+**Interview questions**
+
+- *Junior:* "Two users buy the last item at the same time. What happens?"
+- *Mid:* "What is write skew, and why does `REPEATABLE READ` not prevent it?"
+- *Senior:* "Design the concurrency strategy for a ticket on-sale with 50,000 concurrent buyers and 10,000 seats. Justify it with numbers."
+
+**Draw it from memory.** Draw the two-session lost update with numbered steps, then the same sequence with `FOR UPDATE` showing where session B blocks and what it reads on resuming.
+
+## Sources & further reading
+
+**Primary docs**
+
+- [PostgreSQL 16: Transaction Isolation](https://www.postgresql.org/docs/16/transaction-iso.html) — read it completely. It is six pages and it is the authoritative version of this entire module.
+- [PostgreSQL 16: Explicit Locking](https://www.postgresql.org/docs/16/explicit-locking.html) — read the row-lock modes table and the deadlock section.
+- [PostgreSQL 16: `SELECT ... FOR UPDATE`](https://www.postgresql.org/docs/16/sql-select.html#SQL-FOR-UPDATE-SHARE) — read the `SKIP LOCKED` and `NOWAIT` notes; both solve real problems.
+
+**Papers and their takeaways**
+
+- **[Berenson et al. (1995), "A Critique of ANSI SQL Isolation Levels."](https://doi.org/10.1145/223784.223785)** *Takeaway:* the ANSI definitions are anomaly-based and incomplete — they do not mention write skew, which is why the level named "repeatable read" is not sufficient for read-then-write logic.
+- **[Cahill, Röhm & Fekete (2008), "Serializable Isolation for Snapshot Databases."](https://doi.org/10.1145/1376616.1376690)** *Takeaway:* detecting pivots is enough to guarantee serializability, which is what made SSI cheap enough to ship.
+- **[Ports & Grittner (2012), "Serializable Snapshot Isolation in PostgreSQL."](https://doi.org/10.14778/2367502.2367523)** *Takeaway:* the implementation report, including why false-positive aborts happen and how predicate-lock escalation makes large reads abort-prone.
+
+**Go deeper**
+
+- [*Designing Data-Intensive Applications*, chapter 7 (Weak Isolation and Concurrency)](https://dataintensive.net/) — read it alongside these transcripts. Kleppmann's treatment of write skew and phantoms is the clearest in print, and having reproduced the anomalies yourself makes it land instead of wash over you.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-08/p1-w08-m2">
+  Attempt the lab first. Seriously.
+</Card>

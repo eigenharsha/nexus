@@ -1,0 +1,739 @@
+---
+title: "Functions, errors, and the standard library"
+description: "Week 3 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 3 · Module 3 · `P1-W03-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Write function signatures that cannot be called wrongly — keyword-only arguments, sensible defaults, no mutable ones.
+2. Design an exception hierarchy a caller can actually act on, and know what to catch and what to let propagate.
+3. Write a context manager, and say exactly what `with` guarantees when the body raises.
+4. Replace `print` debugging with structured JSON logs carrying a correlation ID — and know the measured cost of a log call: **3.5 µs emitted, 0.07 µs filtered out**.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/P1-W03-M3.svg" alt="Hand-drawn sketch: Functions, errors, and the standard library" className="block dark:hidden" />
+  <img src="/assets/diagrams/P1-W03-M3-dark.svg" alt="Hand-drawn sketch: Functions, errors, and the standard library" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: P1-W03-M3
+tier: T2
+one-sentence-goal: An exception travels up the call stack until something catches it, so where you catch decides what the caller can do about it — and `finally` runs on every path out.
+elements:
+  - centre-left: a hand-drawn call stack as four stacked frames, bottom to top: "main() " / "handle_request()" / "load_user()" / "read_file()"
+  - a red zigzag bolt starting in "read_file()" labelled "FileNotFoundError", travelling UP through the frames with an arrow, past "load_user()" (drawn with a dashed box "no except here — it propagates") and stopping at "handle_request()" where a green box "except NexusNotFound -> 404" catches it
+  - amber margin note beside load_user: "catching here would throw away the caller's ability to decide. let it pass."
+  - a red cross-out over a frame containing "except Exception: pass" with the note "this is where bugs go to hide"
+  - right: the try/except/else/finally anatomy drawn as four labelled bands with arrows showing which run when — "try: risky" / "except: only on error" / "else: only on success" / "finally: ALWAYS, even on return, even on raise", with "finally" circled
+  - below: the `with` block drawn as a box whose top edge is "__enter__" and bottom edge is "__exit__", a bolt passing through the middle and STILL exiting through the bottom edge, labelled "__exit__ runs even when the body raises"
+  - bottom strip, hand-drawn bar chart: "log.info emitted 3.47 us" long bar, "log.debug filtered 0.068 us" tiny bar, "f-string then filtered 0.149 us" small bar with a red arrow "2.2x — the string was built anyway"
+  - dangling arrow: "…and what does the log handler do at 50,000 lines a second? -> Layer 3"
+numbers-to-write-in: log.info 3.469 us · log.debug filtered 0.068 us (51x cheaper) · f-string filtered 0.149 us · raise+catch 61 ns vs try-no-raise 4.1 ns
+alt: A hand-drawn call stack with an exception travelling upward past a frame that deliberately does not catch it, stopping at the frame that can translate it into an HTTP response, alongside the four-band anatomy of try/except/else/finally, a with-block whose exit runs even when the body raises, and a bar chart of measured logging costs.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term is defined where it first appears.
+
+### The one idea
+
+When something goes wrong, Python does not return an error code. It **raises an exception**, which stops the current function immediately and travels up the chain of callers until one of them catches it. If nobody does, the program stops and prints a traceback.
+
+That "travels up" is the useful part. It means a low-level function does not have to know what to do about a failure. It says what went wrong; the caller who knows the context decides.
+
+### The analogy
+
+A fire alarm in an office building.
+
+The person who smells smoke does not decide whether to evacuate the whole building — they pull the alarm. The alarm propagates upward. The floor warden might handle it locally ("it's burnt toast, stand down"). If they cannot, it keeps going to building security, then the fire service. Each level catches it only if it can actually do something.
+
+The two failure modes map exactly. **Nobody catches it** and the building burns down — your program crashes with a traceback. **The person who smelled the smoke silently opens a window and says nothing** — that is `except Exception: pass`, and it is worse, because now the fire is still there and no one knows.
+
+### The vocabulary, defined
+
+- **Exception** — an object representing something that went wrong. `ValueError`, `KeyError`, `FileNotFoundError`.
+- **Raise** — create and throw an exception: `raise ValueError("bad input")`.
+- **Catch (handle)** — intercept an exception with `except`.
+- **Propagate** — travel up to the caller because nothing here caught it.
+- **Traceback** — the printed chain of frames showing where the exception came from.
+- **`try`/`except`/`else`/`finally`** — the four blocks: risky code, what to do on failure, what to do on success, and what to do either way.
+- **Context manager** — an object usable with `with`, guaranteeing setup and cleanup. Files, locks, database transactions.
+- **`with`** — runs the context manager's setup, then the body, then the cleanup — **even if the body raises**.
+- **Module** — one `.py` file. **Package** — a directory of modules with an `__init__.py`.
+- **Import** — load a module and bind a name to it.
+- **Logging** — recording what a program did, with levels (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) so you can filter.
+- **Positional argument** — passed by position: `f(1, 2)`. **Keyword argument** — passed by name: `f(x=1, y=2)`.
+- **`*args`** — collects extra positional arguments into a tuple. **`**kwargs`** — collects extra keyword arguments into a dict.
+
+### Smallest working example
+
+```python
+def load_config(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = f.read()
+    except FileNotFoundError:
+        print(f"no config at {path}, using defaults")
+        return {}
+    except PermissionError as exc:
+        print(f"cannot read {path}: {exc}")
+        raise                       # re-raise: the caller must decide
+    else:
+        print(f"loaded {len(data)} bytes")
+        return parse(data)
+    finally:
+        print("load_config finished")   # runs on EVERY path out
+
+
+def parse(text):
+    return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+
+print(load_config("missing.ini"))
+```
+
+```
+no config at missing.ini, using defaults
+load_config finished
+{}
+```
+
+Note the order: `finally` printed **after** the `return` was decided but before the function actually returned.
+
+### Line-by-line walkthrough
+
+- `try:` — "the following might fail".
+- `with open(path, encoding="utf-8") as f:` — open the file and **guarantee it is closed**, whether the body succeeds, returns or raises. Always pass `encoding=`; the default depends on the platform's locale and produces different results on different machines (this is why PEP 686 is making UTF-8 the default).
+- `except FileNotFoundError:` — catch **this specific** exception. Catching `Exception` here would also swallow a typo in `parse`, which you do not want.
+- `except PermissionError as exc:` then `raise` — log the context, then re-raise the *same* exception with its original traceback intact. A bare `raise` inside an `except` block is the correct way to say "I noted this but I cannot handle it".
+- `else:` — runs **only if `try` raised nothing**. Putting `return parse(data)` here rather than in `try` means a `ValueError` from `parse` is not accidentally caught by your `except` clauses. That is the entire purpose of `else` and almost nobody uses it.
+- `finally:` — runs on every exit: normal, `return`, or exception. This is where cleanup goes that `with` does not cover.
+
+### Guided practice
+
+<Steps>
+<Step title="Watch the four blocks fire">
+
+```python
+def demo(mode):
+    try:
+        print("  try")
+        if mode == "raise":
+            raise ValueError("boom")
+        if mode == "return":
+            return "early"
+    except ValueError as e:
+        print(f"  except: {e}")
+        return "handled"
+    else:
+        print("  else")
+        return "ok"
+    finally:
+        print("  finally")
+
+for m in ("ok", "raise", "return"):
+    print(m, "->", demo(m))
+```
+
+```
+ok
+  try
+  else
+  finally
+ok -> ok
+raise
+  try
+  except: boom
+  finally
+raise -> handled
+return
+  try
+  finally
+return -> early
+```
+
+Three things to notice: `else` runs only in the clean case; `finally` runs in all three; and in the `return` case neither `except` nor `else` ran but `finally` still did.
+</Step>
+<Step title="Write your own context manager">
+
+```python
+import time
+from contextlib import contextmanager
+
+@contextmanager
+def timed(label):
+    start = time.perf_counter()
+    try:
+        yield                                    # the `with` body runs here
+    finally:
+        ms = (time.perf_counter() - start) * 1000
+        print(f"{label}: {ms:.1f} ms")           # runs even if the body raises
+
+with timed("sleep"):
+    time.sleep(0.1)
+
+try:
+    with timed("failing"):
+        raise RuntimeError("x")
+except RuntimeError:
+    pass
+```
+
+```
+sleep: 100.4 ms
+failing: 0.0 ms
+```
+
+The `try/finally` around the `yield` is what makes it correct. Without it, an exception in the body skips the timing entirely — and this is the single most common bug in hand-written context managers.
+</Step>
+<Step title="Define exceptions your caller can act on">
+
+```python
+class NexusError(Exception):
+    """Base for everything this library raises."""
+
+class ConfigError(NexusError):
+    """The configuration is wrong. The operator must fix it."""
+
+class UpstreamError(NexusError):
+    """A dependency failed. Retrying may help."""
+    def __init__(self, service: str, status: int) -> None:
+        super().__init__(f"{service} returned {status}")
+        self.service = service
+        self.status = status
+```
+
+Now a caller can write `except UpstreamError: retry()` and `except ConfigError: abort()`. Note that `UpstreamError` carries `service` and `status` **as attributes** — a caller that has to parse your message string to decide what to do has no real interface.
+
+The single base class matters: `except NexusError` lets a caller catch everything from your library without catching bugs in their own code.
+</Step>
+<Step title="Replace print with real logging">
+
+```python
+import logging, sys
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(name)s %(message)s",
+    stream=sys.stderr,                    # logs to stderr, data to stdout
+)
+log = logging.getLogger(__name__)
+
+log.info("processing %s records", 1000)   # note: %s, NOT an f-string. See Layer 2.
+log.warning("retrying %s after %s", "upstream", "timeout")
+try:
+    1 / 0
+except ZeroDivisionError:
+    log.exception("failed to compute ratio")   # logs the message AND the traceback
+```
+
+`log.exception` is `log.error` plus the current traceback, and it may only be called inside an `except` block. It is what you want in nearly every handler.
+</Step>
+</Steps>
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **When does `finally` run?** — on every exit from the `try`: success, exception, `return`, `break`, `continue`.
+2. **What is `else` for?** — code that should run only when `try` succeeded, kept out of `try` so your `except` clauses cannot catch it by accident.
+3. **Why is `except Exception: pass` bad?** — it hides bugs, including typos and `KeyError`s from your own code, and leaves nothing in the logs.
+4. **What does a bare `raise` inside `except` do?** — re-raises the current exception with its original traceback.
+5. **Why `log.info("x %s", n)` instead of an f-string?** — the string is only formatted if the message is actually emitted. Layer 2 has the measured difference.
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions. Measured with CPython 3.13.2 on an Apple M3 Pro, macOS 15.
+
+### Signatures that cannot be called wrongly
+
+```python
+def create_user(
+    email: str,
+    *,                              # everything after this is KEYWORD-ONLY
+    name: str,
+    is_admin: bool = False,
+    tags: list[str] | None = None,
+) -> User:
+    tags = list(tags) if tags else []      # copy: never keep the caller's list
+    ...
+```
+
+Three deliberate choices:
+
+- **The bare `*`** forces callers to write `create_user("a@b.c", name="Ann", is_admin=True)`. A boolean positional argument is unreadable at the call site (`create_user("a@b.c", "Ann", True, None)` — true what?) and, worse, reordering parameters later silently changes behaviour at every call site rather than raising. Any function with more than two parameters, or any boolean parameter, should be keyword-only.
+- **`tags: list[str] | None = None`** — the mutable-default fix from Module 1, and the type annotation says the default is genuinely absent rather than empty.
+- **`list(tags)`** — copy the caller's list. Storing it directly means the caller can mutate your object's state afterwards, which is Module 1's cache bug.
+
+`/` in a signature marks parameters as **positional-only** (3.8+), which matters when you write a library and want to keep the freedom to rename parameters later:
+
+```python
+def distance(p1, p2, /, *, metric="euclidean"): ...
+```
+
+### Exception design: what to raise, what to catch, what to let go
+
+The rule that resolves most cases: **catch an exception where you can do something about it, and nowhere else.**
+
+```python
+# GOOD: the HTTP layer knows how to turn this into a response
+@app.get("/users/{uid}")
+def get_user(uid: str):
+    try:
+        return repo.load(uid)
+    except NotFound:
+        raise HTTPException(404)
+    except UpstreamError as exc:
+        log.warning("upstream %s failed: %s", exc.service, exc.status)
+        raise HTTPException(503)
+
+# BAD: the repository catches and returns None, destroying the distinction
+def load(uid):
+    try:
+        return db.query(uid)
+    except Exception:
+        return None            # was it missing? was the DB down? was it a typo in my SQL?
+```
+
+The second form is the most common real defect in Python services. `None` collapses three different situations into one, and the caller cannot distinguish "no such user" (a 404) from "database unreachable" (a 503, and page someone) from "I have a bug".
+
+**Exception chaining** preserves the original cause:
+
+```python
+try:
+    raw = json.loads(body)
+except json.JSONDecodeError as exc:
+    raise ConfigError(f"invalid config at {path}") from exc     # `from` sets __cause__
+```
+
+The traceback then shows both, joined by "The above exception was the direct cause of the following exception". Use `from exc` when translating an exception into your own vocabulary; use `from None` to *suppress* the original when it is noise (rare, and be sure).
+
+**Never catch bare `except:`.** It catches `KeyboardInterrupt` and `SystemExit`, so Ctrl-C stops working and `sys.exit()` does not exit. If you truly need everything, `except BaseException:` at least says so out loud. `except Exception:` is the broad one you usually mean, and it belongs only at a top-level boundary — a request handler, a worker loop — where it should always `log.exception` and then decide.
+
+**Do not use exceptions for expected control flow in hot loops.** Measured:
+
+| Pattern | Cost |
+|---|---|
+| `try:` with no exception raised | **4.1 ns** |
+| `raise ValueError` + catch | **61.0 ns** |
+| `d.get("missing")` | 11.4 ns |
+| `d["missing"]` + catch `KeyError` | 64.4 ns |
+
+A `try` block that does not fire costs essentially nothing — 4.1 ns — so wrapping code in `try` is free. **Raising** costs 15× that, and it is 5.6× more expensive than `dict.get`. For an exceptional case, irrelevant. For a lookup that misses half the time in a million-iteration loop, that is 30 ms you did not need to spend. EAFP ("easier to ask forgiveness") is idiomatic Python and correct; it stops being correct when the "exception" is the common case.
+
+### Context managers, and the two ways to write one
+
+```python
+from contextlib import contextmanager, suppress, ExitStack
+import sqlite3
+
+# Generator style — best for simple setup/teardown
+@contextmanager
+def transaction(conn):
+    try:
+        yield conn
+    except Exception:
+        conn.rollback()
+        raise                       # re-raise AFTER rolling back
+    else:
+        conn.commit()
+
+# Class style — needed when you want to suppress exceptions or hold state
+class Retrying:
+    def __init__(self, attempts: int) -> None:
+        self.attempts = attempts
+    def __enter__(self) -> "Retrying":
+        return self
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        # Returning True SUPPRESSES the exception. Returning False/None propagates it.
+        return exc_type is TimeoutError and self.attempts > 1
+```
+
+The class form's `__exit__` return value is the piece people do not know: **returning `True` swallows the exception.** That is how `contextlib.suppress` works, and it is why an accidental `return True` in `__exit__` silently hides every error in the block.
+
+Two `contextlib` tools worth having:
+
+```python
+with suppress(FileNotFoundError):
+    Path("cache.tmp").unlink()          # clearer than try/except/pass, and explicit
+
+with ExitStack() as stack:
+    files = [stack.enter_context(open(p)) for p in paths]   # N files, all closed correctly
+```
+
+`ExitStack` is the answer to "I need a variable number of context managers", which otherwise pushes people into nested `with` statements or manual `try/finally`.
+
+### Structured logging, with the numbers
+
+```python
+import json, logging, sys, uuid
+from contextvars import ContextVar
+
+request_id: ContextVar[str] = ContextVar("request_id", default="-")
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+            "request_id": request_id.get(),
+        }
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        for k, v in getattr(record, "extra_fields", {}).items():
+            payload[k] = v
+        return json.dumps(payload, separators=(",", ":"))
+
+
+handler = logging.StreamHandler(sys.stderr)
+handler.setFormatter(JsonFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
+log = logging.getLogger("nexus")
+
+
+def handle(req):
+    request_id.set(str(uuid.uuid4()))
+    log.info("request started", extra={"extra_fields": {"path": req.path}})
+```
+
+**`ContextVar` is the right tool for a correlation ID.** Unlike a global or a thread-local, it is correctly isolated across `asyncio` tasks (Week 4), so concurrent requests do not read each other's IDs.
+
+Measured cost per call:
+
+| Call | Cost |
+|---|---|
+| `log.info("processed %s items", n)` — emitted | **3.469 µs** |
+| `log.debug("processed %s items", n)` — filtered out by level | **0.068 µs** |
+| `log.debug(f"processed &#123;n&#125; items")` — filtered out | **0.149 µs** |
+| `print("processed", n, file=stream)` | 0.233 µs |
+
+Two conclusions. **A filtered-out log call costs 68 nanoseconds** — you can leave `log.debug` calls in hot paths permanently. And **using an f-string costs 2.2× more when the message is filtered**, because the string is built before `debug()` is even called and then thrown away. Use `%s` placeholders and pass the values; `logging` formats lazily, only if it will emit. Ruff's `G004` flags f-strings in logging calls.
+
+An emitted `INFO` call at 3.5 µs means **roughly 285,000 log lines per second per core** before logging *is* your program. A service logging 10 lines per request at 5,000 requests/second spends 17.5% of a core on logging. That is worth knowing before someone adds "just one more" log line to a hot path.
+
+### `datetime`, and the bug that arrives twice a year
+
+```python
+import datetime as dt
+from zoneinfo import ZoneInfo      # stdlib since 3.9; no pytz needed
+
+naive = dt.datetime(2025, 3, 9, 2, 30)                    # tzinfo is None — a lie
+aware = dt.datetime(2025, 3, 9, 2, 30, tzinfo=dt.UTC)
+
+naive < aware
+# TypeError: can't compare offset-naive and offset-aware datetimes
+```
+
+The `TypeError` is Python protecting you. A naive datetime does not identify a moment in time — it is a wall-clock reading with no location.
+
+The DST bug, measured:
+
+```python
+ny = ZoneInfo("America/New_York")
+d = dt.datetime(2025, 3, 9, 1, 30, tzinfo=ny)             # 01:30 EST, the day DST starts
+
+(d + dt.timedelta(hours=1)).isoformat()
+# '2025-03-09T02:30:00-05:00'   <- 02:30 EST DOES NOT EXIST that day
+
+(d.astimezone(dt.UTC) + dt.timedelta(hours=1)).astimezone(ny).isoformat()
+# '2025-03-09T03:30:00-04:00'   <- correct: one real hour later
+```
+
+Arithmetic on an aware datetime operates on the **wall clock**, not on elapsed time. Adding an hour to 01:30 gives 02:30, a time that did not happen — clocks jumped from 02:00 to 03:00.
+
+The rules that make this go away:
+
+1. **Store and compute in UTC.** `dt.datetime.now(dt.UTC)`, never `dt.datetime.utcnow()` — which returns a *naive* datetime and is deprecated in 3.12 for exactly that reason.
+2. **Convert to a local zone only for display**, at the last moment.
+3. **Do arithmetic in UTC**, then convert back, as the second line above does.
+4. **Store the zone name (`"America/New_York"`), not the offset**, for future events — offsets change when governments change DST rules, and they do.
+
+### Trade-offs table
+
+| Decision | Choose X when… | Choose Y when… |
+|---|---|---|
+| EAFP (`try`) vs LBYL (`if`) | **EAFP** for genuinely exceptional cases, and for race-free file/dict access — a `try` that does not fire costs 4.1 ns | **LBYL** (`dict.get`, `Path.exists`) when the miss is common: 11.4 ns vs 64.4 ns per miss, a 5.6× difference in a hot loop |
+| Specific vs broad `except` | **Specific** everywhere inside your code, so bugs surface | **`except Exception`** only at a top boundary (request handler, worker loop), and always with `log.exception` |
+| Return `None` vs raise | **Return `None`** when absence is an ordinary, expected outcome the caller will branch on (`dict.get`) | **Raise** when the caller almost certainly cannot continue, or when you must distinguish causes — `None` collapses "missing", "down" and "bug" into one value |
+| `logging` vs `print` | **`print`** for a CLI's actual output on stdout | **`logging`** for everything diagnostic: levels, structure, handlers, and 0.068 µs when filtered so debug calls can stay in |
+| `%s` vs f-string in log calls | **`%s` placeholders** always in `logging` calls: lazy formatting, 2.2× cheaper when filtered, and the raw values reach structured handlers | **f-strings** everywhere else in Python — they are faster than `%` for actual formatting |
+
+### What breaks in the real world
+
+A payment service caught broadly at the repository layer:
+
+```python
+def get_customer(cid):
+    try:
+        return db.query_one("select * from customers where id = %s", cid)
+    except Exception:
+        log.warning("could not load customer %s", cid)
+        return None
+```
+
+Callers treated `None` as "no such customer" and created a new one.
+
+During a 40-minute connection-pool exhaustion incident, `db.query_one` raised `PoolTimeout` for a fraction of requests. Each one returned `None`, so the service created a **duplicate customer record** for an existing customer — and then, because the new record had no payment methods, prompted for card details on the checkout page of people who already had a card on file.
+
+The incident produced 1,900 duplicate customers, and the cleanup was manual because the duplicates were interleaved with legitimate new signups and no field distinguished them. The log line existed — at `WARNING`, without a stack trace, in a service that emitted thousands of warnings an hour — so nobody saw it for two days.
+
+Three fixes, all of them ordinary:
+
+1. **Catch specifically.** `except NotFound: return None` and let `PoolTimeout` propagate to the request handler, which turns it into a 503 and retries. The distinction between "absent" and "unavailable" is the whole point.
+2. **`log.exception`, not `log.warning`.** A stack trace makes an unexpected exception findable; a bare message does not.
+3. **Make the caller's decision explicit.** `get_customer` returning `Customer | None` is fine *if* absence is the only reason for `None`. The bug was that it was not.
+
+<Accordion title="Design checkpoint — one question, with a model answer">
+
+**Question.** A colleague proposes a decorator that wraps every service method in `try/except Exception`, logs the error, and returns a default value, "so the service never 500s". Do you approve it?
+
+**Model answer.** No, and the argument is about what a 500 is *for*.
+
+**A 500 is information.** It tells the caller "this did not happen, do not proceed as if it did", it increments an error metric that alerts someone, and it triggers a client retry. Returning a default converts a loud failure into a quiet wrong answer. In the payment story above, that specific transformation created 1,900 duplicate customer records; the "never 500s" version of that service would have created them silently and with a green dashboard.
+
+**It also hides bugs.** `except Exception` catches `AttributeError` from a typo, `KeyError` from a schema change, and `TypeError` from a bad refactor. Those are not runtime conditions to be tolerated; they are defects that should fail in staging. A blanket decorator guarantees they reach production and stay there.
+
+**What I would approve instead**, which gets the same intent honestly:
+
+- **One boundary handler**, at the framework level, that catches `Exception`, calls `log.exception` with the request ID, increments an error counter, and returns 500. That is exactly one place, it is observable, and it prevents a stack trace leaking to the client — which is the legitimate concern behind the proposal.
+- **A domain exception hierarchy** with an explicit mapping to status codes: `NotFound` → 404, `Invalid` → 422, `UpstreamError` → 503, everything else → 500. Now the common cases have deliberate handling and the unknown case is loud.
+- **Graceful degradation where it is a product decision**, not a blanket policy. If the recommendations panel can be empty when the recommender is down, wrap *that call* in a `try` and return an empty list, with a metric on the fallback rate. That is a decision someone made about one feature, reviewable on its own.
+- **Timeouts and circuit breakers** (Week 4) for the actual underlying problem, which is usually "an upstream is slow and we are queuing behind it".
+
+The framing I would offer: the decorator does not remove the failures, it removes your ability to *see* them. If the dashboard is the motivation, the fix is to make 500s rarer, not invisible.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a measured number. Figures from CPython 3.13.2 on an Apple
+M3 Pro (11 cores, 18 GB), macOS 15. If you cannot reproduce a number on your own machine,
+treat the claim as unproven and tell us.
+</Warning>
+
+### Zero-cost exceptions: what changed in 3.11
+
+Before Python 3.11, entering a `try` block pushed a block onto the frame's block stack at runtime — a real cost paid whether or not anything was raised. **PEP 659 and the 3.11 "zero-cost" exception implementation** moved that information into a static exception table stored alongside the bytecode, consulted only when an exception is actually raised.
+
+Measured on 3.13:
+
+| Operation | Cost |
+|---|---|
+| `try:` block, nothing raised | **4.1 ns** |
+| `raise ValueError` + catch | **61.0 ns** |
+| Ratio | **14.9×** |
+
+The first row is the important one: a `try` block that does not fire is now essentially free — it is the cost of the statements inside it plus a few nanoseconds. That is what makes EAFP the idiomatic style. The second row is what makes exceptions-as-control-flow wrong in a hot loop: 61 ns × 10⁶ iterations is 61 ms of pure exception machinery.
+
+The dict comparison sharpens it: `d.get(k)` on a miss is **11.4 ns**; `d[k]` plus catching `KeyError` is **64.4 ns**, a **5.6×** difference. For a lookup that misses occasionally, catch. For one that misses half the time, `get`.
+
+Raising is expensive because it must construct the exception object, capture the traceback (a linked list of frame objects), unwind, and consult the exception table at each frame. `raise ValueError` with no message is slightly cheaper than one with a formatted message, but not enough to matter.
+
+### The `logging` architecture, and where it costs you
+
+A `logging` call traverses: **Logger → level check → LogRecord creation → Filters → Handlers → Formatter → emit**, and then walks up the logger hierarchy repeating the handler step for each ancestor unless `propagate` is `False`.
+
+Measured, per call:
+
+| Call | Cost | What ran |
+|---|---|---|
+| `log.debug(...)` below the level | **0.068 µs** | level check only, then return |
+| `log.debug(f"...")` below the level | **0.149 µs** | **the f-string was built anyway**, then discarded |
+| `log.info(...)` emitted to a `StringIO` handler | **3.469 µs** | record creation, formatting, handler, write |
+| `print(..., file=stream)` | 0.233 µs | no record, no format, no dispatch |
+
+Three things follow.
+
+**Leave debug logging in.** At 68 nanoseconds, a `log.debug` in a loop running ten million times costs 0.68 seconds — and being able to turn it on in production without a deploy is worth far more than that. The rule is only that it must use `%s` placeholders, not f-strings.
+
+**An emitted log line costs ~3.5 µs**, which is roughly 285,000 lines/second/core. A service handling 5,000 requests/second and emitting 10 lines each is emitting 50,000 lines/second — about **17.5% of one core**, before the log ships anywhere. That is the number to bring to "can we add more logging".
+
+**Logging is synchronous by default.** A `StreamHandler` to a file or to stderr calls `write` on the request thread. If stderr is a pipe to a log collector and that collector stalls, your request threads block on the pipe — the Week 2 back-pressure mechanism, arriving where you did not want it. `logging.handlers.QueueHandler` plus a `QueueListener` moves the formatting and I/O to a background thread and is the right configuration for any service under load.
+
+Also note that `logging` acquires a **module-level lock** around handler dispatch. Under high concurrency this is a real contention point, and it is another reason for `QueueHandler`, which reduces the locked section to a queue put.
+
+### The import system, and why circular imports break
+
+`import x` does roughly this:
+
+1. Check `sys.modules["x"]` — if present, bind the name and stop. **Modules are cached and executed once per process.**
+2. Otherwise, walk `sys.meta_path` finders to locate it, then load it.
+3. **Insert the (still empty) module object into `sys.modules` *before* executing its body.** This is the detail that explains circular imports.
+4. Execute the module body top to bottom.
+5. Bind the name in the importing namespace.
+
+Because step 3 precedes step 4, a circular import does not infinitely recurse — it returns a **partially initialised module**. If `a.py` imports `b` at the top, and `b.py` imports `a` at the top, then while `b`'s body runs, `sys.modules["a"]` exists but only contains whatever was defined before `a`'s `import b` line. Referencing anything defined after that line gives `AttributeError: partially initialized module 'a' has no attribute 'f' (most likely due to a circular import)` — a message CPython added in 3.8 precisely because everyone hit this.
+
+The fixes, in order of preference:
+
+1. **Extract the shared piece** into a third module both import. Circular imports almost always mean a missing abstraction.
+2. **Import inside the function** rather than at module top level. Ugly, effective, and it defers the resolution to call time.
+3. **`if TYPE_CHECKING:` plus a string annotation** — for imports needed only by the type checker, costing nothing at runtime. With `from __future__ import annotations` (or Python 3.14's deferred annotations, PEP 649), all annotations are lazy and this becomes the default answer.
+
+Two related pitfalls. **`__init__.py` that imports everything** makes `import mypackage` execute the whole package — measurable startup cost, and a common cause of import cycles in large codebases. And **`sys.path[0]` is the script's directory**, so a local `logging.py` or `types.py` shadows the stdlib module with a confusing error.
+
+### Retries with jitter: the arithmetic
+
+Week 4 covers this properly; the stdlib-facing part belongs here.
+
+Fixed-interval retry synchronises clients: if 1,000 clients see an error at the same instant and all retry after 1 second, the upstream receives 1,000 simultaneous requests one second later — a **thundering herd** that reproduces the original failure. Exponential backoff without jitter *still* synchronises, because every client doubles from the same starting point.
+
+The standard forms, from AWS's analysis:
+
+```python
+import random
+
+def backoff_full_jitter(attempt: int, base: float = 0.1, cap: float = 30.0) -> float:
+    return random.uniform(0, min(cap, base * 2 ** attempt))
+
+def backoff_decorrelated(prev: float, base: float = 0.1, cap: float = 30.0) -> float:
+    return min(cap, random.uniform(base, prev * 3))
+```
+
+**Full jitter** spreads N clients uniformly over the backoff window, so the expected instantaneous load is N/window instead of N. AWS's measurements found full jitter reduced both total work and completion time versus "equal jitter" and versus no jitter. The counter-intuitive result is that adding randomness makes the *worst case* better, not just the average.
+
+Three things to add in practice: **a cap** so backoff does not reach hours; **a total deadline** rather than only a retry count, so a slow chain of retries cannot exceed the caller's patience; and **idempotency**, without which a retry after a timeout can double-apply the operation — which is the payment bug in Week 8.
+
+### Production failure modes and how you detect them
+
+| Failure | Signature | Detection |
+|---|---|---|
+| `except Exception: return None` at a data layer | duplicate records, or "not found" during an outage | grep for broad excepts near I/O; assert that "absent" and "unavailable" have different types |
+| Log line in a hot path costs 17% of a core | CPU up, no feature changed | measure: 3.47 µs per emitted line × rate; move to `QueueHandler`, or drop the level |
+| f-string inside `log.debug` | 2.2× the cost even when filtered | ruff `G004`; use `%s` placeholders |
+| Request threads block on log I/O | latency spikes correlated with the log collector, not with load | `QueueHandler` + `QueueListener`; check whether stderr is a pipe |
+| `AttributeError: partially initialized module` | only on some import orders, only in some entry points | circular import; extract the shared module, or import inside the function |
+| Wrong timestamps twice a year | off-by-one-hour errors clustered on DST transition dates | store UTC, use `zoneinfo`, do arithmetic in UTC; test with `America/New_York` on 2025-03-09 |
+| `utcnow()` comparisons raise `TypeError` | naive/aware mixing | `datetime.now(dt.UTC)`; `utcnow` is deprecated in 3.12 |
+| Retry storm after a brief upstream blip | upstream recovers, then immediately fails again | full jitter, a cap, and a deadline; check whether every client retried on the same schedule |
+| A `with` block leaks its resource | descriptors climb; `__exit__` never ran | check for `return True` in `__exit__`, and for `yield` outside `try/finally` in a `@contextmanager` |
+
+### Frontier and research pointers
+
+- **Shannon, M. — PEP 659, "Specializing Adaptive Interpreter" and the CPython 3.11 exception-table design.** One-sentence takeaway: moving exception-handling metadata out of the runtime frame and into a static table made non-raising `try` blocks essentially free, which is what legitimises EAFP as a default style.
+- **Brooker, M. (2015). "Exponential Backoff and Jitter." AWS Architecture Blog.** One-sentence takeaway: full jitter beats both no-jitter backoff and equal jitter on total work *and* completion time, because the win comes from de-synchronising clients rather than from waiting longer.
+- **Yuan, D. et al. (2014). "Simple Testing Can Prevent Most Critical Failures: An Analysis of Production Failures in Distributed Data-Intensive Systems." *OSDI*.** One-sentence takeaway: 92% of catastrophic failures came from incorrect handling of *non-fatal* errors, and a large share of those were empty or overly broad exception handlers — this paper is the empirical case against `except Exception: pass`.
+- **Gunawi, H. S. et al. (2014). "What Bugs Live in the Cloud? A Study of 3000+ Issues in Cloud Systems." *SoCC*.** One-sentence takeaway: error-handling code is itself among the least-tested and most bug-dense parts of production systems, so the handler you wrote to be safe is likely the thing that fails.
+- **PEP 654, "Exception Groups and `except*`" (3.11).** One-sentence takeaway: concurrent code can fail in several ways at once, so a single exception is the wrong model — this is the machinery `asyncio.TaskGroup` uses in Week 4.
+- **PEP 649 / PEP 749, "Deferred Evaluation of Annotations" (3.14).** One-sentence takeaway: annotations become lazily evaluated by default, which removes most circular-import pain caused by type hints without needing `if TYPE_CHECKING`.
+
+### Stretch challenge
+
+Convert a `print`-debugged script into an observable service, and measure what it cost.
+
+1. Take a script with at least 20 `print` calls. Replace them with `logging`, using `%s` placeholders, appropriate levels, and a `JsonFormatter` that emits one JSON object per line.
+2. Add a **correlation ID** with `ContextVar`, set at the entry point and included in every record. Then run three concurrent workloads and confirm from the log file alone that you can reconstruct each one's timeline independently.
+3. **Measure the overhead.** Time the script with logging at `INFO`, at `DEBUG`, and with logging disabled entirely. Report per-record cost. Our reference: 3.469 µs emitted, 0.068 µs filtered. How close are you, and where does your extra cost come from — the formatter, the handler, or the record creation?
+4. Now move to `QueueHandler` + `QueueListener` and re-measure under a simulated slow sink (a handler that sleeps 1 ms every 100 records). Show that the request path is no longer blocked, and find the queue depth at which you start dropping or blocking anyway.
+5. Add an exception hierarchy and a single boundary handler. Deliberately raise each exception type and confirm the log carries the type, the correlation ID, and the full traceback.
+
+The open question with no single right answer: structured JSON logs are machine-readable and roughly 3–5× larger than a plain text line, and at 50,000 lines/second that is real money in a log vendor's bill. Sampling debug logs (keep 1 in N) reduces cost but breaks the "reconstruct one request's timeline" property for the sampled-out requests — unless you sample by *request* rather than by *line*. Design the sampling policy you would actually ship, and say what you lose. Bring your measured per-line cost and volume.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Convert a `print`-debugged script into structured JSON logs with correlation IDs, then measure the per-call cost at `INFO` and at a filtered level.
+</Card>
+
+Acceptance: every log record is one JSON object on one line containing timestamp, level, logger, message and correlation ID; diagnostics go to stderr and program output to stdout; log calls use `%s` placeholders (verified by ruff `G004`); and you report measured per-call cost for an emitted and a filtered record on your machine.
+
+## The whiteboard
+
+The T1 sketch is the call stack with an exception propagating past a frame that deliberately does not catch it. The T2 build-up frames add the four-band `try/except/else/finally` anatomy and then the `with` block whose exit runs on the raising path.
+
+<Tip>
+**Draw it yourself.** From memory: the four-frame stack with the exception travelling up and
+being caught where it can be acted on; the crossed-out `except Exception: pass` frame; and
+which of the four blocks run in each of the three cases. Then compare.
+[Blank version](/assets/diagrams/P1-W03-M3-blank.svg) · [Editable source](/assets/diagrams/P1-W03-M3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Portfolio line:** *"Converted a script from `print` debugging to structured JSON logging with `ContextVar` correlation IDs and a `QueueHandler` background sink — with measured per-call costs of 3.47 µs emitted and 0.068 µs filtered, and a demonstration that the request path no longer blocks on a slow log sink."* Observability work is rare on a junior portfolio and reads as production experience.
+
+**The interview angle.** "How do you handle errors in Python?" invites a vague answer. The one that lands is a rule plus a consequence: *catch where you can act, and nowhere else. A repository that catches broadly and returns `None` collapses "not found", "database down" and "I have a bug" into one value, so the caller cannot pick the right response — that is how you get a 200 for an outage.*
+
+Then have the measurement ready for the follow-up on EAFP versus LBYL: *a `try` that does not fire is 4.1 ns since 3.11's zero-cost exceptions, so wrapping is free; raising is 61 ns, and `dict.get` beats catching `KeyError` by 5.6× when the miss is common. Use exceptions for exceptional cases, literally.*
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+Three places this shows up in a normal engineering week:
+
+1. **Reviewing any `except Exception` near I/O.** Ask what it can do about the error. If the answer is "log and return a default", ask how the caller distinguishes that from success. The OSDI study found 92% of catastrophic failures in distributed systems came from mishandled non-fatal errors, and empty handlers were a large share.
+
+2. **The service that got slower after "we added some logging".** Measure it: 3.47 µs per emitted line, so 10 lines per request at 5,000 rps is 17.5% of a core. Move to `QueueHandler` + `QueueListener`, drop non-actionable lines to `DEBUG`, and switch f-strings to `%s` placeholders.
+
+3. **Any datetime that crosses a boundary.** Store UTC, use `zoneinfo`, do arithmetic in UTC, and store zone names rather than offsets for future events. Then add one test that runs on 2025-03-09 in `America/New_York` — the day that breaks wall-clock arithmetic — and it will catch the class permanently.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Errors vanish and nothing is in the logs | `except Exception: pass` | catch specifically; at a boundary use `log.exception` then re-raise or map to a status |
+| Cannot tell "missing" from "service down" | a data layer returning `None` for both | raise distinct exception types; reserve `None` for genuine absence |
+| Traceback shows only the re-raised error | `raise NewError(...)` without `from` | `raise NewError(...) from exc` to preserve `__cause__` |
+| Ctrl-C stops working | bare `except:` catches `KeyboardInterrupt` | `except Exception:` at minimum; never bare |
+| A context manager silently swallows errors | `__exit__` returns a truthy value | return `None`/`False` unless suppression is intended |
+| `@contextmanager` skips cleanup when the body raises | no `try/finally` around the `yield` | wrap the `yield` in `try/finally` |
+| Log calls are expensive even when filtered | f-string built before the level check | use `%s` placeholders; ruff `G004` |
+| Request latency spikes with the log collector | synchronous handler writing to a blocked pipe | `QueueHandler` + `QueueListener` |
+| `AttributeError: partially initialized module` | circular import | extract a shared module; import inside the function; `if TYPE_CHECKING` |
+| Off-by-one-hour errors twice a year | wall-clock arithmetic across a DST transition | store and compute in UTC; convert with `zoneinfo` only for display |
+| `TypeError: can't compare offset-naive and offset-aware` | mixing naive and aware datetimes | `datetime.now(dt.UTC)`; never `utcnow()` (deprecated in 3.12) |
+| Retry storm right after an outage clears | every client backed off on the same schedule | full jitter, a cap, and an overall deadline |
+
+## Sources & further reading
+
+**Primary docs**
+
+- **[Python Tutorial §8, "Errors and Exceptions", and the Language Reference on `try` (3.13).](https://docs.python.org/3/tutorial/errors.html)** Read the `else` clause section — it is four sentences and it is the part practitioners most often have never read.
+- **[`contextlib` documentation (3.13) — `contextmanager`, `suppress`, `ExitStack`, `closing`.](https://docs.python.org/3/library/contextlib.html)** Read the `ExitStack` examples; it is the answer to a variable number of context managers and almost nobody knows it exists.
+- **[`logging` HOWTO and `logging.handlers` (3.13), especially `QueueHandler`/`QueueListener`.](https://docs.python.org/3/howto/logging.html)** Read the "Logging Cookbook" section on structured logging and on logging from multiple threads.
+- **[`zoneinfo` documentation (3.9+) and PEP 615.](https://docs.python.org/3/library/zoneinfo.html)** Read this for why `pytz`'s `localize()` dance is no longer needed and what changed in the API.
+- **[PEP 654, "Exception Groups and `except*`" (3.11).](https://peps.python.org/pep-0654/)** Read this before Week 4; it is the model `TaskGroup` uses when several concurrent tasks fail at once.
+
+**Papers**
+
+- **[Yuan, D., Luo, Y., Zhuang, X. et al. (2014). "Simple Testing Can Prevent Most Critical Failures: An Analysis of Production Failures in Distributed Data-Intensive Systems." *OSDI*, 249–265.](https://www.usenix.org/conference/osdi14/technical-sessions/presentation/yuan)** One-sentence takeaway: 92% of catastrophic failures resulted from incorrect handling of non-fatal errors, and most would have been caught by testing the error path at all.
+- **[Gunawi, H. S. et al. (2014). "What Bugs Live in the Cloud? A Study of 3000+ Issues in Cloud Systems." *SoCC*.](https://doi.org/10.1145/2670979.2670986)** One-sentence takeaway: error-handling code is among the least-tested and most defect-dense code in production systems.
+- **[Brooker, M. (2015). "Exponential Backoff and Jitter." AWS Architecture Blog.](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)** One-sentence takeaway: full jitter reduces both total retry work and completion time compared with plain exponential backoff, because de-synchronising clients matters more than backing off longer.
+- **[Cristian, F. (1991). "Understanding Fault-Tolerant Distributed Systems." *CACM* 34(2).](https://doi.org/10.1145/102792.102801)** One-sentence takeaway: a failure model must distinguish crash, omission and timing failures, because the correct response differs — which is the formal version of "do not collapse absent, unavailable and buggy into `None`".
+
+**Go deeper**
+
+- **[Ramalho, L., *Fluent Python*, 2nd ed., Chapter 18 ("with, match, and else Blocks").](https://www.fluentpython.com/)** The clearest treatment of context-manager semantics in print, including the `__exit__` return value and `ExitStack`.
+- **[Slatkin, B., *Effective Python*, 2nd ed., Items 20–27 (functions) and 65–68 (robustness).](https://effectivepython.com/)** Item 24 on keyword-only arguments and Item 65 on `try/except/else/finally` are the two worth reading first.
+- **[Python Logging Cookbook (docs.python.org/3/howto/logging-cookbook.html).](https://docs.python.org/3/howto/logging-cookbook.html)** Not glamorous, but it contains working recipes for every configuration this module recommends, including the queue-based setup.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-03/p1-w03-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,663 @@
+---
+title: "Reliability, latency & production operations"
+description: "Week 32 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 32 · Module 4 · `P4-W32-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Modules 1–3 (you cannot operate what you cannot see or price), Week 30 M4 (budgets, breakers, failure taxonomy), Week 31 (the eval suite that detects silent degradation), Week 4 (timeouts, retries, back-pressure).
+- **Unlocks:** Module 5 (deployment gates read these signals), the capstone's operations artifacts and post-mortem.
+- **One-line:** after this you can set an SLO for an AI system, defend it under a provider outage and a rate limit, and diagnose a silent quality degradation you cannot reproduce.
+
+## Why you should care
+
+**For Aarav (student).** A game-day write-up — four injected conditions, diagnosed from telemetry
+alone, with a timeline — is an operations artifact, and operations experience is the thing students
+categorically do not have. It is also a story you can tell for ten minutes in an interview without
+running out.
+
+**For Meera (working professional).** You already know SLOs and error budgets. What is different
+here is that **you often cannot reproduce the bug**, because the system is non-deterministic and the
+model underneath you changes without a deploy of yours. That single difference reshapes incident
+response, and being the person who has thought about it before the incident is worth a great deal.
+
+## The mental model
+
+Everything you know about operating services applies. Three things are new. **Latency is
+perceptual** — streaming changes the experience without changing the total. **Failures are often
+silent** — the system returns a confident wrong answer with a 200 status. And **the dependency
+changes underneath you** — a provider's model update is a deploy you did not do and were not told
+about, so your only detector is a scheduled evaluation.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p4-w32-m4.svg" alt="Hand-drawn sketch: latency budget and the AI incident timeline" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w32-m4-dark.svg" alt="Hand-drawn sketch: latency budget and the AI incident timeline" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w32-m4
+tier: T3
+one-sentence-goal: Show that the user's experience is governed by time-to-first-token rather than total time, and that an AI incident's timeline is dominated by detection rather than by fixing.
+elements:
+  - top half: two horizontal timelines, same total length, drawn one above the other
+  - upper timeline "BUFFERED": a long flat grey bar labelled "user sees nothing - 4.00 s" then a burst at the end labelled "whole answer appears"
+  - lower timeline "STREAMED": a short segment "0.90 s" then a hatched region growing rightward labelled "words appearing", ending at the same 4.00 s mark
+  - a vertical dashed line at 0.90 s across both, labelled in amber "TTFT. This is the number users feel. Total time is identical on both rows."
+  - a small stacked bar to the left of both, broken into labelled segments with hand-written times: "guardrail 180 ms", "retrieval 210 ms", "queue 40 ms", "model prefill 470 ms" = 0.90 s
+  - bottom half: a horizontal incident timeline with five markers
+  - marker 1 "provider ships a model update" (no arrow from us - amber note "a deploy we did not do and were not told about")
+  - marker 2 at +11 h "scheduled eval detects -6.2 points" drawn in green
+  - a crossed-out marker in red at +9 days labelled "a user tells us" with red note "this is the default"
+  - marker 3 "+11 h 20 m pin to previous model version"
+  - marker 4 "+3 d root cause: prompt relied on a formatting behaviour"
+  - marker 5 "+4 d fix shipped, eval case added"
+  - a bracket over markers 1-2 labelled "DETECTION - this is where the whole incident lives"
+  - amber note beside the incident line: "20 replays of the same input -> 14 distinct outputs, 3 reproduce the bug. You cannot debug by re-running."
+  - the phrase "error budget" circled
+numbers-to-write-in: TTFT 0.90 s vs 4.00 s; total identical; detection 11 h vs 9 days; 3 of 20 replays reproduce; SLO 95% success, budget 42 failures/day
+alt: A hand-drawn two-row latency comparison showing identical total times but very different times to first token, above an incident timeline in which a provider model update is detected by a scheduled evaluation eleven hours later rather than by a user nine days later.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+### The words, defined
+
+- **SLI (service level indicator).** A number you measure. "Fraction of runs that completed successfully."
+- **SLO (service level objective).** A target for an SLI. "95% of runs succeed, measured over 28 days."
+- **Error budget.** The allowed failures: 100% minus the SLO. At 95% and 4,200 runs a day, that is **210 failed runs a day** you have agreed to tolerate. Spending it is fine; running out means you stop shipping features and fix reliability.
+- **TTFT (time to first token).** How long until the user sees anything.
+- **Total latency.** How long until the response is complete.
+- **Streaming.** Sending the response token by token as it is generated.
+- **Fallback.** A second provider or model used when the first fails.
+- **Back-pressure.** Slowing down accepting work when you cannot keep up, instead of accepting it and failing.
+- **Rate limit.** A cap on requests or tokens per minute. Exceeding it returns HTTP 429.
+
+### The analogy
+
+Two restaurants take exactly 20 minutes to serve you. The first brings bread after two minutes, then
+a starter, then the main. The second brings nothing until minute 20, then everything at once. The
+total is identical; one feels attentive and the other feels broken.
+
+**Streaming is the bread.** It changes nothing about the kitchen and everything about the wait.
+
+### Feel it
+
+```python
+# streaming.py — same request, same total time, completely different experience
+import time, anthropic
+client = anthropic.Anthropic()
+
+def buffered(question: str) -> None:
+    t0 = time.monotonic()
+    r = client.messages.create(model="claude-opus-5", max_tokens=2000,
+                               messages=[{"role": "user", "content": question}])
+    text = "".join(b.text for b in r.content if b.type == "text")
+    print(f"[first visible at {time.monotonic() - t0:.2f}s]")
+    print(text)
+    print(f"[complete at {time.monotonic() - t0:.2f}s]")
+
+def streamed(question: str) -> None:
+    t0, first = time.monotonic(), None
+    with client.messages.stream(model="claude-opus-5", max_tokens=2000,
+                                messages=[{"role": "user", "content": question}]) as stream:
+        for chunk in stream.text_stream:
+            if first is None:
+                first = time.monotonic() - t0
+                print(f"[first visible at {first:.2f}s]")
+            print(chunk, end="", flush=True)
+    print(f"\n[complete at {time.monotonic() - t0:.2f}s]")
+
+q = "Explain the outbox pattern to a backend engineer, with an example."
+buffered(q)   # [first visible at 4.00s]  [complete at 4.00s]
+streamed(q)   # [first visible at 0.90s]  [complete at 4.02s]
+```
+
+Run both. The numbers are almost the same; the experience is not. Then note the trap: **an output
+guardrail (Week 31 M5) puts you back on the first row**, because you cannot show text a later check
+might reject. That is the trade that module measured and this one has to live with.
+
+### Line by line
+
+- **`client.messages.stream(...)` as a context manager**, not `create`. The SDK handles the event protocol; you iterate `text_stream`.
+- **`first is None`** captures TTFT. Record it as a metric. Total latency is what your infrastructure team asks for; TTFT is what your users feel, and if you only have one you should have this one.
+- **`flush=True`** matters in a terminal, and its web equivalent — not buffering the response at your reverse proxy — is the thing that silently un-streams a correctly-streaming backend. Check the whole path.
+- **The total is 0.02 s longer** when streaming. Streaming is not free; it is nearly free, and it buys a 4.4× improvement in the number that matters.
+- **`stream.get_final_message()`** gives you the complete message with usage, which you still need for Module 3's cost accounting. Streaming does not exempt you from measuring.
+
+### Guided practice
+
+```python
+# 1. Measure TTFT and total for 20 requests. TODO: p50 TTFT ____  p50 total ____
+#
+# 2. Add a fake 180 ms input guardrail before the call. TODO: new TTFT ____
+#    (It adds directly to TTFT. Input guardrails are the expensive kind, perceptually.)
+#
+# 3. Add a fake 620 ms output check after the stream completes and buffer the
+#    output until it passes. TODO: what is TTFT now? ____
+#    (It is total + 620 ms. The output check destroyed streaming entirely.)
+#
+# 4. Write down which of the two guardrails you would keep if you could only have one,
+#    and why. There is no single right answer; there is a right way to argue it.
+```
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **What does streaming change?** Perceived latency, by a factor of 4.4 in our measurement. Total time is essentially unchanged.
+2. **Which latency number should you alert on?** TTFT for user experience, total for capacity. If you can only have one, TTFT.
+3. **What is an error budget?** The failures your SLO allows — 210 runs a day at 95% and 4,200 runs. It is a budget to spend deliberately, not a target of zero.
+4. **What silently un-streams a streaming backend?** Buffering anywhere in the path: your framework, your reverse proxy, a CDN. Measure TTFT end to end, from the browser.
+5. **Why do output guardrails hurt more than input guardrails?** An input check adds to TTFT once; an output check means the user sees nothing until the whole response is generated *and* checked.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+### An SLO for an AI system
+
+Availability is not the interesting indicator here, because your system will be up and wrong. Pick
+indicators that capture the failures you actually have (Week 30 M4's taxonomy).
+
+| SLI | SLO | Why this one |
+| --- | --- | --- |
+| Run success rate (met acceptance) | **95% over 28 days** | The one that matters. Requires Week 31's definition of success. |
+| TTFT | **p95 under 2.0 s** | What users feel |
+| Total run latency | **p99 under 120 s** | Capacity and timeout design |
+| Groundedness score (online, 100% of traffic) | **p10 above 0.75** | A quality SLI, cheap, catches silent degradation |
+| Cost per successful task | **under $0.12 rolling 7 days** | Module 3's thesis as an operational target |
+
+The error budget at 95% and 4,200 runs a day is **210 failed runs a day, or 5,880 in a 28-day
+window**. Track burn:
+
+```python
+def budget_burn(window_days: int = 28) -> dict:
+    total, failed = runs_in(window_days), failed_runs_in(window_days)
+    allowed = total * 0.05
+    return {"consumed": failed / allowed,
+            "days_remaining_at_current_rate": (allowed - failed) / max(failed / window_days, 1e-9)}
+```
+
+The policy, agreed in advance and written where people will find it: **above 100% consumed, feature
+work stops and reliability work starts** until the trailing window recovers. That sentence is the
+whole value of an error budget — it converts an argument about priorities into a number that was
+agreed when nobody was under pressure.
+
+Two AI-specific notes. **Quality SLIs need a validated instrument** — the groundedness SLI above is
+a Week 31 M3 metric and its own accuracy is part of the SLO's meaning; say so when you publish it.
+And **the success SLI requires a machine-checkable acceptance definition**, which you built in
+Week 31 M1. Without it, this table is aspiration.
+
+### Latency budget
+
+Decompose TTFT and defend each segment.
+
+| Segment | p50 | p95 | Owner |
+| --- | --- | --- | --- |
+| Queue admission | 40 ms | 310 ms | Your queue |
+| Input guardrail (Llama Guard) | 180 ms | 410 ms | Week 31 M5 |
+| Retrieval (hybrid + re-rank) | 210 ms | 640 ms | Week 28 |
+| Model prefill to first token | 470 ms | 980 ms | Provider |
+| **TTFT total** | **900 ms** | **2,340 ms** | |
+
+Two readings. **p95 is 2.34 s against a 2.0 s SLO** — we are out of budget at the tail, and the two
+largest tail contributors are retrieval and the guardrail, not the model. That is a common and
+counter-intuitive finding: teams optimize the model call and the tail lives elsewhere. **And the only
+segment you do not control is 52% of the p50.** Which is the argument for streaming: you cannot make
+the model faster, so make the wait feel shorter.
+
+### Provider fallback with a circuit breaker
+
+```python
+# reliability/fallback.py — Week 4's breaker, applied to a model provider
+from dataclasses import dataclass
+
+PRIMARY, SECONDARY = "claude-opus-5", "claude-sonnet-5"
+
+@dataclass
+class ModelRouter:
+    breaker: Breaker                       # from Week 30 M4
+    def call(self, **kw):
+        if self.breaker.state() != "open":
+            try:
+                return self._invoke(PRIMARY, **kw)
+            except (anthropic.APIConnectionError, anthropic.InternalServerError) as e:
+                self.breaker.record_failure()
+                span.set_attribute("nexus.fallback.reason", type(e).__name__)
+            except anthropic.RateLimitError as e:
+                self.breaker.record_failure()   # a sustained 429 is an outage for our purposes
+        span.set_attribute("nexus.model.fallback", True)
+        return self._invoke(SECONDARY, **kw)     # degraded, and RECORDED as degraded
+```
+
+Three things that make this real rather than decorative:
+
+1. **Measure the fallback's quality before you need it.** Ours: the Week-31 suite scores 0.92 on the primary and **0.89 on the secondary** — a 3-point drop. That number belongs in your runbook, so that during an incident you know you are running degraded and by how much, rather than wondering.
+2. **Record the fallback on the span.** Otherwise a week of degraded quality looks like an unexplained eval drift. `nexus.model.fallback` is a filter in every quality query.
+3. **A sustained 429 is an outage.** Treating rate limits as retryable-forever produces a retry storm that guarantees the limit stays exceeded. Trip the breaker and shed to the secondary or to the queue.
+
+Reference figure — modelled failover: **1.4 s** from the primary's first failure to a successful secondary response,
+because the breaker trips on the fifth failure within 60 s and subsequent calls skip the primary
+entirely.
+
+### Queue and back-pressure
+
+```python
+# reliability/admission.py — admit what you can serve; reject the rest fast.
+class TokenBucketAdmission:
+    """Sized on the PROVIDER's tokens-per-minute limit, not on our own optimism."""
+    def __init__(self, tokens_per_minute: int, burst: float = 1.2):
+        self.rate = tokens_per_minute / 60.0
+        self.capacity = tokens_per_minute * burst / 60.0
+        self.tokens = self.capacity
+        self.updated = time.monotonic()
+
+    def try_admit(self, estimated_tokens: int) -> bool:
+        now = time.monotonic()
+        self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+        self.updated = now
+        if self.tokens >= estimated_tokens:
+            self.tokens -= estimated_tokens
+            return True
+        return False        # caller queues, or returns 503 with Retry-After. Never retries now.
+```
+
+Reference figure, modelled under a load test at 3.1× normal traffic (our real morning peak):
+
+| | Blind retry on 429 | Token-bucket admission + queue |
+| --- | --- | --- |
+| 429 rate seen by the provider | 8.1% | **0.2%** |
+| p99 end-to-end latency | 210 s | **94 s** |
+| Runs that eventually succeeded | 91.2% | **99.1%** |
+| Wasted tokens on requests that later failed | 14.8% of spend | 0.9% |
+
+Back-pressure is faster *and* cheaper, which surprises people every time. Blind retrying converts a
+brief overload into a sustained one and pays for every failed attempt.
+
+### The runbook for "the model is producing garbage"
+
+This is the runbook nobody writes and everybody needs. Ours, in order, because order is the value:
+
+<Steps>
+<Step title="1 · Is it us or them? (2 minutes)">
+Check `nexus.model.fallback` and `gen_ai.response.model` on recent spans. If the response model differs from the request model, or fallback is on, you are running degraded — that may be the whole answer.
+</Step>
+<Step title="2 · Did we change anything? (3 minutes)">
+Prompt version, retrieval config, dependency versions, guardrail thresholds. Module 2's per-version query answers this in one statement. Most incidents end here.
+</Step>
+<Step title="3 · Run the eval suite against production config, now (6 minutes)">
+Not the nightly result — a fresh run. If offline score dropped too, the cause is in your system. If offline is fine and production is bad, the cause is in the traffic or the environment.
+</Step>
+<Step title="4 · Sample ten bad traces and read them (10 minutes)">
+Yes, by hand. This is faster than any dashboard for identifying a new failure mode, and Week 31 M1's taxonomy tells you what to look for.
+</Step>
+<Step title="5 · Mitigate before you understand">
+Pin the previous prompt version (42 s, Module 2), or pin a previous model version, or fall back. Understanding can wait; the error budget cannot.
+</Step>
+<Step title="6 · Only then, root cause">
+And the output is an eval case (Module 2's flywheel), not a wiki page nobody reads.
+</Step>
+</Steps>
+
+### War story
+
+An assistant's quality degraded over about four days. No deploy, no config change, no error rate
+movement, no latency movement. Support volume rose 14%. The team spent three days examining their
+own code because that is what you do when nothing changed.
+
+The cause was a provider-side model update. Their prompt had come to rely on a formatting behaviour
+— the model reliably ending structured sections with a particular marker — and the updated model
+formatted slightly differently, so their downstream parser silently dropped a field in about 9% of
+responses. The parser did not error; it produced a valid object with a missing optional field, and
+the assistant produced an answer missing one section.
+
+Three changes came out of it, and the first two are the ones that matter. **A scheduled eval run
+every six hours against production configuration**, which now detects this class of change in about
+11 hours instead of 9 days. **Alerting on `gen_ai.response.model`** — a new value appearing is a
+notification, because that is the earliest signal that anything underneath you moved. And **the
+parser now validates rather than tolerating**: a missing field raises, which converts a silent
+degradation into a loud one, which is almost always the trade you want.
+
+<Accordion title="Design checkpoint — with model answer">
+
+**Question.** Your assistant's quality dropped and you cannot reproduce it. The same input produces
+a good answer when you run it. What do you do?
+
+**Model answer.** Accept that reproduction is not the path, and switch to population evidence.
+
+The system is non-deterministic: we measured 20 replays of the same input producing 14 distinct
+outputs, with the failure reproducing 3 times out of 20. So "I ran it and it was fine" is worth very
+little — with a 15% failure rate you would see a clean run 85% of the time. The right question is
+not "does it fail now" but "what fraction of runs fail, and did that fraction change".
+
+So: pull 100 traces from before the change and 100 from after, score them with the same instrument
+(the online groundedness score, or the judge from Week 31 M2), and compare rates with a confidence
+interval. That either establishes a change or tells you the perception is not real — and both are
+useful outcomes.
+
+Then look for what differs *between* the two populations rather than trying to make one case fail.
+`gen_ai.response.model`, prompt version, retrieved document ids, guardrail verdicts, input length
+distribution, time of day. In the war story the differing field was the response model and nobody had
+thought to look because nobody had deployed.
+
+And the thing to fix regardless of the outcome: **log enough to make a failed run replayable** —
+the exact request body hash, prompt version, retrieved document ids, model version from the response,
+and every tool result. You will not reproduce the *output*, but you can reproduce the *inputs*, and
+that is what lets you test a fix against the actual conditions rather than against a fresh run that
+was going to be fine anyway.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+### Non-determinism changes incident response
+
+The measurement that should reset your expectations. Same input, same prompt version, same model,
+20 replays:
+
+| | Result |
+| --- | --- |
+| Distinct outputs | **14 of 20** |
+| Replays reproducing the reported failure | **3 of 20 (15%)** |
+| Distinct tool-call sequences | 6 of 20 |
+| Cost spread across replays | $0.11 to $0.31 (2.8×) |
+
+Three consequences that ordinary service operations does not prepare you for:
+
+1. **"I could not reproduce it" is not evidence of anything.** At a 15% failure rate you see a clean run 85% of the time. Any triage process that closes on a single clean replay will close most real bugs.
+2. **A fix must be validated on a population.** Run the failing input 20 times before and 20 after, and compare rates. A single successful run after a fix proves nothing.
+3. **The cost of an incident varies 2.8× per run**, so a spike in spend may be one bad input class rather than a volume change. Module 3's p95 cost alert exists for this.
+
+What to log so that a run is *reconstructable* even if not reproducible:
+
+| Field | Why |
+| --- | --- |
+| Hash of the exact request body (prompt, tools, messages) | Proves what was sent; catches a config change nobody remembers |
+| `nexus.prompt.version` | Attribution (Module 2) |
+| `gen_ai.response.model` | The provider-side change detector |
+| Retrieved document ids and their scores | The single most common cause of a "different answer" is different retrieved context |
+| Every tool call, its arguments and a digest of its result | Lets you replay the run with the *same* observations |
+| Guardrail verdicts and scores | A refusal or a redaction changes the answer and is invisible otherwise |
+| Random seed or request id for any sampling you do | Your own non-determinism, at least, can be pinned |
+
+With those, you can build a **conditioned replay**: re-run the agent with the recorded tool results
+substituted, so only the model's non-determinism varies. That isolates "the model behaved
+differently" from "the world was different", and in our experience about 60% of "the model got worse"
+reports turn out to be the second.
+
+### Detecting silent quality degradation
+
+The provider-side model update is the failure mode with no other detector. Your defence is a
+scheduled evaluation.
+
+```yaml
+# .github/workflows/scheduled-eval.yml — every six hours, against PRODUCTION config
+on:
+  schedule: [{cron: "0 */6 * * *"}]
+jobs:
+  eval:
+    steps:
+      - run: make evals SUITE=canary CONFIG=production        # the frozen 30-case canary
+      - run: make evals SUITE=full   CONFIG=production        # the 120-case suite
+      - run: python scripts/compare.py --baseline 7d --alert-on-drop 4
+```
+
+Design decisions that matter:
+
+- **Against production configuration**, including the live prompt label and the live model alias. An eval run against a pinned model cannot detect a model change, which is the entire purpose.
+- **The frozen canary subset** (Week 31 M1) runs alongside the full suite. It never changes, so a drop on the canary is unambiguously about the system rather than about the suite having grown.
+- **Alert on a drop, not on a level.** Four points below the trailing 7-day baseline. Levels drift as the suite grows; drops do not.
+- **Six hours, not nightly.** Modelled detection time is 11 hours with a six-hour schedule. Nightly would be up to 24, and the war story's alternative was 9 days.
+
+Reference figure — eight months of a modelled deployment (see [About the numbers](/start/about-the-numbers)): **three detections.** One genuine provider-side behaviour change,
+one of our own dependency bumps that changed tokenization, and one false alarm caused by a
+retrieval index rebuild that briefly served a partial index. All three were caught by the scheduled
+run before a user reported anything. Three catches in eight months for a job that costs $2.40 a day.
+
+### A post-mortem worth reading
+
+> **INC-2026-08-14 — Degraded diagnosis quality, 4 days**
+>
+> **Impact.** From 10 to 14 August, roughly 9% of incident diagnoses were missing the "recommended
+> next step" section. 412 affected runs. Support contacts up 14% over the period. No incorrect
+> remediation was executed — the approval boundary held, and every proposal a human saw was complete.
+>
+> **Detection.** A support lead reported it on 14 August, four days in. Our nightly eval had run
+> eleven times during the window and passed, because the suite scored the *diagnosis text* and not
+> the *parsed structure*.
+>
+> **Timeline.** 10 Aug 04:00 — provider model update, unannounced to us (visible in retrospect as a
+> new value in `gen_ai.response.model`). 10–13 Aug — degradation, undetected. 14 Aug 11:20 — report.
+> 14 Aug 11:52 — pinned the prior model version; impact stopped. 17 Aug — root cause identified.
+> 18 Aug — fix deployed.
+>
+> **Root cause.** Our parser extracted sections by a formatting marker the model had reliably
+> produced. The updated model produced an equivalent but differently-formatted output. The parser
+> tolerated the absence — the field was optional in the schema — and emitted a valid object with a
+> missing section.
+>
+> **Why detection failed.** Three reasons and all three are the lesson. The eval suite scored text,
+> not the parsed object, so it never exercised the parser. The parser tolerated missing data instead
+> of rejecting it. And `gen_ai.response.model` was recorded but not alerted on.
+>
+> **What we changed.** (1) The eval suite now asserts on the *parsed structure*, not the text — five
+> new assertions, tier one, free. (2) The parser validates against a Pydantic model with the field
+> required; a missing section now raises and routes to escalation. (3) An alert on any new value of
+> `gen_ai.response.model`. (4) Scheduled evals moved from nightly to six-hourly. (5) Model version
+> pinned explicitly rather than using a moving alias, with a deliberate upgrade process (Module 5).
+>
+> **What we did not change.** We did not add a model-output format check in the prompt. The prompt
+> is not a contract and asking it to be one was the original mistake.
+>
+> **Cost.** 412 degraded runs, roughly 26 hours of engineering, and one uncomfortable conversation
+> with a customer. Model spend impact: negligible.
+
+The general lesson, worth stating separately because it applies to almost every AI incident we have
+seen: **the eval suite measured the thing a human reads, and the bug was in the thing a machine
+reads.** Test every consumer of the output, not just the one you find interesting.
+
+### Game day: the four conditions
+
+Run these deliberately, in production or a faithful staging environment, and diagnose each **from
+telemetry alone** — no prior knowledge of which one you injected.
+
+| Condition | How to inject | The telemetry signature | Time to diagnose (ours) |
+| --- | --- | --- | --- |
+| Provider outage | Block the provider endpoint at the firewall | `APIConnectionError` spike; `nexus.model.fallback` true; quality SLI down ~3 points | 2 min |
+| Rate limiting | Reduce the admission bucket to 20% | 429s; queue depth rising; p99 latency up; success rate steady | 4 min |
+| Silently degraded model | Point the alias at a smaller model | **No error signal at all.** Quality SLI down; token counts change; `gen_ai.response.model` differs | 19 min |
+| Prompt-injection attempt | Plant a hostile instruction in a runbook document | `suspicious_content` field populated; guardrail category spike; a tool call inconsistent with the ticket | 7 min |
+
+The third row is the point of the exercise. **Nineteen minutes, and it was the only one with no
+error signal.** Everything that made it findable — the quality SLI on 100% of traffic, response-model
+recording, token-count distributions — is something you must have built in advance. Run the game day
+before you need it, and the deliverable is not "we survived" but the **detection times**, because
+those are what your incident response actually depends on.
+
+### Papers and primary sources
+
+- **Beyer et al., *Site Reliability Engineering*, chapters on SLOs, error budgets and handling overload.** Takeaway: an error budget converts a priority argument into an agreed number, and the overload chapter's central finding — that retrying into an overloaded system is what turns a blip into an outage — is exactly why blind 429 retries measured worse on every axis in our load test.
+- **Anthropic API documentation on rate limits, error types and streaming.** Takeaway: which errors are retryable and what `retry-after` means are provider-specific facts your backoff must encode; and streaming's `get_final_message()` is what keeps cost accounting intact when you stream.
+- **OpenTelemetry GenAI semantic conventions, `gen_ai.response.model`.** Takeaway: recording what you actually got, separately from what you asked for, is a two-line change and the cheapest available detector for a change underneath you.
+- **Allspaw, 2012 — *Blameless PostMortems and a Just Culture*.** Takeaway: post-mortems produce learning only when they are safe to write honestly, which matters more with AI systems because the honest finding is often "we trusted a behaviour that was never a contract".
+
+### Stretch challenge
+
+Run a game day on your Week-30 system with all four conditions, diagnosed from telemetry alone, and
+publish the detection times.
+
+Then the harder version: have someone else inject **one** of the four, without telling you which, at
+a time you do not know, and measure your time to detection and to correct diagnosis. Ours went from
+"19 minutes" to "we did not notice for 3 hours" the first time we did it blind, because the
+degraded-model condition looks like nothing at all when you are not watching for it.
+
+The open problem, and we have no good answer: how do you detect a degradation *smaller* than your
+eval suite can resolve? A 4-point drop on a 120-case suite is inside the noise band (Week 31 M1 says
+you can detect about 11 points), so a 3-point real degradation is invisible offline and, at 4,200
+runs a day, would take weeks to establish from production scores. Candidates worth testing: a much
+larger cheap-assertion-only suite where near-boundary rates give you power; a paired design that
+runs the same input against pinned and current model versions on a sample of live traffic; or a
+sequential test that alarms on cumulative evidence rather than on a window. Try one, report its
+detection latency for a synthetic 3-point regression, and be honest about its false-alarm rate.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Run a game day on your Week-30 system: provider outage, rate limiting, a silently degraded model, and
+a prompt-injection attempt. Diagnose all four from telemetry alone and publish the detection times.
+</Card>
+
+<Steps>
+<Step title="Write the SLO first">
+Success rate, TTFT, total latency, a quality SLI, and cost per successful task. With an error budget and a written policy for what happens when it is exhausted.
+</Step>
+<Step title="Instrument TTFT end to end">
+From the browser, not from your service. Then find whatever is buffering — there usually is something.
+</Step>
+<Step title="Build fallback and admission control">
+Breaker on the primary provider with the fallback's quality delta measured in advance; token-bucket admission sized on the provider's limit.
+</Step>
+<Step title="Schedule the eval">
+Every six hours, against production configuration, alerting on a drop from the trailing baseline, with the frozen canary alongside.
+</Step>
+<Step title="Run the game day, then run it blind">
+Four conditions, telemetry only. Then have a colleague inject one without telling you. Publish both sets of times.
+</Step>
+</Steps>
+
+## The whiteboard
+
+**T3 hero animation** — streaming versus buffered as two synchronized timelines with a "what the user
+sees" panel beneath each, so the identical total time and the very different experience are visible
+simultaneously. **T1** — the latency-budget breakdown as a stacked bar with each segment's p50 and
+p95 and its owner. **T1** — the incident timeline sketch with the detection bracket.
+
+<Tip>
+**Draw it yourself.** The two timelines with the shared 4.00 s end and the 0.90 s marker, then the
+incident timeline with detection at +11 h and the crossed-out +9 days. Write "3 of 20 replays" in
+the margin.
+[Blank version](/assets/diagrams/p4-w32-m4-blank.svg) · [Editable source](/assets/diagrams/p4-w32-m4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Resume line:** *"Defined and operated SLOs for an agent system (95% success over 28 days, p95 TTFT
+under 2 s, quality SLI on 100% of traffic). Implemented provider fallback with a measured 3-point
+quality delta and token-bucket admission control that cut the 429 rate from 8.1% to 0.2% and p99
+latency from 210 s to 94 s. Ran a four-condition game day; the silently degraded model took 19
+minutes to diagnose and was the only condition with no error signal."*
+
+**How to talk about it.** Lead with the non-determinism finding — 20 replays, 14 distinct outputs,
+the failure reproducing 3 times — and what it means for triage. It is a genuinely different
+operational world from the services most interviewers have run, and demonstrating that you have
+thought about it is memorable.
+
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+**1. Record and alert on `gen_ai.response.model`.** Two lines. It is the earliest possible signal
+that the thing underneath you changed, and in the war story it was recorded and not alerted on,
+which cost three days.
+
+**2. Schedule an eval run against production configuration.** Not against a pinned model — against
+whatever production is actually using, or it cannot detect the thing it exists to detect. Six-hourly,
+alerting on a drop from the trailing baseline.
+
+**3. Replace blind 429 retries with admission control.** It is faster, cheaper and more reliable on
+every measure we took. Most teams have blind retries because they are the default, not because
+anyone chose them.
+
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Users say it is slow; total latency looks fine | TTFT never measured | Measure TTFT end to end from the browser; it is the number people feel |
+| Streaming implemented and it still feels slow | Something in the path buffers — framework, proxy, CDN | Measure from the browser and find the buffer |
+| Quality drops for days with no error signal | No quality SLI and no scheduled eval | A cheap score on 100% of traffic, plus a six-hourly eval against production config |
+| Rate limiting turns into an outage | Blind retries on 429 | Trip a breaker; admission control sized on the provider's limit; shed with `Retry-After` |
+| A fallback silently runs for a week | Fallback not recorded on the span | `nexus.model.fallback` attribute, and a dashboard tile |
+| Incident triage closes on "cannot reproduce" | Non-determinism: 15% failure rate means an 85% chance of a clean replay | Compare populations, not runs; log enough for a conditioned replay |
+| Root cause never found | Retrieved doc ids and tool results not logged | Log inputs and observations; you cannot reproduce the output, you can reproduce the conditions |
+| Provider model change goes unnoticed | `gen_ai.response.model` not alerted on | Alert on any new value |
+| Eval suite passes while the product breaks | The suite tested the text and the bug was in the parsed object | Assert on every consumer of the output, not the one you find interesting |
+| Error budget arguments happen during the incident | No policy agreed in advance | Write the stop-feature-work rule when nobody is under pressure |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="8 concept questions (with answers)" icon="circle-question">
+
+1. *What does streaming change and what does it not?* Perceived latency (4.4× in our measurement); total time is essentially unchanged.
+2. *Why is an output guardrail perceptually expensive?* Nothing can be shown until generation *and* the check complete, which converts streaming back to buffered.
+3. *What is an error budget and what is it for?* The failures the SLO allows — 210 runs a day at 95% — and it exists to make the priority decision in advance.
+4. *Why does blind retrying on 429 make things worse?* It converts a brief overload into a sustained one and pays for every failed attempt: 8.1% versus 0.2% 429 rate in our test.
+5. *Why is "I could not reproduce it" weak evidence?* At a 15% failure rate a single replay is clean 85% of the time.
+6. *How do you detect a provider-side model change?* Scheduled evals against production configuration, plus an alert on any new `gen_ai.response.model` value.
+7. *What must you log to make a run reconstructable?* Request body hash, prompt version, response model, retrieved doc ids, every tool call and result, guardrail verdicts.
+8. *Which game-day condition is hardest and why?* The silently degraded model — no error signal, so only a quality SLI and response-model recording find it. Ours took 19 minutes.
+
+</Accordion>
+<Accordion title="Coding challenge (hidden tests)" icon="code">
+
+Implement the reliability layer to pass tests covering: TTFT recorded separately from total latency
+on a streamed response; a breaker tripping after five failures in 60 s and routing to the secondary
+with `nexus.model.fallback` set; a `RateLimitError` counting toward the breaker rather than being
+retried immediately; token-bucket admission refilling at the configured rate and refusing when
+empty rather than blocking; error-budget burn computed over a rolling window with days-remaining;
+and a scheduled-eval comparison that alerts on a 4-point drop from a trailing baseline but not on a
+level change caused by the suite growing.
+
+</Accordion>
+<Accordion title="Interview questions — junior / mid / senior" icon="user-tie">
+
+- **Junior.** "Two systems take four seconds. One feels fast. Why?"
+- **Mid.** "Quality dropped, nothing was deployed, and you cannot reproduce it. What do you do?" (Population comparison, response-model check, prompt version, retrieved context — not repeated replays.)
+- **Senior.** "Define SLOs for an AI product and describe how you would detect a provider-side regression." (Expect: quality SLIs with a validated instrument, an error budget with a policy, scheduled evals against production config with a frozen canary, response-model alerting, and honesty about the size of regression the suite cannot resolve.)
+
+</Accordion>
+<Accordion title="Draw it from memory" icon="pencil">
+
+The two latency timelines with the shared end point and different TTFT markers, and the incident
+timeline with the detection bracket.
+
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+- [Anthropic API rate limits, error types and streaming](https://docs.claude.com/en/api/rate-limits) — read this for which errors are retryable, what `retry-after` means, and how to keep usage accounting when streaming.
+- [OpenTelemetry GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) — read the `gen_ai.response.model` definition; recording what you got separately from what you asked for is the cheapest change-detector available.
+
+**Papers**
+- [Beyer et al. 2016, *Site Reliability Engineering*](https://sre.google/sre-book/table-of-contents/) — SLOs and error budgets, and the overload chapter whose central finding (retrying into overload sustains it) our load test reproduced exactly.
+- Allspaw 2012, *Blameless PostMortems and a Just Culture* — honest post-mortems are what make the uncomfortable finding sayable, and with AI systems the finding is usually "we relied on a behaviour that was never a contract".
+
+**Go deeper**
+- Week 30 M4's failure taxonomy, re-read here — the SLIs in this module are that taxonomy expressed as things you can alert on, and the mapping between them is worth writing out for your own system.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-32/p4-w32-m4">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

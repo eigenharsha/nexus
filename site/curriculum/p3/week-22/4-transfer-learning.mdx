@@ -1,0 +1,624 @@
+---
+title: "Transfer learning"
+description: "Week 22 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 22 · Module 4 · `P3-W22-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+**This module is Week 26 in disguise.** Frozen backbone + new head is structurally the same
+thing as frozen LLM weights + LoRA adapter: same freezing decision, same parameter ratio, same
+staged unfreezing, same catastrophic-forgetting failure, same "small data favours the smaller
+trainable set" crossover. Layer 3 draws the mapping row by row. Learn it here on 12,500 images
+you can look at, and Week 26 will feel like a re-run.
+</Info>
+
+## What you'll be able to do
+
+1. Explain why features learned on one dataset transfer to another, and where that stops being true.
+2. Replace a classification head and freeze a backbone correctly — including the two things people forget.
+3. Run the full recipe: head first, then staged unfreezing with discriminative learning rates.
+4. Choose a backbone from an accuracy / latency / size table rather than by reputation.
+5. Decide between feature extraction and full fine-tuning from your dataset size, with a number.
+6. Measure catastrophic forgetting and say what it costs you.
+7. Map every element of this onto LLM fine-tuning, term by term.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w22-m4.svg" alt="Hand-drawn sketch: Transfer learning" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w22-m4-dark.svg" alt="Hand-drawn sketch: Transfer learning" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w22-m4
+tier: T2
+one-sentence-goal: Freezing a large pretrained body and training a tiny new head is the same operation whether the body is a ResNet and the head is a Linear layer, or the body is an 8B language model and the head is a LoRA adapter.
+elements:
+  - the diagram is split down the middle by a hand-drawn vertical dashed line
+  - LEFT half titled "Week 22 - vision": a tall stack of five blocks labelled conv1, layer1, layer2, layer3, layer4, drawn with hatched fill and a padlock icon on each, total "11.7 M params FROZEN" written down the side
+  - on top of that stack a small bright unhatched box labelled "Linear(512, 4) - 2,052 params - TRAINED", drawn much smaller than the blocks below it
+  - "0.018% of the model is learning" written beside it and circled
+  - RIGHT half titled "Week 26 - language": a tall stack of 32 thin blocks labelled "Llama-3-8B layers", hatched, padlocked, "6.74 B params FROZEN (4-bit)" down the side
+  - beside each of four of those blocks, a thin bright parallel path drawn as two skinny rectangles B and A joined by an arrow, labelled "LoRA r=16"
+  - "16.8 M params = 0.25% is learning" written beside it and circled
+  - a thick double-headed arrow across the dashed line joining the two bright regions, labelled "SAME THING"
+  - bottom-left: a small line chart, x-axis "training images 250 -> 8,742", two hand-drawn curves: "feature extraction" starting high and flattening, "full fine-tune" starting lower and crossing above it, the crossing point circled with "~700 images" written
+  - amber margin note beside the crossing: "small data -> freeze more. This is the same reason LoRA beats full fine-tuning on 2k instructions."
+  - red cross-out over a box "forgot model.fc = new head BUT left requires_grad=True on the backbone" with note "trains, works, 40x slower, and forgets ImageNet"
+  - dangling arrow off the right edge: "...and how much does it forget? -> Layer 3"
+numbers-to-write-in: "2,052 of 11.7M = 0.018%", "16.8M of 6.74B = 0.25%", "scratch 84.2% / frozen 89.6% / fine-tune 93.8%", "22 min vs 4.1 min vs 18 min", "crossover ~700 images"
+alt: A hand-drawn diagram split in two, with an ImageNet-pretrained ResNet stack frozen under a tiny trainable linear head on the left and a frozen eight-billion-parameter language model with thin LoRA adapter paths on the right, joined by a double-headed arrow labelled same thing, plus a small chart showing feature extraction and full fine-tuning curves crossing at around seven hundred training images.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The one idea
+
+A network trained on a million photographs has already learned what edges, textures, curves and object parts look like. Those things are not specific to the photographs — they are properties of images. So instead of learning them again from your 8,000 blood-cell pictures, **take them**, and only learn the last bit that's specific to your problem.
+
+This is not a shortcut or a hack. On small datasets it is the correct method, and it will beat a from-scratch model by a wide margin in a fraction of the time.
+
+### Vocabulary, defined before use
+
+- **Pretrained model** — a network someone already trained, whose weights you download.
+- **Backbone** (or **body**, or **feature extractor**) — everything except the last layer. It turns an image into a vector.
+- **Head** — the final layer or two that maps that vector to your classes.
+- **Freezing** — setting `requires_grad = False` on a parameter, so it receives no gradient and never changes.
+- **Feature extraction** — freeze the whole backbone, train only a new head.
+- **Fine-tuning** — train some or all of the backbone too, usually with a small learning rate.
+- **Unfreezing** — turning `requires_grad` back on, usually a block at a time.
+- **Discriminative learning rates** — a different learning rate per layer group; lower for the early layers.
+- **Domain gap** — how different your images are from the ones the backbone was trained on.
+- **Catastrophic forgetting** — when fine-tuning on your task destroys the general abilities the backbone had.
+
+### The analogy
+
+You need someone to sort blood cells into four types. Two options:
+
+**Hire a school leaver and train them from nothing.** They have to learn what a microscope is, what "in focus" means, what a cell looks like, what a nucleus is — and *then* the four types. It takes months and they'll be mediocre because you only have 8,000 examples to show them.
+
+**Hire a biologist and teach them your four categories.** They already know microscopy, cell structure, staining. You teach them one thing — which four buckets — in an afternoon.
+
+The backbone is the biologist's general training. The head is the afternoon.
+
+Two things follow directly from the analogy, and both are true in practice:
+
+- If your images are *very* different from photographs — satellite imagery, ultrasound, spectrograms — the biologist knows less that transfers. That's the **domain gap**.
+- If you retrain the biologist intensively on only blood cells, they may get worse at everything else. That's **catastrophic forgetting**.
+
+### The five-minute version
+
+```python
+"""transfer_quick.py — frozen ResNet-18 + new head. PyTorch 2.4, torchvision 0.19."""
+import torch, torch.nn as nn, torchvision
+
+model = torchvision.models.resnet18(weights="IMAGENET1K_V1")   # download the weights
+
+for p in model.parameters():          # 1. freeze EVERYTHING
+    p.requires_grad = False
+
+model.fc = nn.Linear(512, 4)          # 2. replace the head.
+                                      #    A new Linear has requires_grad=True by default,
+                                      #    so this is the only trainable part.
+
+trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+total     = sum(p.numel() for p in model.parameters())
+print(f"{trainable:,} / {total:,} = {100*trainable/total:.3f}% trainable")
+# 2,052 / 11,178,051 = 0.018% trainable
+
+# 3. Give the optimizer ONLY the trainable parameters.
+opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-3)
+```
+
+Three steps. Note the order: freeze first, *then* replace the head, because replacing after freezing gives you a fresh unfrozen layer automatically.
+
+**Reference figure — Machine B** (RTX 4090, modelled), blood-cell dataset, 8,742 training images:
+
+| Approach | Test accuracy | Training time | Trainable params |
+| --- | --- | --- | --- |
+| `BloodCellNet` from scratch (Module 2) | 84.2% | 22 min | 390,404 |
+| **ResNet-18 frozen + new head** | **89.6%** | **4.1 min** | **2,052** |
+| ResNet-18 full fine-tune | 93.8% | 18 min | 11,178,051 |
+
+The middle row is the headline: **5.4 points better than a from-scratch model, in a fifth of the time, training 2,052 numbers.**
+
+### Line-by-line walkthrough
+
+- `weights="IMAGENET1K_V1"` downloads the trained weights (44.7 MB, cached in `~/.cache/torch/hub`). Passing `weights=None` gives you the architecture with random weights — which is the from-scratch case, and is what the old `pretrained=False` meant.
+- `for p in model.parameters(): p.requires_grad = False` — every weight is now fixed. The backward pass still runs *through* these layers (it has to, to reach anything above them), it just doesn't store gradients for them.
+- `model.fc = nn.Linear(512, 4)` — ResNet-18's final layer is called `fc` and takes 512 inputs (the output of its global average pool). Four outputs for four classes. It is brand new, so it is trainable.
+- `[p for p in model.parameters() if p.requires_grad]` — **the step people forget.** If you pass `model.parameters()` to the optimizer, it will happily create Adam state for all 11.2 million frozen parameters: 89 MB of optimizer state that will never be used, and the optimizer will try to apply weight decay to them.
+
+<Warning>
+**The two things people forget.** (1) Pass only the trainable parameters to the optimizer.
+(2) Call `model.eval()` before evaluating — a frozen backbone still contains BatchNorm layers,
+and in `train()` mode they update their running statistics from your batches even though the
+weights are frozen. That means your "frozen" backbone is quietly changing. Freezing
+`requires_grad` does **not** freeze BatchNorm statistics. Layer 2 has the fix.
+</Warning>
+
+### Guided practice
+
+```python
+import torchvision, torch.nn as nn
+
+model = torchvision.models.resnet18(weights="IMAGENET1K_V1")
+
+# TODO 1: how many parameters does the ORIGINAL fc layer have? (1000 ImageNet classes)
+# TODO 2: freeze everything except layer4 and fc. One loop, one condition.
+# TODO 3: how many parameters are trainable now, and what percentage?
+# TODO 4: efficientnet_b0's head is not called `fc`. Find its name.
+```
+
+**Answers.** TODO 1: `512 × 1000 + 1000 = 513,000`. Replacing it with `Linear(512, 4)` removes 510,948 parameters, which is why the parameter total drops from 11,689,512 to 11,178,051. TODO 2:
+
+```python
+for name, p in model.named_parameters():
+    p.requires_grad = name.startswith("layer4") or name.startswith("fc")
+```
+
+TODO 3: `layer4` has 8,393,728 parameters plus its BatchNorms, and `fc` has 2,052 — about **8,395,780**, or 75.1%. Layer 4 is where nearly all of a ResNet's parameters live (Module 2, Layer 3). TODO 4: `model.classifier`, which is a `Sequential` — you replace `model.classifier[1]`. Every architecture family names its head differently (`fc`, `classifier`, `head`, `heads.head`), which is why `timm`'s `model.reset_classifier(num_classes)` exists and is worth using.
+
+### Checkpoint — five questions
+
+<AccordionGroup>
+<Accordion title="1. Why do ImageNet features help on blood cells, which are nothing like ImageNet photos?">
+The early and middle layers learn edges, textures, curves and blob-like structures — properties of images generally, not of dogs and cars specifically. Those transfer. The late layers, which encode "this is a golden retriever", transfer much less, which is exactly why you replace the head and often retrain the last block.
+</Accordion>
+<Accordion title="2. What does requires_grad = False actually stop?">
+Gradient storage for that parameter, so the optimizer never updates it. The backward pass still flows *through* the layer to reach layers above it, and the forward pass still caches activations. Freezing saves optimizer memory and compute, not activation memory.
+</Accordion>
+<Accordion title="3. Why replace the head at all — why not keep 1000 outputs?">
+The 1000 outputs mean ImageNet classes. You need four, meaning your four. A fresh `Linear(512, 4)` starts random and learns your mapping. Keeping the old head and adding another on top also works and is strictly worse — you're passing your signal through a layer trained for a different task.
+</Accordion>
+<Accordion title="4. Why is feature extraction so much faster than full fine-tuning?">
+Two reasons. No gradients or optimizer state for 11.2M parameters. And, if you precompute the backbone's outputs once, you never run the backbone again — training the head becomes logistic regression on 8,742 vectors, which takes seconds.
+</Accordion>
+<Accordion title="5. You froze the backbone but its BatchNorm statistics still changed. Why?">
+BatchNorm's running mean and variance are buffers, not parameters. They update during any forward pass in `train()` mode, regardless of `requires_grad`. To truly freeze a backbone you must also put its BatchNorm modules in `eval()` mode.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### The full recipe
+
+Four stages. Each one is a decision point, not a ritual.
+
+**Stage 1 — replace the head and train only it.** Cheap, fast, and it stops a randomly-initialized head from sending garbage gradients into a carefully-pretrained backbone. Skipping this is the most common cause of a fine-tune that ends up *worse* than feature extraction.
+
+**Stage 2 — unfreeze the last block, low LR.** `layer4` is where the ImageNet-specific semantics live and where most of the parameters are.
+
+**Stage 3 — unfreeze everything, discriminative LRs.** Early layers get a much smaller rate than late ones, because early features are more general and you want to disturb them less.
+
+**Stage 4 — evaluate on a held-out set you have not touched.**
+
+```python
+"""finetune.py — the staged recipe. PyTorch 2.4.0, torchvision 0.19.0."""
+from __future__ import annotations
+import torch, torch.nn as nn, torchvision
+
+def build(n_classes: int = 4) -> nn.Module:
+    m = torchvision.models.resnet18(weights="IMAGENET1K_V1")
+    m.fc = nn.Linear(m.fc.in_features, n_classes)
+    return m
+
+def set_trainable(model: nn.Module, prefixes: tuple[str, ...]) -> None:
+    for name, p in model.named_parameters():
+        p.requires_grad = name.startswith(prefixes)
+
+def freeze_bn_stats(model: nn.Module, prefixes: tuple[str, ...]) -> None:
+    """Put frozen blocks' BatchNorm in eval mode so running stats stop moving.
+    requires_grad=False does NOT do this, and forgetting it is worth ~1 point."""
+    for name, m in model.named_modules():
+        if isinstance(m, nn.modules.batchnorm._BatchNorm) and not name.startswith(prefixes):
+            m.eval()
+            for p in m.parameters():
+                p.requires_grad = False
+
+def discriminative_groups(model: nn.Module, base_lr: float = 1e-3) -> list[dict]:
+    """Earlier layers move less. Ratios from fast.ai practice, validated below."""
+    return [
+        {"params": model.conv1.parameters(),  "lr": base_lr / 100},
+        {"params": model.bn1.parameters(),    "lr": base_lr / 100},
+        {"params": model.layer1.parameters(), "lr": base_lr / 100},
+        {"params": model.layer2.parameters(), "lr": base_lr / 50},
+        {"params": model.layer3.parameters(), "lr": base_lr / 10},
+        {"params": model.layer4.parameters(), "lr": base_lr / 3},
+        {"params": model.fc.parameters(),     "lr": base_lr},
+    ]
+
+# ---- the three stages -----------------------------------------------------
+model = build().cuda()
+
+# Stage 1: head only, 5 epochs, lr 1e-3
+set_trainable(model, ("fc",))
+freeze_bn_stats(model, ("fc",))
+opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
+                        lr=1e-3, weight_decay=0.05)
+train(model, opt, epochs=5)
+
+# Stage 2: + layer4, 8 epochs, lr 1e-4
+set_trainable(model, ("layer4", "fc"))
+freeze_bn_stats(model, ("layer4", "fc"))
+opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
+                        lr=1e-4, weight_decay=0.05)
+train(model, opt, epochs=8)
+
+# Stage 3: everything, discriminative LRs, 17 epochs
+for p in model.parameters():
+    p.requires_grad = True
+model.train()
+opt = torch.optim.AdamW(discriminative_groups(model, base_lr=3e-4), weight_decay=0.05)
+train(model, opt, epochs=17)
+```
+
+**Reference figure — Machine B** (RTX 4090, modelled), blood-cell dataset, 5 seeds:
+
+| Strategy | Test acc | Time | Notes |
+| --- | --- | --- | --- |
+| From scratch (`BloodCellNet`) | 84.2% ± 0.6 | 22 min | Module 2's model |
+| From scratch (ResNet-18, random init) | 86.9% ± 0.7 | 19 min | Architecture alone is worth 2.7 points |
+| Feature extraction (frozen + head) | 89.6% ± 0.3 | 4.1 min | 2,052 trainable parameters |
+| Full fine-tune, one LR, 30 epochs | 93.8% ± 0.4 | 18 min | The straightforward version |
+| **Staged + discriminative LRs** | **94.4% ± 0.3** | 21 min | The recipe above |
+| Full fine-tune with **no** stage 1 | 92.1% ± 0.9 | 18 min | Random head damaged the backbone |
+
+Two things to take from the table. The staged recipe buys **0.6 points** over a plain fine-tune — real but modest. Skipping stage 1 **costs 1.7 points** and triples the seed variance — that one is not modest, and it is the cheapest mistake to avoid.
+
+### Choosing a backbone
+
+Reputation is a bad selection criterion. Measure three things: accuracy on *your* data, latency on *your* serving hardware, and size.
+
+**Reference figures** — blood-cell test accuracy from Machine B (RTX 4090) and CPU latency from Machine C (`c7i.xlarge`, 4 vCPU, batch 1, 224×224, ONNX Runtime 1.19.2, median of 500), both modelled rather than run; see [About the numbers](/start/about-the-numbers):
+
+| Backbone | Params | ImageNet top-1 | CPU p50 | File size | Blood-cell acc |
+| --- | --- | --- | --- | --- | --- |
+| MobileNetV3-Small | 2.5 M | 67.7% | **12 ms** | **9.8 MB** | 91.2% |
+| ResNet-18 | 11.7 M | 69.8% | 41 ms | 44.7 MB | 93.8% |
+| EfficientNet-B0 | 5.3 M | 77.7% | 63 ms | 20.5 MB | **94.9%** |
+| ResNet-50 | 25.6 M | 76.1% | 108 ms | 97.8 MB | 94.6% |
+| ViT-B/16 | 86.6 M | 81.1% | 312 ms | 330.3 MB | 92.4% |
+
+Read the last two columns against each other. **ViT-B/16 has the best ImageNet score and the worst score here**, at 26× the latency of MobileNet. Layer 3 explains why (data efficiency). EfficientNet-B0 wins on accuracy at 5.3M parameters — but it is *slower* than ResNet-18 despite having half the parameters, because depthwise convolutions are memory-bandwidth-bound (Module 2).
+
+**FLOPs and parameters do not predict latency. Measure on the hardware you will serve on.**
+
+### The domain-gap question
+
+How much does ImageNet pretraining help when your images look nothing like ImageNet? Reference figures, same protocol, on three datasets with increasing distance:
+
+| Dataset | From scratch | Feature extraction | Full fine-tune | Transfer gain |
+| --- | --- | --- | --- | --- |
+| Blood cells (stained microscopy) | 86.9% | 89.6% | 93.8% | **+6.9** |
+| Chest X-ray (pneumonia, 5,856 imgs) | 84.1% | 85.3% | 91.7% | **+7.6** |
+| Sentinel-2 satellite (EuroSAT, 27,000 imgs) | 94.6% | 88.2% | 96.9% | +2.3 |
+
+The satellite row is the interesting one. **Feature extraction is 6.4 points *worse* than training from scratch there.** ImageNet's frozen features are not a good description of 13-band multispectral 64×64 tiles, and freezing forces the model to use them anyway. Full fine-tuning still helps — the pretrained weights are a better *starting point* than random even when they're a bad *representation* — but only barely.
+
+**The rule:** the larger the domain gap, the more of the backbone you must unfreeze, and the smaller the benefit. If your data is spectrograms, point clouds, or anything non-photographic, run the from-scratch baseline; it may win.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **Feature extraction vs full fine-tune** | Under ~700 labelled examples (modelled crossover on this dataset), or you need many task heads over one backbone, or CPU-only training. Trains in minutes and cannot overfit much with 2,052 parameters. | You have thousands of examples and the domain differs from ImageNet. Worth 4.2 points here at full data. |
+| **Precompute features vs run the backbone every epoch** | Feature extraction with fixed (non-random) preprocessing. Run the backbone once, cache 8,742 × 512 floats (17 MB), then train the head in **3 seconds** instead of 4.1 minutes — a 80× speedup for the head-tuning phase. | You use random augmentation, which changes the features every epoch. Then you must run the backbone each time. |
+| **Discriminative LRs vs one LR** | Fine-tuning a deep backbone on a small dataset. Worth 0.6 points here and more when data is scarcer, because it limits damage to the general early features. | Rapid iteration, or a large target dataset where the whole model should move. One fewer thing to tune. |
+| **`torchvision` vs `timm`** | You need ResNet/EfficientNet/ViT and nothing exotic; it's already a dependency. | You want a current architecture (ConvNeXt, EVA, modern ViT variants), better pretrained weights, or `reset_classifier` and `features_only` — `timm` 1.0 has ~1,300 pretrained models against torchvision's ~80. |
+
+### War story — the backbone that kept learning after it was frozen
+
+A team fine-tuned a ResNet-50 for a quality-inspection model. They froze the backbone, trained the head, got 91.4% on validation. They retrained the next week with more data and got 88.1% — worse, with more data. Then 92.7%. Then 89.3%. The results were not reproducible run to run, and the variance was far larger than seed noise should allow.
+
+They had frozen `requires_grad` and left the model in `train()` mode. ResNet-50 has 53 BatchNorm layers, and every forward pass in `train()` mode updates their running mean and variance with `momentum=0.1`. So the "frozen" backbone's *statistics* were being overwritten by whatever distribution the last few hundred training batches happened to have. The learned weights were frozen; the normalization the network depended on was not.
+
+The tell, once someone looked: `model.layer1[0].bn1.running_mean` differed between two runs that were supposed to be identical.
+
+The fix is `freeze_bn_stats` above — three lines. Reference figure — effect on the blood-cell set: feature extraction with BatchNorm statistics left drifting scored **88.6% ± 1.4**; with statistics properly frozen, **89.6% ± 0.3**. **One point of accuracy and a 4.7× reduction in variance.**
+
+Two lessons:
+
+1. **`requires_grad = False` freezes parameters, not buffers.** Running statistics, `num_batches_tracked`, and anything else registered with `register_buffer` are unaffected. If a module has state that isn't a parameter, freezing does not touch it.
+2. **Unexplained run-to-run variance is a bug, not noise.** ±1.4 points on a 5,800-image validation set is far outside binomial sampling error. When your variance is larger than it should be, you have a specific cause, and finding it is usually faster than averaging over more seeds.
+
+### Design checkpoint
+
+<Accordion title="You have 300 labelled images per class for a 6-class defect-detection task, and the customer will send 50,000 more over the next year. Design the training approach for now and for then.">
+**Now (1,800 images):** feature extraction, not fine-tuning. Below the crossover — modelled at roughly 700 images on the blood-cell set — a frozen backbone with a small head beats full fine-tuning, because 11.2 million trainable parameters on 1,800 examples overfits before it generalizes.
+
+Concretely:
+
+1. Precompute backbone features once (a few minutes), cache them, and sweep heads in seconds each. With features cached, a logistic regression head, a two-layer MLP head, and a linear SVM are all a minute's work — try all three. On small data the head choice is worth more than you'd think.
+2. **Cross-validate**, don't hold out. 1,800 images means a 20% test set is 360 images, and the 95% interval on 90% accuracy there is roughly ±3 points. Five-fold CV gives you a usable estimate; a single split does not.
+3. Run the from-scratch baseline anyway, because if the domain gap is large (defect images are often high-resolution greyscale of a repeating texture, which is quite unlike ImageNet), feature extraction may lose — as it does on satellite data.
+4. Heavy augmentation matched to the real variation: lighting, minor rotation, sensor noise. Not colour jitter if the defect is defined by colour.
+
+**Then (50,000 images):** full fine-tune with the staged recipe, and re-run the backbone comparison. At that scale the ranking changes — a bigger backbone becomes worth its latency, and ViT-style models stop being data-starved.
+
+**What I'd build now so the transition is cheap:**
+
+- **A fixed, versioned test set**, held out from day one and never touched. When the new data arrives, the comparison must be against the same test set or you cannot tell improvement from distribution shift.
+- **The dataset-size curve as a standing artifact.** Train at 300, 600, 1200, 1800 images and plot it. The slope tells the customer what more data is worth, in accuracy points per thousand images. That is a far better conversation than "more data would help", and it is a genuinely useful business input.
+- **A config-driven training script** (Module 3) so "re-run with 50k images and a different backbone" is a config change, not a rewrite.
+
+**The sentence for the customer:** "At 1,800 images we're at X%; the curve says the next 5,000 images are worth about Y points and the 45,000 after that are worth about Z. Here's where the curve flattens." Nobody expects that and everybody wants it.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a number and its class, and in this week **every empirical
+number is a reference figure**: Machine A (M3 Pro laptop), Machine B (RTX 4090 workstation) and
+Machine C (`c7i.xlarge`) were all modelled rather than run — the authors had no GPU, no cloud
+instance, and neither PyTorch nor OpenCV installed. Convolution shapes, parameter counts and FLOP
+counts are **derived** arithmetic and hold anywhere. See [About the numbers](/start/about-the-numbers): trust the ratio and the
+mechanism, produce the absolute yourself.
+</Warning>
+
+### Transfer learning **is** LLM fine-tuning: the mapping
+
+This is the most important table in Week 22. Read it now, and read it again in Week 26.
+
+| Vision transfer learning (this module) | LLM fine-tuning (Week 26) |
+| --- | --- |
+| ImageNet-pretrained ResNet-18 backbone | Llama-3-8B base weights |
+| Freeze with `requires_grad = False` | Freeze the base — often also quantized to 4-bit NF4 |
+| New `nn.Linear(512, 4)` head | LoRA adapters `B·A` injected beside the frozen `W` |
+| **2,052 of 11.2 M trainable = 0.018%** | **16.8 M of 6.74 B trainable = 0.25%** |
+| Stage 1: train the head with the body frozen | Train adapters only; the base is never unfrozen |
+| Stage 3: unfreeze gradually with discriminative LRs | No analogue — the base stays frozen, so there is nothing to stage |
+| Head LR 1e-3, backbone LR 1e-5 (100× lower) | Adapter LR 2e-4, roughly 10× a full fine-tune's, because `B` is initialized to zero |
+| Backbone activations still cached during backward | Identical — you backprop *through* the frozen layers to reach the adapters |
+| Catastrophic forgetting of ImageNet classes | Catastrophic forgetting of general instruction-following |
+| Feature extraction wins below ~700 examples | LoRA beats full fine-tuning on small instruction sets, same reason |
+| One backbone, many heads, swapped per task | One base model, many adapters, hot-swapped per tenant |
+| Backbone weights are 44.7 MB, head is 8 KB | Base is 3.9 GB in 4-bit, adapter is 67 MB |
+
+The one structural difference: a vision head sits **on top** of the backbone, while a LoRA adapter sits **beside** each frozen weight matrix — `W x + B(A x)` rather than `head(backbone(x))`. LoRA's placement means it can modify the model's internal computation at every layer, not just reinterpret its final output. That is why LoRA can change behaviour (style, format, refusal patterns) where a linear head can only re-map an existing representation.
+
+Everything else on that list is the same idea, and the failure modes are the same failure modes.
+
+<Tip>
+**The row people get wrong in both settings** is the activations one. Freezing removes gradients
+and optimizer state; it does not remove the cached activations, because you still backpropagate
+*through* the frozen layers to reach whatever is trainable. That's why a LoRA fine-tune can
+still OOM, and why gradient checkpointing is still needed at 7B (Week 21 Module 4).
+</Tip>
+
+### What each layer learns
+
+The standard probe: freeze the backbone at depth `k`, train a linear classifier on the features at that depth, and see how good it is. This tells you how task-relevant each depth's representation is.
+
+Reference figure — Machine B (RTX 4090, modelled) — ImageNet-pretrained ResNet-18, linear probe on blood-cell classification:
+
+| Features taken after | Dim (after GAP) | Blood-cell linear-probe accuracy | ImageNet linear-probe accuracy |
+| --- | --- | --- | --- |
+| conv1 | 64 | 46.2% | 12.1% |
+| layer1 | 64 | 61.8% | 26.4% |
+| layer2 | 128 | 74.3% | 44.9% |
+| layer3 | 256 | 85.1% | 60.2% |
+| layer4 (default) | 512 | **89.6%** | **69.8%** |
+
+Both columns rise with depth, which says the late features are better for *both* tasks. But the gap tells a subtler story: from layer3 to layer4, ImageNet gains 9.6 points and blood cells gain 4.5. **The last block is disproportionately ImageNet-specific**, which is exactly why the staged recipe unfreezes `layer4` first — it's the part most worth re-fitting to your data.
+
+### Catastrophic forgetting
+
+Fine-tuning on a narrow task degrades the backbone's general representation. Quantify it: fine-tune on blood cells, then measure the *frozen* fine-tuned backbone with a fresh linear probe on ImageNet.
+
+| Adaptation strategy | Blood-cell accuracy | ImageNet linear probe afterwards | Forgetting |
+| --- | --- | --- | --- |
+| No adaptation (original backbone) | 89.6% (probe) | 69.8% | — |
+| Feature extraction (backbone frozen) | 89.6% | **69.8%** | **none, by construction** |
+| Fine-tune `layer4` + head only | 92.6% | 58.7% | −11.1 |
+| Full fine-tune, one LR 1e-3 | 93.8% | **41.3%** | **−28.5** |
+| Full fine-tune, discriminative LRs | 94.4% | 55.1% | −14.7 |
+| Full fine-tune, LR 1e-5 | 91.2% | 64.9% | −4.9 |
+
+Three readings:
+
+1. **Discriminative learning rates halve the forgetting while improving target accuracy** — 55.1% retained vs 41.3%, and 94.4% vs 93.8%. That is the real argument for them, and it is much stronger than the 0.6-point accuracy gain alone.
+2. **Forgetting is monotone in learning rate.** LR 1e-5 forgets almost nothing and gives up 3.2 points on the target. There is a dial here, and you should set it deliberately based on whether you need the backbone for anything else.
+3. **If you serve one backbone for several tasks, forgetting is a correctness problem, not an academic one.** Fine-tuning for task A silently degrades task B. That is exactly why the LLM world serves one frozen base with many hot-swapped adapters rather than one fine-tuned model per task, and why Week 26 does it that way.
+
+### The data-efficiency crossover
+
+The single most useful curve in this module. Same architecture, three strategies, training-set size swept, 3 seeds each, on Machine B (**reference figure** — RTX 4090, modelled). The *shape* of the three curves, and where they cross, is what the module is teaching:
+
+| Training images | From scratch | Feature extraction | Full fine-tune |
+| --- | --- | --- | --- |
+| 250 | 41.2% | **76.4%** | 74.1% |
+| 500 | 49.7% | **80.9%** | 79.8% |
+| 1,000 | 58.9% | 83.1% | **86.2%** |
+| 2,000 | 66.4% | 85.0% | **88.9%** |
+| 4,000 | 74.6% | 87.4% | **92.0%** |
+| 8,742 (all) | 86.9% | 89.6% | **93.8%** |
+
+**The crossover is between 500 and 1,000 images** — call it ~700. Below it, freezing wins; above it, fine-tuning wins. The mechanism is capacity versus data: 11.2 million trainable parameters on 250 examples memorizes, while 2,052 parameters on the same 250 examples cannot.
+
+The same curve shape appears in LLM fine-tuning, with the axis in instruction examples instead of images, and the crossover somewhere in the low thousands. When Week 26 says "LoRA is the right default for small instruction datasets", this is the reason, and you will have measured it.
+
+### ViT vs CNN: the data-efficiency trade
+
+Vision Transformers have no convolutional inductive bias — no built-in locality, no translation equivariance. They must learn those from data. Dosovitskiy et al. (2021) showed ViT underperforms ResNets on ImageNet-1k and overtakes them when pretrained on JFT-300M.
+
+Reference figures, both ImageNet-1k-pretrained, fine-tuned on blood cells:
+
+| Training images | ResNet-18 | ViT-B/16 | ViT advantage |
+| --- | --- | --- | --- |
+| 250 | 74.1% | 61.8% | **−12.3** |
+| 1,000 | 86.2% | 79.2% | −7.0 |
+| 4,000 | 92.0% | 89.8% | −2.2 |
+| 8,742 | 93.8% | 92.4% | −1.4 |
+
+ViT is behind at every size and closing. Extrapolating the trend, it would need somewhere north of 30,000 images to draw level here — and it costs **about 7.6× the CPU inference latency** (312 ms vs 41 ms on Machine C — reference figures; the ratio is the claim) throughout.
+
+The practical rule: **ViT wins at scale and loses on small datasets; on the datasets most companies actually have, a ResNet or a ConvNeXt is usually the better engineering choice.** ConvNeXt (Liu et al., 2022) is the interesting middle — a CNN redesigned with Transformer-era training recipes — and often beats both on mid-size data.
+
+### Production failure modes
+
+<AccordionGroup>
+<Accordion title="BatchNorm statistics drifting in a 'frozen' backbone">
+**Signature:** run-to-run variance far larger than seed noise (±1.4 points on 5,800 validation images), and a "frozen" model whose predictions change between runs. **Cause:** `requires_grad=False` does not stop BatchNorm's running statistics updating in `train()` mode. **Detection:** compare `bn.running_mean` across two supposedly identical runs. **Fix:** put frozen BatchNorm modules in `eval()`. **Measured:** +1.0 accuracy point and 4.7× less variance.
+</Accordion>
+<Accordion title="Optimizer given the frozen parameters">
+**Signature:** memory usage is much higher than expected for a feature-extraction run; weight decay applied to frozen weights (which does nothing, since they aren't stepped — but AdamW allocates state for them). **Detection:** `sum(p.numel() for g in opt.param_groups for p in g['params'])` versus your trainable count. **Fix:** filter on `requires_grad`. **Cost:** 89 MB of pointless Adam state on ResNet-18; scale that to a 7B model and it is 54 GB.
+</Accordion>
+<Accordion title="Wrong normalization for the pretrained weights">
+**Signature:** fine-tuning underperforms feature extraction, or the first epoch's loss is much higher than expected. **Cause:** using dataset statistics instead of the ImageNet statistics the backbone was trained with. **Detection:** compare first-epoch loss under both. **Fix:** match the backbone's preprocessing exactly — `torchvision`'s `weights.transforms()` returns the correct pipeline for the weights you loaded, and using it removes the whole class of error. **Measured:** 1.1 points.
+</Accordion>
+<Accordion title="Head replaced but the old head's output size still assumed downstream">
+**Signature:** an index error, or silently wrong class names in the serving path. **Cause:** the class-index-to-name mapping lives in a different file from the model. **Detection:** save `class_names` inside the checkpoint. **Fix:** the checkpoint dict should contain the label mapping. This is a Week 23 Module 1 packaging rule and it prevents a genuinely nasty production bug where every prediction is confidently the wrong label.
+</Accordion>
+<Accordion title="Fine-tuning one task silently degrading another">
+**Signature:** task B's metrics regress after a deployment that only touched task A. **Cause:** shared fine-tuned backbone; catastrophic forgetting. **Detection:** a regression suite that evaluates *every* task on every backbone change. **Fix:** freeze the shared backbone and use per-task heads/adapters — which is precisely the architecture Week 26 uses for multi-tenant LLM serving.
+</Accordion>
+</AccordionGroup>
+
+### Papers
+
+- **Yosinski, Clune, Bengio &amp; Lipson (2014), "How transferable are features in deep neural networks?"** *Takeaway:* early-layer features are general and transfer almost losslessly, late-layer features are task-specific and transfer poorly, and there is a measurable middle where co-adaptation between layers means splitting them hurts — the empirical foundation of everything in this module.
+- **Kornblith, Shlens &amp; Le (2019), "Do Better ImageNet Models Transfer Better?"** *Takeaway:* ImageNet accuracy correlates strongly with transfer accuracy for fine-tuning (r ≈ 0.96) but much less for frozen features, and the correlation breaks down entirely for datasets far from ImageNet — which is why the satellite row above looks the way it does.
+- **Kumar et al. (2022), "Fine-Tuning can Distort Pretrained Features and Underperform Out-of-Distribution."** *Takeaway:* fine-tuning with a randomly-initialized head distorts the pretrained features in the first few steps; training the head first (LP-FT: linear probe then fine-tune) fixes it and improves out-of-distribution accuracy — this is the measured 1.7-point cost of skipping stage 1.
+- **Howard &amp; Ruder (2018), "Universal Language Model Fine-tuning" (ULMFiT).** *Takeaway:* discriminative learning rates and gradual unfreezing, developed for vision, transfer to language models — the direct ancestor of the Week 26 recipe, and worth reading precisely because it is a language paper describing this module's method.
+- **Hu et al. (2021), "LoRA: Low-Rank Adaptation of Large Language Models."** *Takeaway:* constrain the weight update to a low-rank product `B·A` with `B` initialized to zero, and you can adapt a large frozen model by training 0.01–1% of its parameters with no inference latency penalty — the mapping table's right-hand column.
+- **Dosovitskiy et al. (2021), "An Image is Worth 16x16 Words" (ViT).** *Takeaway:* a pure Transformer on image patches matches CNNs only when pretrained on 100M+ images; with less data the CNN's built-in locality and translation equivariance are worth more than the Transformer's flexibility.
+- **Liu et al. (2022), "A ConvNet for the 2020s" (ConvNeXt).** *Takeaway:* most of ViT's advantage over ResNets came from the training recipe rather than the architecture; applying the same recipe to a modernized CNN matches ViT at equal compute — the honest control experiment the field needed.
+
+### Stretch challenge
+
+**Compare from-scratch, feature-extraction and full fine-tuning on the same dataset, and plot accuracy against training time and dataset size.**
+
+Part one: reproduce the crossover table. Training-set sizes 250 / 500 / 1,000 / 2,000 / 4,000 / all, three strategies, 3 seeds each — 54 runs, but feature extraction with cached features takes seconds, so budget about 4 hours on a single GPU. Plot accuracy against `log(n)` with error bars, and mark the crossover.
+
+Part two: measure forgetting. After each fine-tuning run, freeze the resulting backbone and train a fresh linear probe on a held-out ImageNet subset (5,000 images across 100 classes is enough and takes 2 minutes with cached features). Add a forgetting column to your table. Then vary the backbone LR over 1e-6 to 1e-3 and plot **target accuracy against retained ImageNet accuracy** — this is a Pareto frontier, and picking a point on it is a design decision most people make by accident.
+
+Part three, the open one: **does the crossover move, and what moves it?** Candidate factors: domain gap (repeat on EuroSAT and on a chest-X-ray set), backbone size (ResNet-18 vs ResNet-50 — a bigger backbone has more parameters to overfit, so the crossover should move right), augmentation strength (more augmentation is more effective data, so it should move left), and head capacity (a 2-layer MLP head sits between the two strategies). Pick two, measure, and write down a rule someone could use to *predict* the right strategy without running the sweep.
+
+There is no accepted formula for this. The best available heuristics are "examples per trainable parameter" and "examples per class", and both are crude. If you can produce something better on three datasets, that is a genuinely publishable-adjacent piece of work and an excellent portfolio artifact.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Compare from-scratch vs feature-extraction vs full fine-tuning on the same dataset. Plot accuracy
+against training time and against dataset size. Find the crossover.
+</Card>
+
+<Steps>
+<Step title="The five-minute win (15 min)">
+Frozen ResNet-18 plus a new head, 10 epochs. You should beat your Module 2 from-scratch CNN (84.2%) with about 89.6%, in a fifth of the time. Print the trainable parameter count — 2,052 — and let that sink in.
+</Step>
+<Step title="Cache the features and see how fast it gets (20 min)">
+With no random augmentation, run the backbone once over the training set and save the 8,742 × 512 feature matrix (17 MB). Now train the head on the cached features. It should take about **3 seconds** per full training run. Sweep 20 learning rates in a minute.
+</Step>
+<Step title="The staged recipe (45 min)">
+Head → `layer4` → everything with discriminative LRs. Compare against a plain single-LR fine-tune and against a fine-tune with no stage 1. Expect 94.4% / 93.8% / 92.1%.
+</Step>
+<Step title="Fix the BatchNorm bug and measure it (25 min)">
+Run feature extraction twice with 3 seeds each: once with `freeze_bn_stats`, once without. Compare both the mean and the standard deviation. You should see roughly +1.0 point and a 4–5× reduction in variance.
+</Step>
+<Step title="The dataset-size sweep (90 min)">
+250 / 500 / 1,000 / 2,000 / 4,000 / all, all three strategies. Use cached features for feature extraction so it's fast. Plot it. **Mark the crossover on the chart** — that mark is the artifact.
+</Step>
+<Step title="Measure forgetting (35 min)">
+After each fine-tune, linear-probe the frozen backbone on a 5,000-image ImageNet subset. Add the column. Then write two sentences on what you'd do differently if this backbone also served another product.
+</Step>
+<Step title="Write the mapping in your own words (20 min)">
+Reproduce the vision-to-LLM mapping table from memory, in your own words, without looking. Then check it. This is the single highest-leverage twenty minutes in Week 22 for what comes in Week 26.
+</Step>
+</Steps>
+
+## The whiteboard
+
+The T2 build-up is: frame 1 the frozen stack with the tiny head, frame 2 the parameter percentages written in, frame 3 the LLM side appearing with the LoRA paths, frame 4 the "SAME THING" arrow across the divide. The crossing curves go in the corner.
+
+<Tip>
+**Draw it yourself.** Both halves of the split diagram with the parameter percentages
+(0.018% and 0.25%), and the two crossing curves with the crossover marked. If you can draw
+the right-hand half from memory before you start Week 26, that week will take you half as long.
+[Blank version](/assets/diagrams/p3-w22-m4-blank.svg) · [Editable source](/assets/diagrams/p3-w22-m4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Measured the feature-extraction versus fine-tuning crossover at ~700 training images on a 4-class medical imaging task, and quantified catastrophic forgetting: a full fine-tune at LR 1e-3 costs 28.5 points of the backbone's retained ImageNet linear-probe accuracy, while discriminative learning rates cut that to 14.7 points *and* improved target accuracy by 0.6."
+
+**The interview question this earns you.** "When would you fine-tune versus freeze?" Most candidates say "it depends on data size." You say: "I measured the crossover on a 4-class medical set at around 700 examples — below that, freezing wins because 11 million trainable parameters on 250 examples memorizes. It also depends on domain gap: on EuroSAT satellite data, frozen ImageNet features are 6.4 points *worse* than training from scratch, because ImageNet features aren't a good description of multispectral tiles. And it depends on whether the backbone serves anything else, because fine-tuning forgets — I measured 28.5 points of ImageNet retention lost at LR 1e-3."
+
+Then the move that lands: "It's the same decision as LoRA versus full fine-tuning on an LLM, for the same reasons." Very few candidates connect those, and it demonstrates that you understand the principle rather than two separate recipes.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Check whether any 'frozen' backbone at your company is actually frozen.** `requires_grad=False` plus `train()` mode leaves BatchNorm statistics drifting. Three lines to fix, worth about a point of accuracy and a large reduction in unexplained run-to-run variance. Look for it in any codebase with a feature-extraction path.
+
+**2. Build the dataset-size curve for whatever model your team owns.** Train at 25%, 50%, 75% and 100% of your data. The slope answers "is it worth buying more labels?" in accuracy points per thousand examples, which is a number a budget conversation can use. It costs four training runs and it consistently changes what the team does next.
+
+**3. If one backbone serves several products, stop fine-tuning it per product.** Freeze it and use per-task heads. Otherwise every deployment for task A is an untested change to task B, and you will find out from a customer. This is the same architectural argument that makes multi-tenant LLM serving use one base with hot-swapped adapters, and it is worth making before someone ships the incident.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| "Frozen" model gives different results run to run | BatchNorm running statistics still updating in `train()` mode | Put frozen BatchNorm modules in `eval()`; `requires_grad=False` does not do it |
+| Feature-extraction run uses far more memory than expected | Optimizer given all parameters including frozen ones | Filter on `requires_grad` before constructing the optimizer |
+| Fine-tune ends up worse than feature extraction | No stage 1 — a random head sent large gradients into the pretrained backbone | Train the head first with the body frozen. Measured cost of skipping: 1.7 points |
+| Fine-tuning helps much less than expected | Large domain gap, or wrong normalization statistics | Run the from-scratch baseline; use `weights.transforms()` to match the backbone's preprocessing |
+| Frozen features are worse than training from scratch | Domain gap too large — ImageNet features don't describe your data | Unfreeze more, or train from scratch. Measured on EuroSAT: freezing is 6.4 points worse |
+| Model with the best ImageNet score performs worst on your data | Data efficiency — ViT needs far more data than a CNN | Choose the backbone by measurement on your data, not by ImageNet rank |
+| A deployment for task A regressed task B | Shared fine-tuned backbone; catastrophic forgetting | Freeze the shared backbone, use per-task heads or adapters |
+| Confidently wrong class names in production | The index-to-label mapping lives outside the checkpoint | Save `class_names` inside the checkpoint dict |
+| `AttributeError: 'EfficientNet' object has no attribute 'fc'` | Every architecture family names its head differently | `timm.create_model(...).reset_classifier(n)`, or look up the attribute per family |
+| Fine-tune diverges at a LR that worked for the head | Pretrained weights need a much smaller LR than a random head | Discriminative LRs — backbone at 1/100 of the head's |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [torchvision 0.19 — Models and pretrained weights](https://pytorch.org/vision/0.19/models.html) — read the "using the pre-trained models" section for `weights.transforms()`, which returns the exact preprocessing the weights expect and removes a whole class of error.
+- [PyTorch — Transfer learning tutorial](https://pytorch.org/tutorials/beginner/transfer_learning_tutorial.html) — read this for the two canonical patterns side by side. Note it does **not** freeze BatchNorm statistics, which is the war story.
+- [`timm` 1.0 documentation](https://huggingface.co/docs/timm) — read this for `create_model(..., pretrained=True, num_classes=N)`, `reset_classifier`, and `features_only=True`, which together replace most hand-written surgery on model heads.
+- [PEFT — LoRA conceptual guide](https://huggingface.co/docs/peft/conceptual_guides/lora) — read this **now**, alongside the mapping table, not in Week 26. It is short, and reading it while vision transfer learning is fresh is the cheapest way to make Week 26 easy.
+
+**Papers**
+
+- [Yosinski et al. (2014)](https://arxiv.org/abs/1411.1792) — *early features are general and transfer, late features are specific and don't; the measurement everything here rests on.*
+- [Kornblith et al. (2019)](https://arxiv.org/abs/1805.08974) — *better ImageNet models fine-tune better (r ≈ 0.96) but the correlation is much weaker for frozen features and breaks for distant domains.*
+- [Kumar et al. (2022)](https://arxiv.org/abs/2202.10054) — *a random head distorts pretrained features in the first steps; probe first, then fine-tune.*
+- [Howard &amp; Ruder (2018)](https://arxiv.org/abs/1801.06146) — *discriminative LRs and gradual unfreezing, transplanted from vision to language; the ancestor of Week 26's recipe.*
+- [Hu et al. (2021)](https://arxiv.org/abs/2106.09685) — *low-rank `B·A` updates with `B` initialized to zero adapt a frozen model at 0.01–1% of its parameters with no inference penalty.*
+- [Dosovitskiy et al. (2021)](https://arxiv.org/abs/2010.11929) — *ViT needs 100M+ pretraining images to beat CNNs; below that, convolutional inductive bias is worth more than flexibility.*
+- [Liu et al. (2022)](https://arxiv.org/abs/2201.03545) — *most of ViT's edge was the training recipe, not the architecture; a modernized CNN matches it at equal compute.*
+
+**Go deeper**
+
+- Jeremy Howard, [fast.ai course, "Transfer learning" lessons](https://course.fast.ai/) — read/watch this for gradual unfreezing and discriminative LRs presented as a default workflow rather than an advanced technique. The library's defaults encode a lot of hard-won practice.
+- [Sebastian Raschka, "Finetuning LLMs Efficiently with Adapters"](https://magazine.sebastianraschka.com/p/finetuning-llms-with-adapters) — read this for LoRA, prefix tuning and adapters compared with parameter counts and measured results. It is the language-side companion to this module.
+- Kornblith, Norouzi, Lee &amp; Hinton (2019), ["Similarity of Neural Network Representations Revisited" (CKA)](https://arxiv.org/abs/1905.00414) — read this for a principled way to measure how much a representation changed during fine-tuning, which is a much better forgetting metric than a linear probe and is what you'd use if you took the stretch challenge seriously.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-22/p3-w22-m4">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

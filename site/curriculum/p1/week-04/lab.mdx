@@ -1,0 +1,198 @@
+---
+title: "Lab — Async Concurrent Downloader"
+description: "Week 4 lab · three tracks · self-graded"
+icon: "flask-conical"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**`LAB-P1-W04`** — one lab, three tracks. Beginners start at `basic` and climb.
+Working professionals start at `standard`. `hard` is where the interview stories come from.
+</Note>
+
+## The ticket
+
+> **NEXUS-455 · The dataset sync takes 9 hours and corrupts files when it is interrupted**
+>
+> Reported by: ML platform
+>
+> The nightly job downloads about 10,000 model shards and datasets from a partner API. It is a
+> `for` loop with `requests.get`, and it takes 9 hours — which is fine until it fails at hour 7
+> and we start again from zero.
+>
+> Two incidents last month. First, someone "fixed" it with 200 threads and we got rate-limited
+> for 40 minutes, which broke three other teams that share the API key. The limit is 500
+> requests per minute for the whole organisation. Second, the job was killed mid-write during a
+> deploy and left a truncated `.safetensors` file that a training run then loaded — the loss
+> curve looked plausible for six hours before anyone realised.
+>
+> We need this to be fast, to stay inside 500 req/min, to survive being killed at any moment,
+> and to be able to prove afterwards that every file is intact. The box it runs on has 512 MB.
+
+**Time box.** `basic` 1–2 h · `standard` 5–7 h · `hard` 4–6 h on top of `standard`.
+
+## Get the starter
+
+```bash
+cd labs/p1/week-04
+tree -L 2
+# starter/   basic/  standard/  hard/  tests/  fixtures/
+# solution/  (do not open until you have a failing attempt)
+
+python3 fixtures/slow_server.py  &          # 127.0.0.1:8099 — fixed 50 ms, always 200
+python3 fixtures/flaky_server.py &          # 127.0.0.1:8098 — 30% fail, 500/min, Retry-After
+```
+
+<Tabs>
+<Tab title="basic">
+
+**Roughly 60% is written for you.** The URL list, the fixture servers and the test harness exist. You write the fetch loop.
+
+Fetch a list of URLs concurrently with `asyncio.gather` and print a progress counter.
+
+```python
+# starter/basic/download.py
+async def fetch_all(urls: list[str]) -> list[bytes]:
+    """TODO: fetch all URLs concurrently and return their bodies, in order."""
+```
+
+**Acceptance criteria — all five:**
+
+1. `pytest tests/test_basic.py` passes: 40 URLs are fetched and the bodies come back **in input order**.
+2. Wall time for 40 URLs against the 50 ms fixture server is **under 0.5 s**. Sequential would be 2.0 s; the reference measured **0.081 s**. If you are near 2 s, something is blocking the loop.
+3. **One `ClientSession` for all requests.** The harness inspects your code for a session created inside the fetch function — a fresh session per request means a fresh TCP handshake each time and is an automatic fail on this criterion.
+4. A progress counter prints as responses arrive, not after they all finish. Use `asyncio.as_completed` or a callback.
+5. `PYTHONASYNCIODEBUG=1 python3 download.py` produces **no** "Executing ... took N seconds" warnings. That warning means you blocked the loop.
+
+<Info>
+The most common `basic` failure is `time.sleep`, `requests.get` or a synchronous file write
+inside a coroutine. All three freeze the single thread, so `gather` schedules 40 tasks and the
+first one refuses to give the loop back. Debug mode names the offending coroutine in one run.
+</Info>
+
+</Tab>
+<Tab title="standard">
+
+**Spec and tests only.** You write a class-based downloader.
+
+```python
+class Downloader:
+    def __init__(self, *, concurrency: int = 20, attempts: int = 4,
+                 rate_per_sec: float | None = None) -> None: ...
+    async def fetch(self, job: Job) -> Result: ...
+    async def run(self, jobs: list[Job]) -> list[Result]: ...
+```
+
+**Acceptance criteria — all nine:**
+
+1. **Bounded concurrency**, enforced by both an `asyncio.Semaphore` *and* `TCPConnector(limit=, limit_per_host=)`. The harness counts simultaneous connections at the server and fails if the configured bound is ever exceeded.
+2. **Retries with full jitter**: `random.uniform(0, min(cap, base * 2 ** attempt))`. Fixed backoff, or jitter of the `delay ± 10%` kind, fails this criterion — the harness inspects the arrival-time histogram at the server and fails if retries cluster.
+3. **Error classification.** 4xx other than 408/425/429 must not be retried; 429 must honour `Retry-After` (both delta-seconds and HTTP-date forms), capped.
+4. **Checksum verification.** Every job carries an expected SHA-256; a mismatch deletes the partial file and either retries or fails loudly. Never leave a bad file in place.
+5. **Atomic publish.** Write to `NAME.part` in the same directory, then `os.replace` to the final name. The harness kills the process at random points and asserts that no file with the final name is ever incomplete.
+6. **Graceful `Ctrl-C`.** `SIGINT` cancels in-flight tasks, deletes `.part` files, and exits **130** within 2 seconds. `CancelledError` must never be swallowed.
+7. **Per-file progress**, and an aggregate line with completed/total, bytes/second and ETA — all to **stderr**, so stdout stays usable for data.
+8. **Structured logs** (Week 3, Module 3): one JSON object per line with a run ID and a per-job ID.
+9. **Tests against the local flaky server**, covering: a transient 503 that succeeds on retry, a permanent 404 that is not retried, a 429 with `Retry-After`, a checksum mismatch, and a mid-download cancellation.
+
+<Info>
+Criterion 5 is where the ticket's second incident lives. `os.replace` within one filesystem is
+atomic (Week 2, Module 3), so a reader sees either the old file or a complete new one. Writing
+in place means a killed process leaves a truncated file with the *right name*, which is exactly
+what poisoned the training run.
+</Info>
+
+</Tab>
+<Tab title="hard">
+
+**The constraints the `standard` solution fails: scale, a shared rate limit, a memory ceiling, and proof.**
+
+**10,000 URLs, a 500 requests/minute organisation-wide limit, and a 300 MB RSS ceiling.**
+
+**Acceptance criteria — all seven:**
+
+1. **Never exceed 500 req/min**, measured at the server across the whole run — including retries. The reference client uses a token bucket; the harness fails the run on a single 429 caused by your own volume. Note the arithmetic: 500/min is 8.33 req/s, so 10,000 requests has a **floor of 20 minutes**. Your job is to get close to it, not to beat it.
+2. **Peak RSS under 300 MB**, reported from `getrusage` and cross-checked with `/usr/bin/time`. This forbids materialising 10,000 tasks or 10,000 response bodies; use bounded worker tasks pulling from a bounded `asyncio.Queue`.
+3. **Resumable.** Kill the process at any point and restart: it must not re-download completed files, and it must resume partial ones with HTTP `Range` where the server supports it. Prove it with a run killed three times at random points whose total downloaded bytes are within 5% of a clean run's.
+4. **Prove no corruption and no double-writes.** Every file's SHA-256 matches; the harness also watches the output directory and fails if any final filename is written twice.
+5. **A throughput and latency report**: requests/second, p50/p95/p99 per request, retry count, 429 count, bytes/second, and peak RSS. Include the wall time against the 20-minute floor.
+6. **Compare sync, threaded and async** on an identical 500-URL subset, with speedup, worker count, efficiency and machine load for each. The reference matrix (Module 1) measured sequential 2.184 s, threads(20) 0.155 s, asyncio 0.081 s on 40 requests.
+7. **A deadline**, not just an attempt count: the whole run takes a budget, and a job whose retries would exceed it is abandoned and recorded rather than retried.
+
+**Reference measurements** (Apple M3 Pro, macOS 15, CPython 3.13.2, aiohttp 3.14.3, against the local fixture servers):
+
+| Client | Success | Retries | Server 429s | Wall | p50 | p99 |
+|---|---|---|---|---|---|---|
+| naive (no retry) | 285/400 (71.3%) | 0 | 0 | **0.16 s** | 87 ms | 132 ms |
+| retry + full jitter | 358/400 (89.5%) | 327 | **185** | 14.20 s | 612 ms | 12,885 ms |
+| **retry + token bucket (8/s)** | **400/400 (100%)** | 156 | **0** | 68.59 s | 34,342 ms | 68,164 ms |
+
+Read those rows before you start. **The retrying client caused 185 of its own rate-limit responses**, and that is the ticket's first incident in miniature.
+
+<Warning>
+Three traps are deliberately in this track.
+
+**The bucket rate is a ceiling, not a floor.** The server allows 8.33 req/s; the reference set
+8 and therefore could never go faster than 8 req/s no matter how much headroom existed. Set it
+too low and you waste the budget; too high and you are the retrying client above. Sweep it and
+justify your value.
+
+**`gather` over 10,000 URLs blows criterion 2 immediately** — 10,000 tasks and 10,000 sockets
+created at once. Bounded workers pulling from a bounded queue is the shape that has an upper
+bound on memory *and* gives back-pressure.
+
+**Resumability interacts with atomicity.** A `.part` file left by a killed run is either a
+resumable prefix or garbage, and you cannot tell without recording how many verified bytes it
+holds. Keep a small sidecar record, or re-verify the prefix; do not assume the file's length is
+the number of good bytes.
+</Warning>
+
+</Tab>
+</Tabs>
+
+## Ship it
+
+<Card title="This is the part people skip" icon="rocket" horizontal>
+A public repo with a benchmark README comparing sync, threaded and async on the identical workload.
+</Card>
+
+The README must contain:
+
+1. **Your machine and toolchain**: CPU, core count, OS, Python and library versions, and the **load average during measurement**.
+2. **The three-way comparison** on an identical workload, with time, speedup, worker count and efficiency for each. Explain why the async number is what it is relative to the one-round-trip floor.
+3. **The flaky-server tuning table**: at least three client configurations with success rate, wall time, retries, server 429s and p99. Say which one you would ship and for what caller.
+4. **The bucket-rate sweep** with the value you chose and why — the point at which success rate stops improving and p99 starts getting worse.
+5. **The crash-safety evidence**: N kills at random points, zero corrupt files, checksums verified, and resumption within 5% of a clean run's bytes.
+6. **One thing you got wrong first.** Graded.
+
+## Verify yourself
+
+```bash
+cd labs/p1/week-04
+make verify                 # ruff + mypy + pytest against both fixture servers
+make verify-bounds          # asserts the server never saw more than the configured concurrency
+make verify-ratelimit       # asserts zero 429s across a full hard-track run
+make verify-chaos           # kills the process at random points; asserts no corrupt output
+make verify-memory          # runs the hard track under a 300 MB ceiling
+make bench                  # sync vs threaded vs async on the identical workload
+```
+
+`make verify` fails on any ruff finding, any mypy error, any test failure, any blocked-loop warning under `PYTHONASYNCIODEBUG=1`, and any file left in `.part` state after a clean run.
+
+## Rubric
+
+| Dimension | 0 | 1 | 2 | 3 |
+| --- | --- | --- | --- | --- |
+| Correctness | tests fail | happy path only | retries classified, `Retry-After` honoured, checksums verified | resumable across kills, no double-writes, deadline enforced |
+| Concurrency | unbounded `gather` | a semaphore | semaphore **and** connector limits, sized with Little's law | rate limit never exceeded across the full run, including retries |
+| Robustness | no timeouts | timeouts set | full jitter, atomic publish, `Ctrl-C` exits 130 in under 2 s | survives N random kills with zero corruption, proven by checksum |
+| Explanation | no README | usage documented | the three-way benchmark with speedup and efficiency | the bucket sweep defended, the p50-versus-p99 gap explained, one wrong turn told honestly |
+
+**Passing bar:** 2 or better on every row. **Portfolio bar:** 3 on Robustness and Explanation — the chaos evidence and the tuning sweep are what make this repo worth linking, and they are the two rows most people leave at 1.
+
+<Card title="Reference solution" icon="lock" href="/solutions/p1/week-04/lab">
+  Hidden page. Open it after you have a failing attempt of your own.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

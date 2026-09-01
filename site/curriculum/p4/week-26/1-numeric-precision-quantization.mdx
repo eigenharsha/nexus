@@ -1,0 +1,691 @@
+---
+title: "Numeric precision & quantization"
+description: "Week 26 · Module 1 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 26 · Module 1 · `P4-W26-M1`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Week 1 (how a number is stored in bits), Week 25 M4 (parameter counting), Week 25 M5 (decode is bandwidth-bound — quantization is a bandwidth optimisation before it is a memory one), Week 19 (evaluating a model properly).
+- **Unlocks:** Module 3 (QLoRA quantizes the frozen base), Module 5 (what you serve), Week 27–28 (running an embedding model and a re-ranker on the same box).
+- **One-line:** you will be able to pick a quantization level for a model on a given GPU using measured quality, measured speed and an honest confidence interval — rather than by copying whatever the model card suggests.
+
+## Why you should care
+
+**For Aarav (student).** Quantization is what lets you run a genuinely capable 8B model on a laptop
+for free, which is the difference between doing this course's remaining seven weeks on your own
+hardware and paying for cloud GPUs. Week 1's lesson about bits pays off here in the most literal
+way possible.
+
+**For Meera (working professional).** The question "can we run this on the GPU we already have?"
+is answered by one multiplication, and the follow-up "what does that cost us in quality?" is
+answered by an eval you can build in an afternoon. Teams routinely ship 4-bit because a blog post
+said it was fine, having measured nothing. You can be the person with the Pareto curve.
+
+## The mental model
+
+A model's weights are just a lot of numbers. Storing each in fewer bits makes the model smaller,
+which — because decode is memory-bandwidth-bound — makes it *faster* in almost exact proportion.
+The cost is precision: each stored number is now a rounded approximation. Quantization is the
+engineering of choosing *which* roundings hurt least.
+
+<Frame caption="The same number in 32, 16, 8 and 4 bits, with the error written in.">
+  <img src="/assets/diagrams/p4-w26-m1.svg" alt="Hand-drawn sketch: bit layouts and quantization error" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w26-m1-dark.svg" alt="Hand-drawn sketch: bit layouts and quantization error" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w26-m1
+tier: T2
+one-sentence-goal: show that fewer bits means a coarser grid of representable values, and that the error is not uniform - it is dominated by a handful of outlier weights.
+elements:
+  - four horizontal bit-strips drawn one above the other, each divided into labelled cells: fp32 "1 sign | 8 exponent | 23 mantissa", bf16 "1 | 8 | 7", fp16 "1 | 5 | 10", int8 "1 | 7 (plus one shared scale per block)". cells hand-ruled with visible wobble, exponent cells hachured blue, mantissa cells hachured green
+  - to the right of each strip, the value 0.1 stored in that format, hand-written with its error: "0.100000001 (err 1.5e-9) / 0.100097656 (err 9.8e-5) / 0.099975586 (err 2.4e-5) / 0.09843 (err 1.6e-3)"
+  - an amber margin note beside bf16 and fp16: "bf16 has WORSE precision than fp16 but the SAME range as fp32. that is why training uses it - no overflow, no loss scaling"
+  - centre: a number line drawn twice. top copy has closely spaced tick marks labelled "fp16: 1,024 steps between powers of two". bottom copy has 16 widely spaced ticks labelled "int4: 16 levels for the WHOLE block". a weight value drawn as a small cross snapping to the nearest tick on each, with the snap distance drawn as a short red segment
+  - right: a hand-drawn histogram of one layer's weight magnitudes, a tall narrow bell, with three isolated crosses drawn far out to the right, circled in red and labelled "0.1% of dimensions, up to 20x larger. quantize these with everything else and the layer dies"
+  - underneath that, two boxes: "naive int8: keep all in int8 -> broken past 6.7B params" struck through in red, and beside it "LLM.int8(): outliers stay fp16, the rest go int8" with a green tick
+  - bottom: a hand-drawn Pareto scatter, x-axis "GB on disk", y-axis "score / 50", with seven labelled dots Q2_K through Q8_0 and f16, and a hand-drawn frontier curve through them; an amber note "the knee is Q4_K_M. everything left of it falls off a cliff"
+  - dangling arrow bottom-right: "...and now freeze this and train a tiny patch on top -> LoRA"
+numbers-to-write-in: fp32 32.1 GB, fp16 16.1 GB, Q8_0 8.54 GB, Q5_K_M 5.73 GB, Q4_K_M 4.92 GB, Q2_K 3.18 GB for Llama-3-8B; measured 20.1 / 30.1 / 35.2 / 48.5 tok/s on M2 Pro; eval 43 / 42 / 41 / 27 out of 50
+alt: A hand-drawn whiteboard comparing four numeric formats as labelled bit-strips with the value zero point one stored in each and its error written alongside, a number line showing how few representable levels four-bit quantization has, a weight-magnitude histogram with a handful of circled outliers far from the bell, and a Pareto scatter of file size against evaluation score with the knee marked at Q4_K_M.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### What a floating-point number actually is
+
+    Week 1 covered this; here is the part that matters now. A **floating-point** number stores three
+    things: a **sign** bit, an **exponent** (how big, roughly — which power of two), and a
+    **mantissa** (the precise digits). More exponent bits means a wider *range*. More mantissa bits
+    means finer *precision*.
+
+    | Format | sign | exponent | mantissa | range | decimal digits |
+    | --- | --- | --- | --- | --- | --- |
+    | **FP32** | 1 | 8 | 23 | ±3.4 × 10³⁸ | ~7 |
+    | **BF16** | 1 | 8 | 7 | ±3.4 × 10³⁸ | ~2 |
+    | **FP16** | 1 | 5 | 10 | ±65,504 | ~3 |
+
+    Look at BF16 versus FP16 carefully, because this trips up everyone. They are both 16 bits.
+    BF16 spends more of them on exponent, FP16 on mantissa. So **BF16 is less precise but has
+    exactly FP32's range**, and FP16 is more precise but overflows at 65,504. In training, gradients
+    routinely exceed 65,504 or fall below FP16's smallest normal value, so FP16 training needs
+    "loss scaling" (multiply the loss by a big constant, divide the gradients back) while BF16
+    training just works. That is the entire reason modern training uses BF16.
+
+    Store `0.1` in each and look at the errors:
+
+    ```python
+    import torch
+    for dt in (torch.float32, torch.bfloat16, torch.float16):
+        v = torch.tensor(0.1, dtype=dt).item()
+        print(f"{str(dt):17} {v:.12f}   error {abs(v - 0.1):.2e}")
+    ```
+
+    ```
+    torch.float32     0.100000001490   error 1.49e-09
+    torch.bfloat16    0.100097656250   error 9.77e-05
+    torch.float16     0.099975585938   error 2.44e-05
+    ```
+
+    `0.1` is not exactly representable in *any* binary format — that is a Week 1 fact — but the
+    error grows by four orders of magnitude when you drop to 16 bits.
+
+    ### Integer quantization
+
+    Below 16 bits, floating point stops making sense — there are not enough bits to have a useful
+    exponent *and* a useful mantissa. So we switch to integers plus a shared **scale**.
+
+    **Quantization** means: take a block of weights, find the largest magnitude in it, and map that
+    range onto the integers available. For **INT8** the integers are −127 to +127.
+
+    ```
+    scale = max(|w|) / 127
+    q     = round(w / scale)        # an integer in [-127, 127]
+    w'    = q * scale               # the recovered approximation
+    ```
+
+    The **scale** is one FP16 number stored per block. If a block is 64 weights, you store 64
+    INT8 values (64 bytes) plus one FP16 scale (2 bytes) — 8.25 bits per weight, not 8. That
+    overhead is why a "4-bit" 8B model is 4.9 GB rather than 4.0 GB.
+
+    For **INT4** the integers are −7 to +7. Fifteen possible values for a whole block. That is
+    coarse, and it works far better than it has any right to, for a reason Layer 3 explains.
+
+    ### The analogy
+
+    You are photographing a document to email it.
+
+    - **FP32** is a RAW file: every detail, enormous.
+    - **FP16/BF16** is a high-quality JPEG: visually identical, half the size.
+    - **INT8** is a moderate JPEG: you can see compression if you look closely at fine text.
+    - **INT4** is a heavily compressed JPEG: obviously degraded on gradients, still perfectly
+      readable, and one-eighth the size.
+
+    And the key insight that motivates everything in Layer 3: JPEG does not compress every part of
+    the image equally. It spends bits where the eye looks. Good quantization does the same — it
+    spends bits where the *model* looks.
+
+    ### Smallest working example
+
+    Quantize a real tensor to 4 bits and measure what you lost. Twelve lines, CPU, instant.
+
+    ```python
+    # quantize_demo.py   —   torch 2.4.1
+    import torch
+
+    torch.manual_seed(0)
+    w = torch.randn(4096)                       # pretend this is one row of a weight matrix
+
+    def quantize(w, bits, block=64):
+        levels = 2 ** (bits - 1) - 1            # 127 for int8, 7 for int4
+        wb = w.view(-1, block)
+        scale = wb.abs().amax(dim=1, keepdim=True) / levels
+        q = (wb / scale).round().clamp(-levels, levels)
+        return (q * scale).view_as(w), q, scale
+
+    for bits in (8, 4, 2):
+        wq, q, s = quantize(w, bits)
+        err = (w - wq).abs()
+        bits_per_weight = bits + 16 / 64        # payload + one fp16 scale per 64 weights
+        print(f"int{bits}: mean err {err.mean():.5f}  max err {err.max():.5f}  "
+              f"cosine {torch.nn.functional.cosine_similarity(w, wq, dim=0):.6f}  "
+              f"{bits_per_weight:.2f} bits/weight")
+    ```
+
+    ```
+    int8: mean err 0.00745  max err 0.01867  cosine 0.999982  8.25 bits/weight
+    int4: mean err 0.11979  max err 0.26940  cosine 0.995404  4.25 bits/weight
+    int2: mean err 0.53107  max err 1.16443  cosine 0.885738  2.25 bits/weight
+    ```
+
+    ### Line-by-line walkthrough
+
+    - `w.view(-1, block)` — quantize in blocks of 64, not across the whole tensor. If one weight in
+      the whole matrix is 20× larger than the rest, a single global scale wastes almost all of the
+      available integer levels on empty space. Per-block scales are the single most important
+      practical detail in quantization.
+    - `wb.abs().amax(dim=1)` — the scale is set by the largest magnitude *in that block*. This is
+      **absmax** (symmetric) quantization. There is an asymmetric variant that also stores a zero
+      point, which matters for activations (often all-positive after ReLU) and matters less for
+      weights (roughly symmetric around zero).
+    - `.round().clamp(...)` — the clamp guards against the rounding pushing a value past the
+      integer limit.
+    - **Read the cosine similarity, not the mean error.** `0.9954` at 4 bits means the quantized
+      row points in almost exactly the same direction as the original. Since the next thing that
+      happens to this row is a dot product, direction is what matters — magnitude errors partly
+      cancel. That is the intuition for why 4-bit works at all.
+
+    ### Guided practice
+
+    ```python
+    # practice.py
+    import torch
+    torch.manual_seed(0)
+    w = torch.randn(4096)
+    w[137] = 22.0        # ONE outlier, 20x the typical magnitude
+
+    # TODO 1: quantize to int4 with block=64 and report cosine similarity.
+    # TODO 2: now quantize with block=4096 (one scale for everything). Compare.
+    # TODO 3: explain the difference in one sentence, in terms of wasted integer levels.
+    ```
+
+    <Accordion title="Answers">
+    ```
+    block=64    cosine 0.995398
+    block=4096  cosine 0.767341
+    ```
+    **TODO 3.** With one scale for all 4,096 weights, the scale is set by the outlier
+    (`22.0 / 7 = 3.14`), so every ordinary weight — which lives in roughly ±3 — rounds to
+    integer 0 or ±1. Fourteen of the fifteen available levels go unused, and 78% of the weights
+    become exactly zero. With `block=64` the outlier ruins only its own block of 64, and the other
+    63 blocks keep their full resolution. **This is the whole reason per-block or per-channel
+    scaling exists, and it is a preview of the outlier problem in Layer 3.**
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+    1. **Why does BF16 exist when FP16 is more precise?** BF16 has FP32's exponent range, so training gradients neither overflow nor underflow and no loss scaling is needed.
+    2. **What is a quantization scale and where is it stored?** A single higher-precision multiplier per block of weights, stored alongside the integers.
+    3. **Why is a "4-bit" 8B model 4.9 GB and not 4.0 GB?** Per-block scales plus some tensors kept at higher precision; the real figure is about 4.9 bits per weight.
+    4. **Why quantize in blocks rather than per tensor?** One outlier would otherwise consume the whole integer range and force most weights to zero.
+    5. **Why does 4-bit quantization damage the model less than the error numbers suggest?** The next operation is a dot product, which depends on direction; cosine similarity stays at 0.995 even when mean absolute error is 0.12.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### Two ecosystems, and when to use each
+
+    | Ecosystem | Version | Format | Use it for |
+    | --- | --- | --- | --- |
+    | `bitsandbytes` + `transformers` | 0.43.3 / 4.44.2 | on-the-fly INT8 / NF4 | **Training** (QLoRA needs it) and quick experiments in Python |
+    | `llama.cpp` / Ollama | b3600 / 0.3.11 | GGUF (Q2_K … Q8_0) | **Serving on CPU, Apple Silicon, or a small GPU**; single-file distribution |
+    | AutoGPTQ / AutoAWQ | 0.7.1 / 0.2.6 | GPTQ / AWQ | **Serving on NVIDIA** via vLLM, when you want 4-bit with the best measured quality |
+
+    They are not interchangeable. GGUF cannot be fine-tuned. `bitsandbytes` NF4 is excellent for
+    training and mediocre for serving throughput. Pick by what you are doing, not by what is
+    popular.
+
+    ### Loading a quantized model with `bitsandbytes`
+
+    ```python
+    # pip install transformers==4.44.2 bitsandbytes==0.43.3 accelerate==0.33.0 torch==2.4.1
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+    nf4 = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",            # NF4, not plain int4 — see Layer 3
+        bnb_4bit_compute_dtype=torch.bfloat16,  # dequantize to bf16 for the matmul
+        bnb_4bit_use_double_quant=True,       # quantize the scales too: saves ~0.4 bits/weight
+    )
+
+    name = "meta-llama/Meta-Llama-3-8B-Instruct"
+    model = AutoModelForCausalLM.from_pretrained(name, quantization_config=nf4,
+                                                 device_map="auto")
+    print(f"{model.get_memory_footprint() / 1e9:.2f} GB")     # 5.73 GB
+    ```
+
+    `bnb_4bit_compute_dtype` is the one people get wrong. The weights are *stored* in 4 bits and
+    *dequantized to bf16 immediately before every matmul*. You are not doing 4-bit arithmetic; you
+    are doing bf16 arithmetic on weights that were shipped compactly. That is why the memory saving
+    is large and the speed saving on a compute-bound workload is nil — and why on a
+    bandwidth-bound decode workload the speed saving is nearly proportional to the size reduction.
+
+    ### GGUF and Ollama
+
+    ```bash
+    # Ollama 0.3.11
+    ollama pull llama3.1:8b-instruct-q4_K_M     # 4.92 GB
+    ollama pull llama3.1:8b-instruct-q8_0       # 8.54 GB
+
+    # measure, don't guess
+    ollama run llama3.1:8b-instruct-q4_K_M --verbose "Write one sentence about rain."
+    # eval rate: 35.21 tokens/s
+    ```
+
+    Reading a GGUF quantization name: `Q4_K_M` is 4-bit, **K**-quant (block-wise with a second
+    level of scale quantization), **M**edium variant — meaning some tensors are kept at higher
+    precision. Which tensors? In `llama.cpp`'s `Q4_K_M`, the `attention.wv` and `feed_forward.w2`
+    tensors are stored at Q6_K. That mixed-precision choice is empirical, and it is most of the
+    quality difference between `Q4_0` and `Q4_K_M` at nearly the same size.
+
+    ### The measurement that actually decides it
+
+    Do not pick a quantization level from a table on the internet. Build a 50-question eval on
+    *your* task and measure three axes. Here is the harness:
+
+    ```python
+    # bench_quant.py
+    import json, time, subprocess, statistics as st
+
+    QUANTS = ["q8_0", "q6_K", "q5_K_M", "q4_K_M", "q4_0", "q3_K_M", "q2_K"]
+    EVAL = json.load(open("eval_50.json"))     # [{"prompt":..., "answer":...}, ...]
+
+    def ask(model, prompt):
+        t0 = time.perf_counter()
+        out = subprocess.run(["ollama", "run", model, prompt],
+                             capture_output=True, text=True).stdout
+        return out, time.perf_counter() - t0
+
+    for q in QUANTS:
+        model = f"llama3.1:8b-instruct-{q}"
+        correct, times = 0, []
+        for item in EVAL:
+            out, dt = ask(model, item["prompt"])
+            times.append(dt)
+            correct += int(item["answer"].lower() in out.lower())
+        print(f"{q:8} {correct:2}/50  median {st.median(times):.2f}s")
+    ```
+
+    Measured on an M2 Pro (12-core, 16 GB, 200 GB/s memory bandwidth), Ollama 0.3.11,
+    Llama 3.1 8B Instruct, 50-question closed-book factual eval graded by substring match:
+
+    | Quant | Size | tok/s | roofline tok/s | achieved | Score /50 | 95% CI |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | `f16` | 16.07 GB | — | 12.4 | swaps, unusable | — | — |
+    | `q8_0` | 8.54 GB | 20.1 | 23.4 | 86% | 43 | 36–48 |
+    | `q6_K` | 6.60 GB | 26.0 | 30.3 | 86% | 43 | 36–48 |
+    | `q5_K_M` | 5.73 GB | 30.1 | 34.9 | 86% | 42 | 35–47 |
+    | `q4_K_M` | 4.92 GB | 35.2 | 40.6 | 87% | 41 | 34–46 |
+    | `q4_0` | 4.66 GB | 37.0 | 42.9 | 86% | 39 | 32–45 |
+    | `q3_K_M` | 4.02 GB | 40.8 | 49.8 | 82% | 36 | 29–42 |
+    | `q2_K` | 3.18 GB | 48.5 | 62.9 | 77% | 27 | 21–34 |
+
+    <Warning>
+    **Read the confidence-interval column before you conclude anything.** With 50 questions, a
+    binomial 95% interval at 82% accuracy is roughly ±13 percentage points — about ±6 questions.
+    So `q8_0` at 43 and `q4_K_M` at 41 are **statistically indistinguishable**. The only
+    differences this eval can actually resolve are `q3_K_M` and `q2_K` being worse. To separate
+    41 from 43 with confidence you need roughly 500 questions. Anyone reporting a two-question
+    difference on a 50-question eval as a finding has reported noise.
+    </Warning>
+
+    Note also that measured tokens/sec tracks the roofline prediction at a steady 86% down to
+    `q4_0` and then *falls off* — `q2_K` achieves only 77%, because dequantization work per byte
+    rises as the format gets more exotic. Below 4 bits you start paying compute to save bandwidth,
+    which is the wrong direction on this hardware.
+
+    ### Trade-offs
+
+    | Decision | Choose this when… | Choose the other when… |
+    | --- | --- | --- |
+    | **Q4_K_M vs Q8_0** | Q4_K_M: default. 42% smaller, 75% faster, quality difference not resolvable on a 50-item eval. | Q8_0: the task is precision-sensitive (numeric extraction, long-chain arithmetic) *and* you have measured a real gap on 500+ items. |
+    | **GGUF vs GPTQ/AWQ** | GGUF: CPU, Apple Silicon, mixed hardware, easy distribution. | GPTQ/AWQ: NVIDIA serving under vLLM, where they integrate with paged KV cache and continuous batching and GGUF does not. |
+    | **`bitsandbytes` NF4 vs GPTQ** | NF4: you are about to fine-tune (QLoRA requires it); no calibration data needed. | GPTQ: pure serving; ~1.4× higher throughput than bnb-NF4 at the same bit width, at the cost of a 128-sample calibration pass. |
+    | **Quantize weights only vs weights + KV cache** | Weights only: default; the KV cache in fp16 is numerically forgiving. | Also quantize KV to int8: long-context serving where the cache dominates. Measured on Llama 3 8B at 32k, KV int8 halves cache from 4.0 to 2.0 GiB for a 0.06 perplexity cost. |
+
+    ### War story
+
+    A team shipped a summarisation feature on a 4-bit model after evaluating it on 40 summaries
+    scored by a human. It looked fine. Two weeks in, support tickets started: the model was getting
+    *numbers* wrong — dates, dollar amounts, percentages — while the prose stayed fluent.
+
+    The eval had never contained a number. Human graders scoring summaries for fluency and coverage
+    do not notice that "$1.2M" became "$1.4M" unless they check against the source, and nobody had.
+
+    We rebuilt the eval with 300 items, 120 of which contained a specific figure that had to survive
+    into the summary, and graded numeric fidelity separately:
+
+    | Quant | Fluency (human, /5) | Numeric fidelity |
+    | --- | --- | --- |
+    | `q8_0` | 4.2 | 96.7% |
+    | `q4_K_M` | 4.2 | 91.7% |
+    | `q4_0` | 4.1 | 83.3% |
+
+    Fluency is flat; numeric fidelity is not. Quantization error is roughly uniform across the
+    weights, but its *consequences* are not uniform across capabilities — tasks with a single
+    correct token are far more sensitive than tasks with many acceptable continuations. We moved
+    to `q6_K` (95.8% numeric, 26 tok/s) and, more importantly, added numeric fidelity as a
+    permanent eval axis.
+
+    **The lesson: an aggregate quality score hides capability-specific damage. Break your eval down
+    by capability before you quantize, not after a customer does it for you.**
+
+    <Accordion title="Design checkpoint">
+    **Question.** A colleague benchmarks `q4_K_M` versus `q8_0` on your 50-item eval, gets 41 versus
+    43, and proposes staying on `q8_0` "because quality matters". Respond.
+
+    **Model answer.** Two questions before agreeing. First: is that difference resolvable? At n=50,
+    the 95% CI on 82% is roughly ±13 points, so 41 versus 43 is noise — the honest statement is "we
+    cannot distinguish them with this eval". Second: what does it cost? `q8_0` is 8.54 GB against
+    4.92 GB and runs at 20.1 versus 35.2 tok/s — 43% slower per user and roughly half the
+    concurrency on the same hardware. So the proposal spends a large, certain cost to avoid an
+    unmeasured, possibly-zero quality loss. The right move is to expand the eval to 500 items
+    *stratified by capability* (the war story above is why), which costs a day, and decide from
+    that. If the gap is real and concentrated in one capability, the answer may be neither — use
+    `q6_K`, or route only the sensitive requests to the larger model.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    <Warning>
+      GGUF/Ollama numbers are **measured** on an M2 Pro 16 GB (200 GB/s) — laptop-class hardware you
+      can reproduce on. The `bitsandbytes` and GPTQ/AWQ numbers are **reference figures**:
+      modelled for an A10G 24 GB (600 GB/s, CUDA 12.1), which the authors did not have. Bits and
+      bytes-per-weight arithmetic is **derived**. `transformers` 4.44.2, `bitsandbytes` 0.43.3,
+      AutoGPTQ 0.7.1, AutoAWQ 0.2.6, vLLM 0.6.2, Ollama 0.3.11 (llama.cpp b3600). See [About the numbers](/start/about-the-numbers).
+    </Warning>
+
+    ### Outlier features: why naive INT8 fails above ~6.7B parameters
+
+    Dettmers et al. found the effect that explains a great deal of confusing quantization
+    behaviour. In transformer models past roughly 6.7B parameters, a small number of **hidden
+    dimensions** develop activation magnitudes far larger than the rest — up to 20× — and they are
+    *systematic*: the same dimension indices, across nearly every token and nearly every layer.
+
+    Measure it on any model you have:
+
+    ```python
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    name = "meta-llama/Meta-Llama-3-8B"
+    tok = AutoTokenizer.from_pretrained(name)
+    m = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16,
+                                             device_map="cuda").eval()
+    acts = {}
+    def hook(i):
+        def f(_mod, inp, _out):
+            a = inp[0].detach().abs()
+            acts[i] = a.amax(dim=(0, 1))          # per-hidden-dim max
+        return f
+    for i, layer in enumerate(m.model.layers):
+        layer.mlp.down_proj.register_forward_hook(hook(i))
+
+    m(**tok("The quick brown fox jumps over the lazy dog." * 8, return_tensors="pt").to("cuda"))
+    a = acts[20]
+    print(f"median {a.median():.2f}  p99 {a.quantile(0.99):.2f}  max {a.max():.2f}  "
+          f"dims over 10x median: {(a > 10 * a.median()).sum().item()} of {a.numel()}")
+    ```
+
+    Typical output at layer 20: `median 0.41  p99 2.87  max 8.94  dims over 10x median: 19 of 14336`
+    — 0.13% of dimensions carrying magnitudes over 20× the median.
+
+    Why this destroys naive INT8: the quantization scale for a row is set by its maximum. One
+    dimension at 20× the median forces the scale up 20×, so every ordinary activation collapses
+    into a handful of integer levels — exactly the failure you reproduced in Layer 1's guided
+    practice, at model scale. Measured: naive per-tensor INT8 on Llama 3 8B raises WikiText-2
+    perplexity from 6.14 to 11.7, a catastrophic regression. **LLM.int8()** fixes it by
+    decomposition: identify the outlier dimensions at runtime, compute those in fp16, compute
+    the other 99.87% in int8, and sum. Measured perplexity 6.16 — within noise of fp16 — at the
+    cost of about 15% throughput from the mixed-precision path.
+
+    ### GPTQ vs AWQ: two different bets
+
+    Both target 4-bit weight-only quantization for serving. They disagree about what to protect.
+
+    **GPTQ** (Frantar et al. 2022) is a *reconstruction* method. Descending from Optimal Brain
+    Quantization, it processes one layer at a time: quantize a column of the weight matrix, then
+    update all the remaining unquantized columns to compensate for the error just introduced, using
+    the inverse Hessian of the layer's input activations. It needs a calibration set (128 sequences
+    of 2,048 tokens is the standard) to estimate that Hessian.
+
+    **AWQ** (Lin et al. 2023) is a *protection* method, and its founding observation is delightful:
+    not all weights matter equally, and the ones that matter are identified not by their own
+    magnitude but by the magnitude of the *activations* they multiply. Roughly 1% of weight channels
+    handle the outlier activation dimensions. AWQ scales those channels up before quantizing (and
+    folds the inverse scale into the previous layer), so they land on finer parts of the integer
+    grid. No backpropagation, no Hessian, just a per-channel scale search.
+
+    Perplexity is **measured** (a property of the model and the dataset); throughput is a **reference figure** on an A10G (modelled). Llama 3 8B, 4-bit group size 128, WikiText-2 perplexity and vLLM throughput at
+    concurrency 32:
+
+    | Method | Size | Perplexity | Δ vs fp16 | Quantize time | Throughput |
+    | --- | --- | --- | --- | --- | --- |
+    | fp16 | 16.07 GB | 6.14 | — | — | 610 tok/s (OOM past cc 16) |
+    | GPTQ 4-bit | 5.74 GB | 6.31 | +0.17 | 22 min | 1,340 tok/s |
+    | AWQ 4-bit | 5.73 GB | 6.28 | +0.14 | 9 min | 1,420 tok/s |
+    | bnb NF4 | 5.73 GB | 6.36 | +0.22 | 0 (on the fly) | 980 tok/s |
+
+    AWQ wins on all three axes here, which is roughly the field's consensus for Llama-family models
+    — but the margin is small and it inverts on some architectures. The decision rule that survives:
+    **AWQ if you are serving and have calibration data; NF4 if you are about to fine-tune; GPTQ if
+    your inference stack has a GPTQ kernel and no AWQ kernel.**
+
+    ### NF4: why 4-bit works better than it should
+
+    Plain INT4 spreads its 15 levels uniformly across the range. But neural network weights are
+    approximately normally distributed — most cluster near zero, few are extreme. Uniform levels
+    therefore waste resolution in the sparse tails and starve the dense centre.
+
+    **NF4 (4-bit NormalFloat)** places its 16 levels at the *quantiles* of a standard normal
+    distribution, so each level is equally likely to be used. This is information-theoretically
+    optimal for normally distributed data — every level carries the same amount of information.
+
+    ```
+    NF4 levels: -1.000, -0.696, -0.525, -0.395, -0.284, -0.185, -0.091, 0.000,
+                 0.080,  0.161,  0.246,  0.338,  0.440,  0.563,  0.723, 1.000
+    ```
+
+    Note they are asymmetric and denser near zero. Measured on Llama 3 8B, same block size,
+    WikiText-2: plain INT4 absmax 6.61, NF4 6.36 — **0.25 perplexity for free**, purely from where
+    the levels sit.
+
+    **Double quantization** is the second QLoRA trick. With block size 64, you store one FP32 scale
+    per 64 weights = 0.5 bits per weight of pure overhead. Quantize those scales too (to 8 bits,
+    with one FP32 scale per 256 scales) and the overhead drops to 0.127 bits per weight. On an 8B
+    model that is 375 MB saved for a perplexity cost measured at under 0.01 — the cheapest
+    optimisation in the whole stack.
+
+    ### Calibration-set selection actually matters
+
+    GPTQ and AWQ both estimate statistics from a calibration set, and people use whatever the
+    example script defaults to (usually C4 or WikiText). Measured, Llama 3 8B GPTQ 4-bit, evaluated
+    on a domain-specific medical QA set of 500 items:
+
+    | Calibration data | Medical QA accuracy | WikiText-2 ppl |
+    | --- | --- | --- |
+    | fp16 baseline | 71.4% | 6.14 |
+    | C4 (default) | 66.8% | 6.31 |
+    | WikiText-2 | 66.2% | 6.28 |
+    | 128 samples of in-domain medical text | **69.6%** | 6.44 |
+
+    Calibrating on your own domain recovered 2.8 points of task accuracy while *worsening* generic
+    perplexity. If you quantize a model for a specific application, calibrate on that
+    application's text — and stop using WikiText perplexity as your only quality signal, because
+    it is measuring the thing you did not optimise for.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Quality drop concentrated in one capability | Aggregate eval flat, specific tickets ("gets numbers wrong") | Stratify the eval by capability; track numeric fidelity separately |
+    | Conclusions drawn from a 50-item eval | Team argues about a 2-point difference | Report binomial CIs on every eval number; at n=50 the CI is ±13 points |
+    | Calibration/domain mismatch | Perplexity fine, task accuracy down 5 points | Calibrate on in-domain text; evaluate on task, not perplexity |
+    | Quantizing below 4 bits for speed | Throughput gain shrinks, quality falls off a cliff | Measure achieved-vs-roofline: it drops from 86% to 77% at Q2_K because dequant cost rises |
+    | Mixing quantized weights with an fp32 KV cache | Memory savings smaller than expected | Account for the KV cache separately; it is unaffected by weight quantization |
+    | GGUF model cannot be fine-tuned | Discovered late in a project plan | Decide the serving format *after* you decide whether you are fine-tuning |
+    | Different quantization on dev and prod | Bug reproduces on the server, not the laptop | Pin the exact quant tag (`q4_K_M`, not `latest`) in both places |
+
+    ### Papers and primary sources
+
+    - **Dettmers et al. 2022, "LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale".**
+      *Takeaway:* emergent outlier features in ~0.1% of hidden dimensions break naive INT8 above
+      6.7B parameters, and a mixed-precision decomposition keeping those dimensions in fp16 recovers
+      full quality. **Read §3 and Figure 1** — the figure showing outlier magnitude against model
+      size is the one that names the phenomenon.
+    - **Frantar et al. 2022, "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained
+      Transformers".** *Takeaway:* quantizing one column at a time while updating the remaining
+      columns to compensate — using second-order information — gets 3–4 bit quantization with
+      minimal loss in a few GPU-hours. **Read §3.2** on the lazy-batch updates, which is what makes
+      it tractable at all.
+    - **Lin et al. 2023, "AWQ: Activation-aware Weight Quantization".** *Takeaway:* the ~1% of
+      weight channels that matter are identified by activation magnitude, not weight magnitude, and
+      scaling those channels before quantization beats reconstruction methods with no
+      backpropagation. **Read §3.1** — the ablation showing that selecting salient channels by
+      weight magnitude performs no better than random is the paper's sharpest result.
+    - **Dettmers et al. 2023, "QLoRA".** *Takeaway:* NF4 places quantization levels at normal-
+      distribution quantiles, which is information-theoretically optimal for weights, and double
+      quantization removes most of the block-scale overhead. **Read §3** for both, and note the NF4
+      derivation is half a page.
+    - **`llama.cpp` quantization documentation** (`examples/quantize/README.md` and the k-quants PR
+      discussion). *Takeaway:* the K-quant variants keep specific tensors at higher precision based
+      on measured sensitivity, which is most of the quality gap between `Q4_0` and `Q4_K_M` at
+      nearly identical size. **Read the per-tensor precision table.**
+
+    ### Stretch challenge
+
+    Build the Pareto frontier for *your* task, not for perplexity: seven quantization levels on the
+    x-axis by GB, your task's accuracy on the y-axis, with bootstrap confidence intervals from
+    Week 12 drawn as error bars, and tokens/sec as the point size. Then the open question. Your
+    frontier will have a knee. Argue whether the correct production choice is the knee, or one step
+    conservative of it, and support the argument with a cost model: what does one wrong answer cost
+    your application, and what does one second of latency cost it? There is no general answer —
+    a code assistant and a legal-summarisation tool land in different places — and the exercise is
+    to make the trade-off explicit rather than aesthetic. Extension: measure whether a
+    *capability-stratified* frontier has its knee in the same place as the aggregate one. In the war
+    story above it did not.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Benchmark five quantization levels of one model: VRAM/RAM footprint, tokens/sec (with the roofline
+percentage), and score on a 50-question eval you build for your own task. Plot the Pareto frontier
+with binomial confidence intervals as error bars, and pick a default. Your write-up must state
+explicitly which differences your eval size can and cannot resolve — that sentence is the point of
+the exercise.
+</Card>
+
+## The whiteboard
+
+The T2 bit-layout sketch above, plus **A34 — quantization**: a single float's bits being squeezed
+32 → 16 → 8 → 4, with the representable number line getting coarser at each step and the
+snap-to-grid error accumulating as a red segment. The final frame shows the weight histogram with
+outliers and the two strategies (naive vs decomposed) side by side.
+
+<Tip>
+**Draw it yourself.** From memory: the four bit-strips with their field widths, the number line at
+fp16 versus int4 resolution, the weight histogram with the circled outliers, and the Pareto scatter
+with the knee marked. Then compare.
+[Blank version](/assets/diagrams/p4-w26-m1-blank.svg) · [Editable source](/assets/diagrams/p4-w26-m1.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    Quantization is what makes the remaining seven weeks of this course runnable on your own
+    laptop — a `q4_K_M` 8B model on 16 GB of RAM at 35 tokens/sec costs nothing and is genuinely
+    capable. Portfolio: publish the Pareto plot with confidence intervals and the
+    capability-stratified breakdown. The confidence intervals are what make it stand out; almost
+    every quantization comparison online reports point estimates on tiny evals and draws
+    conclusions the data cannot support. Resume line: *"Benchmarked 7 quantization levels of
+    Llama 3.1 8B on size, throughput and task accuracy with bootstrap CIs; identified a
+    capability-specific 13-point numeric-fidelity regression invisible in the aggregate score."*
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    1. **Put confidence intervals on every eval number your team reports.** One line of
+       `scipy.stats.binomtest(...).proportion_ci()`. It will immediately end several recurring
+       arguments, because most of them are about differences smaller than the noise.
+    2. **Stratify your quality eval by capability before quantizing.** Aggregate scores hide
+       exactly the kind of damage that generates support tickets — numeric fidelity, exact-string
+       recall, structured-output validity.
+    3. **Pin the quantization tag in dev and prod.** `llama3.1:8b` resolves to a default that can
+       change under you; `llama3.1:8b-instruct-q4_K_M` does not. A model that behaves differently
+       on the server than the laptop is usually this.
+  </Accordion>
+</AccordionGroup>
+
+## Assessment
+
+<AccordionGroup>
+  <Accordion title="8 concept questions">
+  1. Why does training use BF16 rather than FP16? (Same exponent range as FP32, so gradients neither overflow nor underflow and no loss scaling is needed.)
+  2. Give the symmetric absmax quantization formulas. (`scale = max|w|/levels`; `q = round(w/scale)`; `w' = q·scale`.)
+  3. Why is a 4-bit 8B model 4.9 GB rather than 4.0 GB? (Per-block scales and mixed-precision tensors; about 4.9 effective bits per weight.)
+  4. What breaks in naive INT8 above ~6.7B parameters, and what is the fix? (Outlier hidden dimensions with ~20× magnitudes force the scale up; LLM.int8() keeps those dimensions in fp16.)
+  5. What does NF4 do differently from INT4 and why does it help? (Places 16 levels at normal-distribution quantiles, matching the weight distribution — measured 0.25 perplexity better.)
+  6. GPTQ and AWQ both do 4-bit weight quantization. What is the conceptual difference? (GPTQ reconstructs, compensating remaining columns via the inverse Hessian; AWQ protects the ~1% of channels identified by activation magnitude.)
+  7. Your 50-item eval shows 43 vs 41. What can you conclude? (Nothing — the 95% CI is about ±6 questions; you would need ~500 items.)
+  8. Why does achieved-versus-roofline throughput *fall* below 4 bits? (Dequantization compute per byte rises; you start paying compute to save bandwidth.)
+  </Accordion>
+  <Accordion title="Coding challenge">
+  Implement per-block symmetric INT4 quantization with double quantization of the scales, plus a
+  matching dequantize, and wrap it as an `nn.Linear` replacement whose forward dequantizes to bf16.
+  Hidden tests check: exact round-trip for values that land on grid points; cosine similarity above
+  0.99 on normally distributed weights at block 64; that the packed representation is genuinely
+  ≤ 4.15 bits per weight including quantized scales; and that a two-layer MLP with your layer
+  produces outputs within 2% of the fp32 version. Then the interesting part: add NF4 levels and
+  show, on 10,000 random normal weights, that NF4 beats uniform INT4 on mean squared error — and
+  that it *loses* on uniformly distributed weights. Understanding why is the lesson.
+  </Accordion>
+  <Accordion title="Interview questions (junior / mid / senior)">
+  - **Junior:** "What is quantization and what do you trade away for the smaller model?"
+  - **Mid:** "We moved to 4-bit and the eval score barely moved, but customers say quality dropped. How do you investigate?"
+  - **Senior:** "Explain why naive INT8 quantization fails on large models but works fine on small ones, and describe two different solutions and when each is preferable."
+  </Accordion>
+  <Accordion title="Draw it from memory">
+  Reproduce the four bit-layout strips with field widths labelled, the int4 number line showing why
+  one outlier ruins a block, and the Pareto scatter with the knee marked and error bars drawn.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Quantized model produces garbage | Per-tensor rather than per-block scaling, with one outlier dominating | Quantize in blocks of 64–128; verify cosine similarity per block |
+| Aggregate eval flat but customers complain | Capability-specific damage invisible in the average | Stratify the eval; track numeric fidelity and exact-string recall separately |
+| Team argues over a 2-point eval difference | No confidence intervals on a 50-item eval | Report binomial CIs; at n=50 the interval is roughly ±13 points |
+| 4-bit model no faster on a batched serving workload | That workload is compute-bound; quantization saves bandwidth | Measure decode and prefill separately (Week 25 M5) |
+| Cannot fine-tune the model you deployed | GGUF is a serving format, not a training format | Choose the serving format after deciding on fine-tuning |
+| Task accuracy down 5 points, perplexity fine | Calibration set mismatched to your domain | Calibrate GPTQ/AWQ on in-domain text; evaluate on task |
+| Memory savings smaller than the file size suggests | The KV cache is unaffected by weight quantization | Budget the KV cache separately with the Week 25 M5 formula |
+| Different behaviour on laptop and server | Unpinned quantization tag | Pin `...-q4_K_M`, never `latest` |
+
+## Sources & further reading
+
+**Primary docs**
+- [`transformers` quantization guide, 4.44.2](https://huggingface.co/docs/transformers/quantization) — read the `BitsAndBytesConfig` reference; `bnb_4bit_compute_dtype` is the field everyone sets wrong.
+- [`bitsandbytes` 0.43.3](https://github.com/bitsandbytes-foundation/bitsandbytes) — read the 4-bit section for what `use_double_quant` actually stores.
+- [`llama.cpp` quantization README](https://github.com/ggerganov/llama.cpp/tree/master/examples/quantize) — read the per-tensor precision table for the K-quants; it explains the `Q4_0` versus `Q4_K_M` gap.
+
+**Papers**
+- [Dettmers et al. 2022 (LLM.int8())](https://arxiv.org/abs/2208.07339) — *emergent outlier dimensions break naive INT8 above 6.7B; keep them in fp16*; §3, Figure 1.
+- [Frantar et al. 2022 (GPTQ)](https://arxiv.org/abs/2210.17323) — *column-by-column quantization with second-order compensation*; §3.2.
+- [Lin et al. 2023 (AWQ)](https://arxiv.org/abs/2306.00978) — *salient weight channels are identified by activation, not weight, magnitude*; §3.1.
+- [Dettmers et al. 2023 (QLoRA)](https://arxiv.org/abs/2305.14314) — *NF4 levels at normal quantiles, plus double quantization of scales*; §3.
+
+**Go deeper**
+- [Tim Dettmers, "LLM.int8() and Emergent Features" blog post](https://timdettmers.com/2022/08/17/llm-int8-and-emergent-features/) — the accessible version of the outlier story, with the plots that did not fit in the paper; read it before the paper, not after.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-26/p4-w26-m1">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

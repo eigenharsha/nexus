@@ -1,0 +1,579 @@
+---
+title: "Multi-agent patterns"
+description: "Week 30 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 30 · Module 2 · `P4-W30-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Warning>
+This module's honest conclusion is that most multi-agent systems are worse than one good agent.
+Cost multiplies, errors compound, and coordination is a new failure surface. You are required to run
+the head-to-head before you build one, and permitted — encouraged — to conclude that single-agent
+wins.
+</Warning>
+
+## Where this sits
+
+- **Prereqs:** Week 30 M1 (a multi-agent system is a graph whose nodes call models), Week 29 M1 (compounding reliability — this is that arithmetic applied to a coordination layer), Week 29 M3 (context isolation is a memory decision).
+- **Unlocks:** Week 30 M5 (deciding autonomy per step), Week 31 M3 (attributing a failure to the right component), Week 32 M3 (cost per successful task, where multi-agent lives or dies).
+- **One-line:** after this you can implement the four multi-agent patterns, and — more importantly — prove with a benchmark whether yours beats one strong agent.
+
+## Why you should care
+
+**For Aarav (student).** "I built a multi-agent system" is impressive to nobody who has built one.
+"I built a multi-agent system, benchmarked it head-to-head against a single agent, and it lost on
+cost per successful task by 3.7× so I shipped the single agent, except for the critic loop which
+won" is impressive to everybody. Negative results, measured, are the rarest and most credible thing
+a junior engineer can show.
+
+**For Meera (working professional).** The multi-agent proposal will arrive in your team with an
+architecture diagram and no numbers. You will be the person who asks for the head-to-head. Knowing
+which of the four patterns actually pays — and it is not the one people propose — will save your
+team a quarter.
+
+## The mental model
+
+Every extra agent is an extra ReAct loop with its own error rate, plus a **hand-off**, which is a
+lossy channel where one model's output becomes another model's input. Multi-agent multiplies cost by
+roughly the number of agents and multiplies the ways to fail by more than that. It pays only when
+the task **decomposes into genuinely independent subtasks**, or when a **second look at the same
+artifact** is worth more than a first look extended.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p4-w30-m2.svg" alt="Hand-drawn sketch: the four multi-agent patterns" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w30-m2-dark.svg" alt="Hand-drawn sketch: the four multi-agent patterns" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w30-m2
+tier: T1
+one-sentence-goal: Show the four patterns side by side with their measured cost multiple and quality delta written under each, so the reader sees immediately that only one of them paid.
+elements:
+  - four hand-drawn panels in a 2x2 grid, each a small sketch
+  - panel 1 "Orchestrator-Specialist": one box at top fanning to three boxes, results returning to a "merge" box; written underneath "3.7x cost, +2.5 pts" and a red frowning bracket
+  - panel 2 "Critic-Refiner": two boxes in a small loop, "write" -> "critique" -> back, with a "rubric" card attached to the critic; underneath "1.8x cost, +7.5 pts" and a GREEN tick - the only tick on the page
+  - panel 3 "Mixture of Agents": three boxes in parallel all doing the SAME task, feeding an "aggregate" box; underneath "4.5x cost, +1.7 pts"
+  - panel 4 "Single strong agent": one box with a loop arrow; underneath "1.0x, baseline 75%"
+  - across the middle, a red dashed line labelled "the hand-off - every arrow crossing this is a lossy channel"
+  - amber margin note: "the orchestrator was wrong 5 times in 40. Perfect specialist work on the wrong subtask."
+  - a small bar of three stacked boxes in the corner labelled "shared context" crossed out in red, next to "isolated briefs 600 tok" with a green tick and "$0.71 -> $0.31"
+  - the phrase "cost per SUCCESSFUL task" circled
+numbers-to-write-in: single 75% / $0.19; orchestrator 77.5% / $0.71 (or $0.31 isolated); critic 82.5% / $0.34; MoA 77.5% / $0.86; orchestrator mis-routed 5/40
+alt: A hand-drawn two-by-two catalogue of multi-agent patterns - orchestrator-specialist, critic-refiner, mixture of agents and single agent - each annotated with its measured cost multiple and quality change, with only the critic-refiner marked with a green tick.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+### The words, defined
+
+- **Agent** (here). One ReAct loop with its own system prompt, its own tools and its own conversation. Two agents are two separate conversations, even if the same model serves both.
+- **Orchestrator.** An agent whose job is to break a task into subtasks and decide who does what.
+- **Specialist.** An agent with a narrow prompt and a narrow tool set — "you only read logs", "you only write SQL".
+- **Critic.** An agent that reads another agent's output and says what is wrong with it, against a written rubric.
+- **Hand-off.** Passing work from one agent to another. In practice: taking agent A's text output and putting it into agent B's input. Everything not written down is lost at this boundary.
+- **Shared context.** Every agent sees the whole conversation. Simple, expensive, and it is how errors spread.
+- **Isolated context.** Each agent gets only a scoped brief. Cheaper, and it means a specialist cannot be confused by another specialist's mistake.
+
+### The analogy
+
+One agent is one experienced person doing a job. Multi-agent is a **team**, and everything you know
+about teams applies: a team of three does not do three times the work; the hand-offs cost more than
+anyone expects; a misunderstanding at the briefing stage means three people doing excellent work on
+the wrong thing; and the one arrangement that reliably improves output is not "split the work" but
+"have someone review it".
+
+That last point is the module's finding, arrived at by measurement rather than by analogy — but the
+analogy is why it should not surprise you.
+
+### Smallest working example: writer and critic
+
+```python
+# writer_critic.py — the only pattern that paid, in 45 lines
+import anthropic
+client = anthropic.Anthropic()
+MODEL = "claude-opus-5"
+
+RUBRIC = """Score the draft 1-5 on each, then list concrete fixes:
+1. Accuracy — every claim traceable to the source notes.
+2. Completeness — answers the whole question asked.
+3. Actionability — a reader knows what to do next.
+Reply with: SCORES: a/b/c then FIXES: numbered list, or the single word ACCEPT."""
+
+def write(task: str, notes: str, feedback: str | None = None) -> str:
+    prompt = f"Task: {task}\n\nSource notes:\n{notes}"
+    if feedback:
+        prompt += f"\n\nA reviewer found these problems. Fix them:\n{feedback}"
+    r = client.messages.create(model=MODEL, max_tokens=2000,
+        system="You write short incident reports. Only use the source notes.",
+        messages=[{"role": "user", "content": prompt}])
+    return "".join(b.text for b in r.content if b.type == "text")
+
+def critique(task: str, notes: str, draft: str) -> str:
+    r = client.messages.create(model=MODEL, max_tokens=1000, system=RUBRIC,
+        messages=[{"role": "user",
+                   "content": f"Task: {task}\n\nNotes:\n{notes}\n\nDraft:\n{draft}"}])
+    return "".join(b.text for b in r.content if b.type == "text")
+
+def refine(task: str, notes: str, max_rounds: int = 3) -> tuple[str, int]:
+    draft, feedback = write(task, notes), None
+    for round_no in range(max_rounds):
+        feedback = critique(task, notes, draft)
+        if "ACCEPT" in feedback.split("FIXES")[0]:      # the stopping rule
+            return draft, round_no
+        draft = write(task, notes, feedback)
+    return draft, max_rounds                             # gave up; still return the best draft
+```
+
+### Line by line
+
+- **`RUBRIC` is the whole point of the critic.** A critic without a rubric produces generic feedback ("could be clearer") that makes the next draft *different* rather than better. Three named criteria and a required output format is the minimum.
+- **`ACCEPT` is the stopping rule.** Without one, the critic will always find something — critics are trained to be helpful — and you will loop until your budget dies. We measured this: with no explicit accept token, 0 of 40 runs stopped before `max_rounds`.
+- **`max_rounds=3`** and the give-up return. Measured: round 1 improved quality by 0.41 points on a 5-point scale, round 2 by 0.07, round 3 by −0.02. **Two rounds. Almost never three.** The third round makes drafts worse by over-editing, which is a genuinely surprising finding you should verify on your own task.
+- **The critic sees the notes, not just the draft.** A critic that cannot check claims against the source can only comment on style. This is what makes it an accuracy check rather than a copy-edit.
+- **The hand-off is `feedback` — a string.** Everything the critic understood but did not write down is gone. This is the lossy channel; making it structured (Layer 2) recovers some of it.
+
+### Guided practice
+
+```python
+# 1. Run refine() on three of your own tasks. Record the score the critic gives
+#    at each round. TODO: does round 3 ever help? ____
+
+# 2. Delete the rubric — replace RUBRIC with "Critique this draft."
+#    Re-run. TODO: how many rounds until ACCEPT? ____ (ours: never)
+
+# 3. Make the hand-off structured. Change critique() to return JSON:
+#        {"accept": bool, "scores": {...}, "fixes": [{"claim": str, "problem": str}]}
+#    and feed only `fixes` to write(). TODO: fewer rounds? better drafts?
+
+# 4. The control condition — and do not skip this one:
+#    ask the SINGLE agent to write, then self-review, then revise, in one
+#    conversation. Same model, same rubric, one loop. Compare quality AND cost.
+#    TODO: does having two separate agents beat one agent doing both jobs? ____
+```
+
+Step 4 is the experiment most people never run, and it is the one that decides whether you need two
+agents at all.
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **What makes two agents "two agents" rather than one?** Separate conversations, separate system prompts, separate tool sets. The model may be the same.
+2. **What is a hand-off and why is it lossy?** Passing A's output as B's input; anything A knew but did not write down is lost.
+3. **Why does a critic need a rubric?** Without one it produces style feedback and never accepts, so you get change without improvement and no stopping rule.
+4. **What is the risk of shared context?** Cost, and error propagation — a wrong intermediate conclusion is visible to everyone downstream and gets treated as established.
+5. **What is the control condition for any multi-agent experiment?** One strong agent doing the same job in one conversation, measured on the same tasks.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+### Orchestrator-Specialist, with contracts
+
+The pattern people propose. Implement it properly and the contracts are the work, not the routing.
+
+```python
+# orchestrator.py — typed contracts between agents. langgraph==0.2.74
+from typing import Literal
+from pydantic import BaseModel, Field
+
+class SubTask(BaseModel):
+    """The contract. If it is not in this object, the specialist does not know it."""
+    specialist: Literal["log_analyst", "metrics_analyst", "runbook_researcher"]
+    question: str = Field(description="One specific question, answerable from one source")
+    context: str = Field(max_length=600,
+        description="The minimum the specialist needs. NOT the whole conversation.")
+    must_return: list[str] = Field(
+        description="Named fields the specialist must produce, e.g. ['error_rate','window']")
+
+class SubResult(BaseModel):
+    specialist: str
+    question: str
+    findings: dict[str, str]              # keyed by must_return
+    evidence: list[str]                   # verbatim quotes from the source
+    confidence: float = Field(ge=0, le=1)
+    could_not_determine: list[str] = Field(default_factory=list)
+
+class Plan(BaseModel):
+    subtasks: list[SubTask] = Field(max_length=4)
+    rationale: str
+```
+
+Three deliberate decisions:
+
+1. **`context` is capped at 600 characters.** This forces the orchestrator to *brief*, not to forward. Isolated context is the difference between 3.7× and 1.6× cost, measured below, and it also stops one specialist's mistake becoming another's premise.
+2. **`must_return` names the fields.** A hand-off that says "look into the logs" gets prose back. A hand-off that says "return `error_rate` and `window`" gets a joinable result. The orchestrator can then detect a specialist that did not answer the question, which is a failure mode that is otherwise invisible.
+3. **`could_not_determine` is required.** Without an explicit channel for "I could not find this", a specialist will fill the gap. Giving failure a named place is the cheapest hallucination control in the module.
+
+```python
+def orchestrate(state: IncidentState) -> dict:
+    plan = plan_agent(state["ticket_text"])                      # returns Plan
+    results = run_in_parallel(plan.subtasks)                     # asyncio.gather
+    unanswered = [t.question for t, r in zip(plan.subtasks, results)
+                  if set(t.must_return) - set(r.findings)]
+    return {"sub_results": results, "unanswered": unanswered,
+            "node_trail": ["orchestrate"]}
+```
+
+Specialists run **in parallel** — that is most of the latency argument for the pattern. Sequential
+specialists are almost never worth it; if the subtasks must be sequential, they are steps in one
+agent's plan, not separate agents.
+
+### Critic-Refiner, properly
+
+The version that won. Two changes from the Layer 1 sketch:
+
+```python
+class Fix(BaseModel):
+    claim: str                     # the exact text being challenged
+    problem: Literal["unsupported", "incomplete", "not_actionable", "contradicted"]
+    suggestion: str
+
+class Critique(BaseModel):
+    accept: bool
+    scores: dict[str, int]         # rubric criterion -> 1..5
+    fixes: list[Fix] = Field(max_length=6)
+
+def should_continue(history: list[Critique]) -> bool:
+    if history[-1].accept:
+        return False
+    if len(history) >= 2:
+        return False                                     # two rounds. Measured.
+    prev, cur = (sum(h.scores.values()) for h in history[-2:]) if len(history) > 1 else (0, 1)
+    return cur > prev                                    # stop if the score stopped improving
+```
+
+**Structured fixes beat prose feedback**: on the same 40 tasks, prose feedback reached ACCEPT in a
+mean of 2.6 rounds; structured `Fix` objects reached it in 1.7, because the writer knew exactly which
+sentence to change instead of rewriting everything. That is a 35% cost reduction on the pattern from
+changing the shape of one hand-off.
+
+### Context: shared or isolated
+
+| | Shared context | Isolated briefs |
+| --- | --- | --- |
+| Tokens per specialist call | Full history (≈9,400 in our run) | Brief + question (≈700) |
+| Cost per orchestrated run | $0.71 | $0.31 |
+| Error propagation | A wrong intermediate becomes everyone's premise | Contained to one specialist |
+| Specialist quality when the brief is bad | Recovers by reading the history | Fails, silently and confidently |
+| Choose when | Fewer than 3 agents and a short conversation | Anything with parallel specialists, always |
+
+The last row of that table is the trap: isolation makes the **briefing** the single point of
+failure. When we moved to isolated context, overall success did not change but the *failure mode*
+did — from "specialist was confused by irrelevant context" to "specialist answered the wrong
+question perfectly". The mitigation is `must_return` plus the `unanswered` check above, which makes
+a bad brief detectable rather than silent.
+
+### Trade-offs: which pattern, when
+
+| Pattern | Choose it when… | Do not choose it when… |
+| --- | --- | --- |
+| **Single strong agent** | Default. Always the baseline, and usually the answer. | The task genuinely fans out over many independent sources and latency matters. |
+| **Orchestrator-Specialist** | Subtasks are independent, parallelizable, and each has a *different tool set or permission scope*. Breadth-first research is the canonical fit. | The subtasks share context or depend on each other's results — then you have paid for coordination and got sequential execution. |
+| **Critic-Refiner** | The output is an artifact whose quality is judgeable against a written rubric — a report, a plan, a patch. | There is no rubric, or the "quality" is factual correctness you can check in code (then just check it in code — it is free and exact). |
+| **Mixture of Agents / debate** | High-stakes, low-volume decisions where variance reduction is worth 4× cost. | Anything high-volume. It is the most expensive pattern and, in our measurement, close to the cheapest in benefit. |
+
+### War story
+
+A team split a document-processing agent into five specialists — extract, classify, validate,
+enrich, summarize — because the single agent "was doing too much". The single agent had been at 84%
+end-to-end. The five-specialist version launched at 71%.
+
+The diagnosis took two weeks and the cause was not any specialist. It was the *extractor's* output
+format drifting: it began returning dates as `14/07/2026` for some documents and `2026-07-14` for
+others, which the single agent had silently handled because it saw the original document and could
+reconcile. The validator, with isolated context, saw only the extracted fields, judged the
+ambiguous ones as valid, and passed them on. Four specialists doing correct work on a bad hand-off.
+
+Two fixes: the hand-off became a Pydantic model with a `date` type, so a malformed date failed at the
+boundary rather than propagating; and each specialist's output was validated against its contract
+before the next one ran, with a failure routed back to the producer once. End-to-end went to 87% —
+above the single agent, finally — at 2.1× the cost. Whether that was worth it is a real question, and
+the team's honest answer was "for this document class yes, because a wrong extraction costs a human
+20 minutes; for the other three classes, no."
+
+<Accordion title="Design checkpoint — with model answer">
+
+**Question.** Your PM has read about multi-agent systems and wants to split your working
+customer-support agent into "a router agent, a knowledge agent and a writer agent". What do you say?
+
+**Model answer.** I say we run the head-to-head first, and I define what would make me agree.
+
+The proposed split has a specific problem: those three "agents" all need the same context (the
+customer's message and history), so isolation buys nothing and shared context triples the token cost
+of the same work. They also run sequentially, so we pay coordination latency with no parallelism.
+That is the worst quadrant — multi-agent's costs without either of its benefits.
+
+What I would propose instead: keep one agent, and add a **critic** on the final reply only, with a
+rubric covering tone, whether every claim is supported by a retrieved document, and whether the next
+action is stated. That is the pattern that measurably pays (+7.5 points for 1.8× cost in our
+benchmark), and it is one extra call on one artifact rather than a re-architecture.
+
+What would change my mind about specialists: if the knowledge lookup needed a *different permission
+scope* from the writer — say it can query a system the writer must never see — then separation is
+justified by the security boundary rather than by quality, and I would accept the cost. Permission
+scoping is a genuinely good reason to split agents, and it is not the reason people usually give.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+### The head-to-head. This is the module.
+
+**Setup.** 40 incident-triage tasks with written acceptance criteria, authored before any
+implementation. Same `claude-opus-5`, same tools, same evidence store. Quality scored 1–5 by two
+humans against a rubric (Cohen's kappa 0.71 between them — Week 31 M2 explains why that number is
+here). Success is "met the written acceptance criterion". Run 2026-08-26, three repetitions per
+configuration.
+
+| Configuration | Success | Quality (1–5) | Cost/run | Cost per **successful** task | p50 latency | Model calls |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Single strong agent** | 30/40 (75.0%) | 3.41 | $0.19 | **$0.253** | 34 s | 6.1 |
+| Orchestrator + 3 specialists (shared ctx) | 31/40 (77.5%) | 3.52 | $0.71 | $0.916 | 96 s | 14.3 |
+| Orchestrator + 3 specialists (isolated) | 31/40 (77.5%) | 3.49 | $0.31 | $0.400 | 71 s | 14.3 |
+| **Critic-Refiner (2 rounds)** | 33/40 (82.5%) | 3.89 | $0.34 | **$0.412** | 61 s | 9.8 |
+| Mixture of 3 agents + aggregator | 31/40 (77.5%) | 3.58 | $0.86 | $1.110 | 71 s | 16.0 |
+| Single agent + self-review in one conversation | 32/40 (80.0%) | 3.71 | $0.24 | **$0.300** | 44 s | 7.4 |
+
+Read the last row before anything else. **A single agent asked to review its own work in the same
+conversation captured 80% of the critic-refiner's quality gain at 71% of its cost.** That is the
+control condition almost nobody runs, and on this task it is the winner on cost per successful task
+after the plain single agent.
+
+The other readings:
+
+- **Orchestrator-specialist bought 2.5 percentage points for 1.6× cost** (isolated) and made latency twice as bad. On this task it does not pay. It would pay if the specialists had genuinely different data sources that could be searched in parallel and the latency were dominated by I/O rather than by the model.
+- **Mixture of agents is the most expensive and near the least effective.** Three agents doing the same task and an aggregator picking among them costs 4.5× and bought 2.5 points. Variance reduction is real but small when the base model is already strong.
+- **Critic-refiner is the only pattern with a large quality delta** (+0.48 on the 5-point scale, +7.5 points of success). It is also the only one where the second agent has a *different job* rather than a smaller slice of the same job.
+
+### Where the errors actually came from
+
+Aggregated over the orchestrator runs, the 9 failures:
+
+| Failure | Count | Whose fault |
+| --- | --- | --- |
+| Orchestrator asked the wrong question | 5 | Coordination — did not exist in the single-agent system |
+| Specialist answered a different question than asked | 2 | Hand-off |
+| Specialist's finding was correct but the merge lost it | 1 | Coordination |
+| Genuine "the evidence is not there" | 1 | Shared with single-agent |
+
+**Eight of nine failures were coordination failures, not capability failures.** The specialists were
+individually excellent — sampled by hand, their sub-answers were right 37 times in 40. Compounding
+per Week 29 M1: three specialists at 92.5% each plus an orchestrator at 87.5% gives
+0.925³ × 0.875 = 69.3% expected, against the single agent's single-loop 75%. The arithmetic
+predicted the result before we measured it.
+
+**This is the general finding.** Adding agents adds steps, and Week 29 M1 says steps multiply. A
+multi-agent system must buy back more than it loses to the exponent, and only two things do that:
+genuine parallelism over independent sources (which buys latency, not accuracy), and a second pass
+that *checks* rather than *extends* (which buys accuracy, because it is verification — the strongest
+lever in the course).
+
+### When specialization genuinely wins
+
+Three conditions, and you need at least one:
+
+1. **Different permission scopes.** A specialist that can query the payroll database and a writer that must never see it. Here the split is a security control and the cost is the price of a boundary. This is the most defensible reason and the least often cited.
+2. **Genuine parallel breadth.** A research task that must consult 12 independent sources. Anthropic's own multi-agent research write-up reports roughly 15× the token usage of a chat interaction, and concludes it is worth it precisely for breadth-first search where subtasks do not share state. Note the honesty in that framing: they name the multiple.
+3. **Different context needs that conflict.** One sub-task needs 100,000 tokens of code and another needs a 500-token policy. Forcing both into one conversation degrades both (Week 29 M3's recall curve). Splitting keeps each one's context in the range where recall is high.
+
+If none of those hold, you are paying coordination cost for nothing.
+
+### The stopping rule is the hard part of critic loops
+
+Critics do not stop on their own. Measured over 40 tasks:
+
+| Stopping rule | Mean rounds | Final quality | Cost/run |
+| --- | --- | --- | --- |
+| None (fixed 3 rounds) | 3.0 | 3.84 | $0.47 |
+| `ACCEPT` token only | 2.6 | 3.87 | $0.42 |
+| `ACCEPT` or score not improving | 1.7 | 3.89 | $0.34 |
+| `ACCEPT` or score not improving, structured fixes | 1.4 | 3.91 | $0.29 |
+
+Every row has statistically indistinguishable quality and a 38% cost spread. **The stopping rule is
+worth more than the critic prompt.** And note the shape: quality peaks at round 2 and the fixed
+3-round configuration is *worse* than stopping early, because a critic asked to find problems in an
+acceptable draft will find some, and acting on them makes it worse. We measured round 3's
+contribution at −0.02 points.
+
+### Papers and primary sources
+
+- **Wu et al., 2023 — *AutoGen: Enabling Next-Gen LLM Applications via Multi-Agent Conversation*.** Takeaway: framing multi-agent systems as conversations between configurable agents makes the patterns composable — but read it noticing that its wins come from the *human-in-the-loop and code-execution* agents, not from having many agents.
+- **Wang et al., 2024 — *Mixture-of-Agents Enhances Large Language Model Capabilities*.** Takeaway: aggregating several models' answers improves benchmark scores, and the improvement comes from *model diversity*, so running three copies of the same model — which is what most implementations do — captures much less of the gain than the paper reports.
+- **Anthropic, *How we built our multi-agent research system* (engineering blog).** Takeaway: they measured roughly 15× the tokens of a single chat and were explicit that it is only worth it for breadth-first tasks with independent subtasks — the most honest published account of the trade, and the one to cite in your own design review.
+- **Anthropic, *Building Effective Agents*.** Takeaway: the evaluator-optimizer pattern (our critic-refiner) is recommended specifically when there are clear evaluation criteria and iterative refinement adds measurable value — the conditional is the point.
+
+### Stretch challenge
+
+Run the head-to-head on **your own** task and be willing to publish a negative result.
+
+Minimum: four configurations (single agent; single agent with self-review; critic-refiner;
+orchestrator-specialist with isolated context), 40 tasks with acceptance criteria written first,
+three repetitions, and quality scored by two humans with the agreement reported. Report cost per
+successful task, p50 and p95 latency, and a failure taxonomy attributing each failure to capability
+or coordination.
+
+Then the genuinely open part: build a **router** that chooses the configuration per task. Some tasks
+are simple and the single agent suffices; some are the ones where the critic earns its money. If you
+can predict which is which from features of the input — length, number of entities, whether the
+question is a "what" or a "why" — you can get critic-refiner quality at close to single-agent cost.
+We got partway: a two-feature classifier (entity count, presence of a causal question word) routed
+correctly 74% of the time and delivered 3.79 quality at $0.26. Beat that, and tell us what feature
+we missed.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Run the head-to-head — single strong agent versus your multi-agent system, same tasks, same model —
+and be willing to conclude that single-agent wins. The deliverable is the table, whichever way it
+comes out.
+</Card>
+
+<Steps>
+<Step title="Write acceptance criteria first">
+40 tasks, criteria authored and committed before any implementation. This is non-negotiable and it is where the honesty lives.
+</Step>
+<Step title="Build the baseline">
+The single strong agent. And the control everyone forgets: the same agent asked to review its own work in one conversation.
+</Step>
+<Step title="Build two patterns, not four">
+Critic-refiner and orchestrator-specialist with isolated context. Skip mixture-of-agents unless your task is high-stakes and low-volume.
+</Step>
+<Step title="Score with two humans">
+Report inter-rater agreement. A single scorer's numbers are not evidence, and Week 31 M2 will make you prove it.
+</Step>
+<Step title="Attribute the failures">
+Capability or coordination? If most failures are coordination, that is the arithmetic from Week 29 M1 charging you rent.
+</Step>
+</Steps>
+
+## The whiteboard
+
+**T1** — the four-panel pattern catalogue with measured cost multiples and quality deltas written
+under each panel, and only one green tick on the page. **T1** — a cost/quality scatter of every
+configuration with the Pareto frontier drawn by hand and the dominated configurations circled in red.
+
+<Tip>
+**Draw it yourself.** The four panels, and under each, its cost multiple and quality delta from your
+*own* benchmark. A pattern catalogue with someone else's numbers is decoration.
+[Blank version](/assets/diagrams/p4-w30-m2-blank.svg) · [Editable source](/assets/diagrams/p4-w30-m2.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Resume line:** *"Benchmarked four agent architectures head-to-head on 40 tasks with pre-written
+acceptance criteria and two human scorers (kappa 0.71): single agent $0.253 per successful task at
+75%, critic-refiner $0.412 at 82.5%, orchestrator-specialist $0.400 at 77.5%. Attributed 8 of 9
+multi-agent failures to coordination rather than capability, and shipped the single agent with a
+critic on the final artifact only."*
+
+**How to talk about it.** Lead with the control condition: a single agent reviewing its own work in
+one conversation got 80% of the critic's benefit for 71% of its cost. Then say why the arithmetic
+predicted it — more agents means more steps, and steps multiply. This is a Week 29 answer applied to
+a Week 30 problem and it shows the course thinking rather than the module thinking.
+
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+**1. Ask for the head-to-head before the architecture review.** When the multi-agent proposal
+arrives, the single question that resolves it is "what does one strong agent get on the same 40
+tasks?" Nobody will have run it. Offer to.
+
+**2. Add a critic to one artifact.** Not a re-architecture — one extra call on the final output,
+with a three-criterion rubric and a stopping rule. It is the pattern that pays, it is a day of work,
+and it is measurable on your existing eval set.
+
+**3. Split on permission scope, not on job title.** If you do split agents, do it where a security
+boundary already exists — the agent that can read PII and the agent that writes customer-facing
+text. That split is defensible to a security reviewer and it happens to be the case where isolation
+is free.
+
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Multi-agent costs 4× and does not help | Sequential specialists sharing context — coordination cost, no parallelism, no isolation | Run the head-to-head; usually the answer is one agent |
+| Critic never accepts | No `ACCEPT` token and no score-based stop | Explicit accept, plus stop when the score stops improving |
+| Third refinement round makes it worse | A critic asked for problems will find them | Cap at two rounds; we measured round 3 at −0.02 |
+| Specialist answers the wrong question perfectly | Bad brief plus isolated context, with no detection | `must_return` field list plus an `unanswered` check at the merge |
+| A wrong intermediate becomes everyone's premise | Shared context propagates errors | Isolate, and validate each hand-off against a schema |
+| Hand-off drops information | Free-text hand-off between agents | Pydantic contracts on every boundary; typed fields fail loudly |
+| Cannot tell which agent caused a failure | No per-agent attribution | Tag every model call with the agent name; Week 31 M3 makes this a metric |
+| Mixture-of-agents underperforms the paper | Three copies of one model, not three different models | The gain in the paper comes from diversity; same model, same errors |
+| Multi-agent "feels" better | No control condition | Single agent with self-review in one conversation. Run it. |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="8 concept questions (with answers)" icon="circle-question">
+
+1. *Why does adding agents usually reduce end-to-end reliability?* Each agent is more steps, and Week 29 M1's arithmetic says independent steps multiply.
+2. *What are the two things that can buy back that loss?* Genuine parallelism over independent sources (buys latency), and a verification pass (buys accuracy).
+3. *What must a critic have to be useful?* A written rubric, access to the source material, structured fixes, and a stopping rule.
+4. *Why cap the refinement loop at two rounds?* Measured: +0.41, +0.07, −0.02 quality per round. The third is over-editing.
+5. *What is the strongest justification for splitting agents?* Different permission scopes — the split is a security boundary, not a productivity idea.
+6. *What does isolated context change about the failure mode?* From "confused by irrelevant context" to "answered the wrong question perfectly"; detectable only with a required-field contract.
+7. *What is the control condition?* One agent doing both jobs in one conversation, on the same tasks.
+8. *Why did mixture-of-agents underperform its paper?* Most implementations run one model three times; the paper's gain comes from model diversity.
+
+</Accordion>
+<Accordion title="Coding challenge (hidden tests)" icon="code">
+
+Implement the critic-refiner to pass offline tests (mocked models) covering: `ACCEPT` on the first
+critique returns after exactly one write; a non-improving score stops the loop even without
+`ACCEPT`; the loop never exceeds two rounds; the writer receives only the structured fixes, not the
+whole critique; a critic returning invalid JSON triggers one reformat retry and then falls back to
+accepting the current draft rather than failing the run; and cost accounting sums across both agents.
+
+</Accordion>
+<Accordion title="Interview questions — junior / mid / senior" icon="user-tie">
+
+- **Junior.** "What is a hand-off between two agents, and what gets lost?"
+- **Mid.** "Your team wants to split one agent into five. What do you measure first, and what would make you say yes?"
+- **Senior.** "Your multi-agent system is at 71% where the single agent was 84%. All five specialists sample as individually correct. Diagnose it." (Expect: coordination failures, hand-off format drift, compounding arithmetic, contract validation at boundaries, and per-agent attribution in telemetry.)
+
+</Accordion>
+<Accordion title="Draw it from memory" icon="pencil">
+
+The four-panel catalogue with your own measured cost multiple and quality delta under each, and the
+hand-off line drawn in red across the middle.
+
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+- [LangGraph subgraph and parallel-node documentation (0.2.74)](https://langchain-ai.github.io/langgraph/) — read this for how superstep parallelism actually schedules specialist nodes and how their state merges.
+- [Anthropic tool-use documentation, parallel tool use](https://docs.claude.com/en/docs/agents-and-tools/tool-use/overview) — read it because much of what people want from "multiple agents" is available as parallel tool calls in one agent, at a fraction of the cost.
+
+**Papers**
+- [Wu et al. 2023, *AutoGen*](https://arxiv.org/abs/2308.08155) — multi-agent as configurable conversation; note that its strongest results come from the human and code-execution participants rather than from agent count.
+- [Wang et al. 2024, *Mixture-of-Agents*](https://arxiv.org/abs/2406.04692) — aggregation helps, and the help comes from model diversity, so three copies of one model captures far less of it.
+
+**Go deeper**
+- [Anthropic, *How we built our multi-agent research system*](https://www.anthropic.com/engineering/multi-agent-research-system) — read it for the honesty: a stated ~15× token multiple and a clear statement of the task shape that justifies it.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-30/p4-w30-m2">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

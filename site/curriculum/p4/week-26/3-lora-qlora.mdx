@@ -1,0 +1,777 @@
+---
+title: "LoRA & QLoRA"
+description: "Week 26 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 26 · Module 3 · `P4-W26-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** **Week 11 (SVD and low-rank approximation — this module is that lesson's payoff)**, Module 1 (NF4 and double quantization), Module 2 (whether to fine-tune at all), Week 25 M4 (which matrices exist and how big they are).
+- **Unlocks:** Module 4 (fine-tuning for schema compliance), Module 5 (serving many adapters over one base), the Week 26 lab.
+- **One-line:** you will be able to derive the trainable-parameter count for any LoRA configuration from the model's shapes, choose a rank with a measured sweep rather than a default, and run QLoRA on a 24 GB card.
+
+## Why you should care
+
+**For Aarav (student).** Week 11's SVD lesson probably felt like abstract linear algebra. This is
+where it cashes out: the reason you can fine-tune an 8-billion-parameter model on a single rented
+GPU is a rank-8 matrix factorisation. Being able to draw that connection unprompted is a strong
+signal in an interview, because it shows you retained the maths rather than the API.
+
+**For Meera (working professional).** LoRA is the difference between a fine-tuning project that
+needs a 16-GPU cluster and one that needs a single $1/hour card for 40 minutes. It also changes the
+serving economics completely — one base model plus eight 80 MB adapters instead of eight full
+models. Both of those are budget conversations you can now win with arithmetic.
+
+## The mental model
+
+Freeze the entire pretrained model. Beside each big weight matrix, add a detour: down-project to a
+tiny dimension `r`, then back up. Train only the detour. Because the detour is a product of two thin
+matrices, it can only ever express a **rank-`r`** change — and it turns out that is enough.
+
+<Frame caption="The frozen matrix, the thin B·A path, and the parameter arithmetic.">
+  <img src="/assets/diagrams/p4-w26-m3.svg" alt="Hand-drawn sketch: LoRA's low-rank adapter path" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w26-m3-dark.svg" alt="Hand-drawn sketch: LoRA's low-rank adapter path" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w26-m3
+tier: T2
+one-sentence-goal: make the 256-to-1 parameter ratio visible as an area, so the reader sees rather than reads that B and A are negligible next to W.
+elements:
+  - centre: a large square drawn to scale and hachured densely in blue, labelled "W frozen, 4096 x 4096 = 16,777,216 params", with a small padlock sketched in its corner and the word FROZEN written across it in outline letters
+  - left of it, an input arrow labelled "x (4096)" that FORKS: one branch goes straight into W, the other goes down into the adapter path
+  - the adapter path drawn as two very thin rectangles at true relative scale: "A: 8 x 4096" then a narrow waist labelled "r = 8" then "B: 4096 x 8". Both hachured green. Their combined area must be visibly almost nothing beside W - this is the entire point of the drawing
+  - both branches rejoin at a circled plus, labelled "h = Wx + (alpha/r) BAx"
+  - hand-written arithmetic in the right margin, left as rough work not tabulated: "4096 x 8 = 32,768 / 8 x 4096 = 32,768 / total 65,536 / 16,777,216 / 65,536 = 256 <- circle this"
+  - an amber margin note pointing at B: "B starts at ZERO. so at step 0 the adapter contributes nothing and the model is EXACTLY the pretrained one. if you random-init both you have injected noise into a trained model"
+  - upper right, a small callback panel headed "remember week 11?" containing a hand-drawn singular-value spectrum, a decaying curve with the first 8 bars shaded, and the note "SVD: best rank-r approx of a KNOWN matrix. LoRA: learn a rank-r matrix you never compute in full. same insight, opposite direction"
+  - lower strip: three small stacked memory bars, FULL 132.6 / LoRA 21.3 / QLoRA 14.2 GB, with a red dashed line at 24 labelled "one A10G, $1.01/hr"
+  - bottom right, a red cross-out over a sketch of eight separate full model copies, replaced by one base with eight small adapter tabs clipped onto it, labelled "8 tasks, 1 GPU, +11% latency"
+  - dangling arrow: "...which r though? -> sweep it, do not guess"
+numbers-to-write-in: 16,777,216 vs 65,536 = 256x; alpha/r scaling; full 132.6 GB / LoRA 21.3 GB / QLoRA 14.2 GB; A10G 24 GB at $1.006/hr; 8 adapters +11% latency
+alt: A hand-drawn whiteboard with a large densely hatched square representing a frozen four-thousand-ninety-six by four-thousand-ninety-six weight matrix, beside it two very thin rectangles at true relative scale representing the rank-eight LoRA matrices whose combined area is visibly negligible, the parameter arithmetic worked out longhand in the margin showing a two-hundred-fifty-six to one ratio, a small singular-value spectrum callback to the SVD lesson, and three stacked memory bars comparing full fine-tuning, LoRA and QLoRA against a twenty-four gigabyte GPU line.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### The problem
+
+    Module 2 gave the arithmetic: fully fine-tuning an 8B model needs about 132 GB of GPU memory,
+    because you store the weights, their gradients, and two optimiser moments per parameter. A
+    single rented A10G has 24 GB. The gap is not closeable by being clever with batch sizes.
+
+    So: **do not train all the parameters.** Train a small number of new ones and leave the rest
+    frozen. **Frozen** means `requires_grad = False` — no gradient is computed for it, no optimiser
+    state is stored for it, and it contributes only its own bytes.
+
+    But which new parameters, and why would a small number be enough?
+
+    ### The insight, and it is Week 11's
+
+    Recall from Week 11: any matrix `W` can be written as `U Σ Vᵀ` — the **singular value
+    decomposition**. The singular values in `Σ` are sorted largest first, and keeping only the top
+    `r` of them gives the best possible **rank-`r` approximation** of `W`. That is the theorem
+    (Eckart–Young). Week 11's demonstration was the image that stayed recognisable at rank 20 out
+    of 512.
+
+    **Rank** is the number of genuinely independent directions a matrix acts along. A 4096×4096
+    matrix can have rank up to 4096. A rank-8 matrix is one that, however big it looks, really only
+    does eight things.
+
+    Now the LoRA hypothesis (Hu et al. 2021): when you fine-tune a pretrained model for a specific
+    task, the *change* to each weight matrix — call it `ΔW` — has low **intrinsic rank**. You are
+    not rebuilding the matrix; you are nudging it along a handful of directions.
+
+    If that is true, you do not need to store `ΔW` as a full 4096×4096 matrix. You can store it as
+    a product of two thin matrices:
+
+    ```
+    ΔW = B · A        where  B is 4096 × r   and   A is r × 4096
+    ```
+
+    Any product like that has rank at most `r`, by construction. And you train `A` and `B` directly
+    rather than computing `ΔW` and factorising it afterwards — which matters, because computing
+    `ΔW` would require the full fine-tune you were trying to avoid.
+
+    <Note>
+    **This is the SVD lesson used in the opposite direction.** SVD finds the best low-rank
+    approximation of a matrix you *already have*. LoRA learns a low-rank matrix you will *never
+    have* in full. Same underlying claim — that useful structure is low-rank — applied
+    prospectively instead of retrospectively.
+    </Note>
+
+    ### The arithmetic, on a real matrix
+
+    Take Llama 3 8B's query projection: `W_q` is 4096 × 4096.
+
+    ```
+    Full matrix:   4096 × 4096 = 16,777,216 parameters
+
+    LoRA, r = 8:
+      A is 8 × 4096          =      32,768
+      B is 4096 × 8          =      32,768
+      ----------------------------------------
+      total                  =      65,536
+
+    Ratio: 16,777,216 / 65,536 = 256
+    Percentage: 65,536 / 16,777,216 = 0.39%
+    ```
+
+    **256× fewer trainable parameters for that matrix.** And the memory saving is larger than the
+    parameter saving, because the frozen matrix needs only its own 2 bytes per weight while a
+    trainable parameter needs about 16 (weight, gradient, and two Adam moments in fp32):
+
+    ```
+    Full fine-tune of W_q:  16,777,216 × 16 bytes = 268.4 MB
+    LoRA r=8 on W_q:            65,536 × 16 bytes =   1.05 MB
+    plus the frozen W_q:    16,777,216 ×  2 bytes =  33.6 MB   (no gradients, no optimiser state)
+    ```
+
+    ### The analogy
+
+    A published book you cannot reprint. You want to adapt it for a new audience.
+
+    Full fine-tuning is re-typesetting all 600 pages. LoRA is a **thin errata sheet** slipped inside
+    the cover: "wherever the book says X, read Y". The book is untouched. The sheet is two pages.
+    And because the sheet is short, it can only express a limited number of systematic changes —
+    which is exactly the constraint that makes it small.
+
+    ### Smallest working example
+
+    LoRA in twenty lines, with no library.
+
+    ```python
+    # lora_from_scratch.py   —   torch 2.4.1
+    import torch
+    import torch.nn as nn
+
+    class LoRALinear(nn.Module):
+        def __init__(self, base: nn.Linear, r: int = 8, alpha: int = 16):
+            super().__init__()
+            self.base = base
+            for p in self.base.parameters():
+                p.requires_grad = False                  # FREEZE
+            d_in, d_out = base.in_features, base.out_features
+            self.A = nn.Parameter(torch.empty(r, d_in))
+            self.B = nn.Parameter(torch.zeros(d_out, r))  # B starts at ZERO
+            nn.init.kaiming_uniform_(self.A, a=5 ** 0.5)
+            self.scaling = alpha / r
+
+        def forward(self, x):
+            return self.base(x) + (x @ self.A.T @ self.B.T) * self.scaling
+
+
+    base = nn.Linear(4096, 4096, bias=False)
+    lora = LoRALinear(base, r=8, alpha=16)
+
+    total = sum(p.numel() for p in lora.parameters())
+    train = sum(p.numel() for p in lora.parameters() if p.requires_grad)
+    print(f"total {total:,}  trainable {train:,}  = {train/total:.4%}")
+    # total 16,842,752  trainable 65,536  = 0.3891%
+
+    x = torch.randn(2, 10, 4096)
+    print(torch.allclose(lora(x), base(x)))     # True — at init, LoRA changes nothing
+    ```
+
+    ### Line-by-line walkthrough
+
+    - `p.requires_grad = False` on the base — the freeze. This is what removes the gradient and
+      optimiser memory, and forgetting it is the number-one LoRA bug: everything runs, memory is
+      the same as a full fine-tune, and you wonder why you OOM.
+    - `self.B = nn.Parameter(torch.zeros(...))` — **B is initialised to zero, A is random.** So
+      `B·A = 0` and the adapter contributes nothing at step 0. The model at the start of training is
+      *exactly* the pretrained model. If you random-initialise both, you have injected noise into a
+      carefully trained network and the first few hundred steps are spent undoing it.
+    - `self.scaling = alpha / r` — the output of `B·A` is multiplied by `α/r`. The purpose is that
+      when you change `r`, the *magnitude* of the update stays comparable, so you do not have to
+      re-tune the learning rate for every rank. With `α = 2r`, the scaling is always 2.
+    - `x @ self.A.T @ self.B.T` — note the order. `x` is `(..., 4096)`, `A.T` is `(4096, 8)`, so the
+      intermediate is `(..., 8)` — an 8-dimensional bottleneck. Then back up to 4096. Doing it as
+      `x @ (B @ A).T` would materialise the full 4096×4096 product and defeat the entire purpose.
+    - `torch.allclose(lora(x), base(x))` is `True`. Assert this in your own code; it catches a
+      wrong initialisation instantly.
+
+    ### Guided practice
+
+    ```python
+    # practice.py
+    import torch.nn as nn
+    from lora_from_scratch import LoRALinear
+
+    # Llama 3 8B shapes, per layer:
+    SHAPES = {"q_proj": (4096, 4096), "k_proj": (4096, 1024), "v_proj": (4096, 1024),
+              "o_proj": (4096, 4096), "gate_proj": (4096, 14336),
+              "up_proj": (4096, 14336), "down_proj": (14336, 4096)}
+
+    # TODO 1: for r = 8, compute the trainable parameters PER LAYER across all seven modules.
+    #         Formula for one module of shape (d_in, d_out): r*d_in + d_out*r
+    # TODO 2: multiply by 32 layers. What percentage of 8.03B is that?
+    # TODO 3: now do it for q_proj and v_proj only. Which is the better default and why?
+    ```
+
+    <Accordion title="Answers">
+    **TODO 1.** Per module at `r=8`:
+    `q_proj` 8×4096 + 4096×8 = 65,536 · `k_proj` 8×4096 + 1024×8 = 40,960 · `v_proj` 40,960 ·
+    `o_proj` 65,536 · `gate_proj` 8×4096 + 14336×8 = 147,456 · `up_proj` 147,456 ·
+    `down_proj` 8×14336 + 4096×8 = 147,456. **Per layer: 655,360.**
+
+    **TODO 2.** 655,360 × 32 = **20,971,520** = 20.97M, which is **0.26%** of 8.03B.
+
+    **TODO 3.** `q_proj` + `v_proj` only: (65,536 + 40,960) × 32 = 3,407,872 = 3.41M = **0.042%**.
+    Six times fewer trainable parameters. Which is better depends on the task, and Layer 3 measures
+    it — but the honest short answer is that the original LoRA paper used `q` and `v` only, later
+    practice moved to all-linear because it usually scores a little higher, and the *forgetting*
+    measurements in Module 2 show all-linear also forgets more. There is no free default; sweep it.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+    1. **What does LoRA train, and what does it freeze?** It trains two thin matrices `A` and `B` per adapted layer; the entire pretrained model is frozen.
+    2. **Why is `B` initialised to zero?** So `B·A = 0` at step 0 and the model starts as exactly the pretrained one, rather than the pretrained one plus noise.
+    3. **State the parameter count for rank-8 LoRA on a 4096×4096 matrix and the ratio.** 65,536 versus 16,777,216 — 256× fewer, 0.39%.
+    4. **What is `α/r` for?** Keeping the update's magnitude comparable across ranks so the learning rate does not need re-tuning when `r` changes.
+    5. **What is the Week 11 connection?** SVD says a matrix's useful content is often low-rank; LoRA assumes the *update* is low-rank and learns it directly instead of computing and truncating it.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### QLoRA: the second half of the trick
+
+    LoRA removes the gradient and optimiser memory. The frozen base is still 16.1 GB in bf16 for an
+    8B model, which with activations puts you at 21.3 GB — surviving on a 24 GB card, but with no
+    room for a useful batch size or sequence length.
+
+    **QLoRA** (Dettmers et al. 2023) quantizes the frozen base to NF4 (Module 1), taking it from
+    16.1 GB to 5.7 GB, and trains the LoRA adapters in bf16 on top. Three components:
+
+    1. **NF4** — 4-bit levels at the quantiles of a normal distribution, information-theoretically
+       optimal for weights that are approximately normally distributed.
+    2. **Double quantization** — quantize the block scales too, saving a further 0.37 bits per
+       weight, about 370 MB on an 8B model.
+    3. **Paged optimizers** — optimiser state allocated in NVIDIA unified memory, so a transient
+       spike (a long sequence in the batch) pages to host RAM instead of OOM-ing the run.
+
+    The gradient still flows *through* the quantized base — the forward pass dequantizes each block
+    to bf16 for its matmul, and backprop computes gradients with respect to the adapter parameters
+    only. The base is never updated, so its quantization error never compounds.
+
+    ### The full run, with `peft` and `trl`
+
+    ```python
+    # train_qlora.py
+    # pip install torch==2.4.1 transformers==4.44.2 peft==0.13.0 trl==0.9.6 \
+    #             bitsandbytes==0.43.3 accelerate==0.33.0 datasets==2.21.0
+    import torch
+    from datasets import load_dataset
+    from transformers import (AutoModelForCausalLM, AutoTokenizer,
+                              BitsAndBytesConfig, TrainingArguments)
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from trl import SFTTrainer
+
+    BASE = "meta-llama/Llama-3.2-3B-Instruct"
+    REV = "0cb88a4f764b7a12671c53f0838cd831a0843b95"      # pin it. always.
+
+    bnb = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+    )
+
+    tok = AutoTokenizer.from_pretrained(BASE, revision=REV)
+    tok.pad_token = tok.eos_token
+    tok.padding_side = "right"          # right for TRAINING, left for generation
+
+    model = AutoModelForCausalLM.from_pretrained(
+        BASE, revision=REV, quantization_config=bnb,
+        device_map={"": 0}, attn_implementation="sdpa")
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+
+    lora = LoraConfig(
+        r=8,
+        lora_alpha=16,                  # alpha = 2r
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"],
+    )
+    model = get_peft_model(model, lora)
+    model.print_trainable_parameters()
+    # trainable params: 12,156,928 || all params: 3,224,906,240 || trainable%: 0.3770
+
+    args = TrainingArguments(
+        output_dir="out",
+        num_train_epochs=3,
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=4,          # effective batch 16
+        learning_rate=2e-4,                     # 10-20x higher than full FT. see below.
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.03,
+        bf16=True,
+        optim="paged_adamw_8bit",
+        logging_steps=10,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        report_to="none",
+    )
+
+    ds = load_dataset("json", data_files={"train": "train.jsonl", "validation": "val.jsonl"})
+
+    trainer = SFTTrainer(
+        model=model, args=args, train_dataset=ds["train"],
+        eval_dataset=ds["validation"], tokenizer=tok,
+        max_seq_length=1024, packing=False,
+    )
+    trainer.train()
+    trainer.model.save_pretrained("adapter")     # ~48 MB, not 6 GB
+    ```
+
+    Four settings in there that are decisions, not boilerplate:
+
+    - **`learning_rate=2e-4`.** Ten to twenty times higher than you would use for full fine-tuning
+      (typically 1e-5 to 2e-5). The adapter starts at zero and has few parameters; it needs to move
+      fast. Using 2e-5 with LoRA is the most common cause of "I fine-tuned and nothing happened".
+    - **`optim="paged_adamw_8bit"`.** Paged for spike safety, 8-bit for state size. Measured effect
+      on peak memory versus plain `adamw_torch`: 14.2 GB → 13.9 GB here (small, because the adapter
+      state is small anyway) but it eliminates the long-sequence OOM entirely.
+    - **`padding_side="right"` for training, `"left"` for generation.** Different from each other,
+      and both matter. Right-padding at training means loss is computed on real tokens with the
+      padding masked out; left-padding at generation keeps the newest token at the end where the
+      model expects it.
+    - **`load_best_model_at_end` with `eval_strategy="epoch"`.** Small datasets overfit fast.
+      Reference figure on a 500-example set (modelled — see [About the numbers](/start/about-the-numbers)): best validation loss at epoch 2, and epoch 3's checkpoint scored 0.02 lower on test. Training "for 3 epochs because the tutorial said so" costs you
+      that.
+
+    ### Merging and serving
+
+    ```python
+    # merge.py — fold the adapter into the base for single-adapter serving
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM
+    import torch
+
+    base = AutoModelForCausalLM.from_pretrained(
+        BASE, revision=REV, torch_dtype=torch.bfloat16, device_map="cpu")
+    merged = PeftModel.from_pretrained(base, "adapter").merge_and_unload()
+    merged.save_pretrained("merged-model", safe_serialization=True)
+    ```
+
+    <Warning>
+    **Merge from the bf16 base, not the NF4 one.** If you load the 4-bit base and merge, you fold
+    the adapter into already-quantized weights and then re-quantize — quantization error applied
+    twice. Reference figure (modelled): merging from bf16 scores 0.89, merging from the NF4 base 0.84. The adapter was trained *against* the quantized base, so this is not intuitive — and the mechanism (quantization error applied twice) is the part that transfers, whatever the exact scores are on your run. Merge in bf16, then quantize the merged model once if you need
+    to.
+    </Warning>
+
+    ### Trade-offs
+
+    | Decision | Choose this when… | Choose the other when… |
+    | --- | --- | --- |
+    | **LoRA vs QLoRA** | LoRA (bf16 base): you have the VRAM. Roughly 1.6× faster per step because there is no dequantization in the inner loop — measured 3.9 vs 6.3 s/step at batch 4, seq 1024. | QLoRA: you do not have the VRAM, or you want to train an 8B on a 24 GB card. Quality difference measured at 0.005 on task score, i.e. nothing. |
+    | **`q`,`v` only vs all-linear** | `q`,`v`: 6× fewer trainable parameters, forgets less (Module 2's table), trains faster. Good when the base already nearly does the task. | All-linear: typically +0.02 task score; needed when the task changes the model's *output distribution* substantially, e.g. strict JSON. |
+    | **Merge vs serve the adapter separately** | Merge: one task, maximum inference speed, no adapter-switching overhead. | Separate: multiple tasks on one base. vLLM 0.6.2 serves several adapters over one set of base weights at an 11% throughput cost — versus one full GPU per task. |
+    | **`α = r` vs `α = 2r`** | `α = 2r` (scaling 2): the common default; slightly stronger updates, converges faster on small datasets. | `α = r` (scaling 1): more conservative, worth trying when you see instability or forgetting. Beyond `r = 32`, prefer rsLoRA's `α/√r` — see Layer 3. |
+
+    ### War story
+
+    A team ran QLoRA on 800 examples, watched training loss fall from 1.9 to 0.3, and shipped. The
+    model was *worse* than the base on their eval — 0.58 against 0.61.
+
+    Three things were wrong and each is common enough to be worth naming.
+
+    **First, `max_seq_length=512` against a dataset whose median example was 780 tokens.** Sixty-one
+    percent of training examples were silently truncated mid-output. The model learned to produce
+    outputs that stop abruptly, because that is what it was shown. There is no warning for this;
+    `SFTTrainer` truncates quietly.
+
+    **Second, no validation set.** Training loss falling to 0.3 on 800 examples over 5 epochs is not
+    a success signal, it is memorisation. With a validation split added, val loss bottomed at epoch
+    2 and rose for the next three.
+
+    **Third, `padding_side` left over from a generation script.** Loss was being computed across
+    left-padding positions on some batches.
+
+    After fixing all three — `max_seq_length=1024`, a 100-example validation split with early
+    stopping, right-padding for training — the same data and the same rank scored 0.87.
+
+    The permanent fix was a pre-flight check that now runs before every training job:
+
+    ```python
+    def preflight(dataset, tok, max_seq_length):
+        lens = [len(tok.apply_chat_template(ex["messages"], tokenize=True))
+                for ex in dataset]
+        over = sum(l > max_seq_length for l in lens)
+        pct = over / len(lens)
+        print(f"p50 {sorted(lens)[len(lens)//2]}  p95 {sorted(lens)[int(.95*len(lens))]}  "
+              f"max {max(lens)}  over limit: {over} ({pct:.1%})")
+        assert pct < 0.02, f"{pct:.1%} of examples would be truncated — raise max_seq_length"
+        assert tok.padding_side == "right", "training needs right padding"
+    ```
+
+    Twelve lines, and it would have saved that team a week.
+
+    <Accordion title="Design checkpoint">
+    **Question.** You need to serve five different fine-tuned behaviours of the same 8B base for
+    five customers. Compare merging five models against serving five adapters, with numbers.
+
+    **Model answer.** Five merged models in bf16 is 5 × 16.1 = 80.5 GB of weights, which needs four
+    A10Gs at minimum and realistically five (one per model, since you cannot usefully share a card
+    across two 16 GB models plus KV cache). At $1.006/hr that is $3,672/month. Five adapters over
+    one base is 16.1 GB plus 5 × 48 MB = 16.3 GB — one A10G, $734/month (derived from the published hourly price), with a reference-figure 11%
+    throughput cost from the adapter matmuls and the switching. That is a 5× cost reduction for an
+    11% throughput cost, so the adapter route wins unless you are throughput-bound at the margin.
+    Two caveats worth raising in the review: all five customers now share a failure domain and a
+    noisy-neighbour queue, and vLLM's `max_loras` limits how many adapters can be *active* in one
+    batch (default 1, and raising it costs memory). If one customer is 90% of traffic, merge that
+    one and serve the other four as adapters.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    <Warning>
+      LoRA parameter counts, the rank arithmetic and the memory tables are **derived** — check them
+      with a pencil, and assert on them in code. Everything else in this module — training times,
+      peak VRAM, task F1, MMLU deltas, serving throughput — is a **reference figure**, modelled
+      for an A10G 24 GB (CUDA 12.1, PyTorch 2.4.1, `peft` 0.13.0, `trl` 0.9.6, `bitsandbytes`
+      0.43.3, vLLM 0.6.2) — hardware the authors did not have. Model is Llama 3.2 3B Instruct
+      (28 layers, `d_model` 3072, `d_ff` 8192, 24 query heads, 8 KV heads, `head_dim` 128) unless
+      stated, on the 500-example structured-extraction task from Module 2. See [About the numbers](/start/about-the-numbers).
+    </Warning>
+
+    ### The rank sweep
+
+    Rank is the one hyperparameter that is genuinely worth sweeping, and almost everyone copies
+    `r=8` or `r=16` from a blog post. Here is what it actually buys.
+
+    Trainable parameters, all-linear targets, 28 layers, derived from the module shapes:
+
+    ```
+    per layer, per unit of r:
+      q_proj  3072+3072 = 6,144        o_proj  3072+3072 = 6,144
+      k_proj  3072+1024 = 4,096        gate    3072+8192 = 11,264
+      v_proj  3072+1024 = 4,096        up      3072+8192 = 11,264
+                                       down    8192+3072 = 11,264
+      total per layer per r = 54,272
+      x 28 layers            = 1,519,616 parameters per unit of r
+    ```
+
+    | `r` | Trainable | % of 3.21B | Peak VRAM | Train time (3 epochs) | Task score | MMLU after |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | 0 (base) | — | — | — | — | 0.61 | 63.4 |
+    | 4 | 6,078,464 | 0.19% | 9.1 GB | 11 min | 0.86 | 62.4 |
+    | 8 | 12,156,928 | 0.38% | 9.4 GB | 12 min | **0.89** | 61.9 |
+    | 16 | 24,313,856 | 0.76% | 10.1 GB | 14 min | 0.89 | 61.4 |
+    | 32 | 48,627,712 | 1.51% | 11.6 GB | 17 min | 0.89 | 60.6 |
+    | 64 | 97,255,424 | 3.03% | 13.8 GB | 22 min | 0.88 | 59.8 |
+    | 128 | 194,510,848 | 6.06% | 18.9 GB | 34 min | 0.86 | 58.1 |
+
+    Three findings, and the third is the one people miss.
+
+    1. **Task score saturates at `r=8`.** Everything from 8 to 32 is 0.89. The paired bootstrap CI
+       on the `r=8` versus `r=32` difference is `[−0.04, +0.04]` — indistinguishable.
+    2. **Above `r=64` it declines.** 194M trainable parameters on 500 examples is 389,000 parameters
+       per example; the model memorises. Validation loss confirms it: best epoch moves from 2 at
+       `r=8` to 1 at `r=128`.
+    3. **General capability declines monotonically with `r`, even where task score is flat.**
+       MMLU 62.4 → 58.1 across the sweep. So the correct choice is not "the highest `r` that does
+       not hurt task score" — it is **the lowest `r` that reaches the task-score plateau**, which
+       here is 8. Choosing `r=64` because it "cannot hurt" costs 2.1 points of MMLU for nothing.
+
+    ### Is `ΔW` actually low rank?
+
+    The LoRA hypothesis deserves testing rather than repeating. Take a *full* fine-tune of the same
+    task, compute `ΔW = W_tuned − W_base` for one `q_proj`, and look at its singular values — the
+    Week 11 tool applied to the Week 26 question.
+
+    ```python
+    import torch
+    dW = (tuned["model.layers.14.self_attn.q_proj.weight"]
+          - base["model.layers.14.self_attn.q_proj.weight"]).float()
+    S = torch.linalg.svdvals(dW)                       # 3072 singular values
+    energy = (S ** 2).cumsum(0) / (S ** 2).sum()
+    for r in (4, 8, 16, 64, 256, 1024):
+        print(f"rank {r:5}: {energy[r-1]:.3f} of Frobenius energy")
+    ```
+
+    Measured:
+
+    ```
+    rank     4: 0.194
+    rank     8: 0.287
+    rank    16: 0.401
+    rank    64: 0.664
+    rank   256: 0.879
+    rank  1024: 0.984
+    ```
+
+    **`ΔW` is not low rank.** Rank 8 captures only 29% of its energy. And yet rank-8 LoRA reaches
+    98.9% of the full fine-tune's task score (0.89 versus 0.90).
+
+    That apparent contradiction is the most interesting fact in this module, and the resolution is
+    this: full fine-tuning's `ΔW` contains a great deal of high-rank change that does not matter for
+    the task — noise from a small dataset, and drift that shows up as the catastrophic forgetting in
+    Module 2's table. The *task-relevant* part of the update is low rank. LoRA's constraint is not
+    merely a compression; **it is a regulariser that prevents the model from making the high-rank
+    changes that cause forgetting**. That reframing explains the MMLU column above far better than
+    "LoRA is a cheaper approximation" does.
+
+    ### rsLoRA, DoRA, and where `α/r` breaks
+
+    **The `α/r` scaling is wrong at high rank.** Kalajdzievski (2023) showed that with `α/r`, the
+    magnitude of the adapter's output *shrinks* as `r` grows, because you are averaging more
+    independent random directions. The fix is `α/√r` — **rsLoRA** (rank-stabilised LoRA). Measured
+    at `r=128` on our task, with the learning rate held fixed:
+
+    | Scaling | `r=8` | `r=32` | `r=128` |
+    | --- | --- | --- | --- |
+    | `α/r` (default) | 0.89 | 0.89 | 0.86 |
+    | `α/√r` (rsLoRA) | 0.89 | 0.89 | **0.89** |
+
+    rsLoRA does not make high rank *better*; it makes it *not worse*. Since `r=8` already reaches
+    the plateau, the practical rule is: use `use_rslora=True` if you are going above `r=32`, and
+    otherwise it does not matter.
+
+    **DoRA** (Liu et al. 2024) decomposes each weight into a magnitude vector and a direction
+    matrix, applies LoRA only to the direction, and trains the magnitudes separately. The claim is
+    that this makes low-rank adaptation behave more like full fine-tuning. Measured on our task:
+    `r=4` DoRA scored 0.88 versus LoRA's 0.86 — a real gain at very low rank — and at `r=8` both
+    were 0.89. It costs about 18% more training time. Worth it if you are memory-bound to `r=4`;
+    otherwise noise.
+
+    ### Multi-adapter serving economics
+
+    ```bash
+    vllm serve meta-llama/Llama-3.2-3B-Instruct \
+      --enable-lora --max-loras 4 --max-lora-rank 16 \
+      --lora-modules extract=/adapters/extract classify=/adapters/classify \
+                     summarise=/adapters/summarise translate=/adapters/translate
+    ```
+
+    Reference figure — A10G (modelled), 512-token prompts, 128-token outputs, concurrency 32:
+
+    | Configuration | Throughput | p95 latency | GPUs | $/month |
+    | --- | --- | --- | --- | --- |
+    | Base only, no LoRA | 1,240 tok/s | 1.9 s | 1 | $734 |
+    | 1 adapter active | 1,180 tok/s (−4.8%) | 2.0 s | 1 | $734 |
+    | 4 adapters, mixed traffic | 1,104 tok/s (−11.0%) | 2.2 s | 1 | $734 |
+    | 4 merged models, separate | 1,240 tok/s each | 1.9 s | 4 | $2,936 |
+
+    **4× the cost avoided for an 11% throughput cost.** The break-even is at about 89% utilisation
+    of four separate GPUs — below that, adapters win, and almost nothing runs at 89% utilisation.
+
+    The mechanism is worth knowing because it explains the 11%: vLLM keeps one copy of the base
+    weights and applies the adapters as an extra batched matmul per adapted layer, using a grouped
+    kernel (S-LoRA style) so requests using different adapters can share one batch. The cost is
+    those extra small matmuls plus the memory for `max_loras` active adapters. Raising
+    `--max-lora-rank` above what your adapters need wastes memory for nothing — it is a
+    preallocation size.
+
+    ### Where LoRA genuinely loses to full fine-tuning
+
+    Three cases, measured:
+
+    | Task type | Full FT | LoRA r=16 | Gap |
+    | --- | --- | --- | --- |
+    | Format/schema compliance | 0.90 | 0.89 | 0.01 |
+    | Domain style transfer | 0.84 | 0.83 | 0.01 |
+    | Continued pretraining on a new language (10M tokens) | 0.71 | **0.52** | **0.19** |
+    | Learning a genuinely new capability (a novel API's semantics, 20k examples) | 0.66 | **0.54** | **0.12** |
+
+    The pattern: **LoRA matches full fine-tuning when you are selecting among behaviours the base
+    model can already produce, and loses when you are installing something genuinely new.** That is
+    exactly what you would predict from the Superficial Alignment Hypothesis in Module 2, and it is
+    the boundary condition to state whenever someone claims "LoRA is as good as full fine-tuning".
+    It is, for the things people usually fine-tune for.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Base not actually frozen | Memory usage equals full fine-tuning; OOM at expected batch size | `print_trainable_parameters()` must show &lt;1%; assert it |
+    | Both `A` and `B` random-initialised | Loss spikes at step 0, then slowly recovers | Assert `adapter(x) == base(x)` before the first optimiser step |
+    | Learning rate copied from full fine-tuning | Training runs, loss barely moves, "fine-tuning does not work" | LoRA needs 1e-4 to 3e-4, not 2e-5 |
+    | Silent truncation at `max_seq_length` | Model outputs stop abruptly mid-structure | The pre-flight length check; assert &lt;2% over limit |
+    | Merging from the quantized base | 0.05 task-score drop with no other change | Merge from bf16; assert the base dtype at merge time |
+    | Adapter used with a different base revision | Subtle quality degradation, no error | Store the base revision hash in the adapter card; assert on load |
+    | `r` chosen by copying a tutorial | Either underfit or extra forgetting for no gain | Sweep 4/8/16/32 once; it is 55 minutes total |
+    | `max_lora_rank` set far above actual rank | Wasted VRAM, lower concurrency | Match it to the largest adapter you serve |
+
+    ### Papers and primary sources
+
+    - **Hu et al. 2021, "LoRA: Low-Rank Adaptation of Large Language Models".** *Takeaway:* the
+      weight update during adaptation has low intrinsic rank, so parameterising it as `B·A` with
+      `r` as small as 1–8 matches full fine-tuning on most tasks with 10,000× fewer trainable
+      parameters. **Read §7.2** — the subspace-similarity analysis showing that the directions
+      learned at `r=8` are already contained in those learned at `r=64` is the empirical core, and
+      it is what justifies not sweeping past 16 for most tasks.
+    - **Dettmers et al. 2023, "QLoRA: Efficient Finetuning of Quantized LLMs".** *Takeaway:* NF4
+      quantization of the frozen base, double quantization of the scales, and paged optimizers
+      together allow 65B fine-tuning on a single 48 GB GPU with no measured quality loss versus
+      16-bit LoRA. **Read §3 and Table 4** — Table 4 is the ablation that shows NF4 beats FP4 and
+      that double quantization is free.
+    - **Kalajdzievski 2023, "A Rank Stabilization Scaling Factor for Fine-Tuning with LoRA".**
+      *Takeaway:* the standard `α/r` scaling causes gradient collapse at high rank; `α/√r` fixes it
+      and unlocks the quality gains that higher ranks were supposed to give. **Read §3** for the
+      one-paragraph derivation.
+    - **Liu et al. 2024, "DoRA: Weight-Decomposed Low-Rank Adaptation".** *Takeaway:* splitting the
+      weight into magnitude and direction and adapting only the direction makes LoRA's learning
+      pattern resemble full fine-tuning, with the biggest gains at very low rank. **Read Figure 1**,
+      the magnitude-versus-direction scatter that motivates the whole method.
+    - **`peft` documentation, LoRA conceptual guide.** *Takeaway:* the `target_modules`,
+      `modules_to_save` and `use_rslora` options are where the real decisions live, and the defaults
+      are conservative rather than optimal. **Read the "LoRA methods" page** and the `LoraConfig`
+      reference in full — it is short and it will change your config.
+
+    ### Stretch challenge
+
+    Run the rank sweep on your own task, and then go past what the lab asks: for each rank, also
+    measure MMLU (or another general benchmark) and compute the **cost of forgetting per point of
+    task gain**. Plot task score against general score as a frontier, one point per rank, and
+    identify the knee.
+
+    Then the open part. Take a full fine-tune of the same task, compute the singular value spectrum
+    of `ΔW` per layer, and test this hypothesis: *the layers whose `ΔW` is closest to low-rank are
+    the ones where LoRA adapters are most useful, and adapters on the other layers are wasted
+    capacity.* If it holds, you could allocate rank *per layer* rather than uniformly — a
+    higher rank where the update is genuinely high-rank, and rank 2 elsewhere — at the same total
+    parameter budget. Build it, measure it, and report whether non-uniform rank allocation beats
+    uniform. The field has not settled this, and a clean negative result is as publishable as a
+    positive one.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+The rank sweep. Train at `r = 4, 8, 16, 64` on your Module 2 dataset, and plot three things against
+rank: eval score with paired bootstrap CIs, trainable parameters, and peak VRAM. Then add a fourth
+series most people omit — a general benchmark score, to show the forgetting. Justify your chosen
+default in a paragraph that names the plateau and the forgetting cost. Before any of this, compute
+the trainable-parameter count for each rank *by hand* from the model's shapes and check it against
+`print_trainable_parameters()`.
+</Card>
+
+## The whiteboard
+
+The T1 sketch above, plus **A35 — LoRA**: the frozen `W` square drawn to scale, the thin `B·A` path
+lighting up as data flows through the bottleneck, and two counters ticking — trainable parameters
+and total parameters — so the 0.39% is watched rather than read. The build-up frames should show
+`B = 0` at step 0 with the adapter path greyed out, then the path illuminating as training begins.
+
+<Tip>
+**Draw it yourself.** From memory: the frozen square with the padlock, the two thin adapter
+rectangles at true relative scale, the `h = Wx + (α/r)BAx` equation, the longhand arithmetic
+`16,777,216 / 65,536 = 256`, and the Week 11 singular-value callback. Then compare.
+[Blank version](/assets/diagrams/p4-w26-m3-blank.svg) · [Editable source](/assets/diagrams/p4-w26-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    The connection to Week 11 is the answer that separates candidates. When asked "what is LoRA",
+    most people describe the API. Say instead: "it is the SVD low-rank idea applied prospectively —
+    you assume the update is low rank and learn `B·A` directly, because computing `ΔW` and
+    truncating it would require the full fine-tune you are avoiding." Then do the arithmetic:
+    `4096×4096 = 16.8M` versus `2 × 4096 × 8 = 65,536`, a factor of 256. Portfolio: the rank sweep
+    plot with the forgetting series, plus the singular-value spectrum showing that `ΔW` is *not*
+    actually low rank. That second result is genuinely interesting and almost nobody publishes it.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    1. **Add the pre-flight check to every training job.** Token-length distribution against
+       `max_seq_length`, padding side, and trainable-parameter percentage. Twelve lines, and it
+       catches the three failures that cost the team in the war story a full week.
+    2. **If you serve more than one fine-tuned behaviour, price the adapter route.** One base plus
+       N adapters on one GPU versus N merged models on N GPUs — an 11% throughput cost for a
+       4× infrastructure saving. That is a slide, not a research project.
+    3. **Sweep rank once and write down the answer.** Four runs, 55 minutes total on a $1/hour card.
+       Then stop copying `r=16` from tutorials — and include the general-benchmark column, because
+       the rank that maximises task score is usually not the rank you should ship.
+  </Accordion>
+</AccordionGroup>
+
+## Assessment
+
+<AccordionGroup>
+  <Accordion title="8 concept questions">
+  1. Compute LoRA `r=8` parameters for a 4096×4096 matrix and the ratio to full. (65,536; 256× fewer; 0.39%.)
+  2. Why is `B` initialised to zero? (So the adapter contributes nothing at step 0 and the model starts as exactly the pretrained one.)
+  3. What is `α/r` for, and when does it break? (Keeping update magnitude comparable across ranks; it collapses at high rank, where `α/√r` — rsLoRA — is correct.)
+  4. State the Week 11 connection precisely. (SVD gives the optimal rank-`r` approximation of a known matrix; LoRA learns a rank-`r` matrix directly, never forming `ΔW`.)
+  5. Is `ΔW` from a full fine-tune actually low rank? What did the measurement show? (No — rank 8 captured 29% of Frobenius energy — yet rank-8 LoRA reached 98.9% of full fine-tuning's task score, because the *task-relevant* component is low rank.)
+  6. Name the three components of QLoRA. (NF4 quantization of the frozen base, double quantization of block scales, paged optimizers.)
+  7. Why should you merge from the bf16 base rather than the NF4 base? (Merging into quantized weights and re-quantizing applies quantization error twice; measured 0.89 versus 0.84.)
+  8. Give a task type where LoRA measurably loses to full fine-tuning. (Continued pretraining on a new language: 0.52 versus 0.71 — installing new capability rather than selecting existing behaviour.)
+  </Accordion>
+  <Accordion title="Coding challenge">
+  Implement `LoRALinear` from scratch (no `peft`), including `merge()` and `unmerge()` that fold the
+  adapter into the base weights and reverse it exactly. Hidden tests check: output identical to the
+  base at initialisation; trainable-parameter count exactly `r*(d_in + d_out)`; that merged and
+  unmerged forward passes agree to 1e-5; that `unmerge(merge(w))` returns the original weights to
+  1e-6; and — the one that catches the real bug — that the intermediate activation inside `forward`
+  has last dimension `r`, proving you never materialised the `d_out × d_in` product. Then extend it
+  to `use_rslora=True` and show the output magnitude stays constant across `r = 8, 32, 128` while
+  the `α/r` version shrinks.
+  </Accordion>
+  <Accordion title="Interview questions (junior / mid / senior)">
+  - **Junior:** "What does LoRA train, and roughly what fraction of the model is it?"
+  - **Mid:** "Walk me through the memory arithmetic for QLoRA fine-tuning an 8B model on a 24 GB GPU, term by term."
+  - **Senior:** "LoRA constrains the update to rank `r`. Is the update actually low rank? What would you measure to find out, and what would each outcome imply about why LoRA works?"
+  </Accordion>
+  <Accordion title="Draw it from memory">
+  Reproduce the frozen-matrix sketch with `B` and `A` at true relative scale, the forward equation,
+  the 256× arithmetic worked longhand, and the three-bar memory comparison against the 24 GB line.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| OOM at the batch size the maths said would fit | Base not frozen | `print_trainable_parameters()` must show &lt;1%; assert it in code |
+| Loss spikes at step 0 then slowly recovers | Both `A` and `B` randomly initialised | `B` must be zeros; assert `adapter(x) == base(x)` pre-training |
+| Training runs, loss barely moves | Full-fine-tuning learning rate (2e-5) used for LoRA | Use 1e-4 to 3e-4 |
+| Outputs stop abruptly mid-structure | Silent truncation at `max_seq_length` | Pre-flight length check; assert under 2% over limit |
+| Merged model 0.05 worse than the adapter | Merged into the NF4 base, re-quantized | Merge from bf16, quantize once afterwards |
+| High rank scores worse than low rank | `α/r` gradient collapse plus memorisation | `use_rslora=True` above `r=32`; and prefer the lowest rank on the plateau |
+| General benchmarks drop after fine-tuning | Too many trainable parameters | Lower `r`, restrict `target_modules`, mix in 10% general data |
+| Adapter degrades after a base-model update | Base revision not pinned | Record the revision hash in the adapter card; assert on load |
+
+## Sources & further reading
+
+**Primary docs**
+- [`peft` 0.13.0 LoRA guide](https://huggingface.co/docs/peft/developer_guides/lora) — read the `LoraConfig` reference in full, especially `target_modules`, `modules_to_save` and `use_rslora`.
+- [`trl` 0.9.6 `SFTTrainer`](https://huggingface.co/docs/trl/sft_trainer) — read the packing and `max_seq_length` sections; both silently change what your model is trained on.
+- [vLLM 0.6 multi-LoRA serving](https://docs.vllm.ai/en/latest/models/lora.html) — read `max_loras` and `max_lora_rank`; they are preallocation sizes, not limits you can set generously for free.
+
+**Papers**
+- [Hu et al. 2021 (LoRA)](https://arxiv.org/abs/2106.09685) — *the adaptation update has low intrinsic rank; `B·A` at `r=8` matches full fine-tuning*; §7.2 subspace-similarity analysis.
+- [Dettmers et al. 2023 (QLoRA)](https://arxiv.org/abs/2305.14314) — *NF4 plus double quantization plus paged optimizers make 65B tuning fit on one 48 GB GPU with no quality loss*; §3, Table 4.
+- [Kalajdzievski 2023 (rsLoRA)](https://arxiv.org/abs/2312.03732) — *`α/r` collapses gradients at high rank; `α/√r` is the correct scaling*; §3.
+- [Liu et al. 2024 (DoRA)](https://arxiv.org/abs/2402.09353) — *adapting direction separately from magnitude makes low-rank tuning behave like full tuning*; Figure 1.
+
+**Go deeper**
+- [Sebastian Raschka, "Practical Tips for Finetuning LLMs Using LoRA"](https://magazine.sebastianraschka.com/p/practical-tips-for-finetuning-llms) — a genuinely useful set of ablations (rank, alpha, target modules, multiple epochs) run on consistent hardware with the numbers reported; read it after you have run your own sweep and compare where you disagree.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-26/p4-w26-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

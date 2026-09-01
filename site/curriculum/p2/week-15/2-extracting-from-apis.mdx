@@ -1,0 +1,1033 @@
+---
+title: "Extracting from APIs"
+description: "Week 15 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 15 · Module 2 · `P2-W15-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Call a REST API with auth, timeouts and error handling that will not lie to you.
+2. Handle all three **pagination** patterns — offset, cursor, and `Link` headers — behind one interface.
+3. Respect **rate limits** with exponential backoff and jitter, and honour `Retry-After`.
+4. Extract **incrementally** with a watermark, and resume correctly after a crash.
+5. Recover from partial failure without duplicating or losing records — **proved with a checksum**.
+6. Design for the API changing underneath you, which it will.
+
+<Info>
+**Where this returns.** Every API client you write for the rest of this course inherits this shape:
+the paginator in week 27 that pulls documents for indexing, the evaluation-run fetcher in week 32,
+and the tool-calling retry loop in week 29 where the "API" is an LLM provider that rate-limits you
+in exactly the same way and with exactly the same headers.
+</Info>
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p2-w15-m2.svg" alt="Hand-drawn sketch: pagination, backoff, and a watermark that survives a crash" className="block dark:hidden" />
+  <img src="/assets/diagrams/p2-w15-m2-dark.svg" alt="Hand-drawn sketch: pagination, backoff, and a watermark that survives a crash" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p2-w15-m2
+tier: T2
+one-sentence-goal: A pipeline survives a crash only if the records and the cursor are committed in the SAME transaction - commit them separately and you either lose data or duplicate it, and which one depends on the order.
+elements:
+  - Frame 1 (top, pagination): three horizontal strips labelled "offset: ?page=1,2,3", "cursor: ?after=abc123", "Link header: rel=next". Under the offset strip, a red cross-out over two rows drawn identically in page 2 and page 3, with the note "rows shifted while you paged. you saw one twice and missed one."
+  - Frame 2 (backoff): a timeline with request attempts drawn as tick marks at increasing gaps - 1s, 2s, 4s, 8s - each labelled. Beside the 4s gap, a small jittered cloud of three tick marks with the amber note "add jitter or every client retries in lockstep and you DDoS the source on recovery."
+  - Frame 3 (the payoff, the transaction): a box drawn around TWO things together - "1000 rows" and "cursor=43000" - with a single arrow labelled COMMIT leaving the box. Beside it, a red cross-out over a version where the two have SEPARATE commit arrows, annotated "rows then cursor -> crash between = duplicates. cursor then rows -> crash between = DATA LOSS."  Circle the word "same transaction".
+  - Frame 4 (the crash, with real numbers): a horizontal progress bar to 100,000 with a red lightning bolt at 43,000. Below it, hand-written: "after crash: 43,000 rows, cursor=43000, 43 api calls" then "after resume: 100,000 rows, 57,000 more pulled, 100 total api calls" then circled "same as a clean run - nothing refetched."
+  - amber margin note bottom-right: "and the checksums matched. that is the whole test."
+numbers-to-write-in: crash at 43,000, 43 api calls before, 57,000 pulled on resume, 100 total api calls (identical to a clean run), checksum sum=14,999,850,000 count=100,000
+alt: A hand-drawn whiteboard sketch showing three pagination styles with offset pagination crossed out in red because rows shift between pages, then an exponential backoff timeline with jitter annotated, then the central idea of committing the fetched rows and the cursor in a single transaction with the two alternative orderings crossed out and labelled as causing duplicates or data loss, and finally a progress bar with a crash at forty-three thousand records out of one hundred thousand, annotated with the measured result that resuming took exactly one hundred API calls in total, the same as an uninterrupted run.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+
+    ## The idea in one paragraph
+
+    An API gives you data a page at a time, and it is a system you do not control. It will be slow,
+    it will rate-limit you, it will return errors, and the connection will drop halfway through.
+    Extraction code that assumes none of that happens works on your laptop and fails on the third
+    night in production. The three things that turn a `requests.get` into an extractor are:
+    **pagination** (getting all of it, not just the first hundred), **retries with backoff** (coping
+    with failures without making them worse), and a **watermark** (knowing where you got to, so a
+    crash costs you minutes rather than the whole job).
+
+    ### The analogy
+
+    Photocopying a 500-page book on a machine that jams.
+
+    - **Pagination.** The feeder takes 50 pages at a time. You need a way to know which 50 you have
+      done and which is next.
+    - **Rate limiting.** The machine overheats if you push it. It has a light that says "wait 30
+      seconds". Ignoring the light does not make it faster; it makes it stop entirely.
+    - **The watermark.** You write "done through page 250" on a sticky note. When the machine jams
+      at page 251, you do not start from page 1.
+    - **The subtle bug.** You write the sticky note *before* the pages actually come out. The
+      machine jams, you resume from 300, and pages 251–299 are gone forever — and nobody notices
+      because the book still looks like a book.
+
+    That last one is the whole module. **The order in which you record progress and save data
+    determines whether a crash loses records or duplicates them.**
+
+    ### Every term, defined
+
+    - **REST API** — a web service you call with HTTP, usually returning JSON.
+    - **Endpoint** — one URL that returns one kind of thing.
+    - **Pagination** — returning results in chunks, because returning 500,000 records in one
+      response would time out.
+    - **Offset pagination** — `?page=3&per_page=100` or `?offset=200&limit=100`. Simple, and
+      **unstable if the data changes while you page**.
+    - **Cursor pagination** — the response contains an opaque token for the next page. Stable under
+      concurrent writes, which is why good APIs use it.
+    - **`Link` header pagination** — RFC 8288. The next URL is in a response *header* rather than
+      the body. GitHub uses this.
+    - **Rate limit** — a cap on requests per unit time. Exceeding it returns HTTP **429**.
+    - **`Retry-After`** — a response header saying how many seconds to wait. **Obey it.**
+    - **Exponential backoff** — wait 1s, then 2s, 4s, 8s between retries.
+    - **Jitter** — randomising the wait so that many clients do not all retry at the same instant.
+    - **Watermark / cursor state** — a persisted marker of how far you got.
+    - **Incremental extraction** — fetching only what changed since the watermark.
+    - **Idempotent** — running it again produces the same result.
+    - **Backfill** — fetching historical data you never had, or re-fetching a past window.
+
+    ### The smallest working example
+
+    ```python
+    # fetch_one_page.py — CPython 3.12, requests 2.32.3
+    import requests
+
+    resp = requests.get(
+        "https://api.github.com/repos/duckdb/duckdb/issues",
+        params={"state": "all", "per_page": 100, "page": 1},
+        headers={"Accept": "application/vnd.github+json"},
+        timeout=(5, 30),          # (connect timeout, read timeout)
+    )
+    resp.raise_for_status()
+    issues = resp.json()
+
+    print(f"got {len(issues)} issues")
+    print(f"rate limit remaining: {resp.headers.get('X-RateLimit-Remaining')}")
+    print(f"next page link:       {resp.links.get('next', {}).get('url')}")
+
+    for it in issues[:3]:
+        print(f"  #{it['number']:<6} {it['state']:<7} {it['title'][:60]}")
+    ```
+
+    ### Line-by-line walkthrough
+
+    - `timeout=(5, 30)` — a tuple of (connect, read). **`requests` has no default timeout at all.**
+      Without this, a half-open TCP connection makes your scheduled job hang forever: it never
+      finishes, never fails, and never alerts. This is the single most common production bug in
+      Python HTTP code.
+    - `resp.raise_for_status()` — turns a 4xx/5xx into an exception. Without it, `resp.json()` on an
+      error page either throws a confusing JSON error or, worse, parses an error object as data.
+    - `resp.headers.get('X-RateLimit-Remaining')` — the API is telling you how much budget is left.
+      **Read it and slow down before you hit zero**, rather than hitting 429 and reacting.
+    - `resp.links` — `requests` parses RFC 8288 `Link` headers for you into a dict. `resp.links['next']['url']`
+      is the next page. Most people do not know this exists and hand-roll a parser.
+    - `params={...}` — pass parameters as a dict, never by string-formatting them into the URL.
+      `requests` handles the URL-encoding, which is what stops a search term containing `&` from
+      silently truncating your query.
+
+    ### The three pagination styles
+
+    ```python
+    # 1. OFFSET — ?page=N. Simple, and subtly wrong on changing data.
+    page = 1
+    while True:
+        r = requests.get(url, params={"page": page, "per_page": 100}, timeout=30)
+        r.raise_for_status()
+        batch = r.json()
+        if not batch:
+            break
+        yield from batch
+        page += 1
+
+    # 2. CURSOR — the response tells you the next token. Stable.
+    cursor = None
+    while True:
+        params = {"limit": 100}
+        if cursor:
+            params["after"] = cursor
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        body = r.json()
+        yield from body["data"]
+        cursor = body.get("next_cursor")
+        if not cursor:
+            break
+
+    # 3. LINK HEADER — RFC 8288. requests parses it for you.
+    next_url = url
+    while next_url:
+        r = requests.get(next_url, timeout=30)
+        r.raise_for_status()
+        yield from r.json()
+        next_url = r.links.get("next", {}).get("url")
+    ```
+
+    <Warning>
+    **Offset pagination is not stable under concurrent writes, and this is not a theoretical
+    concern.** Suppose you fetch page 1 (records 1–100) and, before you fetch page 2, someone
+    inserts a record that sorts near the top. Everything shifts down by one: the record that was
+    #100 is now #101, so it appears again on page 2, and you have a duplicate. If a record is
+    *deleted* instead, everything shifts up and you **skip one entirely**. On a table receiving
+    writes while you page — which is every production table — offset pagination silently loses and
+    duplicates records. **Prefer cursor pagination. If the API only offers offset, sort by an
+    immutable key (usually the primary key) and page by `WHERE id > last_seen_id` instead.**
+    </Warning>
+
+    ### Retries that do not make things worse
+
+    ```python
+    import random, time, requests
+
+    def get_with_retry(url, *, params=None, headers=None, max_attempts=5):
+        """Retry on 429 and 5xx. Never retry on 4xx other than 429 —
+        a 400 or 404 will still be a 400 or 404 in two seconds."""
+        for attempt in range(max_attempts):
+            try:
+                r = requests.get(url, params=params, headers=headers, timeout=(5, 30))
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if attempt == max_attempts - 1:
+                    raise
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                print(f"  {type(e).__name__}, retrying in {wait:.1f}s")
+                time.sleep(wait)
+                continue
+
+            if r.status_code == 429:
+                # The server told us how long to wait. Believe it.
+                wait = float(r.headers.get("Retry-After", 2 ** attempt))
+                print(f"  429 rate limited, sleeping {wait}s")
+                time.sleep(wait)
+                continue
+
+            if 500 <= r.status_code < 600:
+                if attempt == max_attempts - 1:
+                    r.raise_for_status()
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                print(f"  {r.status_code}, retrying in {wait:.1f}s")
+                time.sleep(wait)
+                continue
+
+            r.raise_for_status()      # any other 4xx: fail immediately, do not retry
+            return r
+        raise RuntimeError(f"exhausted {max_attempts} attempts for {url}")
+    ```
+
+    Three decisions in that function are worth stating explicitly:
+
+    - **Retry 429 and 5xx. Do not retry other 4xx.** A 400, 401, 403 or 404 is a statement about
+      your request, not about the server's mood. Retrying it wastes your rate budget and delays the
+      error you need to see.
+    - **`Retry-After` beats your backoff formula.** The server knows when its window resets. Your
+      exponential curve is a guess.
+    - **`random.uniform(0, 1)` is the jitter, and it is not optional.** Without it, if fifty
+      workers hit a rate limit at the same moment, all fifty wake at exactly 1s, 2s, 4s — a
+      synchronised stampede that re-triggers the limit every time. Jitter spreads the retries out.
+
+    ### Checkpoint — 5 questions before you continue
+
+    <AccordionGroup>
+      <Accordion title="1. Why is offset pagination unreliable?">
+        Because the offsets refer to positions in a result set that can change between requests. An
+        insert near the top shifts everything down, so you see a record twice; a delete shifts
+        everything up, so you skip one. Cursor pagination refers to a *record*, not a position, so
+        it is stable. If you only have offsets, page by an immutable sort key: `WHERE id >
+        last_seen_id ORDER BY id LIMIT 100`.
+      </Accordion>
+      <Accordion title="2. Why add jitter to exponential backoff?">
+        Because without it, every client that failed at the same moment retries at the same moment.
+        A brief outage produces a synchronised thundering herd on recovery, which knocks the service
+        back down. Jitter decorrelates the clients. AWS's recommended form is "full jitter":
+        `sleep = random.uniform(0, min(cap, base * 2**attempt))`.
+      </Accordion>
+      <Accordion title="3. Which HTTP status codes should you retry?">
+        **429** (rate limited — obey `Retry-After`), **500, 502, 503, 504** (server-side, likely
+        transient), and connection errors and timeouts. **Never** 400, 401, 403, 404, 422 — these
+        describe your request and will be identical on retry. A special case: **408 Request
+        Timeout** is retryable, and **409 Conflict** sometimes is, depending on the API.
+      </Accordion>
+      <Accordion title="4. What is a watermark and where must it be stored?">
+        A persisted marker of how far the last run got — a timestamp, an ID, or an opaque cursor.
+        It must live **in durable storage that survives the process**, and ideally in the same
+        transactional store as the data, so the two commit together. A watermark in memory is not a
+        watermark; a watermark in a separate system is a distributed-transaction problem.
+      </Accordion>
+      <Accordion title="5. Should you save the watermark before or after writing the data?">
+        **Neither — write them in the same transaction.** Saving the cursor first and crashing loses
+        every record in that page permanently. Saving it after and crashing means you re-fetch the
+        page, which is harmless *if* your load is idempotent. So the safe ordering is data-then-
+        cursor, and the correct design is both in one commit. Layer 2 measures exactly this.
+      </Accordion>
+    </AccordionGroup>
+
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+
+    ## The extractor, built properly
+
+    ```python
+    # extractor.py — CPython 3.12, requests 2.32.3
+    from __future__ import annotations
+    import random
+    import sqlite3
+    import time
+    from dataclasses import dataclass
+    from typing import Any, Callable, Iterator, Protocol
+
+    import requests
+
+
+    class Paginator(Protocol):
+        """One interface over offset, cursor and Link-header pagination."""
+        def first_request(self) -> tuple[str, dict]: ...
+        def next_request(self, response: requests.Response, body: Any) -> tuple[str, dict] | None: ...
+        def extract_records(self, body: Any) -> list[dict]: ...
+
+
+    @dataclass(slots=True)
+    class CursorPaginator:
+        url: str
+        cursor_param: str = "after"
+        cursor_field: str = "next_cursor"
+        data_field: str = "data"
+        page_size: int = 1000
+        start_cursor: str | None = None
+
+        def first_request(self) -> tuple[str, dict]:
+            p = {"limit": self.page_size}
+            if self.start_cursor:
+                p[self.cursor_param] = self.start_cursor
+            return self.url, p
+
+        def next_request(self, response, body):
+            nxt = body.get(self.cursor_field)
+            if not nxt:
+                return None
+            return self.url, {"limit": self.page_size, self.cursor_param: nxt}
+
+        def extract_records(self, body):
+            return body[self.data_field]
+
+
+    @dataclass(slots=True)
+    class LinkHeaderPaginator:
+        url: str
+        params: dict | None = None
+
+        def first_request(self):
+            return self.url, dict(self.params or {})
+
+        def next_request(self, response, body):
+            nxt = response.links.get("next", {}).get("url")
+            return (nxt, {}) if nxt else None
+
+        def extract_records(self, body):
+            return body
+
+
+    @dataclass(slots=True)
+    class KeysetPaginator:
+        """For APIs that only offer offset. Page by an immutable sort key instead —
+        this is stable under concurrent writes where ?page=N is not."""
+        url: str
+        key_field: str = "id"
+        key_param: str = "since_id"
+        page_size: int = 1000
+        start_key: int | None = None
+
+        def first_request(self):
+            p = {"limit": self.page_size}
+            if self.start_key is not None:
+                p[self.key_param] = self.start_key
+            return self.url, p
+
+        def next_request(self, response, body):
+            if not body:
+                return None
+            return self.url, {"limit": self.page_size, self.key_param: body[-1][self.key_field]}
+
+        def extract_records(self, body):
+            return body
+
+
+    class RateLimitedSession:
+        """Retries, backoff with full jitter, and proactive slowdown on
+        X-RateLimit-Remaining. Records every request for the run report."""
+
+        def __init__(self, *, max_attempts: int = 5, cap_seconds: float = 60.0,
+                     min_remaining: int = 10) -> None:
+            self.session = requests.Session()
+            self.max_attempts = max_attempts
+            self.cap = cap_seconds
+            self.min_remaining = min_remaining
+            self.requests_made = 0
+            self.retries = 0
+            self.rate_limit_waits = 0
+            self.seconds_sleeping = 0.0
+
+        def _sleep(self, seconds: float) -> None:
+            self.seconds_sleeping += seconds
+            time.sleep(seconds)
+
+        def get(self, url: str, params: dict | None = None,
+                headers: dict | None = None) -> requests.Response:
+            for attempt in range(self.max_attempts):
+                try:
+                    self.requests_made += 1
+                    r = self.session.get(url, params=params, headers=headers,
+                                         timeout=(5, 30))
+                except (requests.ConnectionError, requests.Timeout):
+                    if attempt == self.max_attempts - 1:
+                        raise
+                    self.retries += 1
+                    # Full jitter (AWS architecture blog): uniform over the whole window,
+                    # not base + small noise. Decorrelates clients much better.
+                    self._sleep(random.uniform(0, min(self.cap, 2 ** attempt)))
+                    continue
+
+                if r.status_code == 429:
+                    self.rate_limit_waits += 1
+                    wait = float(r.headers.get("Retry-After", 2 ** attempt))
+                    self._sleep(min(wait, self.cap))
+                    continue
+
+                if 500 <= r.status_code < 600:
+                    if attempt == self.max_attempts - 1:
+                        r.raise_for_status()
+                    self.retries += 1
+                    self._sleep(random.uniform(0, min(self.cap, 2 ** attempt)))
+                    continue
+
+                r.raise_for_status()
+
+                # Proactive: slow down BEFORE we are cut off.
+                remaining = r.headers.get("X-RateLimit-Remaining")
+                reset = r.headers.get("X-RateLimit-Reset")
+                if remaining is not None and int(remaining) < self.min_remaining and reset:
+                    wait = max(0.0, float(reset) - time.time())
+                    if 0 < wait <= self.cap:
+                        self.rate_limit_waits += 1
+                        self._sleep(wait)
+                return r
+            raise RuntimeError(f"exhausted {self.max_attempts} attempts for {url}")
+
+
+    class StateStore:
+        """Records and cursor in ONE SQLite transaction. This is the whole design."""
+
+        def __init__(self, path: str) -> None:
+            self.con = sqlite3.connect(path)
+            self.con.execute("PRAGMA journal_mode=WAL")
+            self.con.execute(
+                "CREATE TABLE IF NOT EXISTS records ("
+                " id INTEGER PRIMARY KEY, payload TEXT, ingested_at TEXT)")
+            self.con.execute(
+                "CREATE TABLE IF NOT EXISTS _pipeline_state (k TEXT PRIMARY KEY, v TEXT)")
+            self.con.commit()
+
+        def commit_page(self, rows: list[tuple], cursor: str | None) -> None:
+            """Rows and cursor commit together, or neither does."""
+            with self.con:                       # BEGIN ... COMMIT / ROLLBACK
+                self.con.executemany(
+                    "INSERT OR REPLACE INTO records VALUES (?, ?, datetime('now'))", rows)
+                self.con.execute(
+                    "INSERT OR REPLACE INTO _pipeline_state VALUES ('cursor', ?)",
+                    (cursor,))
+
+        def cursor(self) -> str | None:
+            row = self.con.execute(
+                "SELECT v FROM _pipeline_state WHERE k='cursor'").fetchone()
+            return row[0] if row else None
+
+        def count(self) -> int:
+            return self.con.execute("SELECT count(*) FROM records").fetchone()[0]
+    ```
+
+    ## The transaction is the whole design
+
+    This is the sentence to take away from the module:
+
+    > **The fetched records and the cursor that says you fetched them must be committed in the same
+    > transaction.**
+
+    Consider the three orderings for a crash between the two writes:
+
+    | Order | Crash between them | Result |
+    | --- | --- | --- |
+    | Save cursor, then write records | records lost, cursor advanced | **silent permanent data loss** — you will never fetch that page again |
+    | Write records, then save cursor | records written, cursor not advanced | re-fetch the page next run — **harmless if the load is idempotent** |
+    | **Both in one transaction** | neither happened | re-fetch the page — **harmless, and provably so** |
+
+    Option 1 is a data-loss bug that produces no error and no gap you can see. Option 2 is
+    acceptable and is what you get by accident if you happen to write in the right order. **Option 3
+    is what you should build, and in SQLite, DuckDB or Postgres it is free** — a `with connection:`
+    block.
+
+    <Warning>
+    If your data lands in one system (S3, a warehouse) and your state lives in another (Redis, a
+    file), you cannot have a single transaction and you are back to option 2. That is usually fine
+    — but you must then make the load genuinely idempotent, which means a primary key and an
+    upsert, and you must test that re-running a page changes nothing. **"We use S3 for data and
+    Redis for state" is a design decision that obligates you to idempotency**, and most teams make
+    the decision without noticing the obligation.
+    </Warning>
+
+    ## Crash and resume, verified
+
+    A 100,000-record cursor-paginated source, 1,000 per page, killed deliberately at 43,000 records:
+
+    ```
+    crash: simulated crash after 43000 records
+    after crash:  rows=43000    saved_cursor=43000   api_calls=43
+    after resume: rows=100000   pulled_on_resume=57000   total_api_calls=100
+    checksum(sum,count,min,max)=(14999850000, 100000, 0, 99999)
+
+    clean run:    rows=100000   api_calls=100
+    checksum(sum,count,min,max)=(14999850000, 100000, 0, 99999)
+    IDENTICAL RESULT: True
+    ```
+
+    <Info>
+    Method: CPython 3.12.9, a deterministic in-process fake API, SQLite with rows and cursor in one
+    transaction. Reproduce with `w15m2_resume.py`.
+    </Info>
+
+    **The number that proves it is `total_api_calls=100`, exactly equal to the clean run.** The
+    resumed pipeline re-fetched *nothing* — 43 calls before the crash plus 57 after. And the
+    checksums are byte-identical, which is the assertion that actually matters: not "it finished",
+    but "it finished with the same data".
+
+    One honest imperfection in that run, worth stating because it is a real design decision:
+
+    ```
+    re-run of a completed pipeline: pulled=100000 rows=100000 checksum_unchanged=True
+    ```
+
+    Re-running the *finished* pipeline pulled all 100,000 again. The implementation stores `"DONE"`
+    as the terminal cursor and maps it back to `None`, which the paginator reads as "start from the
+    beginning". The data is unchanged — the load is idempotent, so correctness holds — but 100 API
+    calls were wasted. **A real pipeline stores a high-water timestamp, not a sentinel**, so the
+    next run asks for `updated_at > last_seen` and pulls nothing. This is the difference between
+    "resumable" and "incremental", and the lab requires both.
+
+    ## Incremental extraction with a watermark
+
+    ```python
+    from datetime import datetime, timedelta, timezone
+
+    def incremental_window(store: StateStore, overlap_minutes: int = 5) -> datetime:
+        """Where to start this run. ALWAYS overlap the previous window."""
+        row = store.con.execute(
+            "SELECT v FROM _pipeline_state WHERE k='high_water'").fetchone()
+        if row is None:
+            return datetime(2020, 1, 1, tzinfo=timezone.utc)     # initial backfill
+        last = datetime.fromisoformat(row[0])
+        return last - timedelta(minutes=overlap_minutes)
+    ```
+
+    **The overlap is mandatory and it is not paranoia.** A record written at 11:59:59 may be
+    *committed* at 12:00:01 and therefore appear with an `updated_at` before a watermark you already
+    advanced past. Source systems commit out of order, replicas lag, and clocks differ by seconds.
+    An exact-boundary watermark loses those records **permanently and silently** — there is no
+    error, no gap, and nothing to alert on.
+
+    Overlapping costs you a handful of duplicate rows per run, which an upsert absorbs at zero cost.
+    **Overlapping windows plus idempotent writes is the standard correct design.**
+
+    ## Trade-offs table
+
+    | Situation | Choose | Instead of | Because |
+    | --- | --- | --- | --- |
+    | API offers cursor pagination | cursor | offset | stable under concurrent writes; offset silently duplicates and skips |
+    | API offers only offset | keyset — `WHERE id > last_seen ORDER BY id` | `?page=N` | keyset refers to a record, not a position |
+    | API sends `Link` headers | `resp.links['next']['url']` | hand-parsing the header | `requests` implements RFC 8288 already |
+    | Rate limited | obey `Retry-After` | your own backoff formula | the server knows when its window resets |
+    | Many parallel workers | full jitter over the whole window | fixed exponential | fixed backoff synchronises clients into a stampede on recovery |
+    | Data and state in one store | single transaction | two writes | eliminates the crash window entirely |
+    | Data and state in different stores | data first, then state, plus idempotent load | state first | a crash then costs a re-fetch, not a permanent loss |
+    | Incremental, timestamp-based | overlap the window by minutes | exact boundary | out-of-order commits fall through an exact boundary |
+    | Rate budget is the constraint | a token-bucket limiter shared across workers | per-worker sleeps | independent workers each think they have the whole budget |
+    | Response is nested and messy | land raw JSONL first, parse in a second step | parse during extraction | you cannot un-parse; a parser bug then means re-fetching |
+
+    ## What breaks in the real world
+
+    A CRM sync pulled contact records nightly using `?updated_since=<timestamp>` and stored the
+    watermark as the maximum `updated_at` it had *seen in the response*. It ran for a year.
+
+    Sales noticed that a handful of contacts — perhaps 15 or 20 a month out of ~40,000 — were
+    missing from the warehouse. Not wrong: absent. There was no error, no failed run, and no gap in
+    any monitoring, because the pipeline was healthy every single night.
+
+    Two bugs compounded:
+
+    **1. The watermark was set to `max(updated_at)` from the returned records.** The CRM's write
+    path set `updated_at` at the moment a change was *initiated*, then committed the row a few
+    hundred milliseconds later. A record whose `updated_at` was 23:59:59.8 but which committed at
+    00:00:00.1 was not visible when the run queried at 00:00:00.0 — and the next run asked for
+    `updated_since = 23:59:59.9`, so it was never returned again. **Permanently invisible.**
+
+    **2. The watermark was saved even when the load partially failed.** The code was:
+
+    ```python
+    records = fetch_all(since=watermark)
+    for r in records:
+        try:
+            upsert(r)
+        except Exception:
+            logger.warning("failed to upsert %s", r["id"])   # and carried on
+    save_watermark(max(r["updated_at"] for r in records))     # unconditionally
+    ```
+
+    Any record that failed to upsert — usually a validation error on an unexpected field — was
+    logged at WARNING and then permanently skipped, because the watermark moved past it regardless.
+    The warnings went to a log nobody read, at a volume of a few per night.
+
+    The fix was three changes:
+
+    ```python
+    # 1. Overlap the window.
+    since = watermark - timedelta(minutes=15)
+
+    # 2. Advance the watermark only on complete success, and only to the
+    #    START of the window we queried — never to max(updated_at) of the results.
+    window_start = datetime.now(timezone.utc)
+    records = fetch_all(since=since)
+    upsert_all(records)          # raises on any failure; the whole run fails
+    save_watermark(window_start)
+
+    # 3. Reconcile. Nightly, compare source count against warehouse count
+    #    for the last 7 days and alert on any difference.
+    ```
+
+    What generalises:
+
+    - **Never derive the watermark from the data.** Use the *query window*, which you control, not
+      the maximum timestamp in the response, which the source controls and which says nothing about
+      what was still uncommitted.
+    - **A failure that advances the watermark is a permanent data-loss bug.** Partial success must
+      either fail the run or record the failed IDs in a retry queue. `logger.warning` and continue
+      is neither.
+    - **Reconciliation is the only monitoring that catches silent loss.** Every health signal was
+      green for a year. A nightly `count(*)` comparison against the source, for a recent window,
+      would have caught it on day two. **If you build one piece of monitoring for a pipeline, build
+      this one.**
+
+    ### Design checkpoint
+
+    <Accordion title="You must extract 50 million records from an API that allows 100 requests/minute and returns 500 records per page. Initial backfill, then hourly incremental. Design it and state how long the backfill takes.">
+    **Model answer.**
+
+    **First, the arithmetic, because it determines the entire design.** 50,000,000 records ÷ 500 per
+    page = **100,000 requests**. At 100 requests/minute that is **1,000 minutes ≈ 16.7 hours** of
+    pure rate-limited waiting. No amount of concurrency helps — the limit is on requests, not on
+    connections. **This is the number to bring to the conversation before anything else**, because
+    it changes what people ask for.
+
+    **The design.**
+
+    1. **Separate the backfill from the incremental job.** They have different failure modes,
+       different runtimes and different rate budgets. One code path, two configurations. The
+       backfill is a one-off that must be resumable; the incremental is a scheduled job that must
+       be cheap.
+    2. **Backfill by keyset over an immutable key**, not by timestamp. `WHERE id > last_id ORDER BY
+       id LIMIT 500`. This is resumable to the exact record, stable under concurrent writes, and
+       parallelisable by splitting the ID space into ranges — though see the rate-limit point below.
+    3. **Checkpoint every page, in one transaction.** 100,000 pages over 17 hours means the job
+       *will* be interrupted — a deploy, a restart, a network blip. It must resume with zero
+       re-fetching, because at 100 req/min a re-fetch of even 10% costs 100 minutes.
+    4. **Land raw.** Write each page's JSON body verbatim to `raw/backfill/page=NNNNNN.json` before
+       any parsing. If the parser has a bug — and over 50 million records it will — you re-process
+       from disk in minutes instead of re-fetching for 17 hours.
+    5. **A shared token bucket, not per-worker sleeps.** If you run 4 workers each sleeping 600 ms,
+       you are making 400 requests/minute and you will be blocked. Use a single limiter — Redis
+       `INCR` with a TTL, or a leaky bucket in one coordinator process — that all workers draw from.
+       **The rate limit is a shared resource and must have a shared owner.**
+    6. **Incremental hourly by watermark, with a 15-minute overlap.** Expected volume is roughly
+       50M/24/365-ish per hour depending on churn; at even 100,000 changed records per hour that is
+       200 requests, or 2 minutes of budget. Comfortable.
+
+    **What breaks first, in order.**
+
+    1. **The 17-hour backfill hits a deploy.** Hence checkpointing. Run it in a job that survives
+       restarts, not in a request handler or a laptop.
+    2. **The API's cursor expires.** Many APIs invalidate a cursor after minutes or hours. Over 17
+       hours this is near-certain. **This is the argument for keyset over cursor for backfills** —
+       an ID never expires. Test what happens when a stale cursor is submitted, before you rely on it.
+    3. **The rate limit is per-token, and someone else is using the token.** If the production sync
+       and your backfill share credentials, you will starve the production sync during the backfill.
+       Get a separate credential, or run the backfill at a deliberately reduced rate.
+    4. **Storage.** 50M records at, say, 2 KB of JSON is 100 GB raw. On S3 that is $2.30/month —
+       trivial — but it is 100 GB you must not accidentally load into pandas.
+
+    **The thing I would say in the design review:** "the backfill is 17 hours of waiting on the rate
+    limit, and there is no engineering that makes it faster. So the entire design question is what
+    happens when it is interrupted at hour 12, and the answer must be that it resumes at hour 12."
+    </Accordion>
+
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+
+    ## Delivery semantics, stated precisely
+
+    | Guarantee | What it means | What it costs |
+    | --- | --- | --- |
+    | **At most once** | never duplicated; may be lost | nothing; almost never what you want |
+    | **At least once** | never lost; may be duplicated | you must make the *consumer* idempotent |
+    | **Exactly once** | neither lost nor duplicated | genuinely hard in general; achievable at the boundary |
+
+    **You almost always build at-least-once delivery plus an idempotent consumer, and call the
+    combination exactly-once processing.** That distinction matters: true exactly-once *delivery*
+    across a network is impossible in the general case (the two-generals problem), but
+    exactly-once *effect* is achievable whenever the write is idempotent.
+
+    Three ways to get an idempotent write:
+
+    1. **A natural key plus upsert.** `MERGE ... ON (id)`. The default, and it requires the key to
+       genuinely identify the record. Getting this wrong — using `campaign_id` where
+       `(campaign_id, date)` was needed — is the most common cause of the duplicate-inflation bug in
+       module 1's war story.
+    2. **A deduplication key stored alongside.** Hash the record body; skip anything whose hash you
+       have seen. Works when there is no natural key, at the cost of storing the hashes.
+    3. **Transactional offsets.** Store the source cursor *in the same transaction* as the data,
+       which is the design in Layer 2. This is what Kafka's transactional producer plus
+       `read_committed` consumer gives you, and what Flink's checkpoint barriers implement.
+
+    ## Backfill without hammering the source
+
+    A backfill re-fetches history. Done naively it competes with your production sync for the same
+    rate limit and starves it.
+
+    | Strategy | How | When it is right |
+    | --- | --- | --- |
+    | **Reduced-rate background** | run at 20% of the rate budget, continuously, for days | the default; leaves headroom for the incremental job |
+    | **Off-peak windows** | full rate between 02:00 and 06:00 only | the source has a diurnal load pattern you can see |
+    | **Separate credentials** | a distinct API token with its own quota | the cleanest, if the vendor allows it |
+    | **Chunked by key range** | split the ID space into N ranges; process one per day | makes progress observable and each chunk independently resumable |
+    | **Vendor bulk export** | ask for a CSV/S3 dump | **always ask first** — many APIs have a bulk endpoint that is 100× cheaper and is not documented on the page you were reading |
+
+    **That last row is the highest-value line in this module.** A 17-hour paginated backfill and a
+    30-minute bulk export are both "extract the data", and the difference is one email. Salesforce,
+    Stripe, HubSpot, Shopify and most others have a bulk or export API. Check before you build.
+
+    ## Parallel extraction under a shared rate budget
+
+    Concurrency does not increase your rate limit. What it buys is hiding *latency*: if each request
+    takes 200 ms and your budget allows 10 requests/second, one worker can only issue 5/second and
+    is leaving half the budget unused. Two workers saturate it.
+
+    ```python
+    import asyncio, time, random
+
+    class TokenBucket:
+        """Shared rate limiter. All workers draw from one budget.
+
+        Independent per-worker sleeps do not work: N workers each sleeping
+        1/rate seconds collectively make N*rate requests per second.
+        """
+        def __init__(self, rate_per_sec: float, burst: int) -> None:
+            self.rate = rate_per_sec
+            self.capacity = burst
+            self.tokens = float(burst)
+            self.updated = time.monotonic()
+            self.lock = asyncio.Lock()
+
+        async def acquire(self) -> None:
+            while True:
+                async with self.lock:
+                    now = time.monotonic()
+                    # monotonic, never time.time(): an NTP step backwards would
+                    # otherwise grant a burst or stall the bucket forever.
+                    self.tokens = min(self.capacity,
+                                      self.tokens + (now - self.updated) * self.rate)
+                    self.updated = now
+                    if self.tokens >= 1.0:
+                        self.tokens -= 1.0
+                        return
+                    deficit = (1.0 - self.tokens) / self.rate
+                await asyncio.sleep(deficit + random.uniform(0, 0.01))
+    ```
+
+    **The concurrency ceiling is `rate × latency` (Little's law).** At 10 requests/second and 200 ms
+    per request, `10 × 0.2 = 2` — two workers saturate the budget and a third adds nothing but
+    contention on the bucket. **Compute this before choosing a worker count**, because the common
+    failure is 32 workers all blocking on a limiter, which is 32 idle coroutines and one busy one.
+
+    ## Cost arithmetic
+
+    Extraction has three costs and people usually price only the first.
+
+    Take 50 million records at 2 KB each — 100 GB.
+
+    | Cost | Arithmetic | Amount |
+    | --- | --- | --- |
+    | **Time** | 100,000 requests ÷ 100 per minute | 16.7 hours |
+    | **Egress from the source** | usually free for the caller | $0 |
+    | **Ingress to your cloud** | free on AWS, GCP, Azure | $0 |
+    | **Raw storage (S3 standard)** | 100 GB × $0.023/GB-month | **$2.30/month** |
+    | **Raw storage after Parquet+zstd (÷4.7)** | 21 GB × $0.023 | $0.49/month |
+    | **PUT requests** | 100,000 × $0.005/1,000 | $0.50 one-off |
+    | **Compute for the backfill** | 17 h × t4g.small at $0.0168/h | $0.29 |
+    | **Total one-off** | | **under $4** |
+
+    **The whole backfill costs less than a coffee, and the only scarce resource is time.** This is
+    worth internalising because it reframes the design conversation: engineering effort to reduce
+    storage is almost never worth it at these scales, while engineering effort to avoid re-doing the
+    17 hours absolutely is. **Keep the raw data.** Deleting it to save $2.30/month and then needing
+    to re-fetch is a bad trade by three orders of magnitude.
+
+    Where cost genuinely bites is per-request pricing on the *source* side — some APIs charge per
+    call, and some LLM providers (week 29) charge per token. Then the arithmetic inverts and caching
+    the raw response is what saves the money rather than what costs it.
+
+    ## Designing for the API changing
+
+    It will change. The question is whether you find out from a monitor or from a stakeholder.
+
+    | Change | Detection | Mitigation |
+    | --- | --- | --- |
+    | New field added | schema diff on the raw payload | evolve (module 4); usually harmless |
+    | Field removed | required-field assertion fails the run | fail loudly; a null-coalescing parser hides it for months |
+    | Type changed (`"40.50"` for `40.5`) | type assertion, or a coercion warning | pin the expected type; decide coercion policy deliberately |
+    | Enum gains a value | `allowed:` list assertion | quarantine unknown values rather than dropping them |
+    | Endpoint deprecated | `Sunset` / `Deprecation` response headers (RFC 8594) | **log every response header you do not recognise** — vendors announce here first |
+    | Rate limit tightened | 429 rate rises; `X-RateLimit-Limit` changes | alert on the *header value* changing, not only on 429s |
+    | Pagination style changed | pages stop advancing; run returns fewer records | assert record count against the source's own total, if it gives one |
+    | Semantics changed silently | nothing detects this | reconciliation against a source-side aggregate |
+
+    **The one people miss is `Sunset` and `Deprecation` headers.** RFC 8594 defines them, and a
+    surprising number of APIs set them months before removing an endpoint. Logging unrecognised
+    response headers costs nothing and occasionally gives you six months of notice.
+
+    **The one nothing detects is a semantic change.** If the vendor changes what `status: active`
+    means, no schema check fires. The only defence is reconciliation against an aggregate the source
+    computes itself — "the source says 40,132 active contacts; we have 40,132" — which is also the
+    check that catches the silent-loss bug from the war story.
+
+    ## Production failure modes
+
+    | Failure mode | Signature | Detection |
+    | --- | --- | --- |
+    | No timeout on the HTTP call | scheduled job hangs forever; never fails, never alerts | always pass `timeout=(connect, read)`; alert on run duration, not only on failure |
+    | Watermark advanced on partial failure | records silently missing forever; every run green | advance the watermark only on complete success; reconcile counts nightly |
+    | Watermark derived from `max(updated_at)` in the response | records committed out of order are lost | use the query-window start, and overlap it |
+    | Offset pagination on a live table | occasional duplicates and skips, hard to reproduce | keyset pagination on an immutable key |
+    | Retry on a non-idempotent write | totals inflated by a small stable percentage | upsert on the natural composite key |
+    | Fixed backoff, many workers | source recovers, then immediately falls over again | full jitter; a shared token bucket |
+    | Per-worker rate limiting | 429s despite "respecting" the limit | one shared limiter; N workers × rate = N × rate |
+    | Cursor expired mid-backfill | 400 or 404 after hours of progress; job restarts from zero | keyset pagination for backfills; test stale-cursor handling |
+    | Parsing during extraction | a parser bug means re-fetching everything | land raw first, parse second |
+    | `time.time()` in the rate limiter | NTP step grants a burst or stalls the bucket | `time.monotonic()` |
+
+    ## Frontier and research pointers
+
+    - **RFC 8288, "Web Linking."** — **Takeaway:** the `Link` header with `rel="next"` is a
+      standard, and `requests` parses it into `resp.links` for you; hand-rolling a parser for it is
+      a small, common, avoidable waste.
+    - **RFC 6585, "Additional HTTP Status Codes"** (429) and **RFC 9110 §10.2.3** (`Retry-After`). —
+      **Takeaway:** `Retry-After` may be either a delay in seconds *or* an HTTP-date, and a parser
+      that assumes an integer will crash on the date form; handle both.
+    - **RFC 8594, "The Sunset HTTP Header Field."** — **Takeaway:** vendors have a standard way to
+      tell you an endpoint is going away, and almost nobody logs it; a five-line header check buys
+      you months of warning.
+    - **Marc Brooker (2015), "Exponential Backoff and Jitter,"** AWS Architecture Blog. —
+      **Takeaway:** "full jitter" (`sleep = uniform(0, min(cap, base·2^n))`) beats both no-jitter
+      and equal-jitter on measured total work and completion time; the post has the simulation.
+    - **Gray & Lamport (2006), "Consensus on Transaction Commit."** *ACM TODS* 31(1). —
+      **Takeaway:** why atomically committing across two independent systems requires consensus, and
+      therefore why "write to S3 and update Redis" cannot be made atomic — which is precisely why
+      you make the consumer idempotent instead.
+    - **Kleppmann & Kreps (2015), "Kafka, Samza and the Unix Philosophy of Distributed Data."**
+      *IEEE Data Eng. Bull.* — **Takeaway:** an immutable, replayable log makes reprocessing a
+      routine operation instead of an incident; the "land raw, parse later" rule in this module is
+      the same idea applied to file storage.
+
+    ## Stretch challenge
+
+    **Build an extractor test harness that fails your pipeline the way production will.**
+
+    You cannot test resilience against a real API — it is well-behaved on the day you test it. So
+    build the adversary.
+
+    Build a **chaos proxy**: a local HTTP server that sits between your extractor and a mock source
+    and injects, on a configurable schedule:
+
+    1. **429s** with `Retry-After` in both the seconds form and the HTTP-date form.
+    2. **5xx bursts** — a run of 503s, then recovery.
+    3. **Connection resets mid-response** — the hardest case, because your client has a partial JSON
+       body and must not treat it as a short page and stop.
+    4. **Slow responses** — 45 seconds of trickle, to prove your read timeout fires.
+    5. **Cursor expiry** — a 400 with `"cursor expired"` after N pages.
+    6. **Duplicate pages** — return page 5 twice.
+    7. **A shifted page** — simulate an insert at the top during offset pagination, and confirm
+       your keyset paginator is immune where a page-number paginator is not.
+    8. **Schema drift** — add a field, remove a field, change a type, mid-run.
+
+    Then run your extractor against it and assert, after every scenario, that **the final checksum
+    matches a clean run**. Not "it completed" — the checksum.
+
+    The open questions:
+
+    - **Which failure does your extractor handle worst?** My prediction is the mid-response
+      connection reset, because a truncated JSON body often parses as a shorter page and looks like
+      the end of the data. Confirm or refute it.
+    - **What is your recovery cost per failure type?** Measure wasted API calls and wall-clock
+      overhead for each scenario. A design that re-fetches an entire page on every transient error
+      is fine at 100 pages and ruinous at 100,000.
+    - **Does your backoff actually decorrelate?** Run 50 concurrent extractors against a proxy that
+      429s all of them simultaneously, and plot the request timeline on recovery. With fixed
+      backoff you will see vertical bars; with full jitter, a smear. **This plot is the most
+      convincing artifact in the whole project.**
+    - **Can you get to exactly-once?** Inject a crash at every possible point — after the fetch,
+      after the parse, after the row write, after the cursor write — and assert the checksum each
+      time. If any injection point produces a different checksum, you have found your real
+      guarantee, and it is weaker than you thought.
+
+    A chaos proxy plus a "checksum matches under every injected failure" test suite is a genuinely
+    reusable piece of engineering and an unusually strong portfolio artifact, because the *tests*
+    are the interesting part rather than the pipeline.
+
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Extract 100,000 records across pages under a rate limit, then **force a crash at record 43,000** and
+resume. Assert two things: the total API call count equals a clean run's (nothing re-fetched), and
+the final checksum is identical. Then re-run the completed pipeline and assert it pulls zero records.
+</Card>
+
+<Steps>
+  <Step title="Build the fake source first">
+    A deterministic in-process generator, not a live API. You need to crash it at an exact record
+    and re-run it a hundred times, and a real API gives you neither determinism nor patience.
+  </Step>
+  <Step title="Commit rows and cursor in one transaction">
+    `with connection:` in SQLite. This is the design decision the whole module exists to teach, and
+    it is one line.
+  </Step>
+  <Step title="Assert on the checksum, not on completion">
+    `sum(value), count(*), min(id), max(id)`. "It finished" is not a correctness claim. The crashed-
+    and-resumed run must produce a byte-identical aggregate to the clean run.
+  </Step>
+  <Step title="Then make it incremental">
+    Store a high-water timestamp, not a terminal sentinel. Re-running a completed pipeline must
+    issue zero data requests. That is the difference between resumable and incremental, and the lab
+    requires both.
+  </Step>
+</Steps>
+
+## The whiteboard
+
+The T2 build-up has four frames: the three pagination styles with offset crossed out, the backoff
+timeline with jitter, the single-transaction commit, and the crash-and-resume progress bar with the
+measured call counts.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p2-w15-m2-blank.svg) · [Editable source](/assets/diagrams/p2-w15-m2.excalidraw)
+</Tip>
+
+The thing to get right on redraw: frame 3, the box around *both* the rows and the cursor with one
+commit arrow. If your sketch shows two separate arrows, you have drawn the bug.
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    **Portfolio line:** "Built an extractor with pluggable pagination (cursor, keyset, `Link`
+    header), full-jitter backoff and a shared token bucket; proved crash-resumability by killing it
+    at record 43,000 and asserting the resumed run made exactly 100 API calls — identical to a clean
+    run — with a matching checksum."
+
+    **The interview move.** "How would you extract data from an API?" is a standard data-engineering
+    question and most candidates describe a `for` loop over pages. Three things separate a strong
+    answer:
+
+    1. **Name the pagination instability.** "I'd use cursor or keyset pagination, because offset
+       pagination duplicates and skips records when the underlying table changes between pages."
+    2. **Name the transaction.** "The records and the cursor go in one transaction, so a crash
+       between them is impossible. If they're in different systems I can't do that, so the load has
+       to be idempotent and I'd test that explicitly."
+    3. **Name the monitoring.** "Every health signal can be green while the pipeline silently loses
+       records, so I'd reconcile counts against the source for a recent window nightly."
+
+    Point three is the one that marks out someone who has operated a pipeline rather than written one.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **1. `grep -rn "requests.get\|requests.post" --include=*.py .` and check every one for a
+    timeout.** `requests` has no default. Every call without one is a job that can hang forever
+    without failing or alerting. This is a mechanical fix, it takes an afternoon, and it removes a
+    genuinely nasty failure mode where the symptom is "the job just stopped".
+
+    **2. Add a reconciliation check to your most important pipeline this week.** Nightly, compare a
+    count (or a sum) from the source against the same aggregate in your warehouse, for the last 7
+    days. Alert on any difference. **This is the only monitoring that detects silent data loss**,
+    and in the war story above it would have caught a year-old bug on day two.
+
+    **3. Check whether any extractor advances its watermark on partial failure.** Look for a loop
+    that catches exceptions per record and logs a warning, followed by an unconditional watermark
+    save. That pattern permanently drops every record that fails, and the warnings go to a log
+    nobody reads. Either fail the run or write the failed IDs to a retry table — silently
+    continuing is not an option.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Scheduled job hangs forever, never alerts | No timeout on the HTTP call — `requests` has no default | `timeout=(5, 30)`; alert on run duration too |
+| Occasional duplicate or missing records | Offset pagination over a table receiving writes | Keyset pagination on an immutable sort key |
+| Records silently missing, every run green | Watermark derived from `max(updated_at)` in the response, or advanced on partial failure | Use the query-window start; advance only on complete success; reconcile nightly |
+| Duplicates after a retry | Non-idempotent write plus a retry policy | Upsert on the natural composite key |
+| 429s despite "respecting" the rate limit | Per-worker sleeps — N workers make N× the requests | One shared token bucket |
+| Source recovers, then immediately falls over | Fixed exponential backoff synchronises all clients | Full jitter: `uniform(0, min(cap, base * 2**n))` |
+| `ValueError` parsing `Retry-After` | It can be an HTTP-date, not just an integer | Handle both forms (RFC 9110 §10.2.3) |
+| Backfill restarts from zero after hours | Cursor expired; no checkpoint | Keyset pagination; checkpoint every page |
+| Truncated response treated as the last page | Connection reset mid-body; short JSON parsed successfully | Validate the page size, or the total count if the API reports one |
+| Rate limiter grants a sudden burst | `time.time()` and an NTP step backwards | `time.monotonic()` |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [`requests` — advanced usage](https://requests.readthedocs.io/en/latest/user/advanced/) (requests 2.32.3) — read the Timeouts and Session sections; note explicitly that there is **no default timeout**, and that `Session` gives you connection pooling, which is a free 2–5× on many-request extractions.
+- [`requests` `Response.links`](https://requests.readthedocs.io/en/latest/api/#requests.Response.links) — read this before hand-parsing a `Link` header; RFC 8288 parsing is already done for you.
+- [GitHub REST API — rate limits and pagination](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api) — read this as the reference example of a well-documented rate-limit contract: `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and `Retry-After` on secondary limits.
+- [Stripe API — pagination](https://docs.stripe.com/api/pagination) — read this as the reference example of cursor pagination done properly, including the `has_more` field that removes the "is an empty page the end?" ambiguity.
+- [`dlt` REST API source](https://dlthub.com/docs/dlt-ecosystem/verified-sources/rest_api) (dlt 1.4.1) — read this after building your own; it implements every paginator in this module declaratively, and comparing your design to theirs is instructive.
+
+**Papers and standards**
+
+- [RFC 8288, *Web Linking*.](https://www.rfc-editor.org/rfc/rfc8288) — **Takeaway:** `Link: <url>; rel="next"` is a standard with a defined grammar; `requests` parses it, so use `resp.links`.
+- [RFC 6585 (429) and RFC 9110 §10.2.3 (`Retry-After`).](https://www.rfc-editor.org/rfc/rfc6585) — **Takeaway:** `Retry-After` may be a delay-seconds integer **or** an HTTP-date, and a parser assuming the former crashes on the latter.
+- [RFC 8594, *The Sunset HTTP Header Field*.](https://www.rfc-editor.org/rfc/rfc8594) — **Takeaway:** a standard way for a vendor to warn you that an endpoint is going away; logging unrecognised response headers is a five-line change that can buy months of notice.
+- [Marc Brooker (2015), *Exponential Backoff and Jitter*, AWS Architecture Blog.](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/) — **Takeaway:** full jitter measurably beats both no-jitter and equal-jitter on total work and completion time under contention.
+- [Gray & Lamport (2006), *Consensus on Transaction Commit*, ACM TODS 31(1).](https://doi.org/10.1145/1132863.1132867) — **Takeaway:** atomic commit across independent systems requires consensus, which is why "data in S3, state in Redis" cannot be made atomic and must be made idempotent instead.
+- [Kleppmann & Kreps (2015), *Kafka, Samza and the Unix Philosophy of Distributed Data*, IEEE Data Eng. Bull. 38(4).](http://sites.computer.org/debull/A15dec/p4.pdf) — **Takeaway:** an immutable replayable log turns reprocessing from an incident into a routine operation; "land raw, parse later" is the same principle for files.
+
+**Go deeper**
+
+- Joe Reis & Matt Housley, *Fundamentals of Data Engineering* (2022), **Chapter 7 (Ingestion)** — the vendor-neutral treatment of batch ingestion patterns, CDC, and the "should you even build this?" question.
+- [Martin Kleppmann, *Designing Data-Intensive Applications*, **Chapter 11 (Stream Processing)**](https://dataintensive.net/) — read the "Fault Tolerance" section for exactly-once semantics explained properly; it is the clearest available account of why idempotent consumers are the practical answer.
+- [Michael Nygard, *Release It!* 2nd ed., **Chapters 4–5**](https://pragprog.com/titles/mnee2/release-it-second-edition/) — the stability patterns: circuit breakers, bulkheads, timeouts. Read chapter 4 for why a missing timeout is a cascading-failure vector rather than merely a slow job.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p2/week-15/p2-w15-m2">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,172 @@
+---
+title: "Lab — Static frontend against a public API"
+description: "Reference solution — Week 5"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `LAB-P1-W05`
+
+### Architecture
+
+Four files, no build step, no framework.
+
+```
+index.html      structure + the four state containers + a <template> for a row
+styles.css      tokens, shell grid, card grid, dark mode
+app.js          state machine, fetch layer, virtualized list, URL sync
+sw.js           service worker: app shell + last-good API response
+```
+
+The single most important design decision is that **one object owns UI state**, so an
+inconsistent combination is unrepresentable:
+
+```js
+const ui = {
+  status: 'idle',      // idle | loading | success | empty | error
+  error: null,
+  all: [],             // everything fetched
+  filtered: [],        // after search
+  page: 1,
+  perPage: 24,
+};
+
+function render() {
+  for (const [name, el] of Object.entries(panels)) el.hidden = (name !== ui.status);
+  if (ui.status === 'error') panels.error.textContent = ui.error;
+  if (ui.status !== 'success') return;
+  renderWindow();      // only the visible rows
+  renderPager();
+  liveRegion.textContent = `${ui.filtered.length} countries`;   // announced to screen readers
+}
+```
+
+Every event handler mutates `ui` and calls `render()`. Nothing else touches the DOM. This is
+roughly 40 lines and it is why the state tests pass on the first try.
+
+### Search: debounce *and* cancel
+
+```js
+let inFlight = null;
+
+const onSearch = debounce(async (q) => {
+  inFlight?.abort();                       // cancel the previous request
+  inFlight = new AbortController();
+  ui.status = 'loading'; render();
+  try {
+    const data = await fetchJSON(url(q), { signal: inFlight.signal, timeout: 8000 });
+    ui.all = data; ui.filtered = filter(data, q); ui.page = 1;
+    ui.status = ui.filtered.length ? 'success' : 'empty';
+  } catch (err) {
+    if (err.name === 'AbortError') return;  // expected; a newer request owns the UI now
+    ui.status = 'error'; ui.error = `${err.message}${err.requestId ? ` (ref ${err.requestId})` : ''}`;
+  }
+  render();
+}, 250);
+```
+
+The `if (err.name === 'AbortError') return;` line is the whole answer to acceptance criterion 5 on
+the `hard` track. Without it, cancelling a request paints an error over results that are about to
+arrive.
+
+### Virtualization
+
+```js
+const ROW_H = 34;                      // fixed row height keeps the maths trivial
+const spacer = document.getElementById('spacer');
+const viewport = document.getElementById('viewport');
+
+function renderWindow() {
+  const total = ui.filtered.length;
+  spacer.style.height = total * ROW_H + 'px';            // real scrollbar length
+  const first = Math.max(0, Math.floor(viewport.scrollTop / ROW_H) - 5);   // 5-row overscan
+  const count = Math.ceil(viewport.clientHeight / ROW_H) + 10;
+  const frag = document.createDocumentFragment();
+  for (let i = first; i < Math.min(first + count, total); i++) {
+    const node = rowTpl.content.cloneNode(true);
+    const row = node.querySelector('[data-row]');
+    row.dataset.index = i;
+    row.style.transform = `translateY(${i * ROW_H}px)`;   // transform: no layout
+    node.querySelector('.name').textContent = ui.filtered[i].name.common;
+    node.querySelector('.capital').textContent = ui.filtered[i].capital?.[0] ?? '—';
+    frag.appendChild(node);
+  }
+  rowsHost.replaceChildren(frag);                        // one DOM write per frame
+}
+
+viewport.addEventListener('scroll', () => requestAnimationFrame(renderWindow), { passive: true });
+```
+
+Four details that decide whether this passes: positioning with `transform` rather than `top` keeps
+each frame on the compositor; `replaceChildren` is one write; the scroll listener is `passive` so
+it never blocks scrolling; and the work is deferred to `requestAnimationFrame` so a burst of
+scroll events produces one render per frame instead of dozens.
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: scattering `hidden = true` across handlers.** Every cohort produces at least one
+submission that shows the loading spinner *and* the error at once, or leaves the spinner up after
+an abort. The cause is always several places deciding visibility. One `render()` derived from one
+`status` field makes those bugs impossible rather than rare.
+
+**Wrong turn 2: debouncing and calling it cancellation.** The `hard` checker types 12 characters
+at 40 ms intervals. A 250 ms debounce fires roughly twice during that burst, both requests are in
+flight, and whichever the network returns last wins — which is not necessarily the last query.
+Only `abort()` on the previous controller makes the final render deterministic.
+
+**Wrong turn 3: virtualizing with absolute `top` and no overscan.** `top` triggers layout for
+every row on every frame; `transform` does not. And with zero overscan, a fast scroll shows blank
+rows for a frame because the new window is computed after the paint. Five rows of overscan above
+and below costs 10 nodes and removes the flicker entirely.
+
+**Wrong turn 4: caching the API response in the service worker with `cache.put` and no staleness
+marker.** The offline requirement is not "show something"; it is "show something *and say it is
+old*". Store the response with a `Date` header you set yourself, and render the banner from it.
+A cached view presented as live is worse than an error.
+
+## Measured numbers this solution produces
+
+| Metric | Reference solution |
+| --- | --- |
+| Initial render, 50,000 rows, virtualized | 0.3 ms of layout; under 20 ms end to end including fetch parse |
+| Same data rendered fully (the `standard` approach) | 252.8 ms layout — ~15 dropped frames |
+| Improvement | **843×** on layout |
+| DOM row nodes at any scroll position | 30–40 (limit is 200) |
+| Median frame during a 10,000 px scripted scroll | under 16.7 ms; worst frame 24 ms |
+| Requests outstanding after a 12-character burst | 1 (11 `AbortError`) |
+| Lighthouse (mobile profile) | Performance 96 · Accessibility 100 · Best Practices 100 · SEO 100 |
+| Shipped JS | 9.4 KB gzipped |
+
+## Grading notes
+
+**A 3/3 on correctness**: all four states reachable and mutually exclusive; pagination boundaries
+correct; the resize sweep from 320 px to 2560 px reports zero overflow; the 12-character burst
+leaves exactly one live request; offline reload shows cached data *with* the staleness banner.
+
+**A 3/3 on code quality**: one state object, one `render()`, one delegated listener, no
+`innerHTML` fed by data, and the fetch layer separated from the UI layer so tests can drive either
+alone.
+
+**A 3/3 on performance**: `PERFORMANCE.md` with the learner's own naive-versus-virtualized
+numbers, a frame-time histogram, DOM node counts, and a paragraph on something that did not work.
+
+**A 3/3 on explanation**: defends the virtualization approach *against* `content-visibility: auto`
+with reasons, and states one thing the solution does badly.
+
+**The five most common ways submissions lose points**
+
+1. Debounce presented as cancellation. Fails the burst test every time.
+2. `overflow-x: hidden` on `body` to pass the resize sweep. It does not pass; it just hides it locally.
+3. A "virtualized" list with 50,000 nodes hidden by CSS. Node count check catches it.
+4. Offline mode that shows stale data with no indication it is stale.
+5. A README with no numbers. The lab is a measurement exercise wearing a UI; a submission with no numbers cannot score above 2 on explanation regardless of how good the code is.

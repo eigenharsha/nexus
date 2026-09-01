@@ -1,0 +1,284 @@
+---
+title: "Lab — `ledger` — a typed, tested, packaged Python library"
+description: "Reference solution — Week 3"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `LAB-P1-W03`
+
+The two graded ideas are **Open/Closed proven by a diff** and **an invariant proven by hypothesis**. Everything else is scaffolding around them.
+
+### The Protocol boundary
+
+```python
+# ledger/storage/__init__.py
+from __future__ import annotations
+
+from typing import Protocol, runtime_checkable
+
+from ledger.models import Snapshot
+
+
+@runtime_checkable
+class Storage(Protocol):
+    """What the domain needs from persistence. Backends do NOT import or inherit this."""
+
+    def load(self) -> Snapshot: ...
+    def save(self, snapshot: Snapshot) -> None: ...
+
+
+_REGISTRY: dict[str, type] = {}
+
+
+def register(name: str):
+    """Registration hook that already exists, so a new backend needs no core edit."""
+    def deco(cls: type) -> type:
+        _REGISTRY[name] = cls
+        return cls
+    return deco
+
+
+def open_storage(uri: str) -> Storage:
+    scheme, _, rest = uri.partition("://")
+    try:
+        cls = _REGISTRY[scheme]
+    except KeyError:
+        raise StorageError(f"no backend registered for {scheme!r}") from None
+    return cls(rest)
+```
+
+```python
+# ledger/storage/sqlite.py  — the ONLY file added for the hard track
+from __future__ import annotations
+
+import sqlite3
+from ledger.models import Snapshot
+from ledger.storage import register
+
+
+@register("sqlite")
+class SqliteStorage:                       # note: no base class, no import of Storage
+    def __init__(self, path: str) -> None:
+        self._conn = sqlite3.connect(path)
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS txn ("
+            " id INTEGER PRIMARY KEY, account TEXT NOT NULL,"
+            " amount_minor INTEGER NOT NULL, description TEXT NOT NULL)"
+        )
+        self._conn.commit()
+
+    def load(self) -> Snapshot: ...
+    def save(self, snapshot: Snapshot) -> None: ...
+```
+
+`make verify-openclosed` then passes because `git diff --stat` shows exactly two new files and nothing modified.
+
+### The stateful property test
+
+```python
+# tests/test_invariants.py
+from hypothesis import strategies as st
+from hypothesis.stateful import RuleBasedStateMachine, invariant, rule, precondition
+
+from ledger import Ledger
+
+NAMES = st.sampled_from(["alice", "bob", "carol"])
+AMOUNTS = st.integers(min_value=1, max_value=10**6)
+
+
+class LedgerMachine(RuleBasedStateMachine):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ledger = Ledger()
+        self.expected_total = 0            # computed INDEPENDENTLY of the ledger
+
+    @rule(who=NAMES, amount=AMOUNTS)
+    def deposit(self, who: str, amount: int) -> None:
+        self.ledger.deposit(who, amount, "d")
+        self.expected_total += amount
+
+    @rule(who=NAMES, amount=AMOUNTS)
+    def withdraw(self, who: str, amount: int) -> None:
+        if self.ledger.balance(who) >= amount:
+            self.ledger.withdraw(who, amount, "w")
+            self.expected_total -= amount
+
+    @rule(src=NAMES, dst=NAMES, amount=AMOUNTS)
+    def transfer(self, src: str, dst: str, amount: int) -> None:
+        if src != dst and self.ledger.balance(src) >= amount:
+            self.ledger.transfer(src, dst, amount)   # total unchanged
+
+    @rule(who=NAMES, parts=st.integers(min_value=1, max_value=8))
+    def split_out(self, who: str, parts: int) -> None:
+        bal = self.ledger.balance(who)
+        if bal > 0:
+            shares = self.ledger.split_evenly(bal, parts)
+            assert sum(shares) == bal
+            assert max(shares) - min(shares) <= 1
+
+    @invariant()
+    def total_is_conserved(self) -> None:
+        # Derived from the LOG, not from any cached balance. This is the point.
+        from_log = sum(t.amount_minor for t in self.ledger.transactions)
+        assert from_log == self.expected_total
+        assert sum(self.ledger.balances().values()) == self.expected_total
+
+    @invariant()
+    def no_negative_balances(self) -> None:
+        assert all(v >= 0 for v in self.ledger.balances().values())
+
+    @invariant()
+    def replay_reproduces_state(self) -> None:
+        replayed = Ledger.from_transactions(self.ledger.transactions)
+        assert replayed.balances() == self.ledger.balances()
+
+
+TestLedger = LedgerMachine.TestCase
+```
+
+## Why this solution and not the obvious one
+
+### Wrong turn 1: a Protocol that nothing is annotated with
+
+`mypy` checks structural conformance **only at a use site**. If no function parameter, no variable and no return type is annotated `Storage`, mypy never compares your backends against the Protocol and a mismatched signature sails through:
+
+```python
+# ledger/storage/jsonfile.py
+class JsonStorage:
+    def load(self) -> dict:          # Protocol says -> Snapshot. mypy: silent.
+        ...
+```
+
+The check only fires when a `Storage`-annotated position receives it:
+
+```python
+def restore(storage: Storage) -> Ledger:      # <- THIS is what makes mypy check
+    return Ledger.from_snapshot(storage.load())
+```
+
+Two habits fix it permanently. **Annotate at least one function with the Protocol** — the harness verifies this. And add an explicit conformance assertion per backend, which turns a silent gap into a compile-time error at the definition site:
+
+```python
+# at the bottom of jsonfile.py
+if TYPE_CHECKING:
+    _: Storage = JsonStorage("")      # mypy errors here if the shape is wrong
+```
+
+Note also what `@runtime_checkable` does and does not buy: `isinstance(obj, Storage)` then checks that the **method names exist**, not their signatures or types. It is a smoke test. Do not present it as verification.
+
+### Wrong turn 2: an invariant computed the way the code computes it
+
+This is the trap the harness explicitly tests for, by injecting a mutation that corrupts the cached balance while leaving the transaction log correct.
+
+```python
+@invariant()
+def total_is_conserved(self):
+    assert sum(self.ledger.balances().values()) == self.ledger.total()   # VACUOUS
+```
+
+If `total()` is implemented as `sum(self.balances().values())`, this asserts that a number equals itself. It passes on every mutation, including the injected one, and it will pass forever while the ledger quietly loses money.
+
+An invariant is only worth anything if it is derived **independently** of the code path it checks:
+
+- `expected_total` is maintained by the *test*, by adding and subtracting as it issues operations. The test is the oracle.
+- The second assertion recomputes from the **transaction log**, a different code path from the cached balances.
+- `replay_reproduces_state` rebuilds a ledger from scratch and compares. That catches state that has drifted from its own history — which is the actual bug class in an accounting system.
+
+The general rule: **the property must be checkable by someone who has not read the implementation.** If you had to open the source to write it, it is probably a tautology.
+
+### Wrong turn 3: floats for money
+
+Every share of this lab assumes integer minor units, and the reason is measured in Week 1: `0.1 + 0.2 = 0.30000000000000004441`, one ULP off, and an fp32 accumulator summing 10 million values of 0.1 was **8.794% wrong**. An fp64 ledger drifts more slowly and still drifts, and the drift is invisible until reconciliation.
+
+The reference rejects floats at construction with a message that says why:
+
+```python
+def __post_init__(self) -> None:
+    if isinstance(self.amount_minor, float):
+        raise TypeError(
+            "amounts are integer minor units (pence/cents); "
+            f"got float {self.amount_minor!r}. Use round(x * 100) at the boundary."
+        )
+```
+
+`isinstance(True, int)` is `True` in Python, so if booleans must also be rejected the check needs `type(x) is not int`. Whether that matters is a judgement call; state which you chose.
+
+### A fourth thing worth knowing: largest-remainder for weighted splits
+
+`split_by_weight` cannot use the `divmod` trick, because the shares are not equal. The correct algorithm is **largest remainder** (Hamilton's method):
+
+```python
+def split_by_weight(total: int, weights: list[int]) -> list[int]:
+    """Shares proportional to weights, summing EXACTLY to total."""
+    if not weights or any(w < 0 for w in weights):
+        raise ValueError("weights must be non-empty and non-negative")
+    w_total = sum(weights)
+    if w_total == 0:
+        raise ValueError("weights must not all be zero")
+    exact = [total * w for w in weights]
+    shares = [e // w_total for e in exact]
+    remainder = total - sum(shares)
+    # hand out the remaining units to the largest fractional parts, largest first
+    order = sorted(range(len(weights)), key=lambda i: (-(exact[i] % w_total), i))
+    for i in order[:remainder]:
+        shares[i] += 1
+    return shares
+```
+
+Multiplying **before** dividing (`total * w // w_total`, not `total // w_total * w`) keeps full precision in integer arithmetic. The `(-(remainder), i)` sort key breaks ties by index so the result is deterministic — which is a property the `hard` track asks you to test, and a real requirement, because a split that changes between runs is unreconcilable.
+
+## The measured numbers this solution produces
+
+Python 3.13.2, uv 0.11.7, ruff 0.16.5, mypy 2.3.1, pytest 9.1.1, hypothesis 6.167.1, Apple M3 Pro, macOS 15.
+
+| Measurement | Value |
+|---|---|
+| Example suite on the broken `split_evenly` | **4 passed**, 100% line and branch coverage |
+| Property suite on the same code | **1 failed** in 0.57 s |
+| Shrunk counterexample | **`split_evenly(2, 3)` → `[2, 0, 0]`** |
+| `RuleBasedStateMachine` catching the injected balance mutation | shortest failing sequence: **3 rules** (deposit, transfer, invariant) |
+| Adding the SQLite backend | `git diff --stat`: **2 files changed, 0 modified** |
+| Full suite against 3 backends | one parametrised fixture, **0 lines of new test code** per backend |
+| `ruff check` on the package | **0.059 s** (100 files / 30,100 lines reference) |
+| `mypy --strict` cold / warm | **1.335 s** / **0.091 s** |
+| `uv pip install -e ".[dev]"` warm | **0.135 s** |
+| `@dataclass(frozen=True, slots=True)` per `Transaction` | **139 B** versus 171 B unslotted, 268 B as a dict |
+
+## Grading notes
+
+**3/3 on correctness** means all three tracks pass, hypothesis invariants hold over arbitrary operation sequences **including the injected mutation**, and integer minor units are enforced at construction with a message that tells the caller what to do instead.
+
+**3/3 on code quality** means `mypy --strict` clean with no bare ignores, `ruff` clean on the full rule set, validation in properties rather than scattered, and an exception hierarchy whose members carry structured attributes (`required`, `available`) rather than only a message.
+
+**3/3 on extensibility** means the SQLite backend added with a **zero-line diff to existing files**, proven by `git diff --stat`, and the test suite parametrised so a fourth backend needs no new test code.
+
+**3/3 on explanation** means the README contains the Open/Closed diff, the shrunk counterexample, the splitting guarantee stated precisely, and one wrong turn told honestly.
+
+The six most common ways submissions lose points:
+
+1. **The Protocol is never used in an annotated position**, so mypy checks nothing and the "structural typing" claim is decorative. Add `def restore(storage: Storage)` and a `TYPE_CHECKING` conformance assertion per backend.
+2. **A vacuous invariant.** The harness injects a mutation specifically to catch this; if your state machine still passes, the invariant is a tautology.
+3. **Backends registered by editing an `if`/`elif` in the core.** That is exactly the Open/Closed violation the ticket describes, and `verify-openclosed` fails on the diff.
+4. **Floats for money**, usually arriving via `json.load` where a JSON number became a float. Convert and validate at the boundary, and reject floats loudly rather than rounding silently.
+5. **`split_by_weight` that does not sum exactly.** Dividing before multiplying, or rounding each share independently, loses or gains units. Largest remainder with integer arithmetic is the fix, and the property test finds it in seconds.
+6. **`uv.lock` not committed, or CI not using `--frozen`.** The lockfile is the reproducibility claim; a repository with a lockfile that CI ignores has the paperwork without the property.
+
+<Tip>
+**The portfolio version of this lab** is two artifacts: the `git diff --stat` showing a new
+backend added without touching a line of existing code, and the hypothesis output showing the
+shrunk counterexample the example tests missed. Put both in the README, above the fold. They
+are short, concrete, and they demonstrate two things most candidates cannot.
+</Tip>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

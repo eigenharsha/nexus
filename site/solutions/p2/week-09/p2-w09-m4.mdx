@@ -1,0 +1,150 @@
+---
+title: "Sequential logic, memory & clock"
+description: "Reference solution — Week 9"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P2-W09-M4`
+
+### The chips
+
+```
+CHIP Bit {
+    IN in, load;
+    OUT out;
+    PARTS:
+    Mux(a=fb, b=in, sel=load, out=d);   // load=0 -> feed back the old value
+    DFF(in=d, out=out, out=fb);         // fan out: 'out' and the feedback path
+}
+
+CHIP Register {
+    IN in[16], load;
+    OUT out[16];
+    PARTS:
+    Bit(in=in[0], load=load, out=out[0]);
+    // ... 15 more, identical
+}
+
+CHIP RAM8 {
+    IN in[16], load, address[3];
+    OUT out[16];
+    PARTS:
+    DMux8Way(in=load, sel=address, a=l0, b=l1, c=l2, d=l3,
+             e=l4, f=l5, g=l6, h=l7);              // exactly one register is written
+    Register(in=in, load=l0, out=r0);
+    // ... 7 more
+    Mux8Way16(a=r0, b=r1, c=r2, d=r3, e=r4, f=r5, g=r6, h=r7,
+              sel=address, out=out);               // one is read
+}
+
+CHIP PC {
+    IN in[16], load, inc, reset;
+    OUT out[16];
+    PARTS:
+    Inc16(in=cur, out=incd);
+    Mux16(a=cur,  b=incd,  sel=inc,   out=m1);     // priority is built by
+    Mux16(a=m1,   b=in,    sel=load,  out=m2);     // MUX nesting order:
+    Mux16(a=m2,   b=false, sel=reset, out=next);   // reset > load > inc
+    Register(in=next, load=true, out=cur, out=out);
+}
+```
+
+### The two-phase Python simulator
+
+```python
+class DFF:
+    def __init__(self):      self.state = 0; self.next = 0
+    def set_input(self, v):  self.next = v & 1
+    def tick(self):          self.state = self.next
+```
+
+The `state`/`next` split is the entire correctness argument: reads see `state`, writes land on
+`next`, and `tick()` is the clock edge. Every component's `tick()` must be called before any
+component is read again.
+
+### The locality benchmark
+
+```c
+for (int i=0;i<N;i++) for (int j=0;j<N;j++) s  += a[(size_t)i*N+j];   /* stride 1 */
+for (int j=0;j<N;j++) for (int i=0;i<N;i++) s2 += a[(size_t)i*N+j];   /* stride N */
+```
+
+## Why this solution and not the obvious one
+
+**`PC` built as nested MUXes with `load=true` on the inner register.** The instinct is to compute a
+condition and only write when it holds. Hardware cannot decline to clock a register — every edge
+latches something. So the priority logic selects the *value* (`reset` innermost so it wins), and the
+register is written unconditionally. This is the same insight as `Bit`'s feedback path: "hold" is
+implemented as "write the same value back".
+
+Note the MUX order carefully: the *last* MUX in the chain has the *highest* priority, because it
+gets the final say on `next`. Reset is last, so reset wins.
+
+**`RAM8` uses `DMux8Way` on `load`, not on `in`.** Data can be broadcast to every register freely —
+they simply ignore it. It is the *write enable* that must be exclusive. Students who route the data
+instead of the enable end up with a chip that writes to all eight registers.
+
+**Wrong turns worth knowing about.**
+
+1. *A one-phase simulator.* Updating each component immediately means the first component in the
+   list sees the old clock and the last sees the new one. Simulated clock skew. Symptom: results
+   depend on the order objects appear in a list. Fix: two-phase update, always.
+2. *`Bit` without the feedback MUX.* If the DFF is fed the raw input, `load` does nothing and the
+   register updates every cycle. Passes a test that only ever loads.
+3. *Benchmarking locality without `-ffast-math`.* Both loops come out equal, and the student
+   concludes the effect is a myth. It is not — the row-major loop is FP-dependency-bound at about
+   1.17 ns/element, slow enough that memory never becomes the limit. Verify vectorisation happened
+   before believing a null result.
+
+## Measured numbers this solution produces
+
+Apple M3 Pro, macOS 26.2, Apple clang 17, `-O2 -ffast-math`, best of 5, machine under load:
+
+| N | Working set | Row-major | Column-major | Slowdown | ns/elem row → col |
+|---|---|---|---|---|---|
+| 256 | 0.2 MiB | 0.03 ms | 0.28 ms | 9.3× | 0.05 → 0.43 |
+| 512 | 1.0 MiB | 0.13 ms | 1.65 ms | 12.7× | 0.05 → 0.63 |
+| 1024 | 4.0 MiB | 0.05 ms | 1.40 ms | 28.0× | 0.05 → 1.34 |
+| 2048 | 16.0 MiB | 0.34 ms | 12.8 ms | 38.2× | 0.08 → 3.06 |
+| 4096 | 64.0 MiB | 1.04 ms | 69.6 ms | **66.7×** | 0.06 → 4.15 |
+
+Across repeated runs the 4096 slowdown ranged 56×–81×. Without `-ffast-math`, both loops measured
+the same (~1.17 ns/element), and the gap disappeared entirely.
+
+Address bits: RAM8 → 3, RAM64 → 6, RAM512 → 9, RAM4K → 12, RAM16K → 14.
+
+## Grading notes
+
+**What 3/3 looks like**
+
+- *Correctness* — a randomised multi-thousand-cycle test of RAM against a `dict` reference, and all
+  eight `(reset, load, inc)` combinations checked on the PC.
+- *Code quality* — each RAM level built from eight of the previous level. If `RAM512.hdl` mentions
+  `Register`, it was not composed.
+- *Performance* — the full slowdown curve, not a single data point, plus the negative control run
+  without `-ffast-math`.
+- *Explanation* — the curve's shape tied to the machine's actual cache capacities, and the
+  observation that the effect is invisible while the fast path is dependency-bound.
+
+**The three most common ways submissions lose points**
+
+1. **One data point instead of a curve.** "I measured 60×" tells you nothing about *why*. The rise
+   from 9× to 67× as the working set outgrows the caches is the entire explanation.
+2. **"Cache misses" as the explanation.** Restating the mechanism's name is not explaining it. A 3/3
+   states line size, how many useful bytes per line each loop gets, and where the working set stops
+   fitting.
+3. **One-phase simulation.** Often invisible in the student's own tests and immediately visible in a
+   randomised order-independent test, which is why the hidden tests include one.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,633 @@
+---
+title: "ER modelling & schema design"
+description: "Week 7 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 7 · Module 2 · `P1-W07-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Draw an ER diagram for a real domain and generate correct DDL from it.
+2. Model 1:1, 1:N and M:N relationships, and know why a junction table is not optional for M:N.
+3. Store money, time and status correctly — the three things every schema gets wrong at least once.
+4. Decide when `JSONB` is right and when it is laziness, with a cost you can state.
+5. Write a zero-downtime migration plan for a change that looks impossible, using expand and contract.
+
+## Where this sits
+
+| | |
+| --- | --- |
+| **Prereqs** | `P1-W07-M1` (normalization, constraints) |
+| **Unlocks** | `P1-W07-M3` (you cannot query what you have not modelled), the Week 7 lab, `P1-W08-M4` (these tables become ORM models) |
+| **One-line** | After this you can model a real domain and evolve it without downtime. |
+
+## Why you should care
+
+### For Aarav (student)
+
+- "Design the schema for X" is a standard interview exercise. Cardinality, junction tables and money representation are the three things the interviewer is checking.
+- Your project schema is the fastest signal of seriousness. `price DECIMAL(12,2)` and `created_at timestamptz` say more than another endpoint would.
+- Zero-downtime migration is a genuinely senior topic you can learn in an afternoon and almost no student can discuss.
+
+### For Meera (working professional)
+
+- This shows up in your job as: "we need to rename a column on a table with 40 million rows and we cannot take downtime". The expand/contract pattern is the answer and it has five specific steps.
+- Storing timestamps as `timestamp` without a time zone is the bug that produces "the report is off by five and a half hours" twice a year, forever.
+- Measured here: backfilling a column on 1M rows took **62.7 seconds** in one statement. On 40M rows that is a 40-minute lock unless you batch — which is why the migration plan matters more than the DDL.
+
+## The mental model
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p1-w07-m2.svg" alt="Hand-drawn sketch: entities, cardinalities and the junction table" className="block dark:hidden" />
+  <img src="/assets/diagrams/p1-w07-m2-dark.svg" alt="Hand-drawn sketch: entities, cardinalities and the junction table" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p1-w07-m2
+tier: T2
+one-sentence-goal: Show that the foreign key always lives on the "many" side, and that a many-to-many relationship has nowhere to put it - which is why the junction table exists.
+elements:
+  - three hand-drawn boxes - customers, orders, products - with crow's-foot notation between them
+  - "customers one-to-many orders (crows foot on the orders end)" with the FK arrow drawn ON the orders box and an amber note "the FK goes on the MANY side, always"
+  - "orders many-to-many products (crows feet on both ends)" drawn first with a red cross-out and the note "nowhere to put the key"
+  - then redrawn with an order_items box in the middle holding both keys, PK (order_id, product_id), plus qty and unit_price_cents
+  - an amber margin note on order_items: "the junction row usually carries data of its own - qty, price at the time - which is why it is an entity, not plumbing"
+  - a side panel of three "get these right" boxes - money as bigint minor units or numeric(12,2) NEVER float; time as timestamptz always; status as a CHECK-constrained closed set
+  - circled key term "junction table"
+  - dangling arrow labelled "...now rename a column on 40M live rows"
+numbers-to-write-in: ADD COLUMN with DEFAULT 577 ms on 1M rows; backfill UPDATE 1M rows 62.7 s; SET NOT NULL 2.0 s; ADD CHECK NOT VALID 51 ms then VALIDATE 133 ms; CREATE INDEX 549.6 ms vs CONCURRENTLY 611.6 ms
+alt: A hand-drawn entity-relationship sketch with customers, orders and products in crow's-foot notation, showing the foreign key placed on the many side, a crossed-out direct many-to-many link, and the junction table that replaces it carrying quantity and price.
+*/}
+
+An ER model is three questions asked repeatedly: **what are the things** (entities), **how are they
+related** (relationships), and **how many of each side participates** (cardinality). Cardinality
+decides where the foreign key goes, and that single rule generates most of your DDL mechanically.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Plain English
+
+    - An **entity** is a thing your system must remember: a customer, an order, a product. Entities
+      become tables.
+    - An **attribute** is a fact about one entity: a name, a price. Attributes become columns.
+    - A **relationship** connects entities: a customer *places* an order.
+    - **Cardinality** is how many of each side take part. Three shapes cover almost everything.
+
+    **1:N (one-to-many)** — one customer has many orders; each order has exactly one customer. This
+    is the common case. The rule: **the foreign key goes on the "many" side.** An order stores its
+    `customer_id`; a customer does not store a list of order ids, because a column cannot hold a
+    list (that was 1NF in the previous module).
+
+    **M:N (many-to-many)** — an order contains many products; a product appears in many orders.
+    Neither side can hold the key, because either would need a list. So you create a third table —
+    a **junction table** — with one row per pairing.
+
+    **1:1 (one-to-one)** — a user has one profile. Usually this should just be more columns on the
+    same table. Split it only when there is a real reason: the extra columns are large and rarely
+    read, or they have a different security or retention policy.
+
+    ### The analogy
+
+    A wedding seating plan. Each guest sits at exactly one table, so you write the table number on
+    the guest's card — the key on the "many" side. But guests know many other guests, and knowing is
+    mutual and unlimited, so you cannot write it on either card. You need a separate list of pairs.
+    That list is the junction table, and it usually gains columns of its own: "how they know each
+    other", "do not seat together".
+
+    ### Smallest working example: an e-commerce core
+
+    ```sql
+    -- PostgreSQL 16
+    CREATE TABLE customers (
+      id         bigserial PRIMARY KEY,
+      email      text        NOT NULL UNIQUE,
+      full_name  text        NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
+
+    CREATE TABLE products (
+      id          bigserial PRIMARY KEY,
+      sku         text    NOT NULL UNIQUE,
+      name        text    NOT NULL,
+      price_cents bigint  NOT NULL CHECK (price_cents >= 0),   -- money as minor units
+      active      boolean NOT NULL DEFAULT true
+    );
+
+    -- 1:N  — the FK lives on orders, the "many" side
+    CREATE TABLE orders (
+      id          bigserial PRIMARY KEY,
+      customer_id bigint      NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+      status      text        NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending','paid','shipped','delivered','cancelled','refunded')),
+      placed_at   timestamptz NOT NULL DEFAULT now(),
+      total_cents bigint      NOT NULL CHECK (total_cents >= 0)
+    );
+
+    -- M:N between orders and products, with its own data
+    CREATE TABLE order_items (
+      order_id   bigint  NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+      product_id bigint  NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+      qty        integer NOT NULL CHECK (qty > 0),
+      unit_cents bigint  NOT NULL CHECK (unit_cents >= 0),   -- price AT THE TIME OF SALE
+      PRIMARY KEY (order_id, product_id)
+    );
+    ```
+
+    ### Line by line
+
+    - `bigserial` for ids — 64-bit, so you will not run out. `int` overflows at 2.1 billion, which
+      real systems have hit.
+    - `email text NOT NULL UNIQUE` — the natural key, enforced, while `id` stays the primary key.
+    - `price_cents bigint` — money as **integer minor units**. Never `float`; `0.1 + 0.2` is not
+      `0.3` in binary floating point, and you proved that in Week 1.
+    - `timestamptz NOT NULL DEFAULT now()` — always `timestamptz`, never `timestamp`. See Layer 2;
+      this is the single most consequential type choice in the file.
+    - `ON DELETE RESTRICT` on `orders.customer_id` — deleting a customer with orders fails loudly.
+      Orders are financial evidence.
+    - `ON DELETE CASCADE` on `order_items.order_id` — an item cannot exist without its order.
+    - `PRIMARY KEY (order_id, product_id)` — the junction's key is the pair, which also enforces
+      "the same product appears at most once per order".
+    - `unit_cents` on the junction row — the price *when the order was placed*. If you join to
+      `products.price_cents` at report time, changing a price silently rewrites history. This is the
+      single most common schema bug in e-commerce projects.
+
+    ### Guided practice
+
+    Model a library. Books, copies, members, loans. Draw it before reading the answer.
+
+    <Accordion title="Answer">
+      ```sql
+      CREATE TABLE books (
+        id     bigserial PRIMARY KEY,
+        isbn   text NOT NULL UNIQUE,
+        title  text NOT NULL,
+        author text NOT NULL
+      );
+      -- a book is a work; a copy is a physical object. This distinction is the whole exercise.
+      CREATE TABLE copies (
+        id       bigserial PRIMARY KEY,
+        book_id  bigint NOT NULL REFERENCES books(id) ON DELETE RESTRICT,
+        barcode  text   NOT NULL UNIQUE,
+        acquired date   NOT NULL
+      );
+      CREATE TABLE members (
+        id         bigserial PRIMARY KEY,
+        email      text NOT NULL UNIQUE,
+        joined_at  timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE TABLE loans (
+        id          bigserial PRIMARY KEY,
+        copy_id     bigint NOT NULL REFERENCES copies(id) ON DELETE RESTRICT,
+        member_id   bigint NOT NULL REFERENCES members(id) ON DELETE RESTRICT,
+        borrowed_at timestamptz NOT NULL DEFAULT now(),
+        due_at      timestamptz NOT NULL,
+        returned_at timestamptz,
+        CONSTRAINT due_after_borrowed CHECK (due_at > borrowed_at),
+        CONSTRAINT returned_after_borrowed CHECK (returned_at IS NULL OR returned_at >= borrowed_at)
+      );
+      -- a copy can be on loan at most once at a time - enforced by the database, not by a check-then-insert race
+      CREATE UNIQUE INDEX one_active_loan_per_copy ON loans (copy_id) WHERE returned_at IS NULL;
+      ```
+
+      The two decisions that matter: separating `books` from `copies` (a library owns three copies of
+      one book, and a loan is of a copy), and the partial unique index, which makes double-lending
+      impossible rather than unlikely.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+      **1. Which side of a 1:N gets the foreign key?**
+      The "many" side. A column cannot hold a list, so the one side cannot point back.
+
+      **2. Why does M:N need a third table?**
+      Both sides would need a list; a junction table stores one row per pairing, and usually carries
+      data about the pairing itself.
+
+      **3. Why store `unit_cents` on `order_items` rather than joining to the product?**
+      Because it is the price at the time of sale. Joining to the current price rewrites history
+      whenever a price changes.
+
+      **4. When is 1:1 justified?**
+      When the columns are large and rarely read, or have a different retention or access policy.
+      Otherwise they are just more columns.
+
+      **5. Why `bigserial` rather than `serial`?**
+      `serial` is 32-bit and overflows at about 2.1 billion rows — a real, and very expensive,
+      failure to fix later.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The three things every schema gets wrong
+
+    **Money.** Two acceptable choices: `bigint` minor units (cents, paise) or `numeric(12,2)`.
+    Never `float`/`double precision`. `numeric` is exact and slower; `bigint` is exact and fast but
+    forces you to remember the scale everywhere. Pick one per codebase, write it in the style guide,
+    and always store the currency next to the amount — an amount without a currency is not money,
+    and multi-currency arrives sooner than anyone plans for.
+
+    **Time.** Always `timestamptz`. The name is misleading: PostgreSQL does **not** store a time
+    zone. It stores a UTC instant, converts on input from the session's zone, and converts on output
+    to the session's zone. Plain `timestamp` stores wall-clock digits with no instant attached, so
+    "2026-03-29 02:30" may be a time that occurred twice, or never, depending on where you are. Use
+    `timestamptz` for instants, `date` for calendar days that are genuinely zoneless (a birthday),
+    and store the user's IANA zone (`Asia/Kolkata`) separately when you must render local times.
+
+    **Status.** A closed set with a `CHECK`, plus the transitions written down:
+
+    ```sql
+    status text NOT NULL CHECK (status IN ('pending','paid','shipped','delivered','cancelled','refunded'))
+    ```
+
+    A state machine is more than the set of states. Enforce the legal transitions in one place — a
+    service method or a trigger — because `pending → refunded` should be impossible and no `CHECK`
+    on a single row can express that. Prefer `CHECK` over a native `ENUM` type: adding a value to an
+    enum is easy, removing or reordering one requires a type rewrite.
+
+    ### The production surface
+
+    **Audit columns**, on every table, from day one:
+
+    ```sql
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    deleted_at timestamptz            -- NULL means live
+    ```
+
+    **Soft deletes have a cost that is rarely stated.** Every query must remember
+    `WHERE deleted_at IS NULL`, and the one that forgets is a data leak or a wrong report. Two
+    mitigations: a partial index (`... WHERE deleted_at IS NULL`, measured at 6,704 kB against
+    6,840 kB for the full index, so essentially free), and a view over the live rows that the
+    application queries instead of the table. Use soft deletes where you genuinely need recovery or
+    audit; use hard deletes plus an archive table where you do not, because a `deleted_at` column is
+    a rule everyone must remember forever.
+
+    **`JSONB`** is right when the shape is genuinely open — a webhook payload you must retain
+    verbatim, per-tenant custom fields, an event body whose schema is the emitter's business. It is
+    laziness when you are avoiding a migration: the moment you write
+    `WHERE data->>'status' = 'paid'` you have a column with no type, no constraint, no default, and
+    a statistics estimate the planner cannot trust.
+
+    ```sql
+    ALTER TABLE events ADD COLUMN payload jsonb NOT NULL DEFAULT '{}'::jsonb;
+    CREATE INDEX idx_events_payload ON events USING gin (payload jsonb_path_ops);
+    ```
+
+    `jsonb_path_ops` indexes only containment (`@>`) but is smaller and faster than the default
+    operator class. The measured trade-off for JSONB in general: it stores keys with every row, so a
+    table of 3 million events with a 12-key payload stores those key names 3 million times, and it
+    cannot be constrained by `CHECK` in any way the planner understands.
+
+    ### Trade-offs
+
+    | Decision | Choose the first when… | Choose the second when… |
+    | --- | --- | --- |
+    | **Column vs `JSONB`** | The field is queried, constrained, indexed, or appears in more than one query. | The shape is genuinely per-tenant or externally defined, and you accept no constraints and weak statistics. |
+    | **Soft delete vs hard delete + archive** | You need recovery, audit or "undo", and you will add the partial index and the view. | You do not — then a `deleted_at` column is a rule every future query must remember, and one will not. |
+    | **`bigint` minor units vs `numeric(12,2)`** | Performance matters and all amounts are whole minor units. | You need fractional units or tax arithmetic with rounding rules; `numeric` is exact and self-documenting. |
+    | **Table inheritance patterns** (single table with a type column vs table per subtype) | Subtypes share most columns and you query across them constantly — one table, a `type` column, and `CHECK` constraints per type. | Subtypes have mostly different columns; then a shared table plus per-subtype tables keyed on the same id keeps `NOT NULL` meaningful. |
+    | **Native `ENUM` vs `CHECK` vs lookup table** | Never `ENUM` first — `CHECK` is simplest and adding a value is one `ALTER`. | A lookup table when the set changes at runtime or needs attributes (label, sort order, active flag). |
+
+    ### Reference implementation: expand and contract
+
+    The ticket: rename `orders.total` to `orders.total_cents` on a live, heavily written table. You
+    cannot do it in one statement, because old and new application code run simultaneously during a
+    rolling deploy.
+
+    **The five phases**, each independently deployable and reversible:
+
+    ```sql
+    -- PHASE 1 (expand): add the new column. Nullable, no default -> metadata only.
+    ALTER TABLE orders ADD COLUMN total_cents bigint;
+
+    -- PHASE 2 (dual write): deploy code that writes BOTH columns and reads the OLD one.
+    --   Also add a trigger so writers you do not control stay consistent.
+    CREATE FUNCTION sync_total() RETURNS trigger AS $$
+    BEGIN
+      IF NEW.total_cents IS NULL THEN NEW.total_cents := NEW.total; END IF;
+      IF NEW.total IS NULL       THEN NEW.total := NEW.total_cents; END IF;
+      RETURN NEW;
+    END $$ LANGUAGE plpgsql;
+    CREATE TRIGGER trg_sync_total BEFORE INSERT OR UPDATE ON orders
+      FOR EACH ROW EXECUTE FUNCTION sync_total();
+
+    -- PHASE 3 (backfill): in BATCHES. Never one statement on a big table.
+    --   Measured: a single UPDATE of 1,000,002 rows took 62.7 SECONDS and held row locks throughout.
+    DO $$
+    DECLARE rows_done integer;
+    BEGIN
+      LOOP
+        UPDATE orders SET total_cents = total
+        WHERE id IN (SELECT id FROM orders WHERE total_cents IS NULL LIMIT 5000);
+        GET DIAGNOSTICS rows_done = ROW_COUNT;
+        EXIT WHEN rows_done = 0;
+        COMMIT;                -- each batch is its own transaction
+        PERFORM pg_sleep(0.05);  -- let autovacuum and other writers breathe
+      END LOOP;
+    END $$;
+
+    -- PHASE 4 (switch reads): deploy code that reads the NEW column, still writing both.
+    --   Then make it non-null safely:
+    ALTER TABLE orders ADD CONSTRAINT total_cents_not_null
+      CHECK (total_cents IS NOT NULL) NOT VALID;     -- measured 51 ms: instant, weak lock
+    ALTER TABLE orders VALIDATE CONSTRAINT total_cents_not_null;  -- measured 133 ms, weaker lock than SET NOT NULL
+
+    -- PHASE 5 (contract): after a full deploy cycle with no reads of the old column,
+    DROP TRIGGER trg_sync_total ON orders;
+    ALTER TABLE orders DROP COLUMN total;
+    ```
+
+    Three measured facts that justify the shape. `ADD COLUMN` with a `DEFAULT` on 1M rows took
+    **577 ms** — since PostgreSQL 11 it is a metadata change, not a rewrite — but it still takes an
+    `ACCESS EXCLUSIVE` lock, so it queues behind and then blocks every other query; set
+    `lock_timeout` before running it. The backfill as one statement took **62.7 s** on 1M rows,
+    which on 40M rows is roughly 40 minutes of held locks and bloat. And `SET NOT NULL` took
+    **2.0 s** because it scans the whole table under a strong lock, which is why the
+    `CHECK ... NOT VALID` then `VALIDATE` pair — 51 ms plus 133 ms — is the safe substitute.
+
+    For indexes during a migration, `CREATE INDEX CONCURRENTLY` cost **611.6 ms** against 549.6 ms
+    for the blocking version: **11% slower, and it does not block writes.** That is the cheapest
+    trade in this entire module.
+
+    ### What breaks in the real world
+
+    A team ran `ALTER TABLE orders ADD COLUMN currency text NOT NULL DEFAULT 'USD'` on a 40-million
+    row table during business hours. They had read that this is instant since PostgreSQL 11, and it
+    is — the statement itself completes in under a second.
+
+    The outage was six minutes and had nothing to do with the rewrite. `ALTER TABLE` needs an
+    `ACCESS EXCLUSIVE` lock. A long-running analytics query was holding an `ACCESS SHARE` lock, so
+    the `ALTER` waited. And because PostgreSQL's lock queue is ordered, **every subsequent query on
+    that table queued behind the waiting `ALTER`** — including all the fast ones. The table was
+    effectively offline until the analytics query finished.
+
+    The fix is two lines and belongs at the top of every migration:
+
+    ```sql
+    SET lock_timeout = '3s';         -- give up rather than queue behind a long reader
+    SET statement_timeout = '30s';
+    ```
+
+    With `lock_timeout`, the `ALTER` fails fast, the migration tool retries, and no queue forms. The
+    team also added a pre-migration check that refuses to run while any query on the target table has
+    been active for more than 30 seconds. **The DDL was correct; the lock behaviour was the
+    incident.**
+
+    <Accordion title="Design checkpoint — model answer inside">
+      **Question.** Product wants "customers can add arbitrary custom fields to a contact". Your
+      colleague proposes a `custom_fields jsonb` column. What do you ask, and what do you build?
+
+      **Model answer.** Ask two questions. *Will anyone query, filter or sort by these fields?* and
+      *does the set of fields differ per tenant, or is it one growing list?* If nobody queries them
+      and they differ per tenant, `JSONB` is right: store it, index with
+      `gin (custom_fields jsonb_path_ops)` if containment queries appear, and accept no constraints.
+      If people will filter by them — and they always will, about three weeks after launch — then
+      `JSONB` gives you untyped, unconstrained columns whose selectivity the planner estimates
+      poorly, which produces exactly the "one report got slow" mystery this course teaches you to
+      avoid. The middle path most products land on is an entity-attribute table
+      (`contact_id, field_id, value_text, value_number, value_date`) with a `field_definitions`
+      table per tenant: it is more work, it keeps types and constraints, and it can be indexed
+      properly. State the trade honestly — EAV queries are uglier and need a pivot — and let the
+      team decide with both costs visible.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    ### Lock levels are the real migration constraint
+
+    Every DDL statement takes a lock, and the lock level — not the statement's runtime — decides
+    whether it is safe. `ACCESS EXCLUSIVE` conflicts with everything including plain `SELECT`, and
+    PostgreSQL's lock queue is FIFO, so a blocked `ACCESS EXCLUSIVE` request blocks every request
+    behind it.
+
+    | Operation | Lock | Measured on 1M rows | Safe on a live table? |
+    | --- | --- | --- | --- |
+    | `ADD COLUMN` (nullable, or with a default) | ACCESS EXCLUSIVE | 577 ms | Yes, **with `lock_timeout`** |
+    | `ADD COLUMN ... NOT NULL` without a default | ACCESS EXCLUSIVE + full rewrite | minutes | No |
+    | `SET NOT NULL` | ACCESS EXCLUSIVE + full scan | 2,026 ms | Only via `CHECK NOT VALID` first |
+    | `ADD CONSTRAINT ... NOT VALID` | ACCESS EXCLUSIVE, no scan | 51 ms | Yes |
+    | `VALIDATE CONSTRAINT` | SHARE UPDATE EXCLUSIVE | 133 ms | **Yes** — concurrent reads and writes continue |
+    | `CREATE INDEX` | SHARE (blocks writes) | 549.6 ms | No |
+    | `CREATE INDEX CONCURRENTLY` | SHARE UPDATE EXCLUSIVE | 611.6 ms | **Yes** |
+    | Backfill `UPDATE` of every row | row locks, heavy bloat | **62,693 ms** | Only in batches |
+    | `DROP COLUMN` | ACCESS EXCLUSIVE, metadata only | milliseconds | Yes, with `lock_timeout` |
+
+    Three notes worth internalising. `CREATE INDEX CONCURRENTLY` costs **11%** more wall-clock time
+    and cannot run inside a transaction block; if it fails it leaves an invalid index you must drop
+    manually — check `pg_index.indisvalid` after every concurrent build. `VALIDATE CONSTRAINT` taking
+    a weaker lock is the mechanism behind almost every safe-migration tool. And `DROP COLUMN` does
+    not reclaim space; the data stays in the heap until those rows are rewritten, which is what
+    `VACUUM FULL` or `pg_repack` is for.
+
+    ### Multi-tenancy: three models, priced
+
+    | Model | Isolation | Ops cost | Noisy neighbour | Migration cost | Best at |
+    | --- | --- | --- | --- | --- | --- |
+    | **Row-level** (`tenant_id` on every table) | weakest — one missing `WHERE` is a breach | lowest | shared everything | one migration for all | thousands of small tenants |
+    | **Schema-per-tenant** | good — separate namespaces | medium | shared connections and cache | N migrations, and N grows | tens to hundreds of tenants |
+    | **Database-per-tenant** | strongest — separate backups, separate restore | highest | none | N migrations plus N connection pools | few large enterprise tenants |
+
+    Row-level is the default and the risk is precisely the IDOR problem from `P1-W06-M4`. PostgreSQL
+    has a real mitigation, **Row-Level Security**:
+
+    ```sql
+    ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY tenant_isolation ON orders
+      USING (tenant_id = current_setting('app.tenant_id')::bigint);
+    ```
+
+    Now a query that forgets its `WHERE` returns zero rows instead of everyone's rows. The costs are
+    real: the policy is applied to every query as an extra predicate, `current_setting` must be set
+    per connection (which interacts badly with connection pooling in transaction mode — see
+    `P1-W08-M5`), and the table owner bypasses RLS unless you set `FORCE ROW LEVEL SECURITY`. It is
+    a seatbelt, not a substitute for the `WHERE` clause.
+
+    Schema-per-tenant's hidden cost is the catalog: PostgreSQL keeps metadata per relation, and
+    1,000 tenants × 30 tables is 30,000 relations, which makes `pg_dump`, autovacuum scheduling and
+    even `\dt` noticeably slow, and blows up the relcache in every backend.
+
+    ### Partitioning a 500-million-row orders table
+
+    Native declarative partitioning, PostgreSQL 16:
+
+    ```sql
+    CREATE TABLE orders (
+      id bigserial, customer_id bigint NOT NULL, placed_at timestamptz NOT NULL, ...
+      PRIMARY KEY (id, placed_at)        -- the partition key MUST be in every unique constraint
+    ) PARTITION BY RANGE (placed_at);
+
+    CREATE TABLE orders_2026_01 PARTITION OF orders
+      FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+    ```
+
+    What you gain: **partition pruning** — a query with a `placed_at` predicate touches one
+    partition instead of all of them — and, more valuable in practice, `DROP TABLE orders_2025_01`
+    as an instant retention policy, against a `DELETE` of 40 million rows that produces 40 million
+    dead tuples for autovacuum to clean up. Recall the measured bloat cost from `P1-W07-M5`: five
+    updates to 200,000 rows grew a table from 48 MB to 284 MB.
+
+    What it costs, and these are the parts people discover late. Every unique constraint must
+    include the partition key, so `UNIQUE (email)` across all partitions is impossible. Queries
+    without a predicate on the partition key touch every partition, and with 60 monthly partitions
+    that is 60 index scans instead of one. Planning time grows with partition count. And foreign
+    keys *referencing* a partitioned table were only supported from PostgreSQL 12, with restrictions
+    that still bite.
+
+    The rule: partition when you have a **retention or archival** requirement, or when a single
+    table's indexes no longer fit in memory. Do not partition to make queries faster — that is what
+    indexes are for, and the measured gain from an index was 1,970× while pruning typically buys a
+    single-digit factor.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Migration takes the table offline | Everything on one table stalls, then recovers together | `ACCESS EXCLUSIVE` queued behind a long reader; always `SET lock_timeout` |
+    | Report off by 5.5 hours, twice a year | `timestamp` instead of `timestamptz` | Audit column types; `timestamp` in a schema is almost always a bug |
+    | Money off by fractions of a cent | `float` for currency | `bigint` minor units or `numeric` |
+    | Historical order totals change | Report joins to the current product price | Store `unit_cents` on the order line at sale time |
+    | Deleted rows appear in a report | One query forgot `WHERE deleted_at IS NULL` | A view over live rows; a partial index; RLS |
+    | Invalid index after a failed concurrent build | The index exists but is never used | `SELECT * FROM pg_index WHERE NOT indisvalid` |
+    | `serial` overflow | Inserts fail at 2,147,483,647 | Use `bigserial`/`bigint` identity from the start; changing later is a full rewrite |
+    | Partitioned table cannot enforce global uniqueness | Duplicate emails across partitions | Include the partition key in the constraint, or keep a separate unique lookup table |
+
+    ### Frontier and primary sources
+
+    - **PostgreSQL 16 docs, "ALTER TABLE" lock notes and "Explicit Locking."** *Takeaway:* the lock
+      level, not the runtime, determines whether a migration is safe — and the FIFO queue means one
+      blocked DDL blocks everything behind it.
+    - **PostgreSQL 16 docs, "Table Partitioning."** *Takeaway:* partitioning is a data-management
+      feature (retention, archival) that sometimes helps queries, not a performance feature that
+      sometimes helps management.
+    - **Chen (1976), "The Entity-Relationship Model."** *Takeaway:* separating entities, relationships
+      and attributes gives you a design vocabulary independent of any particular database, which is
+      why ER diagrams survived every technology shift since.
+    - **`pgroll` and `reshape` (open-source schema-migration tools).** *Takeaway:* expand/contract can
+      be automated with versioned views, so old and new application versions each see the schema they
+      expect during a deploy.
+
+    ### Stretch challenge
+
+    Write the complete, executable zero-downtime plan for the hardest migration in a system you
+    know: splitting one column into two with different semantics — say `name` into `given_name` and
+    `family_name`, where the split rule is ambiguous for a meaningful fraction of rows.
+
+    Deliver five things: the phase-by-phase SQL with lock levels annotated; a batched backfill with a
+    measured throughput number and a projected total runtime for your real row count; the rollback
+    procedure for each phase *including the ones after the backfill*; a reconciliation query that
+    proves the split is reversible; and a decision, with evidence, for the ambiguous rows.
+
+    The genuinely hard part is the rollback after phase 4. Once you have dropped the old column you
+    cannot go back, so the plan must state exactly when the point of no return is crossed and what
+    must be true before crossing it. Most migration plans quietly omit this, which is why most
+    migration incidents are unrecoverable.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Write the zero-downtime plan for renaming a heavily-used column on a live table. Include the lock
+level of every statement, a batched backfill with measured throughput, the rollback for each phase,
+and the point of no return. Then actually run it against your seeded 1M-row table and record the
+wall-clock time of each phase.
+</Card>
+
+## The whiteboard
+
+T1 is the crow's-foot sketch with the junction table. The T2 build-up frames are: (1) entities,
+(2) the 1:N with the FK placed on the many side, (3) the M:N attempted directly and crossed out,
+(4) the junction table with its own columns.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p1-w07-m2-blank.svg) · [Editable source](/assets/diagrams/p1-w07-m2.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    Commit `schema.sql` with comments explaining each non-obvious choice, and an ER diagram in the
+    README. In an interview, the sentence that separates you: "I stored `unit_cents` on the order
+    line rather than joining to the product, because otherwise changing a price rewrites every
+    historical order total." That is a bug you have thought about, not a rule you have read.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **One:** grep your schema for `timestamp` without `tz` and for `float`/`double precision` on
+    money columns — both are latent incidents. **Two:** put `SET lock_timeout = '3s'` at the top of
+    every migration; it converts a six-minute outage into a failed migration you retry. **Three:**
+    check every `CREATE INDEX` in your migration history for `CONCURRENTLY` — measured, it costs 11%
+    more wall time and does not block writes, which is the cheapest safety trade available.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Historical totals change when a price changes | Report joins to the current product price | Store the price on the order line at sale time |
+| Timestamps drift by hours | `timestamp` instead of `timestamptz` | `timestamptz` everywhere; store the IANA zone separately if you render local times |
+| Money is off by fractions | `float` for currency | `bigint` minor units or `numeric(12,2)`, plus a currency column |
+| The same product twice in one order | No unique constraint on the junction pair | `PRIMARY KEY (order_id, product_id)` |
+| Migration takes the site down | `ACCESS EXCLUSIVE` queued behind a long reader | `SET lock_timeout`; check for long-running queries first |
+| Backfill locks the table for an hour | One `UPDATE` over every row — measured 62.7 s per million | Batch it, commit per batch, sleep between batches |
+| Deleted rows show in a report | A query forgot `WHERE deleted_at IS NULL` | A live-rows view, a partial index, or row-level security |
+| Index exists but is never used | A failed `CREATE INDEX CONCURRENTLY` left it invalid | `SELECT * FROM pg_index WHERE NOT indisvalid`; drop and rebuild |
+
+## Assessment
+
+**Concept questions**
+
+1. Which side of a 1:N relationship holds the foreign key, and why? *(The many side; a column cannot hold a list.)*
+2. Why does M:N require a junction table? *(Neither side can store a list, and the pairing usually has its own attributes.)*
+3. Why `timestamptz` rather than `timestamp`? *(It stores a UTC instant; plain `timestamp` stores wall-clock digits that may be ambiguous or non-existent across DST.)*
+4. Give two acceptable money representations and one unacceptable one. *(`bigint` minor units, `numeric(12,2)`; never `float`.)*
+5. When is `JSONB` the right choice? *(Genuinely open or per-tenant shapes you will not filter on; accept no constraints and weak planner statistics.)*
+6. List the five phases of expand/contract. *(Add column; dual write; batched backfill; switch reads and constrain; drop the old column.)*
+7. Why `CHECK ... NOT VALID` then `VALIDATE` instead of `SET NOT NULL`? *(`VALIDATE` takes SHARE UPDATE EXCLUSIVE rather than ACCESS EXCLUSIVE — measured 51 ms + 133 ms versus 2,026 ms under a blocking lock.)*
+8. Name two costs of partitioning. *(Every unique constraint must include the partition key; queries without a partition-key predicate touch every partition, and planning time grows with partition count.)*
+
+**Coding challenge.** Model the full e-commerce domain (users, products, inventory, carts, orders, payments, refunds, reviews) with all constraints, then write the expand/contract migration that splits `orders.total` into `subtotal_cents`, `tax_cents` and `shipping_cents`. Hidden tests: every constraint holds against adversarial inserts; the migration is reversible up to phase 4; the backfill completes in batches with no statement over 2 seconds.
+
+**Interview questions**
+
+- *Junior:* "Design the tables for an e-commerce store."
+- *Mid:* "How do you rename a column on a table with 40 million rows without downtime?"
+- *Senior:* "Compare row-level, schema-level and database-level multi-tenancy for 2,000 tenants, and tell me which you would pick and what would change your mind."
+
+**Draw it from memory.** Draw the e-commerce ER diagram with cardinalities, then annotate each foreign key with its `ON DELETE` behaviour and say why.
+
+## Sources & further reading
+
+**Primary docs**
+
+- [PostgreSQL 16: Data Types](https://www.postgresql.org/docs/16/datatype.html) — read the date/time and numeric sections carefully; they settle the `timestamptz` and money questions permanently.
+- [PostgreSQL 16: ALTER TABLE](https://www.postgresql.org/docs/16/sql-altertable.html) — read the notes on lock levels and which forms require a rewrite.
+- [PostgreSQL 16: Table Partitioning](https://www.postgresql.org/docs/16/ddl-partitioning.html) — read the limitations section before the benefits section.
+- [PostgreSQL 16: Row Security Policies](https://www.postgresql.org/docs/16/ddl-rowsecurity.html) — read it for the pooling and `FORCE` caveats.
+
+**Papers and their takeaways**
+
+- **[Chen (1976), "The Entity-Relationship Model — Toward a Unified View of Data."](https://doi.org/10.1145/320434.320440)** *Takeaway:* entities, relationships and attributes are a design vocabulary independent of any storage technology, which is why the notation outlived every database it was invented for.
+- **[Fowler, *Patterns of Enterprise Application Architecture*, mapping chapters.](https://martinfowler.com/books/eaa.html)** *Takeaway:* the three inheritance-mapping patterns (single table, class table, concrete table) each trade nullable columns against joins, and naming which one you chose ends most design arguments.
+
+**Go deeper**
+
+- [The `pgroll` documentation and design notes](https://github.com/xataio/pgroll) — read how versioned views let two application versions see different schemas simultaneously. It makes expand/contract concrete, and it is the clearest published explanation of why the phases exist.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-07/p1-w07-m2">
+  Attempt the lab first. Seriously.
+</Card>

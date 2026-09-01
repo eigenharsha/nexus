@@ -1,0 +1,720 @@
+---
+title: "Embeddings for retrieval"
+description: "Week 27 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 27 · Module 3 · `P4-W27-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Week 25 M2 (embeddings as vectors; cosine similarity), Week 11 (dot products and normalisation), Modules 1–2 (clean, well-shaped chunks to embed), Week 19 (Recall@k, NDCG).
+- **Unlocks:** Module 4 (what the index stores), Module 5 (the ablation), Week 28 M1 (where dense retrieval fails and sparse wins).
+- **One-line:** you will be able to choose an embedding model by measuring it on your own labelled queries rather than by reading a leaderboard, and to state the storage and latency cost of that choice.
+
+## Why you should care
+
+**For Aarav (student).** "We used the top model on MTEB" is a sentence that sounds rigorous and is
+not. Running four models against your own 100 labelled queries takes an afternoon, produces a
+table, and occasionally produces a *reversal* against the leaderboard — which is the most
+interesting slide in any RAG presentation.
+
+**For Meera (working professional).** Embedding dimension is a storage and latency bill you pay
+forever: 384 versus 3,072 dimensions is an 8× index size difference across every chunk you will
+ever store. And re-embedding a corpus to change models is a migration, not a config change, so this
+decision has more inertia than almost anything else in the stack.
+
+## The mental model
+
+An embedding model is trained so that **text that answers a question lands near that question** in
+vector space. Not "similar text lands near similar text" — that is a different objective and it
+produces a different model. Retrieval quality is entirely about whether that training objective
+matches your queries and your documents.
+
+<Frame caption="Bi-encoder versus cross-encoder: what is precomputable and what is not.">
+  <img src="/assets/diagrams/p4-w27-m3.svg" alt="Hand-drawn sketch: bi-encoder and cross-encoder architectures" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w27-m3-dark.svg" alt="Hand-drawn sketch: bi-encoder and cross-encoder architectures" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w27-m3
+tier: T1
+one-sentence-goal: show that a bi-encoder embeds query and document SEPARATELY so documents can be precomputed, and that this separation is exactly what limits its accuracy.
+elements:
+  - left half headed "BI-ENCODER (this module)": two identical hand-drawn model boxes side by side, one fed "query" and one fed "chunk", each emitting a horizontal vector strip. A dotted vertical line drawn firmly between them labelled "THEY NEVER MEET" in the teacher's hand
+  - the two strips converge on a small circle labelled "cosine" with the output "0.71"
+  - under the document-side box, a clock icon crossed out and the note "computed ONCE at ingest. 47,300 chunks, 33 min. at query time this side is FREE"
+  - amber margin note across the dotted line: "the document vector was computed without ever seeing the query. that is the whole trick AND the whole limitation"
+  - right half headed "CROSS-ENCODER (week 28 m4)": ONE model box fed a single concatenated input "query [SEP] chunk", emitting a single scalar "0.83". No dotted line
+  - under it, in red: "cannot precompute ANYTHING. 1.1k pairs/sec. scoring 47,300 chunks for one query = 43 seconds. that is why it is a re-ranker, never a retriever"
+  - bottom-left: a small hand-drawn 2-D scatter of chunk points with a query point marked by a cross, a dashed circle of radius "top-10" drawn around it, two of the enclosed points shaded green (relevant) and eight left blank
+  - bottom-right: a hand-drawn bar chart, six bars for six embedding models, two series each - Recall@10 and encode throughput - drawn so the tallest quality bar has the shortest throughput bar. Amber note: "3.9x slower for +0.01 recall. measure on YOUR data"
+  - a red cross-out over the phrase "top of the MTEB leaderboard", with the correction "top of YOUR eval set" written beside it
+  - dangling arrow: "...and how do you search 47,300 vectors in under a millisecond? -> module 4"
+numbers-to-write-in: 47,300 chunks; bge-base 768 dims, 145 MB, 1,420 sent/s, R@10 0.88; gte-large 1024 dims, 194 MB, 390 sent/s, R@10 0.885; cross-encoder 1,100 pairs/s = 43 s per query over the full corpus
+alt: A hand-drawn whiteboard split in two, on the left a bi-encoder with separate model boxes for the query and the document divided by a dotted line labelled they never meet and a note that document vectors are precomputed once, on the right a cross-encoder taking a single concatenated input and emitting one score with a red note that scoring the full corpus would take forty-three seconds per query, and below a model comparison bar chart where the highest-quality model has the lowest throughput.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### What an embedding model is trained to do
+
+    Week 25 introduced embeddings as the lookup table inside a language model. A **retrieval
+    embedding model** is a different object with a different job: given a piece of text, produce one
+    fixed-length vector such that **texts about the same thing land close together**.
+
+    The training objective is worth knowing because it explains the failures. These models are
+    trained with **contrastive learning**: show the model a query and its correct passage (a
+    *positive pair*), plus a batch of unrelated passages (*negatives*), and adjust the weights so the
+    positive pair's vectors move together and the negatives move apart. Do that over hundreds of
+    millions of pairs — questions and their answers, titles and their articles, code and its
+    docstrings — and the geometry emerges.
+
+    Two consequences follow directly:
+
+    - **The model is only good at the kinds of pairs it was trained on.** A model trained mostly on
+      web question-answer pairs will do well on questions and less well on "find the clause similar
+      to this clause".
+    - **"Similar" means similar *in the training objective's sense*.** For most retrieval models
+      that means "answers this", not "shares vocabulary" and not "same topic".
+
+    ### Bi-encoders
+
+    The architecture used for retrieval is a **bi-encoder**: the query and the document go through
+    the model *separately* and produce two independent vectors, which are then compared with a
+    single cheap operation.
+
+    That separation is the entire reason retrieval is possible at scale. Because a document's vector
+    does not depend on the query, you compute all 47,300 of them once, at ingest, and at query time
+    you only embed the query and do 47,300 dot products.
+
+    The alternative — a **cross-encoder**, which feeds query and document *together* into one model
+    and outputs a relevance score — is more accurate and cannot be precomputed. Week 28 Module 4
+    uses it as a re-ranker over the top 50 candidates, which is the only way it is affordable.
+
+    ### Similarity: cosine, dot product, Euclidean
+
+    **Cosine similarity** is the cosine of the angle between two vectors: 1.0 for the same
+    direction, 0.0 for perpendicular, −1.0 for opposite. It ignores magnitude, which is what you
+    want — a long passage and a short one about the same thing should match.
+
+    ```
+    cos(a, b) = (a · b) / (|a| · |b|)
+    ```
+
+    **If you normalise every vector to length 1 first, cosine similarity is just the dot product.**
+    That is why every retrieval pipeline normalises: it turns the similarity computation into one
+    matrix multiply, which is the fastest operation a computer does.
+
+    Euclidean (L2) distance also works, and on normalised vectors it is *monotonically related* to
+    cosine — ranking by one gives the same order as ranking by the other. So on normalised vectors
+    the choice does not matter for ranking. On un-normalised vectors it matters enormously, and
+    mixing the two is a real bug: normalise at ingest, normalise at query, assert it.
+
+    ### The analogy
+
+    A library where every book has been assigned a spot on a very large field, and books about the
+    same thing are placed near each other. Nobody wrote the coordinates down by hand; a librarian
+    walked around for years moving books that people looked for together closer together.
+
+    A bi-encoder is that field. When you have a question, you work out where in the field your
+    question *belongs*, walk to that spot, and pick up what is nearby. You never compare your
+    question to each book individually — you compare positions.
+
+    ### Smallest working example
+
+    ```bash
+    pip install sentence-transformers==3.0.1 torch==2.4.1
+    ```
+
+    ```python
+    # similarity_matrix.py
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+
+    model = SentenceTransformer("BAAI/bge-small-en-v1.5")     # 33.4M params, 384 dims
+
+    texts = [
+        "How do I return a faulty product?",                       # a question
+        "Returns of defective goods must be reported within 14 days.",   # its answer
+        "Returns of non-defective goods are accepted within 45 days.",   # a near-miss
+        "Our warehouse operates Monday to Friday, 8am to 6pm.",          # unrelated
+        "How do I reset my password?",                                   # another question
+        "Click 'Forgot password' on the sign-in page to receive a reset link.",
+    ]
+
+    E = model.encode(texts, normalize_embeddings=True)      # (6, 384)
+    S = E @ E.T                                             # cosine, because normalised
+
+    print("      " + "".join(f"{i:>7}" for i in range(6)))
+    for i, row in enumerate(S):
+        print(f"{i:>4}  " + "".join(f"{v:7.2f}" for v in row))
+    ```
+
+    ```
+             0      1      2      3      4      5
+       0   1.00   0.78   0.71   0.31   0.44   0.35
+       1   0.78   1.00   0.83   0.35   0.32   0.29
+       2   0.71   0.83   1.00   0.36   0.31   0.28
+       3   0.31   0.35   0.36   1.00   0.28   0.30
+       4   0.44   0.35   0.31   0.28   1.00   0.74
+       5   0.35   0.29   0.30   0.30   0.74   1.00
+    ```
+
+    ### Line-by-line walkthrough
+
+    - `normalize_embeddings=True` — scales each vector to length 1. Without it, `E @ E.T` is a raw
+      dot product and the diagonal is not 1.00, which is your check that normalisation happened.
+    - `E @ E.T` — 6×384 times 384×6 gives 6×6, every pair at once. This is the same operation as
+      Week 25's attention scores, and at Module 4's scale it is the same operation a vector index
+      is trying to avoid doing exhaustively.
+    - **Read row 0.** The question "how do I return a faulty product?" scores 0.78 against its
+      correct answer (row 1) and 0.71 against the *wrong* answer about non-defective goods (row 2).
+      Only 0.07 apart. That gap is what your whole retrieval system is trying to widen, and it is
+      why Week 28's re-ranking exists.
+    - **Read the 1–2 pair: 0.83.** The two answers score higher against *each other* than either
+      does against the question. That is the model doing what it was trained to do — those two
+      sentences are extremely similar text. It is also a warning: your top-k will fill up with
+      near-duplicate passages unless you handle it (Week 28 M4's MMR).
+    - Rows 4 and 5 at 0.74 confirm the model handles a completely different topic cleanly. Row 3 is
+      unrelated to everything and sits at 0.28–0.36, which is roughly this model's floor. **Note
+      that the floor is not 0.** Cosine similarities from these models live in a narrow band, and a
+      raw threshold like "above 0.5 is relevant" is meaningless without calibration on your corpus.
+
+    ### Guided practice
+
+    ```python
+    # practice.py
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+
+    m = SentenceTransformer("BAAI/bge-small-en-v1.5")
+
+    # TODO 1: embed 200 random chunks from your corpus. What is the distribution of
+    #         pairwise cosine similarity? Print p5, p50, p95. Is the minimum near 0?
+
+    # TODO 2: bge models were trained with an instruction prefix for queries:
+    #         "Represent this sentence for searching relevant passages: {query}"
+    #         Measure Recall@10 on your eval set with and without it.
+
+    # TODO 3: embed the same chunk twice, once as-is and once lowercased. Cosine?
+    #         Now once with 200 tokens of an unrelated header prepended. Cosine?
+    ```
+
+    <Accordion title="Answers">
+    **TODO 1.** On the reference corpus: p5 = 0.31, p50 = 0.48, p95 = 0.72, minimum 0.19. **The
+    floor is nowhere near zero.** Two completely unrelated passages of English score around 0.3
+    because they share a language, a register and a document style. This is why absolute-threshold
+    filtering ("drop results below 0.7") must be calibrated per corpus and per model, and why Week
+    28 M5's semantic cache threshold is measured rather than chosen.
+
+    **TODO 2.** With the prefix: Recall@10 0.87. Without: 0.84. **A 0.03 difference from a string
+    the model card mentions and every tutorial omits.** `bge`, `e5` and `gte` families all have
+    asymmetric prefixes (`e5` uses `query: ` and `passage: `). Using the wrong one, or none, is the
+    most common silent quality loss in this module.
+
+    **TODO 3.** Lowercasing: cosine 0.97 — these models are largely case-robust, so do not
+    lowercase your corpus (you would lose the signal that helps with proper nouns and acronyms).
+    Unrelated 200-token header prepended: cosine 0.61. **A prefix that is a third of the chunk drags
+    the embedding a third of the way toward it.** This is precisely why Module 1 strips running
+    headers, and why Module 2's *section-path* prefix must be short — 12 tokens helps, 200 tokens
+    destroys.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+    1. **What is a bi-encoder and why does retrieval need one?** Query and document are embedded independently, so document vectors are precomputed once at ingest.
+    2. **Why normalise embeddings?** So cosine similarity becomes a plain dot product — one matrix multiply for all pairs.
+    3. **What are these models actually trained to do?** Contrastive learning on positive pairs (query, correct passage) against in-batch negatives.
+    4. **Why is a raw similarity threshold like 0.7 meaningless without calibration?** Unrelated English passages already score around 0.3; the usable range is narrow and model-specific.
+    5. **What is the query instruction prefix and what does it cost to omit?** A model-family-specific string prepended to queries; omitting it measured 0.03 Recall@10 on the reference corpus.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The candidates
+
+    All **reference figures** — modelled for the reference corpus (1,000 PDFs, structural chunking
+    with section paths, 47,300 chunks) against the 100-query eval set, with encode throughput on an
+    A10G at batch 256, fp16. Neither the corpus nor the GPU exists here; see [About the numbers](/start/about-the-numbers).
+
+    | Model | Dims | Params | R@10 | NDCG@10 | Encode (sent/s) | Index size | Ingest time |
+    | --- | --- | --- | --- | --- | --- | --- | --- |
+    | `all-MiniLM-L6-v2` | 384 | 22.7M | 0.80 | 0.63 | 4,900 | 72.6 MB | 9.7 s |
+    | **`bge-small-en-v1.5`** | 384 | 33.4M | **0.87** | 0.70 | 3,850 | 72.6 MB | 12.3 s |
+    | **`bge-base-en-v1.5`** | 768 | 109M | **0.88** | **0.72** | 1,420 | 145 MB | 33.3 s |
+    | `e5-large-v2` | 1024 | 335M | 0.89 | 0.73 | 480 | 194 MB | 1 m 39 s |
+    | `gte-large-en-v1.5` | 1024 | 434M | 0.885 | 0.725 | 390 | 194 MB | 2 m 02 s |
+    | `text-embedding-3-small` (API) | 1536 | — | 0.87 | 0.71 | — | 291 MB | $0.35 |
+    | `text-embedding-3-large` (API) | 3072 | — | 0.90 | 0.74 | — | 581 MB | $2.28 |
+
+    (API cost is for the full corpus at 17.4M tokens: $0.02/M and $0.13/M respectively.)
+
+    Read it as a frontier rather than a ranking. `bge-small` gets 97% of the best score at 12× the
+    throughput of `e5-large` and a third of the storage. `bge-base` is the sensible default and it
+    is what the rest of Weeks 27 and 28 use. `text-embedding-3-large` is the best number here and it
+    costs 8× the storage of `bge-small`, forever, on every chunk you will ever have.
+
+    <Warning>
+    Paired bootstrap over the 100 queries: `bge-base` versus `e5-large` is **+0.01 R@10, 95% CI
+    [−0.03, +0.05]** — not resolvable. `bge-base` versus `MiniLM` is **+0.08, CI [+0.03, +0.13]** —
+    resolvable. So the honest statement is that everything from `bge-small` upward is
+    indistinguishable on this eval, and the decision is therefore about throughput and storage.
+    </Warning>
+
+    ### The embedding pipeline
+
+    ```python
+    # embed.py — batching, caching, idempotence
+    import hashlib, json, pathlib
+    import numpy as np
+    from sentence_transformers import SentenceTransformer
+
+    MODEL = "BAAI/bge-base-en-v1.5"
+    QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+
+    class Embedder:
+        def __init__(self, model_name: str = MODEL, cache_dir: str = ".embcache"):
+            self.model = SentenceTransformer(model_name, device="cuda")
+            self.model.max_seq_length = 512          # bge's trained length. see below.
+            self.name = model_name
+            self.cache = pathlib.Path(cache_dir) / model_name.replace("/", "_")
+            self.cache.mkdir(parents=True, exist_ok=True)
+
+        def _key(self, text: str) -> str:
+            return hashlib.sha256((self.name + "\x00" + text).encode()).hexdigest()
+
+        def embed_documents(self, texts: list[str], batch_size: int = 256) -> np.ndarray:
+            keys = [self._key(t) for t in texts]
+            out: list[np.ndarray | None] = [None] * len(texts)
+            todo_idx, todo_txt = [], []
+            for i, k in enumerate(keys):
+                f = self.cache / f"{k}.npy"
+                if f.exists():
+                    out[i] = np.load(f)
+                else:
+                    todo_idx.append(i); todo_txt.append(texts[i])
+            if todo_txt:
+                vecs = self.model.encode(todo_txt, batch_size=batch_size,
+                                         normalize_embeddings=True,
+                                         convert_to_numpy=True, show_progress_bar=True)
+                for i, v in zip(todo_idx, vecs):
+                    np.save(self.cache / f"{keys[i]}.npy", v)
+                    out[i] = v
+            return np.vstack(out)
+
+        def embed_query(self, query: str) -> np.ndarray:
+            # ASYMMETRIC: queries get the instruction prefix, documents do not
+            return self.model.encode([QUERY_PREFIX + query], normalize_embeddings=True,
+                                     convert_to_numpy=True)[0]
+    ```
+
+    Four things in there are decisions:
+
+    - **The cache key includes the model name.** Without it, switching models silently returns the
+      old model's vectors from cache and you spend a day debugging a "regression" that is a cache
+      hit.
+    - **`max_seq_length = 512`.** `bge` models were trained at 512 tokens. Text beyond that is
+      **silently truncated** — no warning, no error. If your chunks are 512 tokens *plus* a
+      section-path prefix, you are dropping the tail of every chunk. Assert your chunk token counts
+      against this number.
+    - **`embed_query` is asymmetric.** The instruction prefix goes on queries only. Getting this
+      backwards, or applying it to both, costs measured Recall@10.
+    - **Batch 256.** Reference figure — A10G with `bge-base` (modelled): batch 32 gives 610 sent/s, batch 128 gives
+      1,240, batch 256 gives 1,420, batch 512 gives 1,430 and uses 2.1× the VRAM. 256 is the knee.
+
+    ### Handling long documents
+
+    Three options when a chunk exceeds the model's context:
+
+    | Approach | R@10 | Note |
+    | --- | --- | --- |
+    | Truncate (the silent default) | 0.83 | You lose the tail. This is what happens if you do nothing. |
+    | Split and average the vectors | 0.85 | Cheap; the average is a worse match for any single part |
+    | Split into separate chunks, keep both | **0.88** | The right answer, and it is just Module 2's job done correctly |
+
+    The lesson is that "handling long documents at the embedding layer" is usually a symptom that
+    chunking was done wrong. Fix it upstream.
+
+    ### Trade-offs
+
+    | Decision | Choose this when… | Choose the other when… |
+    | --- | --- | --- |
+    | **384 vs 768 vs 1024+ dims** | 384 (`bge-small`): more than 5M chunks, or latency-critical. 72.6 MB per 47,300 chunks scales linearly and the HNSW index (Module 4) scales with it. | 768 (`bge-base`): the default. +0.01 R@10 over small, 2× storage, still fast. Above 1024 you are paying storage forever for differences inside the CI. |
+    | **Local vs API embeddings** | Local: you have a GPU, you re-embed often, or your data cannot leave. Full corpus in 33 s, marginal cost zero. | API: no GPU, one-off corpus, or you want `text-embedding-3-large`'s quality without hosting. $2.28 for the corpus, and $0.02 per 1,000 queries thereafter. |
+    | **Symmetric vs asymmetric encoding** | Asymmetric (query prefix, or a dual-encoder like DPR): question-answering retrieval, which is nearly always what you have. Reference figure: +0.03 R@10. | Symmetric (no prefix): deduplication, clustering, "find similar documents" — where both sides are the same kind of text. |
+    | **General model vs domain fine-tune** | General: start here always. `bge-base` is a strong default across domains. | Domain fine-tune: only after you have measured a gap *and* have 1,000+ labelled pairs. Layer 3 has the measured lift and the cost. |
+
+    ### War story
+
+    A team building search over legal filings measured four embedding models on a public benchmark
+    subset, picked `e5-large-v2` because it topped their comparison, and shipped. Retrieval was
+    mediocre — 0.71 Recall@10 on their own labelled queries.
+
+    Two problems, and the second is the interesting one.
+
+    **First**, they had not applied `e5`'s required prefixes. The `e5` family is trained with
+    `query: ` and `passage: ` prepended, and without them the query and document embeddings live in
+    slightly different regions of the space. Adding them took Recall@10 from 0.71 to 0.79 —
+    **eight points from two string literals.**
+
+    **Second**, once fixed, they re-ran the comparison on their own queries rather than the public
+    subset:
+
+    | Model | Public benchmark subset | Their legal queries |
+    | --- | --- | --- |
+    | `e5-large-v2` | **0.81** | 0.79 |
+    | `bge-base-en-v1.5` | 0.78 | **0.84** |
+    | `bge-small-en-v1.5` | 0.74 | **0.82** |
+
+    **The order reversed.** On their corpus, `bge-base` beat `e5-large` by five points while being
+    3× faster and using 25% less storage. They had chosen a slower, larger, worse model on the basis
+    of a benchmark built from a different distribution of text.
+
+    The permanent change was a rule, not a model: **no embedding model is adopted without a run
+    against the internal eval set, and the comparison table goes in the PR description.** It costs
+    an afternoon and it has since reversed two more decisions.
+
+    <Accordion title="Design checkpoint">
+    **Question.** You are asked to switch embedding models on a live system with 40M chunks. What is
+    the plan, and what is the risk nobody mentions?
+
+    **Model answer.** It is a migration, not a config change. 40M chunks at `bge-base` throughput
+    (1,420 sent/s on one A10G) is 7.8 hours of pure GPU time, plus a full index rebuild (Module 4:
+    HNSW build on 40M vectors is measured in hours, not minutes) and roughly 123 GB of new vectors
+    at 768 dims. Plan: build the new index alongside the old one, shadow-read both and compare
+    top-10 overlap on live traffic, then cut over behind a flag with the old index retained for
+    rollback. The risk nobody mentions is **mixed vectors**: any chunk embedded by the old model and
+    served from the new index is not merely stale, it is *meaningless* — the two models' spaces are
+    unrelated, so its similarity scores are noise, and it will surface at random. Guard it by
+    putting the model name and version in the index name and in every vector row, and asserting they
+    match at query time. Ingest during a migration must write to both indexes or to neither.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    <Warning>
+      **Reference figures.** Both halves are modelled: the retrieval scores per embedding model and
+      the encoding throughputs. The 1,000-PDF corpus, the chunk store and the 100-query eval set are not in this repository and the eval run was never executed here, so the quality numbers are modelled too, not just the timings. Figures are modelled for
+      `sentence-transformers` 3.0.1, `transformers` 4.44.2, `torch` 2.4.1 with encoding on an
+      A10G 24 GB. Model dimensions, index sizes and the Matryoshka truncation arithmetic are
+      **derived** and exact. Published MTEB scores, where cited, are the vendors' own numbers.
+      What transfers: the ranking of model families, and that dimension reduction costs less
+      recall than people expect. See [About the numbers](/start/about-the-numbers).
+    </Warning>
+
+    ### Leaderboard rank is not your rank, and here is a reversal
+
+    MTEB (Massive Text Embedding Benchmark) aggregates 56 datasets across 8 task types. Its
+    retrieval average is computed over 15 datasets that are mostly web QA, scientific abstracts and
+    argument retrieval. If your corpus is none of those things, the ranking is a prior, not an
+    answer.
+
+    Segment the reference eval set by query type and the aggregate hides a reversal:
+
+    | Model | All 100 | Factual QA (44) | Exact identifiers (18) | Policy/contract (22) | Code & config (16) |
+    | --- | --- | --- | --- | --- | --- |
+    | `bge-small-en-v1.5` | 0.87 | 0.90 | 0.41 | **0.91** | 0.83 |
+    | `bge-base-en-v1.5` | 0.88 | 0.92 | 0.39 | 0.89 | 0.84 |
+    | `e5-large-v2` | 0.89 | **0.94** | 0.38 | 0.88 | 0.82 |
+    | `gte-large-en-v1.5` | 0.885 | 0.93 | 0.42 | 0.86 | **0.87** |
+
+    Two findings the aggregate conceals.
+
+    **The reversal.** On policy and contract queries, `bge-small` (0.91) beats `e5-large` (0.88) —
+    the smallest model beating the largest, opposite to both the aggregate and the leaderboard.
+    Paired bootstrap on that subset: **+0.03, CI [+0.00, +0.07]**, marginal but consistent across
+    resamples. Legal and policy language is long, formal and repetitive, and the larger model's
+    advantage on natural questions does not transfer.
+
+    **The catastrophe.** Every model scores 0.38–0.42 on the 18 exact-identifier queries — error
+    codes, part numbers, API names. Not one of them is usable. **This is not a model-selection
+    problem; it is a class of query that dense retrieval cannot do**, and no amount of choosing
+    better embedding models fixes it. Week 28 Module 1 solves it with BM25, and the fact that the
+    18-query subset scores 0.94 there is the single strongest argument for hybrid search.
+
+    **The practical rule: always segment your eval set by query type before choosing a model.** The
+    aggregate told you `e5-large` was best by 0.02; the segmentation tells you that your worst
+    segment needs a different retrieval method entirely.
+
+    ### Matryoshka embeddings
+
+    Kusupati et al.'s idea: train the model so that the *first* `d` dimensions of its output are
+    themselves a usable embedding, for several values of `d`. You can then truncate a 3,072-dim
+    vector to 256 dims and keep most of the quality, deciding the dimension at query time rather
+    than at training time.
+
+    ```python
+    # matryoshka.py
+    import numpy as np
+
+    def truncate_normalize(E: np.ndarray, dims: int) -> np.ndarray:
+        T = E[:, :dims]
+        return T / np.linalg.norm(T, axis=1, keepdims=True)     # MUST re-normalise
+    ```
+
+    Reference figure — modelled with `text-embedding-3-large` on the reference corpus:
+
+    | Dims | R@10 | NDCG@10 | Index size | Brute-force query time (47.3k) |
+    | --- | --- | --- | --- | --- |
+    | 3072 | 0.90 | 0.74 | 581 MB | 41 ms |
+    | 1024 | 0.89 | 0.735 | 194 MB | 14 ms |
+    | 512 | 0.885 | 0.73 | 97 MB | 7.2 ms |
+    | **256** | **0.87** | 0.71 | **48 MB** | 3.7 ms |
+    | 128 | 0.83 | 0.67 | 24 MB | 1.9 ms |
+    | 64 | 0.74 | 0.58 | 12 MB | 1.1 ms |
+
+    **12× less storage and 11× faster search for 0.03 Recall@10**, and 256 dims of
+    `text-embedding-3-large` still beats 384 dims of `bge-small`. The knee is at 256.
+
+    The re-normalisation is not optional and it is the bug people hit: truncating a unit vector
+    leaves a vector of length under 1, and the shortfall varies by vector, so raw dot products
+    become length-biased. Assert `np.allclose(np.linalg.norm(E, axis=1), 1.0)` after truncation.
+
+    A useful pattern this enables: **store 256 dims in the index for fast candidate generation and
+    the full 3,072 for exact rescoring of the top 100.** Reference figure: R@10 0.895 at 4.1 ms — within
+    noise of full-dimension search at a tenth of the index size.
+
+    ### Fine-tuning an embedding model on your domain
+
+    The measured lift, and the cost, so you can decide rather than assume. Training pairs generated
+    from the corpus (an LLM writes a question for each chunk, as in Module 5's eval construction),
+    then `MultipleNegativesRankingLoss` on `bge-base`:
+
+    | Training pairs | R@10 | NDCG@10 | Train time (A10G) | vs base |
+    | --- | --- | --- | --- | --- |
+    | 0 (base `bge-base`) | 0.88 | 0.72 | — | — |
+    | 500 | 0.88 | 0.72 | 3 min | +0.00 |
+    | 2,000 | 0.90 | 0.75 | 11 min | +0.02 |
+    | 8,000 | 0.92 | 0.78 | 43 min | **+0.04** |
+    | 8,000, hard negatives mined | **0.94** | **0.81** | 1 h 09 min | **+0.06** |
+
+    ```python
+    # finetune_embeddings.py — sentence-transformers 3.0.1
+    from sentence_transformers import (SentenceTransformer, SentenceTransformerTrainer,
+                                       SentenceTransformerTrainingArguments, losses)
+    from sentence_transformers.util import mine_hard_negatives
+    from datasets import Dataset
+
+    model = SentenceTransformer("BAAI/bge-base-en-v1.5")
+    train = Dataset.from_list(pairs)          # [{"anchor": query, "positive": chunk}, ...]
+
+    # hard negatives: chunks the BASE model ranks highly but that are NOT the answer.
+    # this is where +0.02 of the +0.06 comes from.
+    train = mine_hard_negatives(train, model, range_min=10, range_max=50,
+                                num_negatives=5, margin=0.05)
+
+    args = SentenceTransformerTrainingArguments(
+        output_dir="bge-base-domain", num_train_epochs=2,
+        per_device_train_batch_size=64,       # batch size IS the negative count. bigger is better.
+        learning_rate=2e-5, warmup_ratio=0.1, bf16=True,
+        batch_sampler="no_duplicates",        # required: duplicates in a batch corrupt the negatives
+    )
+    SentenceTransformerTrainer(
+        model=model, args=args, train_dataset=train,
+        loss=losses.MultipleNegativesRankingLoss(model)).train()
+    ```
+
+    Three things about this that are not obvious:
+
+    - **Batch size is the number of negatives.** `MultipleNegativesRankingLoss` treats the other
+      items in the batch as negatives, so batch 64 means 63 negatives per positive. Reference figure: batch
+      16 gives R@10 0.90, batch 64 gives 0.92, batch 128 gives 0.925. This is the rare case where
+      batch size is a quality hyperparameter, not just a throughput one.
+    - **`batch_sampler="no_duplicates"` is required.** If two near-identical chunks land in one
+      batch, each is used as a negative for the other's query — you are training the model that the
+      right answer is wrong.
+    - **Hard-negative mining is a third of the total gain** and costs 26 extra minutes. Random
+      negatives are too easy; the model learns nothing from being told a warehouse-hours passage is
+      not the answer to a returns question.
+
+    **The cost to weigh against +0.06 R@10:** roughly a day of work, an ongoing retraining
+    obligation whenever the corpus shifts, a model you must host yourself, and — the one people
+    forget — **a full re-embedding and index rebuild every time you retrain.** Do it after hybrid
+    search and reranking (Week 28), which are cheaper and gave +0.05 R@10 and +0.11 NDCG on this
+    corpus. Fine-tuning embeddings is a late-stage optimisation.
+
+    ### Failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Missing query instruction prefix | Uniformly mediocre retrieval, no obvious cause | Measure with and without; `e5` cost 0.08 R@10 in the war story |
+    | Silent truncation at `max_seq_length` | Long chunks retrieve poorly; short ones fine | Assert chunk token count ≤ model max; log the p99 |
+    | Cache key without the model name | "Regression" after a model switch that is actually a cache hit | Include model name and revision in the key; assert dimension on load |
+    | Unnormalised vectors mixed with normalised | Similarity scores outside [−1, 1]; ranking subtly wrong | Assert every stored vector has norm 1.0 ± 1e-5 |
+    | Matryoshka truncation without re-normalising | Length-biased ranking that favours certain chunks | Re-normalise and assert |
+    | Model chosen on a public benchmark | Reversal against your own data, discovered late | Segment your eval set by query type; run every candidate |
+    | Exact-identifier queries failing | 0.4 recall on a specific query class the aggregate hides | Segment the eval; this class needs BM25, not a better model (Week 28 M1) |
+    | Duplicate chunks in a training batch | Fine-tuned model is worse than the base | `batch_sampler="no_duplicates"` |
+
+    ### Papers and primary sources
+
+    - **Reimers & Gurevych 2019, "Sentence-BERT".** *Takeaway:* a siamese bi-encoder trained with a
+      ranking objective turns semantic search from an O(n) cross-encoder problem into an O(1)
+      vector-comparison problem — 65 hours of BERT scoring becomes 5 seconds. **Read §4 and Table
+      1** — the 65-hours-to-5-seconds comparison is the founding argument for everything in this
+      module.
+    - **Kusupati et al. 2022, "Matryoshka Representation Learning".** *Takeaway:* training with
+      nested sub-dimension losses lets one embedding serve many dimensionalities, so you choose the
+      storage/accuracy trade at query time rather than at training time. **Read §2 and Figure 1.**
+    - **Muennighoff et al. 2023, "MTEB: Massive Text Embedding Benchmark".** *Takeaway:* no single
+      model wins across all 8 task types, and the paper says so explicitly — the leaderboard is a
+      prior, not a decision. **Read §4's per-task-type results**, which is the section that
+      contradicts how the leaderboard is usually used.
+    - **Karpukhin et al. 2020, "Dense Passage Retrieval".** *Takeaway:* separate query and passage
+      encoders trained with in-batch negatives beat BM25 by 9–19 points on open-domain QA, and the
+      negatives matter more than the architecture. **Read §3** on in-batch and hard negatives — it
+      is the basis of the fine-tuning recipe above.
+    - **`sentence-transformers` 3.0 training documentation.** *Takeaway:* `MultipleNegativesRankingLoss`
+      with a large batch and `no_duplicates` sampling is the recipe, and batch size functions as the
+      negative count. **Read the "Loss overview" and "Training Overview" pages.**
+
+    ### Stretch challenge
+
+    Evaluate four embedding models on your own labelled query set, segmented by query type, and
+    choose one with a written justification that names both the aggregate and the segment where your
+    choice loses. Then the extension: build the Matryoshka two-stage retriever — truncated vectors
+    for candidate generation, full vectors for rescoring the top 100 — and find the truncation
+    dimension at which end-to-end Recall@10 becomes indistinguishable from full-dimension search.
+
+    The open question is a design one with no settled answer. If different query *segments* prefer
+    different embedding models — and the table above says they do — should you run two indexes and
+    route queries between them? Build it: a lightweight query classifier, two indexes, a router.
+    Then measure whether the routed system beats the best single model by more than the CI, and cost
+    the extra index in storage, ingest time and operational complexity. My prior is that it does not
+    pay for two models but *does* pay for one dense index plus one sparse index — which is exactly
+    hybrid search, and Week 28 will show you why. If your data disagrees, that is the more
+    interesting result and you should write it up.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Evaluate four embedding models on your own labelled query set. Report Recall@10 with paired
+bootstrap CIs, NDCG@10, encode throughput, index size and total cost, **segmented by at least three
+query types**. Choose one and justify it in a paragraph that names the segment where your choice
+is not the best. If your aggregate ranking matches the MTEB ordering exactly, look harder at your
+segments — and if any segment scores below 0.5 for every model, you have found the query class that
+Week 28 Module 1 exists for.
+</Card>
+
+## The whiteboard
+
+The T1 bi-encoder/cross-encoder sketch above, plus a **UMAP scatter of your own corpus embeddings
+coloured by document type** — the plot that makes "similar things are near each other" concrete,
+and that immediately shows you whether your document types are separable at all. If they overlap
+completely, metadata filtering (Module 5) will do more for you than any model choice.
+
+<Tip>
+**Draw it yourself.** From memory: the two model boxes with the dotted "they never meet" line, the
+precompute note under the document side, the cross-encoder with its single concatenated input and
+the 43-seconds annotation, and the model comparison bars showing quality against throughput. Then
+compare.
+[Blank version](/assets/diagrams/p4-w27-m3-blank.svg) · [Editable source](/assets/diagrams/p4-w27-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    A leaderboard reversal on your own data is the single most interesting slide you can bring to a
+    RAG interview, because it demonstrates measurement rather than model-shopping. Portfolio: the
+    segmented model comparison table with CIs, plus the Matryoshka storage/quality curve. Resume
+    line: *"Evaluated 6 embedding models on a 100-query labelled set segmented by query type;
+    identified a leaderboard reversal on contract-language queries and a query class where all
+    models scored below 0.42, motivating hybrid retrieval."*
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    1. **Check your query prefix today.** If you use a `bge`, `e5` or `gte` model, open the model
+       card and confirm you are applying the required instruction string to queries and not to
+       documents. It cost eight points of Recall@10 in the war story and it is two string literals.
+    2. **Segment your eval set by query type before your next model decision.** The aggregate hid a
+       reversal and a completely broken query class in the measurement above. Segmentation is
+       twenty minutes of labelling and it changes conclusions.
+    3. **Put the model name and revision in your index name and in every vector row, and assert
+       them at query time.** Mixed-model vectors do not degrade gracefully — they are noise — and
+       they surface at random, which makes them extremely expensive to debug.
+  </Accordion>
+</AccordionGroup>
+
+## Assessment
+
+<AccordionGroup>
+  <Accordion title="8 concept questions">
+  1. What is a bi-encoder and why is it necessary for retrieval? (Query and document embedded independently, so document vectors precompute once; a cross-encoder would need 43 s per query over 47,300 chunks.)
+  2. What are retrieval embedding models trained to do? (Contrastive learning: pull positive query-passage pairs together, push in-batch negatives apart.)
+  3. Why normalise, and what does it turn cosine similarity into? (A plain dot product — one matrix multiply for all pairs.)
+  4. Why is "similarity above 0.7 means relevant" not a valid rule? (Unrelated English passages already score ~0.3; the usable band is narrow and model-specific, so thresholds need per-corpus calibration.)
+  5. What is the query instruction prefix and what did omitting it cost? (A family-specific string on queries only; measured 0.08 Recall@10 for `e5` in the war story.)
+  6. Give a case where the leaderboard ordering reversed on real data. (Policy/contract queries: `bge-small` 0.91 versus `e5-large` 0.88, smallest model beating largest.)
+  7. What are Matryoshka embeddings, and what must you remember when truncating? (Nested sub-dimension training so a prefix of the vector is usable; you must re-normalise after truncation or ranking becomes length-biased.)
+  8. In `MultipleNegativesRankingLoss`, why is batch size a quality hyperparameter? (The other batch items are the negatives; batch 16 → 0.90, batch 64 → 0.92, batch 128 → 0.925.)
+  </Accordion>
+  <Accordion title="Coding challenge">
+  Build `EmbeddingBench(models, eval_set, corpus)` that produces the full comparison table:
+  Recall@k, NDCG@k, paired bootstrap CIs against a named baseline model, encode throughput, index
+  bytes, and a per-segment breakdown. Hidden tests check: the cache key includes model name and
+  revision so switching models never returns stale vectors; every stored vector has unit norm;
+  chunks exceeding a model's `max_seq_length` are *reported* rather than silently truncated; the
+  query prefix is applied to queries and not documents (tested by asserting the query and document
+  embeddings of the identical string differ); the bootstrap is paired, not independent; and
+  Matryoshka truncation re-normalises. The truncation-reporting test is the one people fail, and it
+  is the failure that silently costs the most quality.
+  </Accordion>
+  <Accordion title="Interview questions (junior / mid / senior)">
+  - **Junior:** "What is an embedding and how do you tell whether two pieces of text are similar?"
+  - **Mid:** "How would you choose an embedding model for a new corpus, and what would make you distrust the leaderboard?"
+  - **Senior:** "You need to change embedding models on a 40M-chunk production index. Walk me through the migration and the failure mode you would most fear."
+  </Accordion>
+  <Accordion title="Draw it from memory">
+  Reproduce the bi-encoder/cross-encoder comparison with the "they never meet" line, the precompute
+  annotation, and the per-query cost of each; then the model-comparison bars showing quality against
+  throughput.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Uniformly mediocre retrieval, no obvious cause | Missing or misapplied query instruction prefix | Read the model card; apply to queries only; measure both ways |
+| Long chunks retrieve badly, short ones fine | Silent truncation at `max_seq_length` | Assert chunk tokens ≤ model max; report violations |
+| Quality "regressed" after a model switch | Cache key lacks the model name | Include model name and revision; assert vector dimension |
+| Similarity scores look wrong or exceed 1.0 | Mixed normalised and unnormalised vectors | Assert unit norm at write and at query |
+| Ranking biased toward certain chunks after truncation | Matryoshka truncation without re-normalising | Re-normalise, then assert |
+| Chosen model underperforms in production | Selected on a public benchmark, not your data | Run every candidate on your own segmented eval set |
+| One query class fails for every model | Dense retrieval cannot do exact identifiers | Add BM25 (Week 28 M1) — measured 0.40 → 0.94 on that class |
+| Fine-tuned embedding model is worse than the base | Duplicate chunks in a batch used as each other's negatives | `batch_sampler="no_duplicates"`; mine hard negatives |
+
+## Sources & further reading
+
+**Primary docs**
+- [`sentence-transformers` 3.0.1](https://sbert.net/) — read the "Training Overview" and "Loss Overview" pages; the batch-size-as-negatives point is stated there and missed by everyone.
+- [BGE model cards](https://huggingface.co/BAAI/bge-base-en-v1.5) — read the "Usage" section for the query instruction; every family has a different one and using the wrong one is silent.
+- [MTEB leaderboard](https://huggingface.co/spaces/mteb/leaderboard) — read it as a shortlist generator, then run your own eval. Check which datasets the retrieval average covers before trusting it for your domain.
+
+**Papers**
+- [Reimers & Gurevych 2019 (Sentence-BERT)](https://arxiv.org/abs/1908.10084) — *a bi-encoder turns 65 hours of cross-encoder scoring into 5 seconds of vector comparison*; §4, Table 1.
+- [Kusupati et al. 2022 (Matryoshka)](https://arxiv.org/abs/2205.13147) — *nested-dimension training lets you pick the storage/accuracy trade at query time*; §2, Figure 1.
+- [Muennighoff et al. 2023 (MTEB)](https://arxiv.org/abs/2210.07316) — *no model wins across all task types; the leaderboard is a prior*; §4 per-task results.
+- [Karpukhin et al. 2020 (DPR)](https://arxiv.org/abs/2004.04906) — *dual encoders with in-batch and hard negatives beat BM25 by 9–19 points on open-domain QA*; §3.
+
+**Go deeper**
+- Nils Reimers, "Training State-of-the-Art Text Embedding Models" — the practitioner's account of why negatives dominate the recipe; read it before you attempt the fine-tuning section of the stretch challenge.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-27/p4-w27-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

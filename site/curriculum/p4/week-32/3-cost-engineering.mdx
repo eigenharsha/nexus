@@ -1,0 +1,623 @@
+---
+title: "Cost engineering"
+description: "Week 32 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 32 · Module 3 · `P4-W32-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Warning>
+**Reason in cost per successful task, never cost per call.** A cheaper model that fails twice as
+often is more expensive. Every table in this module has a "cost per successful task" column, and
+where it disagrees with the "cost per run" column — which it does, twice — the second column is
+the one that is lying to you.
+</Warning>
+
+## Where this sits
+
+- **Prereqs:** Module 1 (cost is a span attribute), Module 2 (per-version cost queries), Week 31 (the eval suite that proves "no quality regression"), Week 29 M3 (prompt caching), Week 28 (semantic caching), Week 26 (local serving and the build-versus-buy arithmetic).
+- **Unlocks:** Module 4 (a cost budget is an SLO), Module 5 (total cost of ownership), the capstone's cost justification.
+- **One-line:** after this you can cut your system's cost per successful task by half or more, with the eval suite proving you did not trade quality for it.
+
+## Why you should care
+
+**For Aarav (student).** "I made it cheaper" is unverifiable. "I cut cost per successful task from
+$0.253 to $0.098 — a 61% reduction — with no regression on a 120-case eval suite, and here is the
+waterfall showing which lever bought what" is an engineering result. It is also a conversation most
+interviewers can have with you at length, because cost is the constraint every team is under.
+
+**For Meera (working professional).** LLM spend is the line item your finance team will ask about
+within two quarters, and the first instinct — switch to a cheaper model — is usually wrong in a way
+you can demonstrate with a table. Being able to run a cost programme that *measures quality at every
+step* is a rare and immediately valuable skill, and most of the wins require no quality trade at all.
+
+## The mental model
+
+Every cost decision is a point on a **cost/quality frontier**, and the only honest axis is money per
+completed job. Some levers are free — caching, trimming, routing mechanical steps — and move you
+straight down. Others buy quality with money, or money with quality, and those you must measure.
+The frontier is your system's, not the industry's, and plotting it is the work.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p4-w32-m3.svg" alt="Hand-drawn sketch: the cost waterfall and the cost/quality frontier" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w32-m3-dark.svg" alt="Hand-drawn sketch: the cost waterfall and the cost/quality frontier" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w32-m3
+tier: T4
+one-sentence-goal: Show a cost waterfall down to a much smaller number, and beside it a frontier plot where the cheapest-per-call option is NOT the cheapest per successful task.
+elements:
+  - left two-thirds: a hand-drawn descending waterfall of bars, each labelled with the lever and the delta
+  - bar 0 "baseline $0.190/run" tall, with "$0.253 per SUCCESSFUL task" written beside it in a box
+  - descending steps: "-$0.047 prompt caching", "-$0.015 route triage+verify to haiku", "-$0.024 evidence digests not full text", "-$0.028 semantic cache (31% hit)", then a small step UP "+$0.008 verify-and-retry" drawn in green
+  - final bar "$0.084/run" short, with "$0.098 per SUCCESSFUL task" in a box, and "-61%" hand-written large with a circle
+  - amber note on the green up-step: "this one costs MORE per run and LESS per task. That is the whole module."
+  - right third: a hand-drawn scatter, x = cost per run, y = end-to-end success, six points plotted as small crosses with labels
+  - a point far left labelled "all-haiku $0.058 / 54%" with a red X through it and a hand-written "$0.107 per success - WORSE"
+  - the chosen point circled in green: "$0.084 / 86% -> $0.098"
+  - a rough hand-drawn Pareto frontier curve through the non-dominated points, with two points clearly BELOW it circled in red and labelled "dominated - more expensive AND worse"
+  - amber margin note: "plot YOUR system. The frontier is not a property of the models."
+  - the phrase "cost per successful task" circled
+numbers-to-write-in: $0.190 -> $0.084 per run; $0.253 -> $0.098 per successful task; -61%; all-haiku $0.058/run but $0.107 per success; semantic cache 31% hit, 1.2% false hits
+alt: A hand-drawn descending cost waterfall from a baseline run cost through five levers to a final much lower cost, one of the steps going upward in green, beside a scatter plot of cost against success rate with a Pareto frontier and the cheapest-per-call configuration marked as worse per successful task.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+### The words, defined
+
+- **Token.** The unit of billing. Roughly 3–4 characters of English.
+- **Input tokens.** Everything you send: system prompt, tool schemas, conversation, retrieved documents. Usually 90%+ of the tokens.
+- **Output tokens.** What the model generates. Priced 5× higher than input on every model in this course.
+- **Prompt caching.** Paying about 0.1× for a prefix you have sent before, and about 1.25× the first time to write it. Week 29 M3.
+- **Semantic cache.** Returning a stored answer for a question that is *similar* to one you have answered. Week 28.
+- **Routing.** Sending easy work to a cheap model and hard work to an expensive one.
+- **Cost per run.** Total spend divided by runs. The number that is easy to compute and easy to be fooled by.
+- **Cost per successful task.** Total spend divided by *runs that met their acceptance criterion*. The number that matters.
+
+### The analogy
+
+A courier charges by the parcel. One firm is £3 a parcel and delivers 95% of the time; another is
+£2 and delivers 70%. The cheap firm looks 33% cheaper. But a failed delivery means you send it
+again, so your real cost per *delivered* parcel is £3.16 against £2.86 — closer than it looked — and
+that is before the customer complaint, the refund and the reputation.
+
+**Price per attempt is the sticker. Price per outcome is the bill.**
+
+### Price one run by hand
+
+Do this once, manually, before you automate anything. Take a real run's token counts from your
+traces (Module 1) and a price table.
+
+| Model | Input $/1M | Output $/1M |
+| --- | --- | --- |
+| `claude-opus-5` | $5.00 | $25.00 |
+| `claude-sonnet-5` | $2.00 | $10.00 |
+| `claude-haiku-4-5` | $1.00 | $5.00 |
+
+One run of the incident agent, five model-calling nodes:
+
+| Node | Model | Input tokens | Output tokens | Cost |
+| --- | --- | --- | --- | --- |
+| triage | opus-5 | 2,100 | 180 | 2,100 × $5/1M + 180 × $25/1M = **$0.0150** |
+| gather | opus-5 | 6,800 | 520 | $0.0340 + $0.0130 = **$0.0470** |
+| diagnose | opus-5 | 9,000 | 800 | $0.0450 + $0.0200 = **$0.0650** |
+| propose | opus-5 | 6,400 | 480 | $0.0320 + $0.0120 = **$0.0440** |
+| verify | opus-5 | 3,100 | 140 | $0.0155 + $0.0035 = **$0.0190** |
+| **Total** | | **27,400** | **2,120** | **$0.1900** |
+
+Two observations that shape everything:
+
+- **Input is 72% of the cost** ($0.137 of $0.190) despite output being priced 5× higher, because there is 13× more input. Cost engineering is mostly input engineering.
+- **`diagnose` is 34% of the run** and `triage` is 8%. Optimize where the money is. People start with the prompt they find annoying, not the one that costs.
+
+At 75% success, cost per successful task is $0.190 / 0.75 = **$0.253**.
+
+```python
+# price.py — do it in code once you have done it by hand
+PRICES = {"claude-opus-5": (5e-6, 25e-6),
+          "claude-sonnet-5": (2e-6, 10e-6),
+          "claude-haiku-4-5": (1e-6, 5e-6)}
+
+def cost(model: str, usage) -> float:
+    cin, cout = PRICES[model]
+    return (usage.input_tokens * cin
+            + usage.output_tokens * cout
+            + getattr(usage, "cache_creation_input_tokens", 0) * cin * 1.25
+            + getattr(usage, "cache_read_input_tokens", 0) * cin * 0.1)
+```
+
+**Cache tokens are billed separately and are not included in `input_tokens`.** A cost function that
+ignores them under-reports a cached workload by 40–80%, always in the flattering direction. This is
+the single most common bug in home-made cost dashboards.
+
+### Guided practice
+
+```python
+# 1. Price your own run by hand from a trace. TODO: cost per run ____
+#    Then divide by your success rate. TODO: cost per SUCCESSFUL task ____
+#
+# 2. Which node is the most expensive? TODO: ____   What fraction of the run? ____
+#
+# 3. Split the cost into input and output. TODO: what percentage is input? ____
+#    If it is not above 60%, check whether you are truncating tool results.
+#
+# 4. The thought experiment that sets up Layer 3: if you moved every call to a
+#    model one-fifth the price and success fell from 75% to 55%, would cost per
+#    successful task go up or down?
+#    ($0.038 / 0.55 = $0.069 — down. Now try 75% -> 40%: $0.038/0.40 = $0.095.
+#     Work out the break-even success rate. That number is your decision rule.)
+```
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **Why is input usually the dominant cost despite output being priced higher?** There is far more of it — 13× in our run — because you re-send system prompt, tools and history every step.
+2. **Where do cache tokens appear?** In their own usage fields, not in `input_tokens`. Omitting them makes a cached workload look 40–80% cheaper than it is.
+3. **What is cost per successful task?** Total spend divided by runs that met their acceptance criterion.
+4. **Why does the cheapest model not always win?** Because failures are re-attempted or escalated, and the extra cost lands on the successful runs.
+5. **Where should you start optimizing?** The node with the largest share of spend — `diagnose` at 34%, not `triage` at 8%.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+### Attribution: cost per step, from traces
+
+You instrumented this in Module 1. Now query it.
+
+```sql
+-- Cost per node per run, and each node's share. Ninety seconds of work, and it
+-- decides where the next two weeks go.
+WITH per_run AS (
+  SELECT trace_id,
+         node,
+         sum(cost_usd)                             AS node_cost,
+         sum(sum(cost_usd)) OVER (PARTITION BY trace_id) AS run_cost
+  FROM   spans WHERE name LIKE 'chat %' GROUP BY trace_id, node)
+SELECT node,
+       count(*)                        AS runs,
+       round(avg(node_cost)::numeric, 4)  AS avg_cost,
+       round(avg(node_cost / run_cost)::numeric, 3) AS share,
+       round(percentile_cont(0.95) WITHIN GROUP (ORDER BY node_cost)::numeric, 4) AS p95
+FROM per_run GROUP BY node ORDER BY avg_cost DESC;
+```
+
+Add the p95 column and read it. Ours: `diagnose` averaged $0.065 with a p95 of $0.214 — a long tail
+where the bounded retry loop ran three times. **The tail is often a bigger prize than the mean**, and
+it is invisible in an average.
+
+### The five levers, measured
+
+Each applied cumulatively to the incident system, quality checked against the Week-31 120-case suite
+after every step. "No regression" means within the suite's detectable difference (Week 31 M1: 11
+points at 100 cases, so we also ran the 800-case nightly suite for anything that looked close).
+
+| # | Lever | Cost/run | Success | **Cost per successful task** |
+| --- | --- | --- | --- | --- |
+| 0 | Baseline | $0.190 | 75.0% | **$0.253** |
+| 1 | Prompt caching on the stable prefix | $0.143 | 75.0% | **$0.191** |
+| 2 | Route `triage` and `verify` to `claude-haiku-4-5` | $0.128 | 74.2% | **$0.173** |
+| 3 | Evidence digests in context instead of full text | $0.104 | 75.0% | **$0.139** |
+| 4 | Semantic cache on repeated incidents (31% hit rate) | $0.076 | 75.8% | **$0.100** |
+| 5 | **Verify-and-retry on `diagnose`** | $0.084 | 86.1% | **$0.098** |
+| — | (counter-example) route `diagnose` to haiku too | **$0.058** | 54.0% | **$0.107** |
+
+**61% reduction in cost per successful task**, and note the two rows that break the pattern.
+
+**Row 5 costs more per run and less per task.** Adding a verification retry raised run cost by
+$0.008 (it fires on 18% of runs at about $0.045 each) and raised success from 75.8% to 86.1%. Anyone
+optimizing cost per *call* would have deleted this. It is the single best change in the table.
+
+**The counter-example row is the cheapest per call and the worst per task.** $0.058 a run looks like
+a 69% saving. Success collapses to 54%, and $0.058 / 0.54 = $0.107 — worse than the $0.098 we
+actually shipped, and vastly worse in product terms. This is the row to put in front of anyone who
+proposes a blanket model downgrade.
+
+Now the levers themselves.
+
+**1. Prompt caching.** The stable prefix is the system prompt plus tool schemas: 2,800 tokens,
+byte-identical across all five calls in a run.
+
+```python
+r = client.messages.create(
+    model="claude-opus-5", max_tokens=2000,
+    system=[{"type": "text", "text": STABLE_SYSTEM,        # frozen. No timestamps.
+             "cache_control": {"type": "ephemeral"}}],
+    tools=sorted_tools,                                     # deterministic order (Week 29 M2)
+    messages=history + [{"role": "user", "content": question}])
+assert r.usage.cache_read_input_tokens > 0 or first_call_in_run   # verify it, always
+```
+
+Uncached: 5 × 2,800 × $5/1M = $0.070. Cached: one write at 1.25× ($0.0175) plus four reads at 0.1×
+($0.0056) = $0.0231. **Saving $0.047 per run, 25% of the total, for a five-line change.** The assert
+matters: a single varying byte silently takes you back to $0.070 and nothing else tells you.
+
+**2. Routing.** Send mechanical steps to a cheap model, and *measure the step*, not the system.
+
+```python
+NODE_MODELS = {
+    "triage":   "claude-haiku-4-5",   # classification against a fixed taxonomy
+    "verify":   "claude-haiku-4-5",   # did the signal recover? yes/no
+    "gather":   "claude-opus-5",      # tool selection over 11 tools — needs the strong model
+    "diagnose": "claude-opus-5",      # the judgement step. Do not touch this.
+    "propose":  "claude-opus-5",      # produces an action a human approves
+}
+```
+
+The rule that emerged from measuring each node separately: **route steps whose output is a
+constrained choice; keep the strong model where the output is free-form judgement.** Triage picks
+one of four severities and haiku matched opus on 118 of 120 cases. Diagnose writes a causal
+explanation and haiku matched on 71 of 120.
+
+**3. Context trimming.** `gather` was putting full retrieved documents into the prompt. Replacing
+them with 400-character digests plus an id the model can expand on demand cut input tokens on
+`gather` and `diagnose` by 38%, saving $0.024 a run, with success unchanged at 75.0%. The
+expansion tool was used in 9% of runs, which is the honest cost of the trade and is included above.
+
+**4. Semantic cache.** Week 28's machinery: embed the incoming request, look for a stored answer
+within a cosine threshold, serve it if found.
+
+```python
+def cached_or_run(request: str) -> tuple[str, bool]:
+    vec = embed(request)                                   # bge-m3, 1024-dim
+    hit = vector_store.nearest(vec, threshold=0.93)
+    if hit and not is_stale(hit, max_age_minutes=30):      # incidents go stale FAST
+        return hit.answer, True
+    answer = run_agent(request)
+    vector_store.put(vec, answer, ttl_minutes=30)
+    return answer, False
+```
+
+**31% hit rate** on our traffic, because incident alerts repeat. Saving $0.028 a run on average. Two
+things that must be stated: the **1.2% false-hit rate** at threshold 0.93 — cases where a
+similar-looking but materially different incident got a stale answer — and the fact that a 30-minute
+TTL is what keeps that acceptable. We measured the threshold sweep and 0.93 was where false hits
+crossed our 1% tolerance. **A semantic cache is a classifier and it needs the Week 31 M5 treatment:
+a threshold, an error rate, and a stated budget.**
+
+**5. Verify-and-retry.** Week 29 M1's arithmetic, now as a cost lever. The groundedness validator
+from Week 31 M3 runs on `diagnose`'s output; a failure triggers one retry with the specific problem
+fed back. Fires on 18% of runs, costs $0.045 when it fires, raises success 10.3 points.
+
+### War story
+
+A team was told to cut LLM spend 40%. They moved every call from the strong model to a mid-tier one
+and hit the target on the invoice in a fortnight. Nobody measured quality, because there was no eval
+suite.
+
+Over the next six weeks the support queue grew 22% and the assistant's thumbs-down rate went from
+4% to 11%. Cost per *call* was down 47%. Cost per successfully-resolved ticket — reconstructed later
+from the ticketing system — was **up 19%**, because more tickets needed a second interaction and
+more escalated to a human, and a human costs about 400× a model call.
+
+The recovery took a quarter and its first step was building the eval suite that should have existed
+first. The final configuration used the strong model on two of five nodes and a cheap model on
+three, plus caching, and beat the original on both cost and quality. **The direction was right and
+the method was wrong**: they optimized the number they could see instead of the number that mattered,
+and they had no instrument that would have told them.
+
+<Accordion title="Design checkpoint — with model answer">
+
+**Question.** Your PM says the LLM bill must halve by the end of the quarter. Where do you start?
+
+**Model answer.** Three questions before any change, and then a specific order.
+
+First: **halve which number?** If it is the invoice, that is achievable and possibly harmful. If it is
+cost per successful task, that is the right target and I would get it written that way, because it
+protects both of us later.
+
+Second: **is there an eval suite?** If not, that is week one, non-negotiable. Every lever below is a
+change whose quality effect must be measured, and without the suite I would be doing what the war
+story did.
+
+Third: **where is the money?** Per-node cost attribution from traces, with a p95 column. In our
+system 34% was one node and the p95 was 3.3× the mean, so there were two distinct problems — the
+mean and the tail — and the tail turned out to be a retry loop, which was a correctness issue
+wearing a cost costume.
+
+Then, in this order, because it is free-wins-first: **caching** (25% for five lines, no quality
+risk); **context trimming** (13%, and it usually improves quality slightly by removing distractors —
+Week 31 M3's precision finding); **routing the constrained-choice steps** (8%, measured per node,
+never blanket); **semantic caching** if your traffic repeats (15%, and it needs a threshold and an
+error budget); and only then anything that trades quality.
+
+What I would *not* do first, and would push back on: a blanket model downgrade. It is the most
+visible lever and, per the counter-example row, it can raise cost per successful task while lowering
+the invoice. If the pressure is severe I would offer the counter-example table as the reason, and
+offer the target in the right units instead.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+### Unit economics: the frontier is yours, not the industry's
+
+Plot your own configurations. Ours, eleven of them, on the 120-case suite plus a 400-run production
+sample:
+
+| Configuration | Cost/run | Success | **Per successful task** | On the frontier? |
+| --- | --- | --- | --- | --- |
+| All haiku | $0.058 | 54.0% | $0.107 | No — dominated |
+| All haiku + caching | $0.041 | 54.0% | $0.076 | **Yes** |
+| All sonnet | $0.094 | 68.5% | $0.137 | No — dominated |
+| Baseline (all opus) | $0.190 | 75.0% | $0.253 | No — dominated |
+| Opus + caching | $0.143 | 75.0% | $0.191 | No — dominated |
+| Mixed routing + caching | $0.128 | 74.2% | $0.173 | No — dominated |
+| + trimming | $0.104 | 75.0% | $0.139 | No — dominated |
+| + semantic cache | $0.076 | 75.8% | $0.100 | **Yes** |
+| **+ verify-and-retry** | $0.084 | 86.1% | **$0.098** | **Yes** |
+| + critic-refiner (Week 30 M2) | $0.171 | 89.4% | $0.191 | **Yes** |
+| + critic on every run, no cache | $0.294 | 89.4% | $0.329 | No — dominated |
+
+Six of eleven configurations are **dominated** — something else is both cheaper and better. That is
+the normal state of an unexamined system and it is why plotting the frontier is worth an afternoon:
+most of the wins are not trades at all.
+
+The three frontier points are the actual menu: cheap-and-adequate at $0.076 per success, the
+balanced $0.098, and quality-at-a-price at $0.191. Which you choose is a product decision, and the
+useful thing you can hand a product owner is those three points rather than a recommendation.
+
+**Success rate enters the denominator, so it is a cost lever with unusually strong leverage.** Going
+from 75.8% to 86.1% while adding $0.008 of spend improved cost per success by 2%. Going from 86.1%
+to 89.4% cost $0.087 and made it 95% worse. There is a point where buying quality with money stops
+paying, and it is specific to your acceptance criteria — find it rather than assuming.
+
+### Capacity planning and rate limits
+
+Cost is not the only budget. At 4,200 runs a day with a p50 of 27,400 input and 2,120 output tokens:
+
+```
+input:  4,200 × 27,400  = 115.1 M tokens/day  = 3.45 B/month
+output: 4,200 ×  2,120  =   8.9 M tokens/day  = 0.27 B/month
+peak:   traffic is 3.1x the mean between 09:00 and 11:00 local
+        peak input rate = 115.1M / 86400 × 3.1 ≈ 4,130 tokens/second
+```
+
+Two things follow. **Your rate limit must cover peak, not mean** — sizing on the daily average
+under-provisions by 3.1× and the failure appears as 429s during your busiest two hours, which is
+when it is most visible. And **queue with back-pressure rather than retrying blindly**: a 429 storm
+where every client retries immediately makes the limit permanent. Module 4 covers the queue; the
+point here is that the capacity calculation is a cost-engineering output, because reserved or
+committed capacity is priced differently from on-demand and the decision needs this number.
+
+Caching interacts with this pleasantly: our 25% input-token reduction from prompt caching was also a
+25% reduction in peak token rate, which moved us from 92% of our limit at peak to 69%.
+
+### The build-versus-buy crossover, recomputed
+
+Week 26 asked whether to serve your own model. Now recompute it with real numbers, for one step
+rather than the whole system.
+
+**Candidate: the `triage` step**, a four-way classification, currently `claude-haiku-4-5` at
+$0.0030 per run.
+
+Self-hosted alternative: an 8B model fine-tuned on 4,000 labelled triage examples, served on vLLM on
+one A10G at $0.62/hour on-demand. The crossover below is **derived** — arithmetic over a published
+hourly price and a token-throughput figure; the throughput itself is a **reference figure** for an
+A10G (modelled, see [About the numbers](/start/about-the-numbers)), so re-run the division with your own measured tokens/second before you
+take this to a budget meeting.
+
+```
+Fixed cost:      $0.62/h × 730 h = $452.60/month  (single instance, no redundancy)
+Throughput:      ~2,300 tokens/s at batch 16 for an 8B model on A10G
+Triage tokens:   2,100 in + 180 out = 2,280 → ~1.0 s of GPU time per run
+Marginal cost:   $0.62 / 3600 ≈ $0.00017 per run
+Crossover:       452.60 / (0.0030 − 0.00017) = 159,900 runs/month ≈ 5,300/day
+```
+
+**We run 4,200/day — 21% below the crossover.** So the honest answer today is: do not self-host this
+step. At our growth rate we cross it in about five months, and the decision is diarized rather than
+argued about.
+
+Three costs the arithmetic above omits, and you should name them when you present it:
+
+- **Redundancy.** One instance means a single point of failure. Two instances doubles the fixed cost and moves the crossover to 10,600 runs/day.
+- **The fine-tune itself.** 4,000 labelled examples, roughly three engineer-days, plus about $40 of GPU. Amortized over a year that is another ~$150/month equivalent, moving the crossover again.
+- **Ongoing ownership.** Model updates, dependency upgrades, quality drift on a model you now own. Call it two engineer-hours a month.
+
+With all three, the real crossover is nearer 12,000 runs/day. **The naive crossover flatters
+self-hosting by about 2.3×**, and that gap is where most "we should host our own" proposals live.
+What genuinely changes the answer: a data-residency requirement that makes hosted impossible, or a
+latency requirement that a local model meets and a hosted one does not (our triage p50 was 240 ms
+hosted against 90 ms local).
+
+### Budget alerts that are worth having
+
+| Alert | Threshold | Why this one |
+| --- | --- | --- |
+| Cost per successful task, 24 h rolling | above 1.3× the 7-day median | Catches quality regressions and cost regressions with one number |
+| Spend in the last 5 minutes | above 4× the 5-minute median | The Week 30 M4 fleet guard. Catches runaway loops in minutes, not at month end. |
+| Cache read ratio | below 60% of the 7-day median | A silent cache invalidation is a 25% cost increase with no other symptom |
+| p95 cost per run | above 3× the mean | The expensive tail — usually a retry loop, i.e. a correctness bug |
+| Semantic cache false-hit rate | above 1% on the sampled audit | A cache serving wrong answers is worse than no cache |
+
+The first one is the important one and it is the module's thesis as an alert: **a single metric that
+moves when either cost or quality degrades**, so nobody has to remember to look at both.
+
+### Papers and primary sources
+
+- **Anthropic pricing and prompt-caching documentation.** Takeaway: cache reads are ~0.1× and writes ~1.25×, billed in separate usage fields — so a cost function that only reads `input_tokens` under-reports a cached workload by 40–80%, and always in the direction that makes you look good.
+- **Chen et al., 2023 — *FrugalGPT: How to Use Large Language Models While Reducing Cost and Improving Performance*.** Takeaway: a cascade that tries a cheap model first and escalates on a learned confidence signal can cut cost substantially at equal accuracy — the important subtlety being that the escalation *scorer* is the hard part, and a bad one turns the cascade into paying twice.
+- **Ong et al., 2024 — *RouteLLM: Learning to Route LLMs with Preference Data*.** Takeaway: routing can be learned from preference data rather than hand-written rules, and their results show most of the gain comes from correctly identifying the small fraction of genuinely hard queries — which is why our per-node routing beat a blanket downgrade.
+- **Week 26's serving material and vLLM's throughput documentation.** Takeaway: the self-hosting crossover is dominated by fixed cost and utilization, so a step you call 4,200 times a day and a step you call 400,000 times a day are entirely different decisions with the same model.
+
+### Stretch challenge
+
+Cut your system's cost per successful task by at least 50% with no measured quality regression on the
+Week-31 suite, and publish the before/after table with every intermediate step.
+
+Beyond that: **plot your full cost/quality frontier** with at least eight configurations and identify
+the dominated ones. Then answer the question that decides your product's economics: at what success
+rate does buying quality with money stop paying? For us, spending $0.087 to move from 86.1% to 89.4%
+made cost per success 95% worse — but if a failure costs a human 20 minutes at $60/hour, that is $20
+of human time per failure, and the arithmetic reverses completely: at 4,200 runs/day the extra 3.3
+points of success saves 139 failures a day, about $2,780 of human time, against $365 of extra model
+spend.
+
+**So the honest unit is not cost per successful task either — it is total cost per task including the
+cost of failure.** Compute that for your system: what does a failure actually cost, in human time,
+in customer churn, in an incident? Then re-plot the frontier with that number in it and see which
+configuration wins. We suspect, and cannot prove, that most teams optimizing model spend are
+optimizing the smaller of two numbers. Find out for yours, and show your working — including how you
+estimated the cost of a failure, which is the part that will be argued with.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Cut your system's cost per successful task by 50% or more with no measured quality regression on your
+Week-31 eval suite. Show the before/after table with every lever's contribution.
+</Card>
+
+<Steps>
+<Step title="Price one run by hand">
+From a real trace. Then per node, with a p95 column. The tail is often the bigger prize.
+</Step>
+<Step title="Free wins first">
+Caching (verify `cache_read_input_tokens` is non-zero), context trimming, deterministic tool order. Re-run the eval suite after each.
+</Step>
+<Step title="Route per node, never blanket">
+Measure each node separately against the suite. Constrained-choice steps move; judgement steps do not.
+</Step>
+<Step title="Semantic cache with a threshold and an error budget">
+Sweep the threshold, measure the false-hit rate, set a TTL that matches how fast your domain goes stale.
+</Step>
+<Step title="Add the lever that costs more">
+Verify-and-retry. It raises cost per run and lowers cost per successful task, and it is the row that proves you understood the module.
+</Step>
+</Steps>
+
+## The whiteboard
+
+**T4 interactive widget** — the cost-attribution explorer from the visual spec: the learner adjusts
+token counts per step, model per step, cache hit rate and success rate, and watches the waterfall and
+the cost-per-successful-task figure respond. The moment the widget must produce: dragging the model
+selector to "cheap everywhere" makes cost per run fall and cost per successful task rise.
+**T1** — the hand-drawn waterfall and the frontier scatter.
+
+<Tip>
+**Draw it yourself.** The waterfall with five descending steps and one green step going *up*, the
+two boxed numbers (cost per run, cost per successful task) at each end, and the frontier scatter with
+the dominated points circled in red.
+[Blank version](/assets/diagrams/p4-w32-m3-blank.svg) · [Editable source](/assets/diagrams/p4-w32-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Resume line:** *"Cut an agent system's cost per successful task from $0.253 to $0.098 (−61%) with
+no regression on a 120-case eval suite: prompt caching (−25%), context digests (−13%), per-node
+model routing (−8%), a semantic cache at a measured 1.2% false-hit rate (−15%), and a verify-and-retry
+step that raised cost per run 10% while raising success from 75.8% to 86.1%. Plotted the full
+cost/quality frontier and identified 6 of 11 configurations as dominated."*
+
+**How to talk about it.** Lead with the counter-example: the all-cheap configuration was the cheapest
+per call and the most expensive per successful task. Then the verify-and-retry row, which costs more
+per run. Those two rows together show you optimized the right quantity, and that is the entire skill.
+
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+**1. Turn on prompt caching and assert on it.** 25% for five lines in our system, and it needs no
+quality review because nothing about the request changes. The assertion matters more than the change:
+a silent cache invalidation is a 25% cost increase with no other symptom.
+
+**2. Compute cost per successful task once.** You need spend and a success definition. Most teams
+have the first and not the second, and building the second is the actual work — but it is also
+Week 31, so you may already have it.
+
+**3. Bring the counter-example table to the "just use a cheaper model" meeting.** It will happen.
+Having measured, on your own system, that the cheapest-per-call option can be the most expensive per
+outcome is the difference between an opinion and a decision.
+
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Invoice falls, support load rises | Optimized cost per call, not per successful task | Every table gets the per-success column; gate every change on the eval suite |
+| Cost dashboard reads 40% low | Cache read and write tokens not priced | They are separate usage fields at 0.1× and 1.25× |
+| Caching stops working silently | A varying byte in the prefix, or tool order changed | Assert `cache_read_input_tokens > 0` after the first call of a run |
+| Blanket model downgrade regresses quality | Routing decided globally rather than per node | Route constrained-choice steps; keep judgement steps on the strong model, measured per node |
+| Semantic cache serves a wrong answer | No threshold sweep, no TTL | Sweep to a stated false-hit budget; TTL matched to how fast your domain goes stale |
+| Optimizing the wrong node | No per-node attribution | Attribute from traces; ours was 34% in one node and 8% in the one people wanted to fix |
+| A cost spike is found at month end | No short-window spend alert | 5-minute rolling spend at 4× the median, plus the Week 30 M4 fleet guard |
+| Self-hosting proposal looks obviously right | Naive crossover ignoring redundancy, the fine-tune and ownership | Ours flattered self-hosting by 2.3×; recompute with all three |
+| 429s during the busy two hours | Rate limits sized on the daily mean | Size on peak; ours is 3.1× the mean |
+| The p95 cost is 3× the mean and nobody looks | Averages hide retry loops | Alert on p95 cost per run; it is usually a correctness bug |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="8 concept questions (with answers)" icon="circle-question">
+
+1. *Why cost per successful task rather than per call?* Failures are re-attempted or escalated, so their cost lands on the successful runs; the cheapest per call can be the most expensive per outcome.
+2. *A model at one-fifth the price drops success 75% → 40%. Better or worse?* $0.038/0.40 = $0.095 against $0.253 — better on this metric, and you must then ask what a failure costs beyond model spend.
+3. *Why is input usually the dominant cost?* Volume: 27,400 input against 2,120 output in our run, because prompt, tools and history are re-sent every step.
+4. *What does prompt caching cost and save?* ~1.25× to write, ~0.1× to read; 25% of our run cost for five lines.
+5. *Which steps can be routed to a cheap model?* Ones whose output is a constrained choice. Haiku matched Opus on 118/120 triage cases and 71/120 diagnosis cases.
+6. *What makes a semantic cache dangerous?* It is a classifier with a false-hit rate — ours 1.2% at threshold 0.93 — so it needs a threshold, an error budget and a TTL.
+7. *Why did verify-and-retry improve cost per successful task while raising cost per run?* It moved the denominator more than the numerator: +$0.008 for +10.3 points of success.
+8. *What does the naive self-hosting crossover omit?* Redundancy, the fine-tune amortization and ongoing ownership; together they moved ours from 5,300 to ~12,000 runs/day.
+
+</Accordion>
+<Accordion title="Coding challenge (hidden tests)" icon="code">
+
+Implement the cost accounting and routing layer to pass tests covering: `cost()` including cache
+creation at 1.25× and cache read at 0.1×; per-node attribution summing exactly to the run total;
+cost per successful task computed against an acceptance function, not a run count; a router that
+selects the model per node from a config and records the choice on the span; a semantic cache that
+respects both the similarity threshold and the TTL and reports its hit rate; and a budget alert that
+fires when 5-minute rolling spend exceeds 4× the rolling median.
+
+</Accordion>
+<Accordion title="Interview questions — junior / mid / senior" icon="user-tie">
+
+- **Junior.** "Your LLM bill doubled and traffic did not. Where do you look first?"
+- **Mid.** "Should you switch to a cheaper model to save money?" (Expect: measure per node against an eval suite, cost per successful task, and the counter-example where the cheapest per call is the most expensive per outcome.)
+- **Senior.** "Halve our inference cost without hurting the product. Walk me through the programme." (Expect: eval suite first, attribution with a p95 column, free wins before trades, per-node routing, a frontier plot with dominated configurations identified, the capacity implication, and the cost-of-failure argument that says model spend may be the smaller number.)
+
+</Accordion>
+<Accordion title="Draw it from memory" icon="pencil">
+
+The cost waterfall with its one upward green step, and the frontier scatter with the cheapest-per-call
+point marked as worse per successful task.
+
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+- [Anthropic pricing and prompt-caching documentation](https://docs.claude.com/en/docs/build-with-claude/prompt-caching) — read the usage-field definitions; the separate cache fields are where home-made cost dashboards go wrong.
+- [vLLM throughput documentation and Week 26's serving material](https://docs.vllm.ai/) — read this before any self-hosting crossover calculation; utilization dominates the answer.
+
+**Papers**
+- [Chen et al. 2023, *FrugalGPT*](https://arxiv.org/abs/2305.05176) — cascades cut cost at equal accuracy, and the escalation scorer is the hard part; a bad one means paying twice.
+- [Ong et al. 2024, *RouteLLM*](https://arxiv.org/abs/2406.18665) — routing learned from preference data, with most of the gain coming from identifying the small fraction of genuinely hard queries.
+
+**Go deeper**
+- Week 31 M1 on statistical power, re-read here — "no quality regression" is a claim your suite may not be able to support, and knowing the smallest difference you can detect is what makes the claim honest.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-32/p4-w32-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

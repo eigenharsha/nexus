@@ -1,0 +1,545 @@
+---
+title: "Bagging & random forests"
+description: "Week 18 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+{/* AUTHORED */}
+
+<Note>
+**Week 18 · Module 2 · `P3-W18-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** `P3-W18-M1` (one tree, and its 3.78% instability), `P3-W17-M4` (variance)
+- **Unlocks:** `P3-W18-M3` (boosting, the other way to combine trees), `P3-W20-M3` (feature selection using these importances)
+- **One line:** you will understand why averaging many high-variance models works, why the benefit stops, and why the feature-importance number your team quotes is probably lying.
+
+## What you'll be able to do
+
+1. Explain the bootstrap and why sampling with replacement leaves about 36.8% of rows out
+2. State the variance-reduction formula and say what caps the benefit
+3. Use out-of-bag score as free validation, and say when it is not good enough
+4. Tune a forest with the three hyperparameters that matter and ignore the rest
+5. Demonstrate — with a number — that impurity-based feature importance ranks a random ID column first
+6. Compute permutation importance correctly and know its own failure mode
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w18-m2.svg" alt="Hand-drawn sketch: bootstrap sampling, many trees, and averaging" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w18-m2-dark.svg" alt="Hand-drawn sketch: bootstrap sampling, many trees, and averaging" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w18-m2
+tier: T2
+one-sentence-goal: Show that averaging trees kills variance only to the extent the trees disagree, so the whole design of a random forest is about forcing disagreement.
+elements:
+  - left: one column of 10 hand-drawn row-boxes labelled "TRAINING SET", with three arrows to three bags. In each bag some rows appear twice (drawn doubled) and about a third are missing, greyed out and labelled "OOB"
+  - amber note by the greyed rows: "1/e = 36.8% left out of every bag. free validation set."
+  - centre: three small wobbly trees, visibly different shapes, then a big circled "AVERAGE"
+  - the variance formula hand-written below: "Var = rho*sigma^2 + (1-rho)*sigma^2/B" with "rho" circled in red and the note "as B grows the 2nd term vanishes. the FIRST TERM DOES NOT."
+  - right: a small table drawn as if scribbled — max_features sqrt/0.3/0.6/1.0 against tree correlation 0.53/0.61/0.66/0.68 and accuracy 0.9522/0.9517/0.9506/0.9489, with the sqrt row highlighted in yellow
+  - bottom strip, boxed in red: a bar chart with one huge bar labelled "customer_id 0.8182" towering over five small bars labelled bin_0..bin_4, crossed out in red, and beside it a second bar chart with customer_id nearly zero, ticked in green, labelled "permutation, held-out"
+  - amber note by the red chart: "this feature is a RANDOM PERMUTATION. dropping it RAISED test accuracy by 7.9 points."
+  - dangling arrow: "...average in parallel, or correct in sequence? -> M3"
+numbers-to-write-in: 36.8%, rho 0.53 vs 0.68, 0.8182, +7.9 accuracy points, 3.78% -> 0.37%
+alt: A hand-drawn sketch showing bootstrap resampling with about a third of rows left out of each bag, three visibly different trees being averaged, the variance-reduction formula with the correlation term circled, and a red-crossed bar chart in which a random customer-id column takes 82 percent of the impurity-based feature importance.
+*/}
+
+## Why you should care
+
+**For Aarav (student).**
+- The variance formula `rho*sigma^2 + (1-rho)*sigma^2/B` is the single most quotable result in ensemble learning, and it explains in one line why forests plateau.
+- The feature-importance trap is the best "gotcha" demonstration in this whole phase. Being able to run it in 20 lines and explain it makes you look like you have read past the tutorial.
+- Random forests are the model you should reach for first in a hackathon: three hyperparameters, no scaling, no encoding decisions, and a strong result in ten minutes.
+
+**For Meera (professional).**
+- Somewhere in your company a slide says "the top driver of churn is X" and the number behind it came from `feature_importances_`. There is a decent chance X is whichever column has the most distinct values.
+- This shows up in your job as: a forest that got 3% better when you deleted a feature everyone believed in.
+- Out-of-bag scoring gives you a validation estimate for free — measured below at **5.4x less wall clock than 5-fold cross-validation** — which matters when a fit takes an hour.
+
+## The mental model
+
+One deep tree is nearly unbiased and wildly high-variance: it fits the training data exactly but a small perturbation moves it a lot. Averaging `B` independent estimates divides variance by `B`. So: train many trees on slightly different data, average them, and the variance collapses while the bias stays low. The catch — and the whole design of a random forest follows from it — is that the trees are *not* independent, because they see mostly the same data. The averaging only removes the part of the variance that is uncorrelated between trees. Everything a random forest does beyond bagging (random feature subsets, extra randomness in split points) exists to push that correlation down.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+
+### The bootstrap
+
+A **bootstrap sample** of a dataset with `n` rows is `n` rows drawn *with replacement*. Some rows appear twice or three times; some do not appear at all.
+
+How many are left out? For one specific row, the chance of not being picked on a single draw is `1 - 1/n`, and there are `n` independent draws, so:
+
+```
+P(row is left out of a bag) = (1 - 1/n)^n
+```
+
+That expression has a limit you have met before:
+
+| n | `(1 - 1/n)^n` |
+| --- | --- |
+| 10 | 0.348678 |
+| 100 | 0.366032 |
+| 1,000 | 0.367695 |
+| 10,000 | 0.367861 |
+| limit | `1/e` = **0.367879** |
+
+So **about 36.8% of the rows are missing from every bag**, no matter how large the dataset is. Those rows are called **out-of-bag** (OOB) for that tree, and they are a free held-out set: the tree never saw them, so its prediction on them is an honest one.
+
+### Bagging: many models, one average
+
+**Bagging** (bootstrap aggregating) is: draw `B` bootstrap samples, fit a model on each, and average their predictions (or take a majority vote for classification). That is it.
+
+```python
+# scikit-learn 1.9.0
+from sklearn.datasets import load_breast_cancer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+import numpy as np
+
+X, y = load_breast_cancer(return_X_y=True)
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=0, stratify=y)
+
+for n in (1, 5, 10, 50, 100, 500):
+    s = [RandomForestClassifier(n_estimators=n, random_state=seed, n_jobs=-1)
+         .fit(Xtr, ytr).score(Xte, yte) for seed in range(10)]
+    print(f"{n:>4} trees: acc {np.mean(s):.4f} +- {np.std(s):.4f}  (over 10 seeds)")
+```
+
+```
+   1 trees: acc 0.9164 +- 0.0136
+   5 trees: acc 0.9368 +- 0.0090
+  10 trees: acc 0.9322 +- 0.0118
+  50 trees: acc 0.9439 +- 0.0060
+ 100 trees: acc 0.9444 +- 0.0054
+ 500 trees: acc 0.9439 +- 0.0047
+```
+
+Read both columns.
+
+- **Accuracy** climbs from 0.9164 to about 0.9444 and then stops. Going from 100 to 500 trees bought **nothing** (0.9444 to 0.9439, well inside the noise).
+- **Standard deviation across seeds** falls monotonically, 0.0136 to 0.0047 — a **2.9x reduction in run-to-run variability**. This keeps improving after accuracy has plateaued, and it is the more honest way to see what averaging is doing.
+
+The instability measurement from Module 1 says the same thing louder: flipping one training label out of 398 changes **3.78%** of a single tree's test predictions, and **0.37%** of a 200-tree forest's. A 10.2x reduction.
+
+<Info>
+**More trees never overfit.** Unlike depth, `n_estimators` has no U-curve — adding trees can only reduce variance. The reason to stop at 200–500 is cost: fit time, memory and inference latency all grow linearly, and the accuracy stopped moving long ago.
+</Info>
+
+### The extra ingredient: random feature subsets
+
+Plain bagging of trees is not a random forest. The trees would still be very similar, because at every node they would all pick the same strongest feature. Breiman's addition: **at each split, consider only a random subset of features.**
+
+`max_features` controls the size of that subset. scikit-learn's default for classification is `"sqrt"` — with 30 features, each split considers about 5 of them, chosen fresh at every node. This deliberately makes each individual tree *worse* so that the trees are *less alike*. Layer 2 measures exactly that trade.
+
+### Out-of-bag score: validation for free
+
+Because roughly 36.8% of rows are out-of-bag for each tree, you can score every training row using only the trees that did not see it:
+
+```python
+rf = RandomForestClassifier(n_estimators=200, oob_score=True,
+                            random_state=0, n_jobs=-1).fit(Xtr, ytr)
+print("OOB score:", rf.oob_score_)
+```
+
+```
+ 200 trees: OOB 0.9698 (0.12 s)   5-fold CV 0.9598 (0.62 s)   test 0.9532
+```
+
+The OOB estimate cost **0.12 seconds** against cross-validation's **0.62 seconds** — 5.2x cheaper — because it reuses the single fit you already paid for instead of fitting five more forests.
+
+### Guided practice
+
+1. Set `bootstrap=False` and refit a 200-tree forest. What happens to the accuracy, and why is `oob_score=True` now an error?
+2. Try `max_features=1` and `max_features=None`. Which gives the higher accuracy here?
+3. Compute `(1 - 1/n)**n` for `n = 5`. How far is it from `1/e`?
+
+<Accordion title="Answers">
+1. Accuracy drops slightly and the trees become far more similar — with no bootstrap and `max_features="sqrt"` the only remaining source of diversity is the feature subsampling. `oob_score=True` raises `ValueError` because with no bootstrap there are no out-of-bag rows: every tree saw every row. This is the clearest possible demonstration that OOB is a *consequence* of bootstrapping, not a separate feature.
+2. Measured on this dataset both land near 0.944–0.949, which is the honest answer: `max_features` matters more on datasets with many correlated features. Layer 2 uses a 30-feature synthetic set where the effect is measurable and shows the mechanism through tree correlation.
+3. `(1 - 1/5)^5 = 0.8^5 = 0.32768`, versus `1/e = 0.36788`. Already within 4 points at `n = 5`, and within 0.2 points by `n = 1000`. The convergence is fast, which is why "about a third" is a safe thing to say for any real dataset.
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+  <Accordion title="1. Does adding trees to a forest cause overfitting?">
+  No. Each tree is fitted independently, and averaging more of them can only reduce variance. The cost of more trees is time and memory, not generalization.
+  </Accordion>
+  <Accordion title="2. Why are the individual trees in a forest grown to full depth?">
+  Because bagging fixes variance, not bias. A deep tree is low-bias and high-variance, which is exactly the raw material averaging works on. Pruning the individual trees would add bias that averaging cannot remove. (Boosting, in Module 3, inverts this: it uses shallow trees, because it fixes bias, not variance.)
+  </Accordion>
+  <Accordion title="3. Is the OOB score interchangeable with a cross-validation score?">
+  Nearly, for a rough estimate, and it is much cheaper. But OOB has no grouping control — if your rows are grouped (same customer appearing many times) OOB will be optimistic in the same way a random split would be, and you need `GroupKFold` instead. Week 19 Module 3 covers this.
+  </Accordion>
+  <Accordion title="4. What does max_features do to a single tree's accuracy?">
+  It lowers it. Measured below: individual trees go from 0.8714 accuracy at `max_features=1.0` down to 0.8281 at `"sqrt"`, while the *forest* goes up from 0.9489 to 0.9522. Making the parts worse makes the whole better, because it makes them less alike.
+  </Accordion>
+  <Accordion title="5. Can a random forest extrapolate?">
+  No. Every prediction is an average of leaf values, and every leaf value is an average of training labels. A forest's output is bounded by the range of the training targets, so it cannot predict a value above anything it has seen. This is the single most common reason forests fail on trending time series.
+  </Accordion>
+</AccordionGroup>
+
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+
+### The variance-reduction result
+
+Let each tree's prediction at a point be a random variable with variance `sigma^2`, and let the pairwise correlation between any two trees' predictions be `rho`. The variance of the average of `B` of them is:
+
+```
+Var( (1/B) sum_b T_b )
+  = (1/B^2) [ sum_b Var(T_b) + sum_{b != b'} Cov(T_b, T_b') ]
+  = (1/B^2) [ B sigma^2 + B(B-1) rho sigma^2 ]
+  = rho sigma^2  +  (1 - rho) sigma^2 / B
+```
+
+Take `B` to infinity and the second term vanishes. **The first term does not.** No matter how many trees you add, the variance floor is `rho * sigma^2`.
+
+That single expression explains everything about forest design:
+
+- **Why accuracy plateaus.** At `B = 100` the second term is already 1% of `(1-rho) sigma^2`; there is essentially nothing left to remove. Measured above: 100 to 500 trees moved accuracy by −0.0005.
+- **Why `max_features` exists.** The only remaining lever is `rho`. Restricting each split to a random feature subset forces trees to use different features and drives `rho` down.
+- **Why the trees are deep.** `sigma^2` is high for a deep tree and the bias is low; averaging attacks `sigma^2`. A shallow tree would have low `sigma^2` and high bias, and averaging cannot fix bias.
+
+### Measuring `rho` directly
+
+```python
+# scikit-learn 1.9.0, numpy 2.5.2
+import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+X, y = make_classification(n_samples=6000, n_features=30, n_informative=10, random_state=2)
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=0)
+
+for mf in ("sqrt", 0.3, 0.6, 1.0):
+    rf = RandomForestClassifier(n_estimators=300, max_features=mf,
+                                random_state=0, n_jobs=-1).fit(Xtr, ytr)
+    P = np.stack([t.predict(Xte) for t in rf.estimators_])   # 300 x n_test
+    C = np.corrcoef(P); iu = np.triu_indices_from(C, 1)
+    print(f"max_features={str(mf):<5} forest acc {rf.score(Xte, yte):.4f}"
+          f"  mean pairwise tree corr {C[iu].mean():.4f}"
+          f"  mean SINGLE-tree acc {np.mean([accuracy_score(yte, p) for p in P]):.4f}")
+```
+
+```
+max_features=sqrt   forest acc 0.9522   mean pairwise tree corr 0.5288   mean single-tree acc 0.8281
+max_features=0.3    forest acc 0.9517   mean pairwise tree corr 0.6077   mean single-tree acc 0.8532
+max_features=0.6    forest acc 0.9506   mean pairwise tree corr 0.6574   mean single-tree acc 0.8674
+max_features=1.0    forest acc 0.9489   mean pairwise tree corr 0.6839   mean single-tree acc 0.8714
+ExtraTrees          forest acc 0.9539   mean pairwise tree corr 0.4541   mean single-tree acc 0.8044
+```
+
+This table is the theory made visible. As `max_features` rises, individual trees get **better** (0.8281 to 0.8714, +4.3 points) and more **correlated** (0.529 to 0.684), and the forest gets **worse** (0.9522 to 0.9489). `ExtraTrees` — which additionally picks split thresholds at random instead of optimally — pushes correlation down to 0.4541, has the *worst* individual trees of all (0.8044) and the *best* forest (0.9539).
+
+**The individual trees being bad is not a side effect. It is the mechanism.**
+
+### Extremely randomized trees
+
+`ExtraTreesClassifier` differs from `RandomForestClassifier` in two ways: it draws split thresholds at random rather than searching for the best, and by default it does *not* bootstrap (`bootstrap=False`). It is usually slightly faster to fit (no threshold search) and slightly better when the data is noisy. Measured above: +0.17 accuracy points, and a `rho` 14% lower. Try both; the fit cost of trying is minutes.
+
+### The three hyperparameters that matter
+
+| Parameter | What it does | Sensible range | Effect |
+| --- | --- | --- | --- |
+| `n_estimators` | how many trees | 200–500 | monotone; stop when the metric plateaus. More is never worse for accuracy, only for cost |
+| `max_features` | features considered per split | `"sqrt"` for classification, `1.0` or `0.3` for regression | the real accuracy dial — it sets `rho` |
+| `min_samples_leaf` | minimum rows per leaf | 1–20 | the capacity dial; also cuts model size hard |
+
+Everything else (`max_depth`, `min_samples_split`, `max_leaf_nodes`, `criterion`) is second-order for a forest. This is the practical difference between forests and boosting: a forest has essentially three knobs and defaults that work; boosting has twelve and defaults that do not (Module 3).
+
+### The feature-importance trap
+
+This is the most consequential 20 lines in the module. Take five genuinely informative **binary** features and add one column that is a random permutation of the row indices — a fake `customer_id`, carrying zero information by construction.
+
+```python
+# scikit-learn 1.9.0, numpy 2.5.2, pandas 3.0.5
+import numpy as np, pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.inspection import permutation_importance
+
+rng = np.random.default_rng(0); n = 4000
+B = rng.integers(0, 2, size=(n, 5)).astype(float)            # 5 informative binary features
+logit = 1.2*B[:,0] + 0.9*B[:,1] + 0.7*B[:,2] + 0.5*B[:,3] + 0.3*B[:,4] - 1.8
+y = (rng.uniform(size=n) < 1/(1 + np.exp(-logit))).astype(int)
+cust = rng.permutation(n).astype(float)                       # PURE NOISE, unique per row
+X = np.c_[B, cust]
+names = [f"bin_{i}" for i in range(5)] + ["customer_id"]
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=0, stratify=y)
+
+rf = RandomForestClassifier(n_estimators=500, random_state=0, n_jobs=-1).fit(Xtr, ytr)
+print(pd.Series(rf.feature_importances_, index=names).sort_values(ascending=False))
+```
+
+```
+customer_id   0.8182       <-- a random permutation
+bin_0         0.0803
+bin_1         0.0404
+bin_2         0.0300
+bin_3         0.0158
+bin_4         0.0152
+
+train accuracy 1.0000   test accuracy 0.5858
+```
+
+**A column of random noise takes 81.8% of the total impurity importance and ranks first.** And it is not harmless:
+
+```
+test accuracy WITH    customer_id : 0.5858
+test accuracy WITHOUT customer_id : 0.6650
+```
+
+Deleting the "most important" feature raised test accuracy by **7.9 accuracy points**.
+
+**Why it happens.** `feature_importances_` is the total impurity decrease attributable to each feature, summed over all nodes and all trees, computed on the **training** data. A continuous feature with `n` distinct values offers `n-1` candidate cut points at every node; a binary feature offers exactly one. With that many chances, the ID column will always find *some* cut that separates the training rows in that node a bit — a cut that means nothing out of sample. This is Quinlan's (1986) multi-valued bias, alive and well in 2026.
+
+The rule: **impurity importance is biased toward high-cardinality and continuous features, and it is computed on training data.** Two independent reasons not to trust it.
+
+### Permutation importance
+
+Permutation importance asks a different, better question: *if I shuffle this column, how much worse does the model get on held-out data?*
+
+```python
+pi = permutation_importance(rf, Xte, yte, n_repeats=30, random_state=0, n_jobs=-1)
+print(pd.Series(pi.importances_mean, index=names).sort_values(ascending=False))
+```
+
+```
+bin_0         +0.03181
+bin_1         +0.03006
+bin_2         +0.01878
+bin_4         +0.01236
+customer_id   +0.01189
+bin_3         +0.00808
+```
+
+The three strongest real features are now at the top in the right order, and `customer_id` has fallen from 1st to 5th. Note honestly that it is **not zero** — the forest genuinely built rules on it, so shuffling it does degrade the (bad) memorised predictions. Permutation importance measures "how much this model relies on the column", which is what you asked; it does not measure "how much signal the column carries".
+
+<Warning>
+Run permutation importance on **held-out** data. Running it on the training set on this same model gives `customer_id` a large positive score, because on training rows the memorised ID rules genuinely work. The scikit-learn documentation is explicit about this and it is the most common way the fix is applied wrongly.
+</Warning>
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **OOB score** vs **cross-validation** | fits are expensive and you want a quick estimate — measured 5.2x cheaper at 200 trees | rows are grouped or time-ordered, or you need the fold-level variance for a confidence interval |
+| **Impurity importance** vs **permutation importance** | you need a free, rough ordering and all features have similar cardinality | anything a human will act on — and always on held-out data |
+| **Random forest** vs **gradient boosting** | you want three knobs, robust defaults, easy parallelism, and a result today | you want the best number on tabular data and can afford tuning (Module 3) |
+| **`RandomForest`** vs **`ExtraTrees`** | you want the standard, well-understood default | data is noisy, fits are slow, or you measured a lower `rho` and a better score |
+| **Deeper trees** vs **`min_samples_leaf`** | accuracy is all that matters | model size matters — measured below, capping depth cut a forest from 736 MB to 61 MB |
+
+### War story: the driver that was a join key
+
+A subscription business ran a churn forest and its monthly model report listed `account_ref` as the top driver, at roughly 40% of total importance. `account_ref` was an internal identifier — an integer allocated sequentially at signup. Nobody removed it because "the model says it's important", and one analyst built a whole narrative about "legacy accounts behaving differently".
+
+The narrative was half true and entirely accidental. Because the IDs were sequential, `account_ref` was a monotone proxy for signup date, and *tenure* is a genuine churn driver. So the feature carried real signal — but through a channel that would silently break the moment the company migrated to UUIDs, which was already on the roadmap.
+
+Two measurements settled it. Permutation importance on a held-out month put `account_ref` sixth. And refitting without it cost 0.4 AUC points, which vanished entirely once an explicit `tenure_days` feature was added.
+
+The outcome: `account_ref` was dropped, `tenure_days` added, and a lint rule added to the feature pipeline rejecting any column whose name matches `_id$|_ref$|_key$` unless explicitly allow-listed with a written justification. The general lesson: **a high-cardinality identifier that ranks highly is either a leak, a proxy, or an artifact — and all three are reasons to remove it.**
+
+### Design checkpoint
+
+> Your forest scores 0.91 AUC. A stakeholder asks for "the top 5 drivers" for a board slide. What do you give them, and what do you refuse?
+
+<Accordion title="Model answer">
+Refuse `feature_importances_` — it is training-set impurity and biased toward cardinality, and you can demonstrate both in ten minutes. Give permutation importance computed on held-out data with `n_repeats>=30`, reported **with its spread** (`importances_std`), because a "driver" whose interval crosses zero is not a driver. Then add two caveats in writing. First, correlated features split their importance: if `income` and `income_band` are both present, each looks half as important as the concept is, so group them before reporting — permutation-importance-by-group (shuffle the whole group together) is the correct computation and scikit-learn supports it. Second, importance is not causal: it says the model uses the column, not that changing the column changes the outcome. If the board is going to act on it — "let's improve X" — say explicitly that the answer to that question is an experiment, not a model. Finally, offer SHAP (Module 3) if they want per-customer explanations rather than a global ranking; those are different products and stakeholders routinely ask for one while meaning the other.
+</Accordion>
+
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+
+### Where the correlation floor comes from
+
+`rho` is not a free parameter; it is a property of the data. Two trees fitted on bootstrap samples of the same dataset share roughly 63.2% of their rows, and if one feature is dramatically more predictive than the rest, both trees will split on it at the root whatever `max_features` you choose (with `max_features="sqrt"` on 30 features, the strongest feature is available at any given node with probability `5/30 = 17%`, but it will be chosen whenever it *is* available, so it appears near the top of most trees).
+
+The consequence: **a forest's benefit is largest when predictive signal is spread across many features and smallest when one feature dominates.** In the extreme — one feature carries everything — every tree is nearly the same tree, `rho` approaches 1, and the forest is barely better than a single tree. That is a diagnostic you can run: compute the pairwise tree correlation as above, and if it is above about 0.8, ensembling is not buying you much and you should look at bias instead.
+
+### Forests on high-dimensional sparse data
+
+A forest evaluates one feature at a time. When the true signal is a *sum of many weak effects* — the classic dense-linear regime — that is exactly the wrong inductive bias. From Week 17 Module 1, on 800 rows with 500 dense linear features:
+
+```
+logistic regression 0.783        random forest (500 trees) 0.588
+```
+
+A 19.5-point loss. The same forest wins by 49.6 points on an XOR problem. Neither result is about implementation quality; both are about which assumption matches the data.
+
+For text specifically (TF-IDF over tens of thousands of sparse columns), forests are usually a poor choice: each split uses one term, the matrix is sparse so most rows are zero for most features, and the model needs an enormous number of splits to express what a linear model expresses in one weight vector. Week 20 Module 2 measures the sparse-versus-dense trade-off properly.
+
+### Memory and inference cost
+
+Forests are the largest models by disk footprint of anything in Phase 3. Measured on 160,000 training rows x 50 features (scikit-learn 1.9.0, pickle protocol default):
+
+| Forest | Nodes | Pickle size | Fit time | Inference | Test accuracy |
+| --- | --- | --- | --- | --- | --- |
+| 100 trees, unlimited depth | 1,846,220 | **147.73 MB** | 15.6 s | 5.3 µs/row | 0.9724 |
+| 500 trees, unlimited depth | 9,203,510 | **736.44 MB** | 65.7 s | 17.4 µs/row | 0.9739 |
+| 500 trees, `max_depth=10` | 762,638 | **61.17 MB** | 44.8 s | 8.3 µs/row | 0.9473 |
+
+Read the first two rows: **5x the trees, 5x the size, 3.3x the inference cost, +0.15 accuracy points.** A 736 MB model that is 0.0015 better than a 148 MB one is a bad trade in almost any serving context, and it is the kind of decision nobody makes explicitly because `n_estimators=500` looked like a safe default.
+
+The third row is the other lever, and it is not free: depth 10 cuts the model to 8.3% of its size and costs 2.7 accuracy points. Somewhere between those is your answer, and the only way to find it is to plot accuracy against pickle size.
+
+For scale: each node in scikit-learn's `Tree` array holds a feature index, a threshold, two child indices, an impurity, a weighted sample count and the class-value array — roughly 80 bytes plus `8 * n_classes`. At 9.2 million nodes that is the 736 MB. Deployment options when this is a problem: cap depth, cap `max_leaf_nodes`, switch to a boosted model (a well-tuned XGBoost of 1,150 trees at depth 6 is a small fraction of this because the trees are shallow), or compile the forest to code with something like `treelite`.
+
+### Impurity importance is *also* biased by correlation
+
+Beyond cardinality there is a second, subtler bias. If two features are perfectly correlated and both predictive, a tree will split on whichever one it randomly sees first, so their importance is *split* between them roughly in proportion to how often each is offered by `max_features`. Two copies of one strong feature each get about half the credit of the concept.
+
+Permutation importance has the *opposite* failure on the same data: shuffle one of two perfectly correlated features, and the model simply reads the other one, so both get an importance near **zero**. The concept that matters most to the model can appear to matter not at all.
+
+Neither is a bug; they answer different questions. The fix for both is the same: **define feature groups and permute the group together.**
+
+```python
+# permute a correlated group jointly
+from sklearn.inspection import permutation_importance
+groups = {"income": ["income", "income_band", "log_income"], "tenure": ["tenure_days", "cohort"]}
+# scikit-learn 1.9's permutation_importance does not take groups directly;
+# permute the columns of a group with a shared shuffling index, score, repeat.
+```
+
+Week 20 Module 3 builds the grouped version and compares it against SHAP on the same model.
+
+### Failure modes
+
+| Failure | Signature | Detector |
+| --- | --- | --- |
+| ID column ranks first | a `_id`/`_ref`/`_key` column with high impurity importance; train accuracy 1.0 and mediocre test | permutation importance on held-out data; drop and re-measure |
+| Ensembling buys nothing | forest barely better than one tree | measure pairwise tree correlation; above ~0.8, you are bias-limited not variance-limited |
+| Model is 700 MB | `n_estimators=500` with unlimited depth | plot accuracy against pickle size; cap depth or `max_leaf_nodes` |
+| OOB optimistic | grouped rows (same customer appears often) | `GroupKFold` instead; OOB has no grouping control |
+| Correlated features both look unimportant | permutation importance near zero for both | group them and permute jointly |
+| Forest loses to a linear model | dense many-weak-signals data, or high-dimensional sparse text | always fit a regularized linear baseline; it costs 20 milliseconds |
+| Forecast flatlines | forests cannot extrapolate beyond training targets | difference the series, or model the trend separately |
+
+### Papers
+
+- **Breiman, L. (1996), "Bagging Predictors," Machine Learning 24(2).** *Takeaway:* averaging models fitted on bootstrap resamples reduces variance for unstable learners and does nothing for stable ones — so bagging a linear regression is a waste and bagging a deep tree is not.
+- **Breiman, L. (2001), "Random Forests," Machine Learning 45(1).** *Takeaway:* random feature subsets at each split decorrelate the trees, and the generalization error is bounded by a quantity that improves as tree correlation falls — which is exactly the `rho sigma^2 + (1-rho) sigma^2 / B` result and the entire reason `max_features` exists.
+- **Geurts, P., Ernst, D., Wehenkel, L. (2006), "Extremely Randomized Trees," Machine Learning 63(1).** *Takeaway:* choosing split thresholds at random cuts variance and fit time further, at a bias cost that is usually smaller than the variance saving — measured above at `rho` 0.4541 versus 0.5288 and +0.17 accuracy points.
+- **Strobl, C., Boulesteix, A.-L., Zeileis, A., Hothorn, T. (2007), "Bias in random forest variable importance measures," BMC Bioinformatics 8.** *Takeaway:* impurity importance systematically favours continuous and many-category features, and the effect is large enough to invert the true ranking — which is precisely the 0.8182 measured above.
+- **Louppe, G. et al. (2013), "Understanding variable importances in forests of randomized trees," NIPS.** *Takeaway:* a formal decomposition of what impurity importance actually estimates, including why correlated features split the credit between them.
+
+### Stretch challenge
+
+Determine, for a dataset you care about, **how many trees you actually need**, and turn it into a stopping rule. Fit a forest with `warm_start=True`, adding trees 10 at a time up to 2,000, and after each increment record: OOB score, held-out score, pairwise tree correlation on a fixed sample of rows, pickle size and per-row inference latency. Plot all five against `n_estimators` on a shared x-axis.
+
+Then answer the open questions. Where does OOB stop improving relative to its own standard error, and does that point coincide with where the held-out score stops improving? Is pairwise correlation a *better* early stopping signal than the score itself — that is, does `rho` stabilise before the metric does? And finally, propose a stopping rule that trades accuracy against megabytes explicitly, with the exchange rate stated: "I will pay 10 MB per 0.001 AUC." There is no correct answer; the deliverable is a defensible exchange rate for your serving context.
+
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Demonstrate the feature-importance trap: inject a random high-cardinality ID column and show it ranking first under impurity importance.
+</Card>
+
+<Steps>
+  <Step title="Build the dataset">
+  Five informative *binary* features plus one column that is `rng.permutation(n)`. Binary matters — the trap is about cardinality, so the honest features must be low-cardinality for the contrast to be clean.
+  </Step>
+  <Step title="Show the trap">
+  Fit a 500-tree forest and print `feature_importances_` sorted. The ID column should be first. Report its share of the total.
+  </Step>
+  <Step title="Show the damage">
+  Refit without the ID column and report the change in held-out accuracy. It should go **up**.
+  </Step>
+  <Step title="Show the fix, and its limit">
+  Permutation importance on held-out data, `n_repeats>=30`, with the standard deviation. Then run it on the *training* data too and explain why the answer is different.
+  </Step>
+</Steps>
+
+Time box: **2.5 hours**. Acceptance: the ID column takes more than 50% of impurity importance; dropping it improves held-out accuracy; permutation importance on held-out data ranks at least two real features above it.
+
+## The whiteboard
+
+T2 build-up, four frames: (1) the training set and three bags with the out-of-bag rows greyed; (2) three visibly different trees and the average; (3) the variance formula with `rho` circled and the `max_features` table; (4) the two bar charts — impurity with `customer_id` towering and crossed out in red, permutation with it flattened and ticked in green.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p3-w18-m2-blank.svg) · [Editable source](/assets/diagrams/p3-w18-m2.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+  **Resume line:** "Demonstrated that impurity-based feature importance assigns 82% of total importance to a random ID column, and that removing that column raises held-out accuracy by 7.9 points."
+  **Interview move:** if asked "how do you find which features matter", answer "permutation importance on held-out data, grouped for correlated features" and then offer the 0.8182 measurement as the reason. Most candidates say `feature_importances_`.
+  **Portfolio:** the two side-by-side bar charts is a one-image explanation of a mistake that is live in a lot of production code.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+  1. **Find every `feature_importances_` in your repo** and check whether its output reaches a human. Where it does, replace it with held-out permutation importance and re-run — expect the ranking to change.
+  2. **Add an identifier lint** to your feature pipeline: reject columns matching `_id$|_ref$|_key$|uuid` unless explicitly allow-listed. This is the war story, prevented, in about 15 lines.
+  3. **Plot accuracy against pickle size** for your largest forest. On the measurement above, dropping from 500 to 100 trees saved 588 MB for 0.0015 accuracy. That is a serving-cost decision your team has probably never made explicitly.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| An ID column is the top "driver" | impurity importance's cardinality bias | permutation importance on held-out data; drop the column and re-measure |
+| Permutation importance run on training data | it measures memorisation, not generalization | always pass held-out `X`, `y` |
+| Two correlated features both look useless | permuting one leaves the other available | permute the group jointly |
+| More trees, no improvement | you are at the `rho * sigma^2` floor | lower `rho` with `max_features`, or switch to boosting to attack bias |
+| Forest loses to logistic regression | many weak additive signals, or sparse high-dimensional data | always fit the linear baseline; it takes 20 ms |
+| `oob_score=True` raises `ValueError` | `bootstrap=False` leaves no out-of-bag rows | set `bootstrap=True`, or use cross-validation |
+| Optimistic OOB on customer-level data | repeated rows per entity | `GroupKFold`; OOB cannot express grouping |
+| Model artifact is hundreds of megabytes | `n_estimators=500` with unlimited depth | cap depth or `max_leaf_nodes`; plot accuracy against size |
+
+## Assessment
+
+**Concept questions (8).**
+1. Derive `Var = rho sigma^2 + (1-rho) sigma^2 / B` from the definition of the variance of a sum.
+2. Why is `(1 - 1/n)^n` approximately 0.368, and what does it mean operationally?
+3. Individual trees get *worse* as `max_features` falls, but the forest gets better. Explain.
+4. Why are forest trees grown deep while boosting trees are shallow?
+5. Give two independent reasons not to trust `feature_importances_`.
+6. Permutation importance gives near-zero to two perfectly correlated strong features. Why, and what do you do?
+7. When is the OOB score not a valid substitute for cross-validation?
+8. Why can a random forest never predict a value above its largest training target?
+
+**Coding challenge.** Implement `grouped_permutation_importance(model, X, y, groups, n_repeats, scoring)` that shuffles all columns in a group with a *shared* permutation index and returns mean and standard deviation per group. Hidden tests: on a dataset with two exact duplicate columns, the grouped importance of the pair must be at least 10x the individual permutation importance of either one.
+
+**Interview questions.**
+- *Junior:* "What is bagging and why does it help?"
+- *Mid:* "Your random forest says the top feature is `customer_id`. What is happening and what do you do?"
+- *Senior:* "You have a 700 MB forest and a 40 ms p99 latency budget. Walk me through the options and how you would choose."
+
+**Draw from memory.** The bags with out-of-bag rows greyed, the variance formula with `rho` circled, and the two importance bar charts.
+
+## Sources & further reading
+
+**Primary docs**
+- [scikit-learn 1.9 "Ensembles: Forests of randomized trees"](https://scikit-learn.org/stable/modules/ensemble.html#forest) — read this for the exact `max_features` defaults per task and the parallelism notes.
+- [scikit-learn 1.9 "Permutation feature importance"](https://scikit-learn.org/stable/modules/permutation_importance.html) — read this for the explicit warning about training-set evaluation and the correlated-feature caveat, both with worked examples.
+- [scikit-learn 1.9 `RandomForestClassifier` — `oob_score`, `warm_start`](https://scikit-learn.org/stable/modules/generated/sklearn.ensemble.RandomForestClassifier.html) — read this for `warm_start`, which is how you do the stretch challenge in one fit.
+
+**Papers**
+- [Breiman, L. (1996), "Bagging Predictors," *Machine Learning* 24(2).](https://doi.org/10.1023/a:1018054314350) *Takeaway:* bagging helps unstable learners and does nothing for stable ones.
+- [Breiman, L. (2001), "Random Forests," *Machine Learning* 45(1).](https://doi.org/10.1023/a:1010933404324) *Takeaway:* decorrelating the trees is the lever, and the generalization bound improves as tree correlation falls.
+- [Geurts, P. et al. (2006), "Extremely Randomized Trees," *Machine Learning* 63(1).](https://doi.org/10.1007/s10994-006-6226-1) *Takeaway:* random thresholds cut variance further, at a bias cost usually smaller than the saving.
+- [Strobl, C. et al. (2007), "Bias in random forest variable importance measures," *BMC Bioinformatics* 8.](https://doi.org/10.1186/1471-2105-8-25) *Takeaway:* impurity importance favours high-cardinality features strongly enough to invert the true ranking.
+- [Louppe, G. et al. (2013), "Understanding variable importances in forests of randomized trees," *NIPS 26*.](https://papers.nips.cc/paper_files/paper/2013/hash/e3796ae838835da0b6f6ea37bcf8bcb7-Abstract.html) *Takeaway:* a formal account of what impurity importance estimates and why correlated features share the credit.
+
+**Go deeper**
+- [Hastie, Tibshirani & Friedman, *The Elements of Statistical Learning*, 2nd ed., Section 15.2 and 15.4.](https://hastie.su.domains/ElemStatLearn/) Read it for the variance derivation done properly and for the discussion of why forests cannot overfit with more trees, in about 8 pages.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-18/p3-w18-m2">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

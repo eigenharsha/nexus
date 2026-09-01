@@ -1,0 +1,528 @@
+---
+title: "Unsupervised learning: clustering"
+description: "Week 18 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+{/* AUTHORED */}
+
+<Note>
+**Week 18 · Module 4 · `P3-W18-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** `P3-W17-M1` (what a label is, and what it means not to have one), Week 11 (Euclidean distance)
+- **Unlocks:** `P3-W18-M5` (reducing dimensions before or after clustering), `P3-W27-M3` (IVF indexes for vector search are K-Means on embeddings)
+- **One line:** you will implement Lloyd's algorithm, choose `k` defensibly, and know the three shapes of data on which K-Means is structurally wrong.
+
+## What you'll be able to do
+
+1. Explain what changes when there are no labels — including what "evaluation" can and cannot mean
+2. Implement Lloyd's algorithm and watch it converge in a handful of iterations
+3. Choose `k` using the elbow, silhouette and Calinski-Harabasz together, and say why no single one is enough
+4. Explain why K-Means needs scaling and why `k-means++` initialisation matters, both with numbers
+5. Name and demonstrate the three failure shapes: non-convex, anisotropic, unequal-variance
+6. Cluster 10 million points and say honestly which algorithm actually wins
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w18-m4.svg" alt="Hand-drawn sketch: K-Means assignment and update steps, and where they fail" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w18-m4-dark.svg" alt="Hand-drawn sketch: K-Means assignment and update steps, and where they fail" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w18-m4
+tier: T2
+one-sentence-goal: Show that K-Means alternates two trivial steps and that its implicit assumption is round, equal-sized, equal-variance blobs — so the failures are predictable from the shape of the data alone.
+elements:
+  - left half, two stacked panels labelled (1) ASSIGN and (2) UPDATE, with the same 12 scattered points. In (1) each point has a short arrow to its nearest of 3 crossed centroid markers, with the dividing lines between centroids drawn as a hand-drawn Voronoi. In (2) the crosses have visibly moved to the middle of their groups, with dashed ghosts showing where they were
+  - a curved arrow looping from (2) back to (1) labelled "repeat. converged in 2 iterations here."
+  - amber margin note: "inertia 1200.2 -> 566.9 -> stop. that's it. that's the algorithm."
+  - right half, three small failure panels in a row, each with a red cross-out:
+      "MOONS: two crescents with a straight vertical cut through both, ARI 0.2549"
+      "ANISOTROPIC: three sheared ellipses with round Voronoi cells slicing them wrongly, ARI 0.8995"
+      "UNEQUAL VARIANCE: one big loose blob and two tight ones, the big one split in half, ARI 0.8265"
+  - beside each failure, in green, the fix: "DBSCAN 1.0000", "GaussianMixture 1.0000", "GaussianMixture 0.9664"
+  - bottom strip: two silhouette numbers side by side with a red cross-out over the larger one — "raw data: silhouette 0.6973, ARI 0.4914" vs "standardised: silhouette 0.3434, ARI 0.6536" and the amber note "the WORSE silhouette is the BETTER clustering. internal metrics measure geometry, not truth."
+  - dangling arrow: "...10M points? -> and the answer surprises you"
+numbers-to-write-in: 1200.2 -> 566.9, ARI 0.2549 / 0.8995 / 0.8265, silhouette 0.6973 vs 0.3434
+alt: A hand-drawn sketch showing the K-Means assign and update steps alternating to convergence in two iterations, three red-crossed failure panels for moon-shaped, anisotropic and unequal-variance data with their adjusted Rand scores, and a bottom strip showing that standardising the data lowered the silhouette score while raising agreement with the truth.
+*/}
+
+## Why you should care
+
+**For Aarav (student).**
+- K-Means is the algorithm most likely to come up in an interview as "explain an unsupervised method", and the two-step loop is short enough to write on a whiteboard from memory.
+- "How do you choose k?" is the follow-up, and having three methods plus a reason why none of them is sufficient is a much better answer than "the elbow".
+- Customer segmentation is a project you can do end-to-end in an afternoon and describe in business terms, which is exactly what a portfolio needs.
+
+**For Meera (professional).**
+- Somebody in your company will ask for "customer segments" this year. The technical part takes an hour; the part that makes it useful is deciding what to cluster on and how to describe the result.
+- This shows up in your job as: a segmentation that changes completely between two runs, because `n_init` was 1 and the initialisation was random. Measured below, that gives inertia ranging from 3,368 to **20,752** — a 6x spread — across 30 seeds.
+- The clustering machinery here is the same machinery inside a vector index: an IVF index in Week 27 is literally K-Means over your embeddings, and `nprobe` is "how many of those clusters to search".
+
+## The mental model
+
+Pick `k` points to be the centres. Repeat two steps until nothing moves: **assign** every point to its nearest centre, then **update** each centre to be the mean of the points assigned to it. That is K-Means, in full. The objective it minimises is **inertia** — the total squared distance from each point to its assigned centre — and each of the two steps provably cannot increase it, which is why it converges. The catch is what "nearest centre" implies: the boundary between two centres is a straight line equidistant from both, so K-Means can only ever produce convex, roughly round, roughly equal-sized regions. Every one of its failures is that assumption meeting data that does not satisfy it.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+
+### What changes without labels
+
+Every model so far had a right answer to compare against. Clustering does not. Three things follow, and they are the reason unsupervised work is harder to do well, not easier:
+
+1. **There is no test set**, because there is nothing to test against. You cannot hold out rows and check whether the clusters were "correct".
+2. **The metrics measure geometry, not truth.** Inertia and silhouette tell you whether your groups are compact and separated. They cannot tell you whether the groups mean anything.
+3. **The output is an input to a human decision.** A segmentation is only useful if somebody can act differently on segment 2 than on segment 3. That makes "can you describe each cluster in one sentence a marketer would understand" a genuine acceptance criterion.
+
+### Lloyd's algorithm
+
+```
+choose k initial centroids
+repeat:
+    ASSIGN:  for each point, find the nearest centroid (Euclidean distance)
+    UPDATE:  move each centroid to the mean of the points assigned to it
+until no centroid moves
+```
+
+```python
+# pip install "numpy==2.5.2" "scikit-learn==1.9.0"
+import numpy as np
+from sklearn.datasets import make_blobs
+from sklearn.cluster import KMeans
+
+X, y_true = make_blobs(n_samples=300, centers=3, cluster_std=1.0, random_state=42)
+rng = np.random.default_rng(3)
+C = X[rng.choice(len(X), 3, replace=False)]          # pick 3 random points as centroids
+
+for it in range(1, 8):
+    d = ((X[:, None, :] - C[None, :, :]) ** 2).sum(-1)     # (n, k) squared distances
+    labels = d.argmin(1)                                   # ASSIGN
+    newC = np.array([X[labels == j].mean(0) for j in range(3)])   # UPDATE
+    inertia = d[np.arange(len(X)), labels].sum()
+    shift = np.linalg.norm(newC - C, axis=1).max()
+    print(f"iter {it}: inertia {inertia:9.3f}   max centroid shift {shift:.5f}")
+    C = newC
+    if shift < 1e-9:
+        break
+
+print("sklearn inertia:", round(KMeans(n_clusters=3, n_init=10, random_state=0).fit(X).inertia_, 3))
+```
+
+```
+iter 1: inertia  1200.226   max centroid shift 1.69292
+iter 2: inertia   566.860   max centroid shift 0.00000
+sklearn inertia: 566.86
+```
+
+**Two iterations.** K-Means converges startlingly fast on well-separated data — most of the work happens in the first pass. It also reaches exactly the same inertia as scikit-learn, and the adjusted Rand index against the true blob labels is **1.0000**: a perfect recovery.
+
+### Line by line
+
+- `((X[:, None, :] - C[None, :, :]) ** 2).sum(-1)` broadcasts to an `(n, k)` matrix of squared distances. This is the expensive step: `O(n * k * d)` per iteration, and it is what every optimisation in the library attacks.
+- `d.argmin(1)` is the assign step: nearest centroid per point.
+- `X[labels == j].mean(0)` is the update step. The **mean** is not arbitrary — it is the point that minimises the sum of squared distances to a set, which is why K-Means specifically minimises *squared* Euclidean distance and not, say, Manhattan distance. (Use the median instead and you get K-Medians, minimising L1.)
+- `inertia` is the objective: total squared distance from each point to its centre. Lower is better, and it can only decrease — the assign step cannot increase it (each point moves to a closer centre or stays) and neither can the update step (the mean minimises it).
+
+<Warning>
+Inertia **always decreases as `k` increases**, reaching zero when `k = n`. So you can never choose `k` by minimising inertia. That is the entire reason the elbow method exists.
+</Warning>
+
+### Choosing k
+
+```python
+from sklearn.metrics import silhouette_score, calinski_harabasz_score
+for k in range(2, 9):
+    m = KMeans(n_clusters=k, n_init=10, random_state=0).fit(X)
+    print(f"k={k}  inertia {m.inertia_:8.2f}  silhouette {silhouette_score(X, m.labels_):.4f}"
+          f"  CH {calinski_harabasz_score(X, m.labels_):8.1f}")
+```
+
+```
+k=2  inertia  5763.46  silhouette 0.7049  CH   756.9
+k=3  inertia   566.86  silhouette 0.8480  CH  5196.3
+k=4  inertia   496.82  silhouette 0.6604  CH  3953.1
+k=5  inertia   426.32  silhouette 0.4924  CH  3455.7
+k=6  inertia   361.11  silhouette 0.3306  CH  3263.3
+k=7  inertia   320.03  silhouette 0.3359  CH  3065.1
+k=8  inertia   272.68  silhouette 0.3625  CH  3079.4
+```
+
+Three different signals, all pointing at `k = 3` (which is the truth, since we generated three blobs):
+
+- **Elbow.** Inertia falls off a cliff from 5,763 to 567 going from `k = 2` to `k = 3`, then only from 567 to 497 going to `k = 4`. The "elbow" is where the curve stops dropping steeply. It is a judgement call and on real data it is often ambiguous.
+- **Silhouette.** For each point, `(b - a) / max(a, b)` where `a` is its mean distance to its own cluster and `b` its mean distance to the nearest *other* cluster. Ranges from −1 to 1; higher is better. Peaks sharply at `k = 3` (0.8480). This is the least ambiguous of the three when it works, and it costs `O(n^2)` distances so it needs subsampling above roughly 20,000 points.
+- **Calinski-Harabasz.** The ratio of between-cluster to within-cluster dispersion. Cheap (`O(nk)`), peaks at `k = 3` (5,196), and is a good default when silhouette is too expensive.
+
+**Use all three, and treat disagreement as information.** If the elbow says 4 and silhouette says 7, your data probably does not have a clean `k`, and forcing one is a decision you should make explicitly rather than by picking whichever metric agreed with you.
+
+### Guided practice
+
+1. Change `cluster_std` to 2.5 and rerun the `k` sweep. Does silhouette still peak at 3?
+2. Run `KMeans(n_clusters=3, n_init=1, init="random", random_state=s)` for `s` in 0..9 on the harder data and print the inertias. How much do they vary?
+3. Compute the silhouette of a `k = 3` solution on data that genuinely has one blob. What do you get?
+
+<Accordion title="Answers">
+1. The peak flattens and can move. With heavy overlap the clusters are not separated, so "the right k" stops being well defined — which is the honest answer for a lot of real data. Do not report a `k` chosen from a flat curve as though it were discovered.
+2. On a 12-cluster dataset, measured: `init="random"` with `n_init=1` gives inertia mean **5,429.7**, standard deviation **2,999.4**, best 3,368.4, **worst 20,752**. A 6x spread. This is why `n_init` exists and why its default is 10 (and `"auto"` in recent versions).
+3. Something around 0.4–0.5, which is not obviously bad. **Silhouette does not have a "there are no clusters" output.** It will happily score an arbitrary partition of a single Gaussian blob. Module 5 shows the same problem for t-SNE, and it is the central hazard of unsupervised work: the methods always produce an answer.
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+  <Accordion title="1. Why does K-Means use the mean and not the median?">
+  Because the mean is the minimiser of the sum of *squared* distances, which is the objective. Swap in the median and you are minimising sum of absolute distances — a different algorithm (K-Medians) that is more robust to outliers and slower.
+  </Accordion>
+  <Accordion title="2. Is K-Means guaranteed to find the best clustering?">
+  No. It is guaranteed to converge to a *local* minimum of inertia. The initialisation determines which one, which is why you run it several times (`n_init`) and keep the lowest-inertia result.
+  </Accordion>
+  <Accordion title="3. What shape are the cluster boundaries?">
+  Straight lines (hyperplanes in higher dimensions) equidistant between pairs of centroids — a Voronoi tessellation. Every cluster is therefore convex. If your true groups are not convex, K-Means cannot represent them at any `k`.
+  </Accordion>
+  <Accordion title="4. Does K-Means need feature scaling?">
+  Yes, badly. Distance is dominated by whichever feature has the largest numeric range, so a feature in dollars will overwhelm one in years. Measured below: standardising `load_breast_cancer` moved agreement with the true diagnosis from ARI 0.4914 to 0.6536.
+  </Accordion>
+  <Accordion title="5. What happens to an empty cluster?">
+  A centroid can end up with no points assigned. scikit-learn relocates it to the point furthest from its current centroid. A naive implementation divides by zero and produces `nan` — this is the single most common bug in a from-scratch K-Means.
+  </Accordion>
+</AccordionGroup>
+
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+
+### `k-means++`, measured
+
+Random initialisation frequently lands two centroids inside the same true cluster, and Lloyd's algorithm cannot recover — no move of a centroid ever crosses another cluster's basin. **`k-means++`** (Arthur & Vassilvitskii, 2007) fixes this by choosing initial centres far apart: pick the first uniformly at random, then pick each subsequent one with probability proportional to `D(x)^2`, the squared distance to the nearest already-chosen centre.
+
+```python
+# scikit-learn 1.9.0 — 3000 points, 12 true clusters, single initialisation
+import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.datasets import make_blobs
+X, _ = make_blobs(n_samples=3000, centers=12, cluster_std=0.8, random_state=7)
+for init in ("random", "k-means++"):
+    ins = [KMeans(n_clusters=12, init=init, n_init=1, random_state=s).fit(X).inertia_
+           for s in range(30)]
+    print(f"{init:<10} mean {np.mean(ins):8.1f}  sd {np.std(ins):7.1f}"
+          f"  best {min(ins):8.1f}  worst {max(ins):9.1f}")
+```
+
+```
+random     mean   5429.7   sd  2999.4   best   3368.4   worst   20751.8
+k-means++  mean   3691.3   sd   332.9   best   3368.2   worst    4616.0
+```
+
+Both find the same best solution (3,368). The difference is reliability: `k-means++` has **9x lower standard deviation** and its worst case is 4,616 against random's 20,752 — a 4.5x difference in how bad a single unlucky run can be. `k-means++` costs `k` extra passes over the data, which is negligible.
+
+Arthur and Vassilvitskii also prove a guarantee: `k-means++` initialisation alone, before any Lloyd iterations, is `O(log k)`-competitive with the optimal clustering in expectation. It is the rare case where the theoretically-motivated method is also the practical default.
+
+### Scaling, and a warning about metrics
+
+```python
+from sklearn.datasets import load_breast_cancer
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import adjusted_rand_score, silhouette_score
+
+X, y = load_breast_cancer(return_X_y=True)
+for name, Xd in [("raw", X), ("standardised", StandardScaler().fit_transform(X))]:
+    lab = KMeans(n_clusters=2, n_init=10, random_state=0).fit_predict(Xd)
+    print(f"{name:<14} ARI vs diagnosis {adjusted_rand_score(y, lab):.4f}"
+          f"   silhouette {silhouette_score(Xd, lab):.4f}")
+```
+
+```
+raw            ARI vs diagnosis 0.4914   silhouette 0.6973
+standardised   ARI vs diagnosis 0.6536   silhouette 0.3434
+```
+
+Read that twice. **Standardising made the clustering much better (ARI 0.4914 to 0.6536, +33% relative) and the silhouette score much worse (0.6973 to 0.3434).**
+
+The reason is that on raw data one feature — `worst area`, with values in the thousands — dominates every distance, so the "clusters" are essentially a threshold on that one column. That produces two very compact, well-separated groups in a space that is effectively one-dimensional, and silhouette *loves* that. It just does not correspond to the diagnosis.
+
+**Internal metrics score geometry. They cannot score correctness.** Any time you have a label available — even a partial or proxy one — compute an external metric (adjusted Rand index, adjusted mutual information, or simply a cross-tab) alongside. And when you have no label at all, remember that a high silhouette is evidence of compact geometry, not evidence of a meaningful segmentation.
+
+### The three shapes K-Means gets wrong
+
+| Data shape | K-Means ARI | Better method | Its ARI |
+| --- | --- | --- | --- |
+| Two interleaved crescents (`make_moons`) | **0.2549** | `DBSCAN(eps=0.18, min_samples=5)` | **1.0000** |
+| Three sheared ellipses (anisotropic) | 0.8995 | `GaussianMixture(covariance_type="full")` | **1.0000** |
+| Three blobs, standard deviations 1.0 / 2.5 / 0.5 | 0.8265 | `GaussianMixture(covariance_type="full")` | **0.9664** |
+
+- **Non-convex.** The crescents cannot be separated by any straight line, so no `k` and no initialisation saves K-Means. DBSCAN, which grows clusters by density connectivity rather than distance to a centre, gets it perfectly.
+- **Anisotropic.** Each true cluster is a stretched ellipse. K-Means' Voronoi cells are bounded by straight lines *equidistant* between centres, which cuts the ellipses at the wrong angle. A full-covariance Gaussian mixture, which learns an orientation and stretch per component, recovers them exactly.
+- **Unequal variance.** The loose cluster is wider than the gap to its neighbours, so K-Means splits it and absorbs part of a tight one. A Gaussian mixture models the different variances directly.
+
+Two of the three fixes are the same fix. Layer 3 explains why: K-Means *is* a Gaussian mixture with the covariance frozen to a shared spherical shape.
+
+### DBSCAN
+
+`DBSCAN(eps, min_samples)` labels a point a **core point** if at least `min_samples` points lie within `eps` of it, links core points that are within `eps` of each other, attaches non-core points that are within `eps` of a core point, and labels everything else **noise** (`-1`).
+
+| Property | K-Means | DBSCAN |
+| --- | --- | --- |
+| Needs `k` | yes | no — it discovers the count |
+| Cluster shape | convex only | arbitrary |
+| Handles noise | no (every point is assigned) | yes, explicitly labels `-1` |
+| Key parameters | `k`, `n_init` | `eps`, `min_samples` — and `eps` is much harder to choose than `k` |
+| Varying density | copes | **struggles badly** |
+| Cost | `O(n k d)` per iteration | `O(n log n)` with a spatial index; `O(n^2)` without |
+
+The last row is the honest caveat and the reason DBSCAN is not simply better. Measured on the unequal-variance blobs above, `DBSCAN(eps=0.6, min_samples=5)` scores **ARI 0.8759** — better than K-Means' 0.8265, but well short of the mixture model's 0.9664 — because a single global `eps` cannot be right for both a tight cluster and a loose one. `HDBSCAN` (in scikit-learn since 1.3 as `sklearn.cluster.HDBSCAN`) removes the `eps` parameter by building a hierarchy over all density levels, and is usually the better default when you were reaching for DBSCAN.
+
+To choose `eps` for plain DBSCAN: plot the sorted distance to each point's `min_samples`-th nearest neighbour and look for the knee. It is the elbow method again, with the same ambiguity.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **K-Means** vs **Gaussian mixture** | you want speed, `O(nkd)` per iteration, hard assignments, and the clusters are roughly round | clusters are elongated or of different sizes; you want soft (probabilistic) membership; you can afford `O(nkd^2)` for full covariances |
+| **K-Means** vs **DBSCAN/HDBSCAN** | you know roughly how many groups you want; every point must be assigned | shapes are irregular, there is genuine noise to exclude, or the number of groups is the question |
+| **K-Means** vs **agglomerative** | `n` is large; you want a flat partition | `n` is under ~20,000 and a dendrogram is itself the deliverable — "which segments merge first" is often the most useful output for a stakeholder |
+| **Standardise** vs **raw** | almost always standardise | the units are already comparable and meaningful (all currency, all counts of the same thing) — and even then, check |
+| **Silhouette** vs **Calinski-Harabasz** | `n` under ~20,000; you want the per-point diagnostic | `n` is large — CH is `O(nk)` where silhouette is `O(n^2)` |
+
+### Turning clusters into a segmentation
+
+The technical output is a label per row. The deliverable is a page a marketing or product team can act on. Four steps that turn one into the other:
+
+1. **Profile each cluster against the population.** For every feature, report the cluster mean and its ratio to the overall mean. The features with the largest ratios are what the cluster *is*.
+2. **Size it.** Percentage of rows and, more usefully, percentage of revenue. A 3%-of-customers cluster that is 40% of revenue is the finding.
+3. **Name it from the top three ratios**, not from the cluster index. "High-frequency low-basket" beats "cluster 2" and survives a re-run with different index numbering.
+4. **State the stability.** Re-run with 20 different `random_state` values and report what fraction of pairs of customers that were together stay together (adjusted Rand index between runs). A segmentation that is not stable across seeds is not a segmentation.
+
+### War story: the segmentation that was a currency
+
+A retail analytics team delivered a five-segment customer clustering built on 14 behavioural features. It was well received and used for a quarter's campaign planning. The most valuable segment, "high-value engaged", was 4% of customers and 31% of revenue.
+
+The problem surfaced when the team expanded into a second country. The new market's customers all landed in one segment, and it was the wrong one.
+
+The features had not been standardised. `total_spend` was in local currency units, and it had a range roughly 400x larger than any other feature, so Euclidean distance was effectively `|spend_i - spend_j|` and the "segmentation" was five spend bands with some noise. In the second market the currency was worth about a hundredth as much per unit, so every customer's spend value was two orders of magnitude larger and the distance geometry was different again.
+
+The measurement that made it undeniable: cluster on `total_spend` **alone** and compare against the 14-feature clustering. Adjusted Rand index **0.87**. Thirteen features were contributing 13% of the structure.
+
+The fix was `StandardScaler` inside the pipeline, plus a log transform on the two heavily skewed monetary features, plus a new acceptance test in CI: cluster on each single feature in turn and assert that no single-feature clustering achieves ARI above 0.5 against the full clustering. The segments changed substantially and the team had to re-brief the campaign — which is why this test belongs in CI *before* the first delivery, not after.
+
+### Design checkpoint
+
+> Marketing want "customer segments". You have 2 million customers and 60 features spanning currency, counts, dates and two high-cardinality categoricals. Walk through your plan.
+
+<Accordion title="Model answer">
+The clustering is the easy part; the four decisions before it are the work. **(1) What is a row?** A customer as of a fixed date, with features computed over a fixed window — not "all time", which makes tenure a hidden feature and means the segmentation drifts as the window grows. **(2) Which features?** Not all 60. Cluster on behaviour you want to act on, and deliberately exclude anything you cannot influence and anything that is a proxy for tenure unless you mean it. Fewer, well-chosen features produce segments people can name. **(3) How are they transformed?** Log-transform the skewed monetary features, then standardise everything; one-hot the low-cardinality categoricals and drop or embed the high-cardinality ones (a 5,000-level category one-hot encoded contributes 5,000 dimensions of almost-orthogonal noise to a Euclidean distance, which is a real problem — Module 5 covers reducing it). **(4) How many?** Sweep `k` from 2 to 12 with `k-means++` and `n_init=10`, look at silhouette on a 20,000-row subsample and Calinski-Harabasz on everything, but choose the final `k` on *actionability*: the marketing team can run at most 4 or 5 distinct campaigns, so `k = 12` is unusable even if it scores best. Then run `MiniBatchKMeans` only if the full fit is too slow, having measured it — Layer 3 shows it may not help. Finally, before delivery: the single-feature ARI test from the war story, and a stability check across 20 seeds.
+</Accordion>
+
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+
+### K-Means is a Gaussian mixture with the covariance frozen
+
+Fit a Gaussian mixture model by expectation-maximisation. The E-step computes each point's *soft* responsibility for each component; the M-step updates each component's mean, covariance and weight. Now impose three restrictions:
+
+1. All components share an identical **spherical** covariance `sigma^2 * I`.
+2. All components have equal mixture weight `1/k`.
+3. Take `sigma^2` to zero.
+
+As `sigma^2` goes to zero the responsibilities become hard — the exponential `exp(-||x - mu_j||^2 / 2 sigma^2)` concentrates entirely on the nearest centre — and the E-step becomes "assign to the nearest centroid". The M-step becomes "set the mean to the average of the assigned points". **That is exactly Lloyd's algorithm.** K-Means is the zero-variance, hard-assignment, equal-weight, spherical-covariance limit of EM for a Gaussian mixture.
+
+This single fact predicts every failure in Layer 2 before you run anything:
+
+- **Spherical covariance** implies round clusters, so anisotropic (sheared) clusters fail: measured ARI 0.8995 for K-Means against **1.0000** for `GaussianMixture(covariance_type="full")`.
+- **Shared covariance** implies equal spread, so unequal-variance clusters fail: 0.8265 against **0.9664**.
+- **Hard assignment** discards the information that a point is genuinely ambiguous between two clusters, which matters most exactly where clusters overlap.
+- **Equal weights** bias toward equal-sized clusters, which is why K-Means tends to split a large cluster and merge two small ones.
+
+The cost of relaxing them: `GaussianMixture(covariance_type="full")` estimates `k * d * (d+1) / 2` covariance parameters. At `d = 60` and `k = 8` that is 14,640 parameters, needing a lot of rows and an `O(n k d^2)` E-step. `covariance_type="diag"` is the usual compromise — it allows different per-axis variances (fixing the unequal-variance case) without allowing rotation (so it does not fix anisotropy).
+
+### The 10-million-point measurement, and what it overturns
+
+The standard advice is that `MiniBatchKMeans` is the answer at scale — it updates centroids from small random batches instead of full passes, so each iteration is `O(batch * k * d)` instead of `O(n * k * d)`. Here is the measurement, on 10,000,000 points, 16 dimensions, `k = 100`, float32 (640 MB), scikit-learn 1.9.0, Apple M3 Pro with 11 cores:
+
+| Method | Wall clock | Inertia | vs full K-Means |
+| --- | --- | --- | --- |
+| `KMeans(n_init=1, max_iter=50)` | **35.3 s** | 3.89096e8 | — |
+| `MiniBatchKMeans(batch_size=4096)` | 59.3 s | 4.16516e8 | **1.7x slower**, 7.05% worse inertia |
+| `MiniBatchKMeans(batch_size=65536)` | 36.2 s | 3.85500e8 | 1.0x, **0.92% better** inertia |
+
+Peak resident memory for the full fit: 2.33 GB for 640 MB of data.
+
+**MiniBatchKMeans bought nothing.** This contradicts advice that is still in most tutorials, and the reason is that the advice is fifteen years old. scikit-learn's `KMeans` is now Cython with OpenMP parallelism and chunked distance computation, so the full assign step saturates 11 cores; `MiniBatchKMeans` processes small batches that cannot fill the machine and pays Python-level loop overhead per batch. At `batch_size=4096` that overhead dominates completely.
+
+The honest statement of when `MiniBatchKMeans` *is* right:
+
+- **The data does not fit in memory.** It supports `partial_fit`, so you can stream. This is its real advantage and it is an availability argument, not a speed argument.
+- **You are on one core** (a constrained container, a serverless function).
+- **`k` is very large** — several thousand — where the full assign step's `n*k` term dominates everything.
+- **You need an answer in seconds, not tens of seconds**, and can accept a 5–10% inertia penalty.
+
+The general lesson is worth more than the specific result: **library performance advice decays.** Re-measure the folklore on your own hardware before designing around it.
+
+### Clustering at scale is vector-index clustering
+
+This is the forward link that makes this module load-bearing for Phase 4. An **IVF** (inverted file) vector index — FAISS's `IndexIVFFlat`, and the same idea inside most managed vector databases — is built by running **K-Means over your embedding vectors** to produce `nlist` centroids, assigning every vector to its nearest centroid, and storing an inverted list per centroid. At query time you compare the query to the `nlist` centroids, pick the closest `nprobe` of them, and search only those lists.
+
+So everything in this module transfers directly to Week 27:
+
+| Here | There |
+| --- | --- |
+| `k` | `nlist`, the number of coarse cells (a common heuristic is `4*sqrt(n)` to `16*sqrt(n)`) |
+| Cluster assignment | which inverted list a vector lives in |
+| `n_init` and initialisation quality | index build quality; a bad clustering means unbalanced lists and worse recall |
+| How many clusters to search | `nprobe` — the recall/latency dial |
+| Unequal cluster sizes | unbalanced lists, so latency varies per query |
+| Curse of dimensionality | why IVF on raw 1536-dimensional embeddings underperforms and why product quantization exists |
+
+The concrete consequence: when Week 27 asks you to tune `nlist` and `nprobe` against a recall target, you are choosing `k` and deciding how many Voronoi cells to search. Same algorithm, different vocabulary.
+
+### The curse of dimensionality
+
+In high dimensions, distances concentrate: the ratio of the distance to the nearest neighbour and the distance to the farthest neighbour approaches 1 as `d` grows, for a wide class of distributions (Beyer et al., 1999). "Nearest" stops being meaningfully different from "typical", and every distance-based method — K-Means, DBSCAN, k-NN — degrades.
+
+The practical thresholds, in the order you should try them:
+
+- Below roughly 10–20 informative dimensions, Euclidean clustering behaves as your intuition expects.
+- Between 20 and a few hundred, results are usable but you should reduce first. PCA to retain 90–95% of the variance is the standard move (Module 5), and it also speeds up every iteration.
+- Above a few hundred — one-hot encoded high-cardinality categoricals, TF-IDF, raw embeddings — plain K-Means on the raw vectors is usually a mistake. Use PCA or a learned reduction first, or switch to a method built for the geometry (spherical K-Means on L2-normalised vectors, i.e. cosine distance, which is what most embedding work uses).
+
+One specific trap: **one-hot encoding a 5,000-level categorical adds 5,000 dimensions in which almost every pair of rows differs by exactly `sqrt(2)`.** That contributes a nearly constant offset to every pairwise distance and drowns your 10 real behavioural features. Reduce it, hash it, or leave it out.
+
+### Failure modes
+
+| Failure | Signature | Detector |
+| --- | --- | --- |
+| Segments are just one feature's bands | one feature has a much larger range | cluster on each feature alone and compare to the full clustering by ARI; alert above 0.5 |
+| Clusters change completely between runs | `n_init=1` with random init | `n_init>=10`, `init="k-means++"`; report ARI across 20 seeds |
+| High silhouette, useless segments | internal metric scoring geometry, not meaning | always report an external metric or a cross-tab against any label you have |
+| `nan` centroids | empty cluster, divide by zero | relocate the empty centroid to the furthest point, as scikit-learn does |
+| K-Means splits one true cluster in two | unequal variance or unequal size | `GaussianMixture(covariance_type="diag" or "full")` |
+| DBSCAN puts everything in one cluster, or all in noise | `eps` wrong by a factor of 2 | k-distance knee plot; or use `HDBSCAN` and remove the parameter |
+| Clustering degrades after adding features | high-dimensional distance concentration | PCA first; check the intrinsic dimension |
+| Segmentation drifts monthly | features computed over an expanding window | fix the window; recompute as of a fixed reference date |
+
+### Papers
+
+- **Lloyd, S. (1982), "Least squares quantization in PCM," IEEE Transactions on Information Theory 28(2)** (circulated 1957). *Takeaway:* the two-step assign/update iteration converges because each step is a coordinate descent on the same objective, which is why it never needs a learning rate.
+- **Arthur, D. & Vassilvitskii, S. (2007), "k-means++: The Advantages of Careful Seeding," SODA.** *Takeaway:* seeding proportional to squared distance from the nearest chosen centre gives an `O(log k)`-competitive expected cost before a single Lloyd iteration — measured here as 9x lower run-to-run variance.
+- **Bishop, C. (2006), *Pattern Recognition and Machine Learning*, Section 9.3.2.** *Takeaway:* K-Means is the zero-variance limit of EM for a Gaussian mixture with shared spherical covariance, which is the single fact that predicts all three of its failure shapes.
+- **Ester, M., Kriegel, H.-P., Sander, J., Xu, X. (1996), "A Density-Based Algorithm for Discovering Clusters…," KDD.** *Takeaway:* defining clusters by density connectivity rather than distance to a centre finds arbitrary shapes and labels noise explicitly — at the cost of a global `eps` that fails when density varies.
+- **Beyer, K., Goldstein, J., Ramakrishnan, R., Shaft, U. (1999), "When Is 'Nearest Neighbor' Meaningful?" ICDT.** *Takeaway:* under broad conditions the contrast between nearest and farthest distances vanishes as dimension grows, which is why every distance-based method needs dimensionality reduction first.
+- **Rousseeuw, P. (1987), "Silhouettes: a graphical aid to the interpretation and validation of cluster analysis," J. Computational and Applied Mathematics 20.** *Takeaway:* the silhouette is a per-point diagnostic first and a scalar second — the distribution of per-point values tells you far more than the mean.
+
+### Stretch challenge
+
+Build the **IVF index that Week 27 will make you tune**, from the K-Means you have here. Take 500,000 sentence embeddings (or generate 500,000 random 384-dimensional unit vectors if you have not got embeddings yet), L2-normalise them, and cluster with `MiniBatchKMeans` into `nlist` cells for `nlist` in [256, 1024, 4096, 16384]. Build the inverted lists yourself with a dictionary. Then implement search: compare a query to the `nlist` centroids, take the top `nprobe`, and exhaustively scan those lists.
+
+Measure, for each `(nlist, nprobe)` pair: recall@10 against a brute-force ground truth, mean query latency, and — the interesting one — the **distribution of list sizes**, because an unbalanced clustering means p99 latency is set by the largest list, not the mean.
+
+The open question: is the best `nlist` for recall the same as the best `nlist` for p99 latency, and does `k-means++` initialisation (better inertia, more balanced cells) buy you more recall or more latency stability? There is no settled answer; produce the recall-versus-latency Pareto frontier and argue which point you would ship.
+
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Cluster customers, then produce a one-page segment description a marketing team could act on.
+</Card>
+
+<Steps>
+  <Step title="Prepare honestly">
+  Fix the reference date and the feature window. Log-transform skewed monetary features, then standardise. Write down which features you excluded and why.
+  </Step>
+  <Step title="Choose k with three signals">
+  Elbow, silhouette (on a subsample if `n` is large) and Calinski-Harabasz, for `k` from 2 to 12. Then choose on *actionability* and say so explicitly if it disagrees with the metrics.
+  </Step>
+  <Step title="Run the two acceptance tests">
+  Single-feature ARI against the full clustering — must be below 0.5 for every feature. Stability across 20 seeds — report the mean pairwise ARI.
+  </Step>
+  <Step title="Write the page">
+  One row per segment: a name derived from its top three feature ratios, its share of customers, its share of revenue, and one sentence naming the action to take. No cluster indices anywhere in the document.
+  </Step>
+</Steps>
+
+Time box: **3 hours**. Acceptance: no single feature reproduces the clustering at ARI above 0.5; mean pairwise ARI across seeds above 0.8; and a one-page document a non-technical reader can act on.
+
+## The whiteboard
+
+T2 build-up, four frames: (1) the points with three random centroid crosses; (2) the assign step with the Voronoi lines drawn in and every point's arrow; (3) the update step with dashed ghosts where the centroids were; (4) the three failure panels with their ARI values in red and the fixes in green.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p3-w18-m4-blank.svg) · [Editable source](/assets/diagrams/p3-w18-m4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+  **Resume line:** "Built a customer segmentation with stability and single-feature-dominance acceptance tests; demonstrated that standardisation raised agreement with ground truth by 33% while lowering the silhouette score."
+  **Interview move:** when asked how you choose `k`, give three methods, then say the thing almost nobody says: "and I choose on actionability, because a segmentation with twelve segments cannot be operated by a team that can run four campaigns."
+  **Portfolio:** the three failure panels with their ARI numbers is one image demonstrating that you know a method's assumptions, not just its API.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+  1. **Add the single-feature ARI test** to any clustering your company already uses. It takes twenty minutes and it is the war story, caught. If any single feature reproduces the segmentation at ARI above 0.5, the segmentation is that feature.
+  2. **Check `n_init` and `init`** in every `KMeans` call in your repo. `n_init=1` with random init has a measured 6x inertia spread across seeds.
+  3. **Re-measure the MiniBatch decision.** If a job uses `MiniBatchKMeans` for speed, time the full `KMeans` on the same data with current scikit-learn. On the measurement above, it was not slower.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Segments are spend bands | features not standardised; one feature dominates distance | `StandardScaler` in the pipeline; run the single-feature ARI test |
+| Clustering changes every run | `n_init=1`, random initialisation | `n_init>=10`, `init="k-means++"`; report cross-seed ARI |
+| Picked `k` by minimising inertia | inertia decreases monotonically in `k` | elbow plus silhouette plus CH, then choose on actionability |
+| High silhouette, meaningless segments | internal metric measures geometry | add an external metric or a cross-tab; profile the clusters |
+| `nan` in centroids | empty cluster | relocate to the furthest point |
+| K-Means splits one obvious cluster | unequal variance or elongation | `GaussianMixture(covariance_type="diag"/"full")` |
+| DBSCAN returns one cluster or all noise | `eps` badly chosen | k-distance knee plot, or use `HDBSCAN` |
+| Adding features made it worse | distance concentration in high dimensions | PCA first; drop one-hot columns from very high-cardinality categoricals |
+
+## Assessment
+
+**Concept questions (8).**
+1. Prove that neither the assign step nor the update step can increase inertia.
+2. Why can inertia never be used to choose `k`?
+3. State the three restrictions that turn a Gaussian mixture into K-Means.
+4. Silhouette went down and ARI went up after standardising. Explain.
+5. What is `k-means++`'s sampling distribution, and what does it guarantee?
+6. Why does DBSCAN struggle when cluster densities differ?
+7. Give the mapping between K-Means parameters and IVF vector-index parameters.
+8. Why does one-hot encoding a 5,000-level categorical break Euclidean clustering?
+
+**Coding challenge.** Implement `kmeans(X, k, init="k-means++", n_init=10, tol=1e-4, max_iter=300)` returning labels, centres and inertia, handling empty clusters by relocation. Hidden tests: inertia within 1% of `sklearn.cluster.KMeans` on three datasets; the `k-means++` variant's inertia standard deviation across 30 seeds must be at least 3x lower than the `"random"` variant's; and it must not produce `nan` on a dataset engineered to empty a cluster.
+
+**Interview questions.**
+- *Junior:* "Explain K-Means in two steps."
+- *Mid:* "How do you choose the number of clusters, and what would make you refuse to give a number?"
+- *Senior:* "You have 50 million 768-dimensional embeddings and need sub-20 ms nearest-neighbour search. How does clustering enter, and what do you tune?"
+
+**Draw from memory.** The assign/update loop and the three failure panels with their ARI values.
+
+## Sources & further reading
+
+**Primary docs**
+- [scikit-learn 1.9 "Clustering"](https://scikit-learn.org/stable/modules/clustering.html) — read this for the comparison table of every algorithm's scalability, geometry and parameters; it is the best one-page overview in any library.
+- [scikit-learn 1.9 "Clustering performance evaluation"](https://scikit-learn.org/stable/modules/clustering.html#clustering-performance-evaluation) — read this for which metrics need ground truth and which do not, and the adjustment-for-chance discussion behind adjusted Rand index.
+- [scikit-learn 1.9 `HDBSCAN`](https://scikit-learn.org/stable/modules/generated/sklearn.cluster.HDBSCAN.html) — read this if you were about to use DBSCAN; it removes `eps` and handles varying density.
+
+**Papers**
+- [Lloyd, S. (1982), "Least squares quantization in PCM," *IEEE Trans. Inf. Theory* 28(2).](https://doi.org/10.1109/tit.1982.1056489) *Takeaway:* the alternating algorithm is coordinate descent on inertia, hence its guaranteed convergence.
+- Arthur, D. & Vassilvitskii, S. (2007), "k-means++: The Advantages of Careful Seeding," *SODA*. *Takeaway:* distance-proportional seeding is `O(log k)`-competitive before any iterations and cuts run-to-run variance ninefold.
+- Ester, M. et al. (1996), "A Density-Based Algorithm for Discovering Clusters in Large Spatial Databases with Noise," *KDD*. *Takeaway:* density connectivity finds arbitrary shapes and isolates noise, at the price of a global density parameter.
+- [Beyer, K. et al. (1999), "When Is 'Nearest Neighbor' Meaningful?" *ICDT*.](https://doi.org/10.1007/3-540-49257-7_15) *Takeaway:* distance contrast vanishes with dimension, so reduce before you cluster.
+- [Rousseeuw, P. (1987), "Silhouettes…," *J. Comput. Appl. Math.* 20.](https://doi.org/10.1016/0377-0427(87)90125-7) *Takeaway:* read the distribution of per-point silhouettes, not the mean.
+
+**Go deeper**
+- [Bishop, C., *Pattern Recognition and Machine Learning*, Sections 9.1–9.3.](https://www.microsoft.com/en-us/research/publication/pattern-recognition-machine-learning/) Read it for the derivation of K-Means as the zero-variance limit of EM, which is about 12 pages and converts three separate empirical failures into one predictable consequence.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-18/p3-w18-m4">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,175 @@
+---
+title: "Lab — Self-Reporting System Monitor"
+description: "Week 2 lab · three tracks · self-graded"
+icon: "flask-conical"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**`LAB-P1-W02`** — one lab, three tracks. Beginners start at `basic` and climb.
+Working professionals start at `standard`. `hard` is where the interview stories come from.
+</Note>
+
+## The ticket
+
+> **NEXUS-208 · We have no idea what the build box is doing**
+>
+> Reported by: platform
+>
+> The shared build machine falls over roughly twice a month. By the time anyone looks, the
+> process that caused it is gone and there is nothing in any log. We do not have — and are not
+> going to buy — a monitoring agent for one box.
+>
+> Build us something that samples CPU, memory and disk every minute, keeps a rolling window,
+> writes a readable daily report, and commits that report to a Git repo over SSH so we have
+> history we did not have to host.
+>
+> Two hard requirements from the last incident review. It must be **safe to run twice** — the
+> previous version's cron and its manual retry both ran and produced a metrics file with
+> interleaved samples that we trusted for a week. And it must **survive being killed** — the
+> box gets OOM-reaped, and a corrupt metrics file is worse than no metrics file.
+
+**Time box.** `basic` 1–2 h · `standard` 4–6 h · `hard` 3–5 h on top of `standard`.
+
+## Get the starter
+
+```bash
+cd labs/p1/week-02
+tree -L 2
+# starter/   basic/  standard/  hard/  tests/  fixtures/
+# solution/  (do not open until you have a failing attempt)
+```
+
+<Tabs>
+<Tab title="basic">
+
+**Roughly 60% is written for you.** The report template, the test harness and the metric-parsing helpers exist. You write the sampler and the formatter.
+
+Sample CPU, memory and disk **once** and print a formatted report to stdout.
+
+```bash
+# starter/basic/monitor.sh
+sample_cpu()  { :; }   # TODO — return one number: percent busy
+sample_mem()  { :; }   # TODO — return one number: percent used
+sample_disk() { :; }   # TODO — return one number: percent used on /
+```
+
+**Acceptance criteria — all five:**
+
+1. `make -C basic verify` is green: the harness runs your script and asserts each value is a number between 0 and 100.
+2. The script starts with `#!/usr/bin/env bash` and `set -Eeuo pipefail`.
+3. It works on **both macOS and Linux** — the metric commands differ (`vm_stat` vs `/proc/meminfo`, `df -k` output columns differ), so branch on `uname`. The harness runs both paths where possible and checks you did not hardcode one.
+4. Diagnostics go to stderr; the report goes to stdout, so `./monitor.sh > report.txt` produces a clean file.
+5. `shellcheck monitor.sh` reports **zero** findings. Not "only warnings" — zero.
+
+<Info>
+The portable-metrics problem is the real content of this track. `free` does not exist on macOS.
+`vm_stat` reports pages, not bytes, and the page size is 16384 on Apple silicon — check with
+`pagesize`, do not assume 4096. Module 2's BSD-versus-GNU table is your reference.
+</Info>
+
+</Tab>
+<Tab title="standard">
+
+**Spec only.** You write the whole thing.
+
+A daemonised sampler (cron on Linux, `launchd` on macOS) that:
+
+- samples every 60 seconds into a rolling metrics file capped at 24 hours of samples;
+- generates a Markdown daily report with min/mean/p95/max for each metric;
+- commits the report and pushes to a Git remote **over SSH**;
+- is idempotent, locked, and logs everything it does.
+
+**Acceptance criteria — all eight:**
+
+1. **Idempotent.** `make -C standard verify-idempotent` runs the script 100 times in a row within one sampling window. Exactly one sample must be recorded and exactly one commit created. Runs 2–100 must exit 0 with a "nothing to do" log line.
+2. **Mutually exclusive.** `make -C standard verify-concurrent` launches 20 copies simultaneously. Exactly one does work; the other 19 exit with a distinct code (use 4) and a clear message. Verified by counting lines in the metrics file, not by reading output.
+3. **Atomic writes.** Every file the script publishes is written to a temporary file in the same directory and `mv`d into place. The harness inspects the script for an in-place write to a published path and fails if it finds one.
+4. **Rolling window.** After 25 hours of simulated samples (the harness fast-forwards timestamps) the metrics file contains exactly 1,440 samples and the oldest is under 24 hours old.
+5. **Percentiles are correct.** The harness feeds a known distribution and checks your p95 against the exact answer, within one sample.
+6. **Git over SSH.** The commit is pushed to a local bare repo over `ssh://`, using a key you generated. No passwords, no HTTPS tokens. The harness provides a container or a local `sshd` fixture.
+7. **Structured logging.** Every log line has an ISO-8601 UTC timestamp, a level, and a message, on **stderr**. `./monitor.sh 2>/dev/null` must produce only the report.
+8. `shellcheck` clean, and `bash -n` clean, on every `.sh` file.
+
+<Info>
+Criterion 5 is where most submissions lose points. A percentile over a sorted array has an
+off-by-one in the index computation that only shows up at small n or at exact boundaries.
+Test with n = 1, n = 2 and n = 20 before you test with 1,440.
+</Info>
+
+</Tab>
+<Tab title="hard">
+
+**The constraints the `standard` solution fails: crash safety, alerting, rotation, and a bisectable history.**
+
+**Acceptance criteria — all six:**
+
+1. **Survives 200 random `SIGKILL`s.** `make -C hard verify-chaos` starts the script and kills it with `-9` at a uniformly random point in its execution, 200 times. After every kill, the next run must succeed: no stale lock, no truncated metrics file, no partial commit, no half-written report. **Report how many of the 200 kills left a stale lock before and after you added PID-based staleness detection.**
+2. **Graceful `SIGTERM`.** On `SIGTERM` the script must finish or abandon the current write cleanly and exit **143** within 2 seconds. Note that a trap cannot run while a foreign command is in the foreground — Module 3, Layer 3 — so long operations must be backgrounded and `wait`ed on. The harness verifies both the exit code and the timing.
+3. **Alert thresholds.** Configurable thresholds per metric; crossing one emits a distinct log line and a non-zero exit code (use 5) **without** preventing the sample from being written. Alert state must be edge-triggered, not level-triggered: a metric that stays over threshold for 30 samples produces one alert, not 30.
+4. **Log rotation.** The script's own log is rotated at 10 MB, keeping 5 generations, using rename-based rotation that does not lose lines written during the rotation. Prove it with a writer running concurrently across a rotation.
+5. **Bisectable history.** Every commit the monitor makes must leave the repository in a state where `make -C hard check-repo` passes. The harness then introduces a defect at a random commit among 200 generated ones and requires you to find it with `git bisect run` in **8 or fewer test runs**, with correct exit-125 handling for commits that cannot be checked.
+6. **Zero data loss under concurrent append.** Two samplers writing to the same metrics file (which criterion 2 should prevent, but prove your defence) must never interleave a partial line. Explain in your README why a short `>>` append is atomic on Linux and what the size limit is.
+
+<Warning>
+Two traps are deliberately in this track.
+
+**The rotation race.** Rotating by `mv log log.1` while another process holds the file open
+means the writer keeps writing to the *old inode* — the Module 1 deleted-but-open-file problem.
+Your rotation must either signal the writer to reopen or use `copytruncate` semantics. The
+harness detects lost lines.
+
+**The alert-state race.** Edge-triggered alerting needs persistent state, and that state file
+is itself subject to the crash test in criterion 1. If you store "already alerted" in a file
+you write non-atomically, criterion 1 will corrupt it and criterion 3 will fail intermittently.
+</Warning>
+
+</Tab>
+</Tabs>
+
+## Ship it
+
+<Card title="This is the part people skip" icon="rocket" horizontal>
+A public GitHub repo whose commit history was generated by the lab itself.
+</Card>
+
+This is the week's portfolio piece and its shape is unusual in a good way: **the repository's own history is the artifact.** A visitor sees hundreds of automated commits, each a daily report, produced by the code in the same repo.
+
+The README must contain:
+
+1. **What it monitors and how**, with the exact commands used on each platform and why they differ.
+2. **The idempotence, concurrency and chaos test results** — the actual numbers: 100 runs → 1 sample, 20 concurrent → 1 winner, 200 kills → 0 corruptions.
+3. **The stale-lock number before and after** the PID check. This is the most interesting measurement in the lab.
+4. **A `git log --oneline --graph` excerpt** showing the generated history, and the bisect run that found the injected defect in 8 steps.
+5. **One thing you got wrong first**, and how you found it. Graded.
+
+## Verify yourself
+
+```bash
+cd labs/p1/week-02
+make verify                    # shellcheck + unit tests, all tracks
+make -C standard verify-idempotent
+make -C standard verify-concurrent
+make -C hard verify-chaos      # 200 random SIGKILLs; takes ~10 minutes
+make -C hard verify-bisect     # injects a defect, requires bisect to find it
+```
+
+`make verify` runs `shellcheck` with `-S style` (the strictest level) and treats any finding as a failure. There is no partial credit inside `verify`.
+
+## Rubric
+
+| Dimension | 0 | 1 | 2 | 3 |
+| --- | --- | --- | --- | --- |
+| Correctness | tests fail | samples correctly on one platform | both platforms, percentiles exact, rolling window correct | edge-triggered alerts and rotation correct under concurrency |
+| Safety | no lock | a lock that is not atomic (test-then-create) | atomic lock, atomic publish, clean `SIGTERM` at 143 | 200 `SIGKILL`s leave zero corruption and zero stale locks |
+| Automation | run by hand | scheduled | scheduled, locked, logging to stderr with levels and timestamps | commits and pushes over SSH with a scoped key, and rotates its own log |
+| Explanation | no README | describes what it does | explains the idempotence and locking design | reports the chaos numbers, defends the rotation approach, and names one wrong turn |
+
+**Passing bar:** 2 or better on every row. **Portfolio bar:** 3 on Safety and Explanation — the chaos-test numbers are what make this repo worth linking, and they are what almost nobody has.
+
+<Card title="Reference solution" icon="lock" href="/solutions/p1/week-02/lab">
+  Hidden page. Open it after you have a failing attempt of your own.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

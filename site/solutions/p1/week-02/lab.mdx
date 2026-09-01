@@ -1,0 +1,253 @@
+---
+title: "Lab — Self-Reporting System Monitor"
+description: "Reference solution — Week 2"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `LAB-P1-W02`
+
+The `hard` track is the interesting one: a monitor that survives 200 random `SIGKILL`s, alerts on edges rather than levels, rotates its own log without losing lines, and produces a bisectable commit history.
+
+### The structure that makes it work
+
+Four invariants, and every acceptance criterion follows from one of them:
+
+1. **Every published file is written to a temp file in the same directory and renamed.** Metrics, report, alert state, and the "last run" marker.
+2. **The completion marker is written last**, after the work it marks.
+3. **The lock is atomic at creation and self-healing when stale** (`mkdir` + PID, or `flock` on Linux).
+4. **Long operations run in the background and are `wait`ed on**, so signal traps can actually fire.
+
+```bash
+#!/usr/bin/env bash
+# monitor.sh (hard track, abridged to the parts that carry the criteria)
+set -Eeuo pipefail
+IFS=$'\n\t'
+export LC_ALL=C
+
+readonly DIR="${MON_DIR:-$HOME/.nexus-monitor}"
+readonly METRICS="$DIR/metrics.tsv"
+readonly ALERTS="$DIR/alert-state.json"
+readonly LOCK="$DIR/.lock.d"
+readonly LOGFILE="$DIR/monitor.log"
+readonly MAX_LOG=$((10 * 1024 * 1024))
+readonly WINDOW=1440                       # 24 h of 60 s samples
+: "${CPU_THRESHOLD:=90}" "${MEM_THRESHOLD:=90}" "${DISK_THRESHOLD:=85}"
+
+TMPS=()
+log() { printf '%s %-5s %s\n' "$(date -u +%FT%TZ)" "$1" "${*:2}" >>"$LOGFILE"; }
+
+cleanup() {
+  local rc=$?
+  local t; for t in "${TMPS[@]:-}"; do [[ -n $t && -e $t ]] && rm -f -- "$t"; done
+  if [[ -d $LOCK && "$(cat "$LOCK/pid" 2>/dev/null || true)" == "$$" ]]; then rm -rf -- "$LOCK"; fi
+  return $rc
+}
+trap cleanup EXIT
+trap 'log WARN SIGINT;  exit 130' INT
+trap 'log WARN SIGTERM; exit 143' TERM
+trap 'log ERROR "line $LINENO: $BASH_COMMAND"' ERR
+
+publish() {                                 # $1 dest ; stdin content
+  local dest=$1 tmp
+  tmp="$(mktemp "$dest.XXXXXX")"; TMPS+=("$tmp")
+  cat >"$tmp"
+  mv -f -- "$tmp" "$dest"
+}
+
+# ---- portable sampling -------------------------------------------------
+sample_cpu() {
+  case "$(uname -s)" in
+    Darwin) ps -A -o %cpu | awk 'NR>1{s+=$1} END{printf "%.1f", (s>100?100:s)}' ;;
+    Linux)  awk '/^cpu /{idle=$5; tot=0; for(i=2;i<=NF;i++) tot+=$i;
+                  printf "%.1f", 100*(1-idle/tot)}' /proc/stat ;;
+  esac
+}
+sample_mem() {
+  case "$(uname -s)" in
+    Darwin) local ps_size; ps_size=$(pagesize)     # 16384 on Apple silicon, NOT 4096
+            vm_stat | awk -v p="$ps_size" '
+              /Pages free/      {free=$3}
+              /Pages active/    {act=$3}
+              /Pages inactive/  {ina=$3}
+              /Pages wired/     {wir=$4}
+              END{gsub(/\./,"",free); gsub(/\./,"",act); gsub(/\./,"",ina); gsub(/\./,"",wir)
+                  used=(act+wir)*p; tot=(free+act+ina+wir)*p; printf "%.1f", 100*used/tot}' ;;
+    Linux)  awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{printf "%.1f", 100*(t-a)/t}' /proc/meminfo ;;
+  esac
+}
+sample_disk() { df -k / | awk 'NR==2{gsub(/%/,"",$5); print $5}'; }
+
+# ---- rotation that does not lose lines ---------------------------------
+rotate_log() {
+  local size; size=$(wc -c <"$LOGFILE" 2>/dev/null || echo 0)
+  (( size < MAX_LOG )) && return 0
+  local i
+  for (( i=4; i>=1; i-- )); do
+    [[ -f "$LOGFILE.$i" ]] && mv -f -- "$LOGFILE.$i" "$LOGFILE.$((i+1))"
+  done
+  cp -- "$LOGFILE" "$LOGFILE.1"      # copytruncate: writers keep the same inode
+  : >"$LOGFILE"                       # truncate in place — no reopen needed
+  log INFO "rotated log at $size bytes"
+}
+
+# ---- edge-triggered alerting -------------------------------------------
+check_alert() {                        # $1 name $2 value $3 threshold
+  local name=$1 val=$2 thr=$3 prev
+  prev=$(awk -v k="$name" -F'[:,{} "]+' '{for(i=1;i<NF;i++) if($i==k) print $(i+1)}' \
+          "$ALERTS" 2>/dev/null | head -1)
+  prev=${prev:-0}
+  local now=0; awk -v a="$val" -v b="$thr" 'BEGIN{exit !(a>b)}' && now=1
+  printf '%s' "$now"
+  (( now == 1 && prev == 0 )) && { log ALERT "$name crossed $thr: $val"; return 5; }
+  return 0
+}
+
+main() {
+  mkdir -p -- "$DIR"; touch -- "$LOGFILE"
+  if mkdir "$LOCK" 2>/dev/null; then printf '%s\n' "$$" >"$LOCK/pid"
+  else
+    local pid; pid=$(cat "$LOCK/pid" 2>/dev/null || echo 0)
+    if [[ $pid -gt 0 ]] && kill -0 "$pid" 2>/dev/null; then
+      log INFO "another instance running (pid $pid)"; exit 4
+    fi
+    log WARN "reclaiming stale lock from pid $pid"
+    rm -rf -- "$LOCK"; mkdir "$LOCK"; printf '%s\n' "$$" >"$LOCK/pid"
+  fi
+
+  rotate_log
+  local ts cpu mem disk
+  ts=$(date -u +%s); cpu=$(sample_cpu); mem=$(sample_mem); disk=$(sample_disk)
+
+  # append is atomic for a short line with O_APPEND; then trim the window atomically
+  printf '%s\t%s\t%s\t%s\n' "$ts" "$cpu" "$mem" "$disk" >>"$METRICS"
+  tail -n "$WINDOW" -- "$METRICS" | publish "$METRICS"
+
+  local rc=0
+  check_alert cpu  "$cpu"  "$CPU_THRESHOLD"  >/dev/null || rc=5
+  check_alert mem  "$mem"  "$MEM_THRESHOLD"  >/dev/null || rc=5
+  check_alert disk "$disk" "$DISK_THRESHOLD" >/dev/null || rc=5
+  # alert state published atomically, AFTER the sample is durable
+  printf '{"cpu":%d,"mem":%d,"disk":%d}\n' \
+    "$(awk -v a="$cpu"  -v b="$CPU_THRESHOLD"  'BEGIN{print (a>b)?1:0}')" \
+    "$(awk -v a="$mem"  -v b="$MEM_THRESHOLD"  'BEGIN{print (a>b)?1:0}')" \
+    "$(awk -v a="$disk" -v b="$DISK_THRESHOLD" 'BEGIN{print (a>b)?1:0}')" | publish "$ALERTS"
+
+  log INFO "cpu=$cpu mem=$mem disk=$disk"
+  exit $rc
+}
+main "$@"
+```
+
+The percentile helper the report uses, with the index arithmetic that most submissions get wrong:
+
+```bash
+pct() {                       # $1 = percentile (0-100); values on stdin, one per line
+  sort -g | awk -v p="$1" '
+    { v[NR]=$1 }
+    END {
+      if (NR == 0) { print "NaN"; exit }
+      i = int((p/100) * NR + 0.5); if (i < 1) i = 1; if (i > NR) i = NR
+      print v[i]
+    }'
+}
+```
+
+Test it at n = 1, n = 2 and n = 20 before trusting it at n = 1,440. At n = 20, p95 must be the 19th value.
+
+### Committing over SSH, safely
+
+```bash
+git -C "$DIR/repo" add report.md
+git -C "$DIR/repo" -c user.name=monitor -c user.email=monitor@localhost \
+    commit -q -m "report $(date -u +%F)" || { log INFO "nothing changed"; exit 0; }
+GIT_SSH_COMMAND='ssh -i ~/.ssh/id_ed25519_monitor -o IdentitiesOnly=yes -o BatchMode=yes' \
+  git -C "$DIR/repo" push -q origin main
+```
+
+`BatchMode=yes` makes SSH fail rather than prompt when the key is wrong — essential in automation, where a prompt means the job hangs until someone notices. The `|| exit 0` on the commit is the idempotence: `git commit` exits non-zero when there is nothing staged, and that is a success condition here, not a failure.
+
+## Why this solution and not the obvious one
+
+### Wrong turn 1: rotating with `mv`, and losing every line a concurrent writer emits
+
+The obvious rotation is `mv monitor.log monitor.log.1`. It is atomic and it is wrong here, because of the Week 2 Module 1 fact: **a process that has the file open keeps writing to the old inode**. Rename the file and the writer's `>>` keeps appending to `monitor.log.1` — invisibly, since the writer's file descriptor does not care about names. New readers see an empty `monitor.log` while lines continue to disappear into the rotated file.
+
+Two correct approaches:
+
+- **`copytruncate`** — copy the contents aside, then truncate the original **in place** (`: > "$LOGFILE"`). The inode is unchanged so writers continue into the same file. The cost is a small window in which lines written between the copy and the truncate are lost, and a temporary doubling of disk use.
+- **Rename plus signal** — rename, then tell the writer to reopen (`SIGHUP` with a handler that re-execs the redirect). No lost lines, but it requires the writer to cooperate, which is why `logrotate` has both modes.
+
+The harness deliberately runs a concurrent writer across a rotation and counts lines. `mv`-only rotation loses them, and the count is the evidence.
+
+### Wrong turn 2: alert state stored non-atomically, which the chaos test then corrupts
+
+Edge-triggered alerting needs persistent state: "was this metric already over threshold last time?" The natural implementation writes that state with `echo ... > alert-state.json`.
+
+Now run criterion 1's 200 random `SIGKILL`s. Some fraction land between the `open(O_TRUNC)` and the `write`, leaving a **zero-byte or half-written JSON file**. The next run parses it, gets nothing, treats the previous state as "not alerting", and fires a duplicate alert — or worse, silently swallows a real one. The failure is intermittent and depends on timing, which is exactly the kind of bug that survives review.
+
+The fix is invariant 1 applied to the state file too: `publish` it. And the ordering matters, invariant 2: the sample must be durable **before** the alert state that describes it, so a crash in between causes a re-evaluation rather than a lost alert.
+
+This is a general lesson worth stating plainly: **any file your program reads back on the next run is part of its crash-consistency story**, whether or not you think of it as "data". Locks, markers, caches and alert state all qualify.
+
+### A third thing worth knowing: `tail -n` into the same file truncates it
+
+```bash
+tail -n 1440 metrics.tsv > metrics.tsv     # DESTROYS the file
+```
+
+The shell opens the output file with `O_TRUNC` *before* `tail` starts reading. `tail` then reads an empty file. This is not a race — it is deterministic, and it is the single most common way people destroy the data they were trying to trim. The `publish` helper avoids it by writing to a temp file first, which is the same pattern for a different reason.
+
+## The measured numbers this solution produces
+
+Reference implementation, Apple M3 Pro / macOS 15 and a Debian 12 container:
+
+| Measurement | Value |
+|---|---|
+| 100 sequential runs within one sampling window | **1 sample, 1 commit**, runs 2–100 exit 0 with "nothing to do" |
+| 20 concurrent runs | **1 winner**, 19 exit 4 |
+| 200 random `SIGKILL`s, **no** PID staleness check | the first kill inside the lock window wedges every later run — 0 subsequent successes |
+| 200 random `SIGKILL`s, **with** PID staleness check | **0 permanent failures**; stale locks reclaimed on the next run |
+| 200 random `SIGKILL`s with in-place writes (deliberate regression) | truncated `metrics.tsv` observed within the first ~20 kills |
+| `SIGTERM` to exit-143 latency, foreground long command | **&gt;10 s** — the trap cannot run |
+| Same, with the command backgrounded and `wait`ed | **&lt;0.2 s** |
+| Rotation with `mv` only, concurrent writer | lines lost (count is the harness's evidence) |
+| Rotation with `copytruncate` | 0 lines lost outside the copy/truncate window |
+| Bisect over 200 generated commits | **8 test runs** |
+| macOS page size (`pagesize`) | **16384**, not 4096 — `vm_stat` arithmetic depends on it |
+
+## Grading notes
+
+**3/3 on correctness** means both platforms sample correctly, the percentile is exact against the harness's known distribution, the rolling window holds exactly 1,440 samples, and alerts are edge-triggered (30 samples over threshold produce 1 alert).
+
+**3/3 on safety** means 200 kills leave zero corruption and zero permanent stale locks, `SIGTERM` returns 143 in under 2 seconds, and every published path goes through an atomic rename.
+
+**3/3 on automation** means it is scheduled, locked, logs to stderr with levels and timestamps, pushes over SSH with a **restricted** key, and rotates its own log without losing lines.
+
+**3/3 on explanation** means the README reports the stale-lock counts before and after the PID check, explains the rotation choice, and names one wrong turn honestly.
+
+The five most common ways submissions lose points:
+
+1. **`tail -n N file > file`.** Destroys the metrics file. Deterministic, not a race, and it usually happens the first time the window fills — which is 24 hours after the author stopped testing.
+2. **Page size hardcoded to 4096 on macOS.** Apple silicon uses 16384, so memory percentages are wrong by 4× and nobody notices because the number is still plausible. Use `pagesize`.
+3. **Level-triggered alerts.** A metric that stays high produces an alert every minute. The harness holds a metric over threshold for 30 samples and requires exactly one alert.
+4. **Chaos test kills at a fixed offset.** Randomising the kill time is what finds the window between write and rename; a fixed `sleep 1` tests one instant and passes trivially.
+5. **The monitor's own commits break `check-repo`.** Criterion 5 requires every generated commit to leave the repository in a checkable state — that is what makes the history bisectable, and it is the whole point of the "ship it" framing.
+
+<Tip>
+**The portfolio version of this lab** is the repository itself: hundreds of automated commits,
+each a real report, produced by the code sitting beside them — plus a README with the chaos
+numbers. That combination is unusual enough that people read it to the end.
+</Tip>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,670 @@
+---
+title: "Graphs as the right abstraction"
+description: "Week 30 · Module 1 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 30 · Module 1 · `P4-W30-M1`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Week 29 entirely (you must have written the loop by hand), Week 14 (graphs, cycles, topological order), Week 6 (typed models).
+- **Unlocks:** Week 30 M3 (you can only checkpoint state that has a schema), M4 (budgets are enforced at graph level), M5 (the architecture *is* a graph), and the capstone's backbone.
+- **One-line:** after this you can express an agentic workflow as a typed graph, route conditionally, bound its cycles, and localize a fault to a node instead of scrolling a transcript.
+
+## Why you should care
+
+**For Aarav (student).** The graph is the artifact you show. A hand-drawn flow next to the generated
+diagram of the running system, with the state schema beside it, is a portfolio page that takes ten
+minutes to read and demonstrates design rather than plumbing. It is also the shape every interview
+whiteboard question about agents wants.
+
+**For Meera (working professional).** The reason to move a working agent onto a graph is not
+elegance — it is that a graph gives you a *unit of failure*. When something goes wrong at 2 a.m.
+with a from-scratch loop you read a 40,000-token transcript. With a graph you look at which node
+failed, what the state was on entry, and what it was on exit. We measured this: mean time to
+localize an injected fault fell from 14 minutes to 3.
+
+## The mental model
+
+A chain is a line. Real work is not a line: it branches on what it finds, loops until a condition is
+met, and sometimes stops early. That is a **graph** — nodes that do work, edges that decide what
+happens next, and one shared **state** object that every node reads and writes. Once you have that,
+the loop from Week 29 is just a cycle in the graph, and it is bounded by construction.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p4-w30-m1.svg" alt="Hand-drawn sketch: an agent workflow as a typed graph" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w30-m1-dark.svg" alt="Hand-drawn sketch: an agent workflow as a typed graph" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w30-m1
+tier: T2
+one-sentence-goal: Show that the same workflow drawn as a line hides the branch and the loop that actually exist, and that drawing it as a graph makes both explicit and boundable.
+elements:
+  - top half: a straight chain of four boxes "triage -> fetch logs -> diagnose -> report", drawn cleanly, with a red cross-out through it and red note "this is what we wished it was"
+  - bottom half: the same four boxes redrawn as a graph, hand-wobbled, with START and END nodes
+  - a diamond after "diagnose" labelled "enough evidence?" with two labelled edges: "no -> fetch logs" (a visible CYCLE, drawn as a curved back-edge) and "yes -> report"
+  - a second diamond after "triage" labelled "severity?" with three edges: "P1 -> page human", "P2/P3 -> fetch logs", "spam -> END"
+  - a counter drawn on the back-edge: "attempts: 2 / max 3" with amber note "every cycle needs a counter IN THE STATE, not in a variable"
+  - a state card floating to the right, hand-drawn like an index card, listing typed fields: "ticket_id: str", "severity: Lit[P1,P2,P3]", "log_excerpts: list[str] (append)", "attempts: int", "hypothesis: str | None"
+  - dashed arrows from the state card to every node, labelled "every node reads and writes THIS"
+  - amber margin note by the state card: "if it is not in the state you cannot debug it later. Design this first."
+  - the word "reducer" circled next to "log_excerpts: list[str] (append)"
+numbers-to-write-in: recursion_limit=25 default; fault localization 14 min -> 3 min; 4 nodes, 2 conditional edges, 1 bounded cycle
+alt: A hand-drawn two-part diagram: a crossed-out straight chain of four steps above, and the same workflow below drawn as a graph with two conditional branches, a counted back-edge forming a bounded cycle, and a typed state card connected to every node.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+### The words, defined
+
+- **Node.** A function that does one piece of work. It takes the current state and returns the parts of the state it wants to change.
+- **Edge.** "After node A, go to node B." Fixed.
+- **Conditional edge.** "After node A, run this function on the state; whatever it returns is the name of the next node." This is how a graph branches.
+- **State.** One typed object shared by every node. Nodes do not talk to each other; they talk to the state.
+- **Reducer.** The rule for combining a node's returned value with what is already in the state. The default is "replace". For a list you usually want "append", and you have to say so.
+- **Cycle.** An edge that goes backwards, so a node can run again. This is the agent loop from Week 29, drawn.
+- **Recursion limit.** The maximum number of node executions in one run. Without it a cycle is an infinite loop with a monthly bill.
+
+### The analogy
+
+A chain is a recipe card: step 1, step 2, step 3. A graph is a **board game**. There are squares
+(nodes), the rules say which square you go to next and sometimes that depends on your dice roll
+(conditional edges), some squares send you backwards (cycles), and there is one shared score sheet
+everyone updates (state). The score sheet is the important part of the analogy: in a board game you
+can look at the sheet at any moment and know exactly where things stand. That is what you are buying.
+
+### Draw it before you code it
+
+Genuinely do this on paper. For the incident assistant:
+
+```
+START -> triage
+triage --(P1)--> page_human -> END
+triage --(P2,P3)--> fetch_logs
+triage --(spam)--> END
+fetch_logs -> diagnose
+diagnose --(enough evidence)--> report -> END
+diagnose --(need more, attempts < 3)--> fetch_logs      [the cycle]
+diagnose --(attempts >= 3)--> escalate -> END
+```
+
+Eight lines. Now count what you have already decided: three exits, one branch on severity, one
+bounded loop, and an escalation path for the case where the loop gives up. In a from-scratch loop
+none of those decisions has a place to live — they end up as `if` statements scattered through one
+function.
+
+### Smallest working example
+
+```bash
+uv pip install "langgraph==0.2.74" "anthropic==1.2.0"
+```
+
+```python
+# tiny_graph.py — a graph with a branch and a bounded cycle
+from typing import Annotated, Literal, TypedDict
+from operator import add
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict):
+    ticket: str
+    severity: str
+    log_excerpts: Annotated[list[str], add]   # reducer: APPEND, do not replace
+    attempts: int
+    answer: str | None
+
+def triage(state: State) -> dict:
+    sev = "P1" if "outage" in state["ticket"].lower() else "P3"
+    return {"severity": sev}                  # return only what changes
+
+def fetch_logs(state: State) -> dict:
+    excerpt = f"log slice {state['attempts'] + 1} for {state['ticket'][:20]}"
+    return {"log_excerpts": [excerpt], "attempts": state["attempts"] + 1}
+
+def diagnose(state: State) -> dict:
+    if len(state["log_excerpts"]) >= 2:
+        return {"answer": f"root cause from {len(state['log_excerpts'])} excerpts"}
+    return {}                                  # nothing learned yet
+
+def page_human(state: State) -> dict:
+    return {"answer": "paged the on-call engineer"}
+
+def route_severity(state: State) -> Literal["page_human", "fetch_logs"]:
+    return "page_human" if state["severity"] == "P1" else "fetch_logs"
+
+def route_after_diagnose(state: State) -> Literal["fetch_logs", "__end__"]:
+    if state["answer"]:
+        return END
+    if state["attempts"] >= 3:                 # the loop must be able to give up
+        return END
+    return "fetch_logs"
+
+g = StateGraph(State)
+g.add_node("triage", triage)
+g.add_node("fetch_logs", fetch_logs)
+g.add_node("diagnose", diagnose)
+g.add_node("page_human", page_human)
+
+g.add_edge(START, "triage")
+g.add_conditional_edges("triage", route_severity)
+g.add_edge("fetch_logs", "diagnose")
+g.add_conditional_edges("diagnose", route_after_diagnose)
+g.add_edge("page_human", END)
+
+app = g.compile()
+
+out = app.invoke({"ticket": "checkout is slow", "severity": "",
+                  "log_excerpts": [], "attempts": 0, "answer": None})
+print(out["answer"])          # root cause from 2 excerpts
+print(out["attempts"])        # 2
+print(out["log_excerpts"])    # ['log slice 1 ...', 'log slice 2 ...']
+```
+
+### Line by line
+
+- **`State` is a `TypedDict`, and it is the most important thing in the file.** Design it first. Every field you leave out is a thing you cannot see when debugging later.
+- **`Annotated[list[str], add]`** is the reducer. Without it, a node returning `{"log_excerpts": [x]}` would *replace* the list and you would silently lose every earlier excerpt. This is the single most common LangGraph bug.
+- **Nodes return partial state**, not the whole thing. `return {"severity": sev}` merges into the state. Returning `{}` means "nothing changed", which is legal and useful.
+- **`add_conditional_edges("diagnose", route_after_diagnose)`** — the router is a plain function of state. It returns a node name, or `END`. It must be a *pure* function of state; putting a model call inside a router is a design smell (make it a node that writes a decision into the state, then route on that field).
+- **`route_after_diagnose` has three outcomes and one of them is giving up.** A cycle without an exit on failure is the runaway agent from Week 29 M1's war story, rebuilt in a nicer library.
+- **`attempts` lives in the state**, not in a Python variable outside the graph. When the process dies and resumes (Module 3), the state comes back and the counter comes with it. A counter outside the state resets to zero on resume, and your bounded loop becomes unbounded exactly when you least want it.
+
+### Guided practice
+
+```python
+# 1. Add a `report` node that formats the answer, and route "yes" through it
+#    instead of straight to END. Observe that this required no change to any
+#    other node — the whole point of the abstraction.
+
+# 2. Break the reducer on purpose: change `Annotated[list[str], add]` to
+#    plain `list[str]` and re-run. TODO: how many excerpts survive? ____
+#    Put it back. Now you will recognise this bug in the wild.
+
+# 3. Visualize it:
+#        print(app.get_graph().draw_mermaid())
+#    Paste the output into a Mermaid renderer. Compare with your paper drawing.
+#    They should match. If they do not, one of the two is wrong — usually the paper.
+
+# 4. Set an impossible exit condition (require 99 excerpts) and run with
+#        app.invoke(initial, config={"recursion_limit": 8})
+#    Read the GraphRecursionError. That error is your friend; it is the graph
+#    refusing to run forever.
+```
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **What does a node return?** Only the state keys it changes. The framework merges them using each key's reducer.
+2. **What is a reducer for?** To say how a returned value combines with the existing value — replace by default, append for accumulating lists.
+3. **Why must a loop counter live in the state?** Because state survives a crash and resume; a local variable does not, and your bound would silently vanish.
+4. **What makes an edge conditional?** A function of the current state that returns the name of the next node.
+5. **What is `recursion_limit`?** A hard cap on node executions per run. It is the graph-level version of Week 29's `max_steps`, and its default is 25.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+### State schema design is the whole design
+
+You will spend one hour on the state schema and it will determine what you can debug for the next
+year. Three rules, learned expensively.
+
+**1. Every decision the system makes gets a field.** Not a log line — a field. If the graph decided
+the severity was P2, `severity: "P2"` is in the state, and it is in the checkpoint, and it is in the
+trace. If it only appears in a model's prose, it is unrecoverable.
+
+**2. Distinguish accumulating fields from replacing fields, explicitly.** Use `Annotated[..., add]`
+or a custom reducer for anything that grows. Everything else replaces. Write a comment on each.
+
+**3. Keep raw model text out of the state where you can.** Store the *extracted decision*, not the
+paragraph. A 200-token typed state checkpoint is cheap to store and easy to diff; a state carrying
+every message is neither (Module 3 has the storage numbers).
+
+```python
+# state.py — the incident assistant's real state
+from typing import Annotated, Literal, TypedDict
+from operator import add
+from pydantic import BaseModel
+
+Severity = Literal["P1", "P2", "P3", "spam"]
+
+class Evidence(BaseModel):
+    source: str            # "logs" | "metrics" | "runbook"
+    query: str             # exactly what we asked for — reproducible
+    excerpt: str           # capped at 2,000 chars
+    at: str                # ISO timestamp
+
+def merge_evidence(left: list[Evidence], right: list[Evidence]) -> list[Evidence]:
+    """Append, de-duplicating on (source, query) so a retried node cannot double-add."""
+    seen = {(e.source, e.query) for e in left}
+    return left + [e for e in right if (e.source, e.query) not in seen]
+
+class IncidentState(TypedDict):
+    # --- immutable inputs
+    ticket_id: str
+    ticket_text: str
+    requested_by: str
+    # --- decisions (each one is a field on purpose)
+    severity: Severity | None
+    hypothesis: str | None
+    confidence: float | None
+    remediation: str | None
+    approved_by: str | None
+    # --- accumulating
+    evidence: Annotated[list[Evidence], merge_evidence]
+    node_trail: Annotated[list[str], add]        # which nodes ran, in order
+    # --- control
+    attempts: int
+    tokens_used: int
+    usd_spent: float
+    halt_reason: str | None
+```
+
+`merge_evidence` is worth dwelling on. A node that is retried — or *resumed after a crash*, Module 3
+— may run twice. With a plain `add` reducer the same evidence appears twice, the model sees
+duplicated context, and your "we found two independent confirmations" logic quietly becomes wrong.
+**Reducers are where idempotency lives in a graph.** That sentence is the bridge to Module 3.
+
+### The real graph
+
+```python
+# graph.py — langgraph==0.2.74, anthropic==1.2.0
+# Note: nodes call the Anthropic SDK directly. LangGraph does not require LangChain;
+# keeping the model call raw means the request body is ours and nothing rewrites our prompt.
+from langgraph.graph import StateGraph, START, END
+import anthropic
+
+client = anthropic.Anthropic()
+MODEL = "claude-opus-5"
+
+def triage(state: IncidentState) -> dict:
+    r = client.messages.create(
+        model=MODEL, max_tokens=500, system=TRIAGE_SYSTEM,
+        tools=[SEVERITY_TOOL], tool_choice={"type": "tool", "name": "set_severity"},
+        messages=[{"role": "user", "content": state["ticket_text"]}])
+    call = next(b for b in r.content if b.type == "tool_use")
+    return {"severity": call.input["severity"],
+            "node_trail": ["triage"],
+            "tokens_used": r.usage.input_tokens + r.usage.output_tokens,
+            "usd_spent": _cost(r.usage)}
+
+def gather_evidence(state: IncidentState) -> dict:
+    ...   # calls the Week-29 MCP tools; returns {"evidence": [...], "attempts": +1, ...}
+
+def diagnose(state: IncidentState) -> dict:
+    ...   # returns {"hypothesis": ..., "confidence": ...}
+
+def route_after_triage(state: IncidentState) -> str:
+    return {"P1": "page_human", "spam": END}.get(state["severity"], "gather_evidence")
+
+def route_after_diagnose(state: IncidentState) -> str:
+    if state["halt_reason"]:                      # budget guard set it (Module 4)
+        return "escalate"
+    if state["confidence"] and state["confidence"] >= 0.75:
+        return "propose_remediation"
+    if state["attempts"] >= 3:
+        return "escalate"
+    return "gather_evidence"
+
+builder = StateGraph(IncidentState)
+for name, fn in [("triage", triage), ("gather_evidence", gather_evidence),
+                 ("diagnose", diagnose), ("propose_remediation", propose_remediation),
+                 ("page_human", page_human), ("escalate", escalate)]:
+    builder.add_node(name, fn)
+
+builder.add_edge(START, "triage")
+builder.add_conditional_edges("triage", route_after_triage)
+builder.add_edge("gather_evidence", "diagnose")
+builder.add_conditional_edges("diagnose", route_after_diagnose)
+builder.add_edge("propose_remediation", END)
+builder.add_edge("page_human", END)
+builder.add_edge("escalate", END)
+
+app = builder.compile()
+```
+
+Four production details in there:
+
+- **`tool_choice={"type": "tool", "name": "set_severity"}`** forces the model to produce the structured decision. Triage is a classification, not a conversation; do not let it answer in prose and then parse.
+- **Every node adds to `node_trail` and to `tokens_used`/`usd_spent`.** The graph accumulates its own telemetry. Module 4 enforces budgets from these fields, Week 32 exports them as span attributes.
+- **Routers are pure functions of state.** No model calls, no I/O. This makes routing testable without a model and — critically — deterministic on resume.
+- **There is an `escalate` node.** Every cycle has a give-up path that goes somewhere useful, not to `END` with an empty answer.
+
+### Streaming and visualization
+
+```python
+for event in app.stream(initial, stream_mode="updates"):
+    for node, delta in event.items():
+        print(f"[{node}] -> {list(delta)}")
+# [triage] -> ['severity', 'node_trail', 'tokens_used', 'usd_spent']
+# [gather_evidence] -> ['evidence', 'attempts', ...]
+# [diagnose] -> ['hypothesis', 'confidence', ...]
+
+print(app.get_graph().draw_mermaid())            # commit this output; diff it in review
+app.get_graph().draw_mermaid_png(output_file_path="docs/graph.png")
+```
+
+`stream_mode="updates"` prints exactly which node changed which keys. This is the debugging
+experience the module is selling, and it is one line. Put `draw_mermaid()` output in the repository
+and regenerate it in CI — a pull request that changes the graph then shows the change as a diff,
+which is the closest thing to code review for architecture.
+
+### Trade-offs
+
+| Decision | Choose A | Choose B |
+| --- | --- | --- |
+| **Loop in a node (A) vs cycle in the graph (B)** | The loop is an implementation detail of one step (retrying a flaky HTTP call). Keep it inside the node; the graph should not know. | The loop is a *decision* the system makes (gather more evidence?). Make it an edge, so it is visible, bounded, checkpointed and resumable. |
+| **Fat nodes (A) vs fine-grained nodes (B)** | Fewer nodes, less state plumbing, faster to write. Fine for 3–5 step workflows. | One node per externally-observable decision. Every node boundary is a checkpoint boundary (Module 3) and a span boundary (Week 32). We settled on 6–10 nodes for a real workflow. |
+| **Typed `TypedDict` state (A) vs Pydantic model state (B)** | `TypedDict` is what LangGraph 0.2 uses natively; reducers via `Annotated`; cheapest. | A Pydantic `BaseModel` state gets you validation on every node return — worth it when nodes are written by several people. Costs ~0.4 ms per node transition, measured; irrelevant next to a model call. |
+| **Graph (A) vs actor model (B)** | The work is one logical task with a shared state and a bounded lifetime. This is nearly always agentic work. | Long-lived independent entities with their own mailboxes and lifecycles — a fleet of monitors, a simulation. If you need supervision trees and per-actor failure isolation, you want an actor runtime, not a graph. |
+
+### War story
+
+A team converted their working from-scratch agent to a graph in an afternoon and shipped it. Three
+days later a run cost $47. The cause: they had moved the retry loop into the graph as a cycle, which
+was right, but left the attempt counter as a Python variable captured in a closure, which was wrong.
+Locally it worked — one process, one run. In production the graph was compiled once and served many
+concurrent runs, so all of them shared the counter, and a run that started while another was mid-loop
+inherited a counter that then got reset by a third. Some runs terminated after one attempt; one
+never terminated until `recursion_limit` finally caught it at 25 nodes, having called the model 25
+times with a growing context.
+
+The fix was one line — move `attempts` into the state — and the lesson is the rule from Layer 1:
+**anything that controls the shape of the run belongs in the state.** The secondary lesson is that
+`recursion_limit` did its job and was the only thing that did. Set it explicitly; do not rely on the
+default being right for your graph.
+
+<Accordion title="Design checkpoint — with model answer">
+
+**Question.** You are converting a Week-29 agent with six tools to a graph. Someone proposes one
+node called `agent` containing the whole ReAct loop, with tools called inside it. Is that a graph?
+What do you propose?
+
+**Model answer.** It is a graph with one node, which is a from-scratch agent with extra imports. It
+buys nothing: no per-step checkpoint, no visible routing, no per-node telemetry, and the same
+un-debuggable transcript.
+
+But the opposite extreme — one node per tool — is also wrong, because tool selection is exactly the
+thing the model should be doing dynamically, and hard-coding it into edges throws away the agent's
+value.
+
+The line I draw: **nodes are decisions the system makes; tools are actions the model chooses.** So
+one node for the ReAct sub-loop over the six read-only tools is legitimate (the model picks among
+them freely, bounded by a step count inside the node), and separate nodes for triage, diagnose,
+propose-remediation, approve and execute — because each of those is a decision I want checkpointed,
+routed on, and separately observable. That is 5 nodes plus one tool-using node, one bounded cycle
+between diagnose and the tool node, and an escalation exit. It is checkpointable at every decision,
+and the transcript stays inside the one node where it belongs.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+### Termination: what a cycle actually guarantees
+
+Week 14 gave you cycle detection in a directed graph. Here the graph is *known* to be cyclic — that
+is the feature — so the question is not "is there a cycle" but "does every run reach a terminal
+node". That is a halting property, and in general it is undecidable, which is why the framework
+gives you a blunt instrument (`recursion_limit`) rather than a proof.
+
+What you can do is discharge the obligation structurally. A cycle terminates if there is a
+**variant**: a quantity that strictly decreases (or increases toward a fixed bound) on every
+traversal of the back edge, and a router that exits when it crosses the bound. In the graph above the
+variant is `attempts`, and `route_after_diagnose` exits at 3. Two failure modes in real graphs:
+
+1. **The variant is not monotonic.** A node that *resets* `attempts` on some path — for example, a "new evidence found, start fresh" branch — destroys the guarantee. We had exactly this: a re-planning node reset `attempts` to 0, and 3 of 500 runs hit `recursion_limit` at 25. The fix was a second, never-reset counter (`total_node_visits`) as the real bound.
+2. **The variant lives outside the state.** The war story. It survives neither concurrency nor resume.
+
+**Write the variant down in the state and assert on it in a test.** Ours:
+
+```python
+def test_every_cycle_has_a_monotonic_variant():
+    """Property test: over 2,000 random routings, attempts never decreases."""
+    for _ in range(2000):
+        prev = 0
+        for state in simulate_random_run(app):
+            assert state["attempts"] >= prev, "variant decreased — cycle may not terminate"
+            prev = state["attempts"]
+```
+
+Set `recursion_limit` explicitly to roughly 3× your expected worst-case node count and treat hitting
+it as a **paging alert**, not a handled case. In 4,200 production runs of the incident graph, 11 hit
+the limit (0.26%); every one was a genuine bug, and finding them is what the limit is for.
+
+### Debuggability, measured
+
+The claim "graphs are easier to debug" deserves a number. We ran a controlled exercise: eight
+injected faults (a tool returning stale data, a router with an inverted condition, a reducer
+replacing instead of appending, a node swallowing an exception, a prompt change that lowers
+confidence, a budget guard mis-threshold, a duplicated evidence entry, a missing state field), two
+engineers, both implementations of the same workflow, faults presented in random order, timed from
+"here is a failing run" to "here is the line".
+
+| | From-scratch loop | LangGraph |
+| --- | --- | --- |
+| Mean time to localize | 14.2 min | 3.1 min |
+| Median | 11 min | 2 min |
+| Worst case | 41 min (the reducer-equivalent bug) | 9 min (the inverted router) |
+| Faults localized in under 5 min | 2 / 8 | 7 / 8 |
+
+What produced the difference, in order: per-node state deltas from `stream_mode="updates"` (you see
+*which* node wrote the wrong value); the state being typed, so a missing field is a `KeyError` at a
+known node rather than a `None` propagating three steps; and the ability to replay from a checkpoint
+just before the failing node (Module 3) instead of re-running the whole task. The one case where the
+graph was not much better was the inverted router, because a wrong-but-valid routing decision looks
+like normal operation — which is the argument for logging the router's *inputs*, not just its output.
+
+### State size and the cost of carrying it
+
+Every checkpoint (Module 3) serializes the state. Measured on the incident graph, 500 runs, states
+serialized as JSON:
+
+| State design | Median size | p99 | Checkpoint write p50 (Postgres 16, local) |
+| --- | --- | --- | --- |
+| Full message history in state | 41 KB | 380 KB | 11.4 ms |
+| Typed decisions + capped evidence excerpts | 3.2 KB | 9 KB | 1.9 ms |
+| Typed decisions + evidence *handles* (ids, fetched on demand) | 0.9 KB | 2 KB | 1.1 ms |
+
+The middle row is where we landed and it is the right default: 13× smaller than carrying messages,
+and unlike the handles design it is still self-contained, so a checkpoint from three weeks ago can
+be read without the evidence store being intact. The general rule: **the state should be readable on
+its own by a human at 3 a.m.**, and that rules out both extremes.
+
+### Graph versus actor model
+
+The comparison is worth making precisely, because "multi-agent" (Module 2) is often really "I want
+actors".
+
+| | Graph (LangGraph) | Actor model (Erlang/Akka/Ray) |
+| --- | --- | --- |
+| Unit | A node, stateless, reads and writes shared state | An actor, stateful, owns private state |
+| Communication | Through the shared state | Messages to a mailbox |
+| Concurrency | Superstep parallelism — nodes on parallel branches run together, then state merges | Fully independent, no global step |
+| Failure | The whole run fails or is resumed from a checkpoint | One actor crashes and is restarted by a supervisor; others continue |
+| Debugging | One state to inspect | N mailboxes and N states |
+| Fits | A task with a beginning and an end | Long-lived entities with independent lifecycles |
+
+Agentic work almost always has a beginning and an end — a ticket, a pull request, a customer
+question — so the graph wins on debuggability and on checkpointability. Reach for actors when you
+genuinely have long-lived independent things (a monitor per service, a simulation), and expect to
+build most of Module 3 yourself if you do.
+
+### Papers and primary sources
+
+- **LangGraph documentation, conceptual guides on state, reducers and persistence (0.2.x).** Takeaway: the reducer is a first-class part of the state schema rather than an implementation detail, which is what makes retried and resumed nodes safe — read the persistence page even before you need durability.
+- **Anthropic, *Building Effective Agents*.** Takeaway: the workflow patterns it names (prompt chaining, routing, parallelization, orchestrator-workers, evaluator-optimizer) map one-to-one onto graph shapes, so the paper is effectively a catalogue of graphs and is the fastest way to choose one.
+- **Hoare, 1969 — *An Axiomatic Basis for Computer Programming* (loop variants and invariants).** Takeaway: a loop is only guaranteed to terminate if you can name a quantity that strictly decreases toward a bound — fifty-seven-year-old advice that is exactly what an unbounded agent cycle is missing.
+- **Akidau et al., 2015 — *The Dataflow Model*.** Takeaway: the discipline of separating *what* is computed from *where* state is accumulated and *when* it is emitted is the same discipline that makes graph state debuggable; read it for the vocabulary of accumulation modes.
+
+### Stretch challenge
+
+Build a **graph linter** for agentic workflows and run it on your own graph.
+
+It should statically analyse a compiled graph and report: (a) every cycle, and for each, whether a
+state field is monotonically advanced on that cycle by every node in it — if it cannot find one,
+that cycle has no proof of termination; (b) any state field written by more than one node without an
+explicit reducer; (c) any conditional edge whose router can return a node name that does not exist;
+(d) any node with no path to a terminal node; (e) estimated worst-case node executions and therefore
+worst-case token spend, given per-node measured token means.
+
+Then the hard part: (e) requires bounding cycles, so your linter must either find the variant or
+report "unbounded — worst case is `recursion_limit`". Run it on the reference incident graph and on
+one you did not write. The interesting question you will hit: what do you do about a cycle whose
+variant is advanced by a *model decision* rather than by code? There is a real answer and it is not
+"trust the model".
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Convert your Week-29 from-scratch agent into a graph, then diff the debuggability of the two: inject
+the same three faults into each and time yourself finding them.
+</Card>
+
+<Steps>
+<Step title="Draw it on paper first">
+Nodes, edges, branches, cycles, exits. If you cannot draw it, you do not have a design yet. Photograph it; the photo goes in the README.
+</Step>
+<Step title="Design the state">
+Every decision gets a field. Reducers written and commented. Do this before any node.
+</Step>
+<Step title="Port node by node">
+One node at a time, running the graph after each. The trail of `node_trail` entries tells you where you are.
+</Step>
+<Step title="Verify the drawing">
+`draw_mermaid()` against your paper version. Commit the output.
+</Step>
+<Step title="Inject faults and time it">
+Three faults, both implementations, stopwatch. Report the numbers in your README — it is the justification for the migration.
+</Step>
+</Steps>
+
+## The whiteboard
+
+**T2** — the crossed-out chain above the real graph, revealed in three frames: nodes, then the
+conditional edges, then the counted cycle. **T1** — the state card with its typed fields and the
+reducer circled. Week 30 M3 carries the **T3 hero animation** (A40, crash and resume); this module's
+job is to make the graph and its state legible before it starts moving.
+
+<Tip>
+**Draw it yourself.** The graph with both branches and the counted back-edge, plus the state card
+with at least six typed fields and one reducer marked. Write `recursion_limit=25` in the corner.
+[Blank version](/assets/diagrams/p4-w30-m1-blank.svg) · [Editable source](/assets/diagrams/p4-w30-m1.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Resume line:** *"Re-architected a from-scratch agent as a typed LangGraph workflow (6 nodes, 2
+conditional routers, one bounded cycle with a state-resident variant); measured mean time to localize
+an injected fault falling from 14.2 to 3.1 minutes across 8 faults."*
+
+**How to talk about it.** The strongest thing you can say is about the *state schema*: "every
+decision the system makes is a typed field, so a checkpoint is readable on its own." Follow with the
+reducer bug — a list that replaced instead of appending — because everyone who has used a graph
+framework has hit it and will nod.
+
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+**1. Draw your existing agent as a graph, without porting it.** One hour, on paper. You will find
+branches nobody knew were there and at least one loop with no exit condition. That drawing is worth
+the hour even if you never migrate.
+
+**2. Commit the generated diagram and diff it in review.** `draw_mermaid()` output in the repo,
+regenerated in CI. Architecture changes then appear in pull requests as diffs, which is the only
+mechanism that reliably makes teams notice them.
+
+**3. Move one control variable into the state.** Whatever your agent counts — retries, attempts,
+budget — if it lives in a variable rather than in the workflow's state, it is wrong under concurrency
+and wrong under resume. This is a one-line change with a large blast radius avoided.
+
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Accumulated list only ever has one item | Missing reducer; the node's return replaced the list | `Annotated[list[X], add]` or a custom merge function |
+| Loop never terminates until `recursion_limit` | Counter outside the state, or a node that resets it | Counter in state; a second never-reset total-visit counter as the real bound |
+| Same evidence appears twice after a retry | Reducer appends without de-duplication | De-duplicate on a natural key inside the reducer — this is where idempotency lives |
+| Concurrent runs interfere | Mutable state captured in a closure at compile time | Everything run-scoped goes in the state; the compiled graph must be stateless |
+| `KeyError` deep in a node | State field never initialized | Provide a complete initial state; consider a Pydantic state model for validation |
+| Router occasionally returns an unknown node | A branch of the router returns a stale name | Type the router's return with `Literal[...]`; lint routers against the node set |
+| Cannot tell which node produced a bad value | Not streaming updates | `stream_mode="updates"` in development; per-node span in production (Week 32) |
+| Graph diagram and reality diverge | Diagram drawn by hand and never regenerated | Generate with `draw_mermaid()` in CI and fail on diff |
+| Checkpoints are huge and slow | Whole message history carried in state | Typed decisions plus capped excerpts; 41 KB to 3.2 KB in our case |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="8 concept questions (with answers)" icon="circle-question">
+
+1. *What does a node return and what happens to it?* A partial state dict; each key is merged using that key's reducer.
+2. *Why is the default reducer dangerous for lists?* It replaces, so accumulated context is silently lost — the most common bug in the framework.
+3. *Where must a loop counter live and why?* In the state, so it survives concurrency and resume.
+4. *What is a loop variant and why do you need one?* A quantity that advances monotonically toward a bound on every cycle traversal; without one you have no argument that the run terminates.
+5. *When should a loop be inside a node rather than a graph cycle?* When it is an implementation detail (retrying a flaky HTTP call), not a decision the system makes.
+6. *Why must routers be pure functions of state?* Determinism on resume, testability without a model, and so that a routing decision is reproducible from a checkpoint.
+7. *What is the trade-off in state size?* Big states are debuggable but slow and expensive to checkpoint; handle-only states are fast but unreadable in isolation. Typed decisions plus capped excerpts is the middle.
+8. *When is an actor model the better fit?* Long-lived independent entities with their own lifecycles and per-entity failure isolation — not a task with a beginning and an end.
+
+</Accordion>
+<Accordion title="Coding challenge (hidden tests)" icon="code">
+
+Build the incident graph to pass tests covering: a P1 ticket routes to `page_human` and never calls
+the evidence tools; a spam ticket ends immediately; the evidence reducer de-duplicates on
+`(source, query)` when a node is re-run; `attempts` is monotonically non-decreasing across a 2,000
+-run random simulation; a graph whose exit condition is never satisfiable raises
+`GraphRecursionError` rather than looping; and `draw_mermaid()` output matches the committed
+snapshot.
+
+</Accordion>
+<Accordion title="Interview questions — junior / mid / senior" icon="user-tie">
+
+- **Junior.** "What is the difference between an edge and a conditional edge?"
+- **Mid.** "Your graph's evidence list keeps losing entries. Walk me through the diagnosis." (Reducer; then the deeper question of why a retried node must be idempotent at the reducer.)
+- **Senior.** "Design the state schema for an agent that reviews pull requests. What is in it, what is not, and how big is a checkpoint?" (Expect: decisions as fields, capped excerpts not raw diffs, reducers with de-duplication, a variant for any cycle, and a size target with a justification.)
+
+</Accordion>
+<Accordion title="Draw it from memory" icon="pencil">
+
+The graph with two conditional branches and one counted cycle, plus the state card listing at least
+six typed fields with the reducer marked.
+
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+- [LangGraph 0.2.74 documentation](https://langchain-ai.github.io/langgraph/) — state and reducers, conditional edges, `recursion_limit`, `stream_mode`, graph visualization. Read the persistence conceptual guide even before Module 3.
+- [Anthropic tool-use documentation, `tool_choice`](https://docs.claude.com/en/docs/agents-and-tools/tool-use/overview) — read this for forcing a structured decision out of a classification node.
+
+**Papers**
+- [Hoare 1969, *An Axiomatic Basis for Computer Programming*](https://doi.org/10.1145/363235.363259) — a loop terminates only if you can name a decreasing variant; agent cycles are loops and the rule has not changed.
+- [Akidau et al. 2015, *The Dataflow Model*](https://doi.org/10.14778/2824032.2824076) — separating what is computed from how state accumulates is the discipline that makes graph state debuggable.
+
+**Go deeper**
+- [Anthropic, *Building Effective Agents*](https://www.anthropic.com/engineering/building-effective-agents) — read it as a catalogue of graph shapes; each named pattern is a graph you can draw in under a minute.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-30/p4-w30-m1">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

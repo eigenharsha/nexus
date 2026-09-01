@@ -1,0 +1,644 @@
+---
+title: "SQL I: querying"
+description: "Week 7 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 7 · Module 3 · `P1-W07-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Write `SELECT`, `JOIN`, `GROUP BY` and subqueries fluently enough to answer a question without reaching for documentation.
+2. Predict what a join does to your row count *before* running it — and catch the fan-out bug that silently triples a revenue figure.
+3. Reason correctly about `NULL`, including why `NOT IN` with a null returns nothing at all.
+4. Read `EXPLAIN ANALYZE` line by line and say which node is the problem.
+5. Name the three join algorithms and say why the planner picked the one it picked.
+
+## Where this sits
+
+| | |
+| --- | --- |
+| **Prereqs** | `P1-W07-M1`, `P1-W07-M2` (you are querying the schema you designed) |
+| **Unlocks** | `P1-W07-M4` (window functions build on this), `P1-W08-M3` (indexing is meaningless without plans) |
+| **One-line** | After this you can express any question as SQL and tell whether the answer is trustworthy. |
+
+## Why you should care
+
+### For Aarav (student)
+
+- SQL is the highest-value-per-hour skill in this course. It is asked in almost every data, backend and analyst interview, and it does not go out of date.
+- Live SQL exercises are common in interviews. Being fluent — not looking things up — is the difference between passing and not.
+- Reading `EXPLAIN` puts you ahead of most working engineers, who write SQL and hope.
+
+### For Meera (working professional)
+
+- This shows up in your job as: "the revenue number on the dashboard does not match finance's". Measured below: one careless join inflated a `SUM` by exactly **3.0×**, with no error.
+- `NOT IN` with a nullable subquery silently returns zero rows. It has cost more engineering hours than any other single SQL construct.
+- A slow endpoint is usually a query plan you have never looked at. Ten minutes with `EXPLAIN ANALYZE` beats a week of caching.
+
+## The mental model
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p1-w07-m3.svg" alt="Hand-drawn sketch: join types shown as rows combining, and the fan-out bug" className="block dark:hidden" />
+  <img src="/assets/diagrams/p1-w07-m3-dark.svg" alt="Hand-drawn sketch: join types shown as rows combining, and the fan-out bug" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p1-w07-m3
+tier: T3
+one-sentence-goal: Show that a join is not a Venn diagram - it is row multiplication - so joining to a child table changes the grain and silently inflates every aggregate.
+elements:
+  - top: two small tables drawn as row stacks - orders (3 rows) and order_items (7 rows) - with hand-drawn lines showing which item belongs to which order
+  - middle: the joined result drawn as 7 rows, with the order total value repeated on each line and the repeats circled in red
+  - a red cross-out over a Venn diagram with the note "a Venn diagram cannot show DUPLICATES - stop using it to teach joins"
+  - right: a SUM box showing the correct total and the inflated total side by side with an arrow labelled "3.0x, and nothing errored"
+  - bottom strip: the four join types as row diagrams - INNER, LEFT, RIGHT, FULL - each with the unmatched rows drawn as NULL-filled ghosts
+  - amber margin note: "if a join can multiply rows, aggregate the child FIRST"
+  - circled key term "grain"
+  - a dangling arrow labelled "...and how does the planner actually DO the join?"
+numbers-to-write-in: 5,002 orders became 15,000 rows after joining items; SUM 507,507,500 -> 1,522,492,500 (3.0x); nested loop 9.5 ms, hash join 1,148 ms, merge join 742 ms; EXISTS 210 ms and IN 171 ms produce the identical plan
+alt: A hand-drawn diagram showing three order rows joined to seven order-item rows producing seven result rows with the order total repeated, a crossed-out Venn diagram, and two SUM boxes showing the correct and the three-times inflated totals.
+*/}
+
+A join does not "combine tables". It produces, for every row on the left, one output row per
+matching row on the right. If two match, you get two. Everything that goes wrong with joins —
+inflated sums, duplicated rows, mysterious `NULL`s — is that sentence, applied.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Plain English
+
+    A `SELECT` statement answers one question. The parts, in the order they are *written*:
+
+    ```sql
+    SELECT   c.country, count(*) AS orders, sum(o.total_cents) AS revenue
+    FROM     orders o
+    JOIN     customers c ON c.id = o.customer_id
+    WHERE    o.status = 'paid'
+    GROUP BY c.country
+    HAVING   count(*) > 100
+    ORDER BY revenue DESC
+    LIMIT    10;
+    ```
+
+    The order they are *executed* is different, and knowing it explains most beginner confusion:
+
+    1. `FROM` and `JOIN` — build the working set of rows.
+    2. `WHERE` — throw away rows. This happens **before** grouping.
+    3. `GROUP BY` — collapse the survivors into one row per group.
+    4. `HAVING` — throw away *groups*. This happens **after** grouping.
+    5. `SELECT` — compute the output columns. This is why you cannot use a `SELECT` alias in `WHERE`.
+    6. `ORDER BY`, then `LIMIT`.
+
+    That is the whole answer to "why can't I use `WHERE count(*) > 100`" — `WHERE` runs before the
+    counting exists. And it is why `ORDER BY revenue DESC` *does* work: `ORDER BY` runs after
+    `SELECT`, so the alias exists.
+
+    **Joins.** A join matches rows from two tables using a condition.
+
+    - `INNER JOIN` — only rows with a match on both sides.
+    - `LEFT JOIN` — every left row; unmatched right columns become `NULL`.
+    - `RIGHT JOIN` — the mirror image. Rarely used; flip the tables and use `LEFT`.
+    - `FULL JOIN` — every row from both sides, `NULL`-filled where unmatched.
+
+    **`NULL` means "unknown", not "empty".** Any comparison with `NULL` yields *unknown*, which is
+    not true, so the row is not returned. `NULL = NULL` is unknown. Use `IS NULL` and `IS NOT NULL`.
+
+    ### The analogy
+
+    Two lists of index cards and a rule for pairing them. For each card in the left pile you look
+    through the right pile and lay out one new card for *every* match — two matches make two cards.
+    A `LEFT JOIN` adds the rule "if there are no matches, still lay out the left card, with the
+    right half blank". Nobody who has physically done this expects the result to have the same
+    number of cards as the left pile, which is exactly the intuition a Venn diagram destroys.
+
+    ### Smallest working example
+
+    Twenty-five queries, increasing in difficulty, are in `labs/p1/week-07/queries/`. Here are the
+    five that carry the ideas.
+
+    ```sql
+    -- 1. filter, sort, limit
+    SELECT id, status, total_cents
+    FROM   orders
+    WHERE  status = 'paid' AND placed_at >= date '2025-01-01'
+    ORDER  BY total_cents DESC
+    LIMIT  10;
+
+    -- 2. join to bring in a related fact
+    SELECT o.id, c.email, o.total_cents
+    FROM   orders o
+    JOIN   customers c ON c.id = o.customer_id
+    WHERE  o.status = 'paid'
+    LIMIT  10;
+
+    -- 3. aggregate per group
+    SELECT c.country, count(*) AS orders, sum(o.total_cents) AS revenue
+    FROM   orders o
+    JOIN   customers c ON c.id = o.customer_id
+    WHERE  o.status = 'paid'
+    GROUP  BY c.country
+    ORDER  BY revenue DESC;
+
+    -- 4. LEFT JOIN to find what is missing
+    SELECT c.id, c.email
+    FROM   customers c
+    LEFT   JOIN orders o ON o.customer_id = c.id
+    WHERE  o.id IS NULL;              -- customers who have never ordered
+
+    -- 5. a CTE, so the query reads top to bottom
+    WITH paid AS (
+      SELECT customer_id, sum(total_cents) AS spent
+      FROM   orders
+      WHERE  status = 'paid'
+      GROUP  BY customer_id
+    )
+    SELECT c.email, p.spent
+    FROM   paid p
+    JOIN   customers c ON c.id = p.customer_id
+    ORDER  BY p.spent DESC
+    LIMIT  20;
+    ```
+
+    ### Line by line
+
+    - Query 1: `WHERE` before `ORDER BY` before `LIMIT`. The database can stop early once it has ten
+      rows *if* an index provides the order — that is the `P1-W08-M3` sort-avoidance idea in embryo.
+    - Query 2: the alias `o` and `c` make the join condition readable. Always alias in a join.
+    - Query 3: every non-aggregated column in `SELECT` must appear in `GROUP BY`. PostgreSQL
+      enforces this; MySQL historically did not, which produced years of wrong answers.
+    - Query 4: the `LEFT JOIN ... WHERE right.id IS NULL` pattern is the standard "anti-join". The
+      `WHERE` must test a column that is `NOT NULL` in the right table — usually its primary key —
+      or you will filter out real rows.
+    - Query 5: a **CTE** (`WITH name AS (...)`) is a named subquery. It makes a query readable
+      top-to-bottom instead of inside-out.
+
+    ### Guided practice
+
+    Three questions against the seeded database. Write them before looking.
+
+    1. The five countries with the highest average order value, among countries with at least 50 paid orders.
+    2. Every product that has never been ordered.
+    3. For each customer, their order count and their most recent order date.
+
+    <Accordion title="Answers">
+      ```sql
+      -- 1
+      SELECT c.country,
+             count(*) AS orders,
+             round(avg(o.total_cents))::bigint AS avg_cents
+      FROM   orders o
+      JOIN   customers c ON c.id = o.customer_id
+      WHERE  o.status = 'paid'
+      GROUP  BY c.country
+      HAVING count(*) >= 50
+      ORDER  BY avg_cents DESC
+      LIMIT  5;
+
+      -- 2  (anti-join; NOT EXISTS is the safe form - see Layer 2 on NOT IN)
+      SELECT p.id, p.sku
+      FROM   products p
+      WHERE  NOT EXISTS (SELECT 1 FROM order_items i WHERE i.product_id = p.id);
+
+      -- 3
+      SELECT c.id, c.email,
+             count(o.id)      AS order_count,     -- count(o.id), not count(*)
+             max(o.placed_at) AS last_order
+      FROM   customers c
+      LEFT   JOIN orders o ON o.customer_id = c.id
+      GROUP  BY c.id, c.email
+      ORDER  BY last_order DESC NULLS LAST;
+      ```
+
+      Question 3 hides the lesson. `count(*)` counts *rows*, and a `LEFT JOIN` produces one row even
+      for a customer with no orders — so `count(*)` returns 1 for them. `count(o.id)` counts
+      non-null values and correctly returns 0. That distinction has produced more wrong dashboards
+      than any other single thing in this module.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+      **1. Why can't you use `WHERE count(*) > 100`?**
+      `WHERE` runs before grouping, so the count does not exist yet. Use `HAVING`.
+
+      **2. Difference between `count(*)` and `count(column)`?**
+      `count(*)` counts rows; `count(column)` counts non-null values. With a `LEFT JOIN` they differ
+      by exactly the unmatched rows.
+
+      **3. What does `LEFT JOIN ... WHERE right.id IS NULL` find?**
+      Left rows with no match — an anti-join.
+
+      **4. Why is `NULL = NULL` not true?**
+      `NULL` means unknown; two unknowns cannot be known to be equal. Use `IS NULL`.
+
+      **5. Why alias tables in a join?**
+      Readability and disambiguation — and it becomes mandatory when a table joins to itself.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The real theory: joins change the grain
+
+    The **grain** of a result is what one row means. `orders` has one row per order. Join it to
+    `order_items` and the grain becomes one row per *item*. Every aggregate you then compute is over
+    the wrong thing.
+
+    Measured on the seeded database, 1,000,000 orders and 3,000,000 items:
+
+    ```sql
+    SELECT count(*) FROM orders WHERE customer_id BETWEEN 1 AND 1000;
+    --  5002
+
+    SELECT count(*) FROM orders o JOIN order_items i ON i.order_id = o.id
+    WHERE o.customer_id BETWEEN 1 AND 1000;
+    -- 15000
+
+    SELECT sum(total_cents) FROM orders WHERE customer_id BETWEEN 1 AND 1000;
+    --  507507500          <- correct
+
+    SELECT sum(o.total_cents) FROM orders o JOIN order_items i ON i.order_id = o.id
+    WHERE o.customer_id BETWEEN 1 AND 1000;
+    -- 1522492500          <- 3.0x inflated. No error. No warning.
+    ```
+
+    **Revenue reported three times too high, and nothing failed.** This is the single most common
+    serious SQL bug in production reporting.
+
+    Two correct fixes. **Aggregate the child first**, then join:
+
+    ```sql
+    WITH item_counts AS (
+      SELECT order_id, count(*) AS items, sum(qty) AS units
+      FROM   order_items GROUP BY order_id
+    )
+    SELECT sum(o.total_cents) AS revenue, sum(ic.units) AS units
+    FROM   orders o
+    LEFT   JOIN item_counts ic ON ic.order_id = o.id
+    WHERE  o.customer_id BETWEEN 1 AND 1000;
+    ```
+
+    Or **use a lateral subquery** when you need only a scalar per row:
+
+    ```sql
+    SELECT o.id, o.total_cents, x.units
+    FROM   orders o
+    LEFT   JOIN LATERAL (
+      SELECT sum(qty) AS units FROM order_items i WHERE i.order_id = o.id
+    ) x ON true
+    WHERE  o.customer_id BETWEEN 1 AND 1000;
+    ```
+
+    The habit that prevents it entirely: **run `count(*)` before and after adding any join.** If the
+    number changed, the grain changed, and every aggregate in the query is now suspect.
+
+    ### `NULL`, precisely
+
+    Three-valued logic — true, false, unknown — and rows are returned only for *true*.
+
+    ```sql
+    -- The classic. If the subquery yields even one NULL, this returns ZERO rows, always.
+    SELECT * FROM products
+    WHERE id NOT IN (SELECT product_id FROM order_items);   -- product_id nullable? disaster
+
+    -- Safe:
+    SELECT * FROM products p
+    WHERE NOT EXISTS (SELECT 1 FROM order_items i WHERE i.product_id = p.id);
+    ```
+
+    Why: `id NOT IN (1, 2, NULL)` expands to `id <> 1 AND id <> 2 AND id <> NULL`. The last
+    conjunct is unknown, so the whole expression is never true. `NOT EXISTS` has no such problem
+    because it tests row existence, not value equality.
+
+    Other `NULL` behaviours that surprise people, all verifiable in `psql`:
+
+    - Aggregates **skip** nulls: `avg(x)` over `(1, NULL, 3)` is 2, not 1.33.
+    - `count(*)` counts rows including all-null ones; `count(x)` does not.
+    - `NULL` sorts last by default in `ORDER BY ... ASC`; control it with `NULLS FIRST`/`NULLS LAST`.
+    - `UNIQUE` allows multiple `NULL`s, because they are not equal to each other. If you want at most
+      one, use a partial unique index.
+    - String concatenation with `NULL` yields `NULL`; use `concat()` or `coalesce()`.
+
+    ### The production surface: `EXISTS` vs `IN` vs `JOIN`
+
+    Three ways to write "customers who have a refunded order". Measured on 200,000 customers and
+    1,000,000 orders:
+
+    | Form | Plan chosen | Time |
+    | --- | --- | --- |
+    | `WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.status='refunded')` | Parallel Hash **Semi** Join | 210 ms |
+    | `WHERE c.id IN (SELECT customer_id FROM orders WHERE status='refunded')` | Parallel Hash **Semi** Join | 171 ms |
+    | `JOIN orders o ON ... WHERE o.status='refunded'` with `count(DISTINCT c.id)` | Hash Join + Aggregate | 237 ms |
+
+    `EXISTS` and `IN` produced **the identical plan** — the planner rewrites both into a semi-join,
+    which stops at the first match per row. The 210 versus 171 ms difference is run-to-run noise on
+    a loaded machine, not a property of the syntax. Choose between them for readability and for
+    `NULL` safety, not for speed.
+
+    The `JOIN` form is genuinely different: it multiplies rows and then needs `DISTINCT` to
+    de-duplicate, which is both slower and a fan-out risk. **Use a semi-join (`EXISTS`) when you
+    want filtering; use a join when you want the other table's columns.**
+
+    ### Trade-offs
+
+    | Decision | Choose the first when… | Choose the second when… |
+    | --- | --- | --- |
+    | **`EXISTS` vs `IN`** | The subquery can produce `NULL`, or it is correlated — `EXISTS` is null-safe and reads as intent. | The list is a small literal set, or it comes from a `NOT NULL` column and reads better. |
+    | **CTE vs subquery** | Readability, or the result is used more than once. Since PostgreSQL 12 CTEs are inlined by default, so there is usually no cost. | You need to force materialisation — then say `WITH x AS MATERIALIZED (...)` explicitly rather than relying on old behaviour. |
+    | **Aggregate-then-join vs join-then-aggregate** | Whenever the child table can produce more than one row per parent. It is the fan-out fix. | The join is to a unique key and provably cannot multiply — and even then, verify with `count(*)`. |
+    | **`DISTINCT` vs fixing the grain** | Never as a first resort. `DISTINCT` on a fan-out result hides the bug and de-duplicates rows that were legitimately different. | Genuine duplicates in the source data, and then say so in a comment. |
+    | **`UNION` vs `UNION ALL`** | You need de-duplication and are prepared to pay for the sort or hash. | You know there are no duplicates — `UNION ALL` skips the dedup entirely and is materially faster on large sets. |
+
+    ### Reference implementation: rewriting a slow query
+
+    The pattern that recurs: a "top N per group" written as a correlated subquery.
+
+    ```sql
+    -- The slow way: for each row, count how many rows beat it.
+    SELECT category, name, units FROM (
+      SELECT p.category, p.name, sum(i.qty) units
+      FROM products p JOIN order_items i ON i.product_id = p.id
+      GROUP BY 1, 2) t
+    WHERE (SELECT count(*) FROM (
+             SELECT p2.name, sum(i2.qty) u2
+             FROM products p2 JOIN order_items i2 ON i2.product_id = p2.id
+             WHERE p2.category = t.category GROUP BY p2.name) x
+           WHERE x.u2 > t.units) < 3;
+    ```
+
+    I ran this on the seeded database and **cancelled it after 5 minutes 7 seconds.** The subquery
+    re-aggregates 3,000,000 order items once per candidate row.
+
+    ```sql
+    -- The fast way: aggregate once, rank once.
+    WITH ranked AS (
+      SELECT p.category, p.name, sum(i.qty) AS units,
+             row_number() OVER (PARTITION BY p.category ORDER BY sum(i.qty) DESC) AS rn
+      FROM   products p JOIN order_items i ON i.product_id = p.id
+      GROUP  BY p.category, p.name)
+    SELECT category, name, units FROM ranked WHERE rn <= 3 ORDER BY category, rn;
+    ```
+
+    **330 ms.** Same answer, same database, no index added. The rule this teaches: a correlated
+    subquery in a `WHERE` clause runs *per row*, so its cost is multiplied by the outer row count.
+    Window functions — the next module — scan once.
+
+    ### What breaks in the real world
+
+    A finance team's monthly revenue dashboard disagreed with the accounting system by between 8%
+    and 340%, varying by month. The query joined `orders` to `order_items` (to filter by product
+    category) and summed `orders.total_cents`. Months where customers bought more items per order
+    were inflated more — which is why the discrepancy varied and why "it was right last month"
+    delayed the diagnosis by weeks.
+
+    The engineer who found it did one thing: added `count(*)` to the query and compared it with the
+    order count. 15,000 against 5,002 on a sample range. Everything followed from that.
+
+    The fix was aggregating items into a CTE first. The durable fix was a convention: **every
+    reporting query states its grain in a comment on line one**, and any query joining to a child
+    table must either aggregate it first or explain in the comment why it cannot multiply. Reviewers
+    check that comment. It is a five-second habit that removes an entire bug class.
+
+    <Accordion title="Design checkpoint — model answer inside">
+      **Question.** A colleague's query returns duplicates. They add `SELECT DISTINCT` and the
+      numbers look right. Do you approve the change?
+
+      **Model answer.** No, and the reason is not style. `DISTINCT` de-duplicates *identical output
+      rows*, so it fixes the symptom only when the duplicates happen to be identical in every
+      selected column. Add one more column later — an item id, a timestamp — and the duplicates
+      become distinct again and silently return. Worse, if the query aggregates, `DISTINCT` runs
+      after the aggregate, so the inflated `SUM` is de-duplicated to a single inflated value.
+      Diagnose instead: run `count(*)` before and after the join. If the count changed, the grain
+      changed. Then either aggregate the child in a CTE, or use `EXISTS` if the child is only being
+      used as a filter, or use `DISTINCT ON (key)` with an explicit `ORDER BY` if you genuinely want
+      one row per key and can say which one. All three are cheap; `DISTINCT` as a reflex is how the
+      3.0× inflation above survives review.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    ### From SQL text to a plan
+
+    PostgreSQL turns your query into a plan in four stages: **parse** (text to a syntax tree),
+    **rewrite** (apply views and rules), **plan/optimize** (enumerate join orders and access
+    methods, cost each, pick the cheapest), **execute** (walk the chosen tree).
+
+    The planner is *cost-based*. It estimates rows using statistics collected by `ANALYZE` —
+    histograms, most-common-values lists, `n_distinct` — and prices each node with
+    `seq_page_cost` (1.0), `random_page_cost` (4.0 by default, and **wrong for SSDs**, where 1.1
+    is realistic), and CPU costs per tuple and operator. Two consequences: stale statistics produce
+    bad plans, and a `random_page_cost` of 4.0 on flash storage systematically discourages index
+    scans.
+
+    ### The three join algorithms, measured
+
+    | Algorithm | How it works | Best when | Measured here |
+    | --- | --- | --- | --- |
+    | **Nested loop** | For each outer row, probe the inner (usually via an index) | The outer side is tiny and the inner has an index | **9.5 ms** for 55 rows out of 1M |
+    | **Hash join** | Build a hash table from the smaller side, probe with the larger | Both sides large, no useful ordering, hash fits in `work_mem` | **1,148 ms** (200k × 40k, cold, 1,859 pages read) |
+    | **Merge join** | Sort both sides on the key, then walk them in step | Both sides already sorted, or sorting is cheap | **742 ms** for the same query, forced |
+
+    Read the numbers carefully. The merge join was *faster* than the hash join on this run — but the
+    hash join run was cold (`Buffers: shared hit=8937 read=1859`) while the merge join was warm.
+    That is exactly the trap in benchmarking plans: **compare only warm-to-warm, and read the
+    `Buffers` line to check.** Reporting the 742 versus 1,148 as "merge beats hash" would be wrong,
+    and the `EXPLAIN (ANALYZE, BUFFERS)` output is what tells you so.
+
+    Nested loop is quadratic when the planner's row estimate is wrong. A plan that estimates 5 rows
+    on the outer side and gets 500,000 will use a nested loop and take minutes. **The first thing to
+    check in any slow plan is the ratio between estimated and actual rows on each node** — an order
+    of magnitude or more means the planner was working from bad information, and the fix is usually
+    `ANALYZE`, extended statistics, or a rewrite that the estimator can reason about.
+
+    ### Reading `EXPLAIN ANALYZE` line by line
+
+    ```
+    Gather  (cost=1000.00..14980.83 rows=5 width=24) (actual time=28.146..269.071 rows=5 loops=1)
+      Workers Planned: 2
+      Workers Launched: 2
+      Buffers: shared hit=8772
+      ->  Parallel Seq Scan on orders  (cost=0.00..13980.33 rows=2 width=24)
+                                       (actual time=71.573..247.706 rows=2 loops=3)
+            Filter: (customer_id = 123456)
+            Rows Removed by Filter: 333332
+            Buffers: shared hit=8772
+    Planning Time: 0.560 ms
+    Execution Time: 269.116 ms
+    ```
+
+    - **Read inner to outer, bottom to top.** The `Parallel Seq Scan` runs first; `Gather` collects.
+    - `cost=start..total` is in arbitrary units. Only compare costs *within one plan*.
+    - `rows=5` is the **estimate**; `rows=5` in the actual section is the **truth**. Compare them —
+      here they agree, so the estimate was good.
+    - `loops=3` means the node ran three times (once per worker). **`actual time` is per loop**, so
+      total work is `time × loops`. Forgetting this is the most common misreading of `EXPLAIN`.
+    - `Rows Removed by Filter: 333332` — each worker examined 333,332 rows to return 2. That single
+      line is the whole argument for the index in `P1-W08-M3`.
+    - `Buffers: shared hit=8772` — 8,772 pages (about 68 MB) read from cache. `read=` would mean
+      from disk; `dirtied=` means pages modified.
+    - `Planning Time` versus `Execution Time` — if planning dominates, you have too many partitions
+      or too many joins, not a slow query.
+
+    Always use `EXPLAIN (ANALYZE, BUFFERS)`. Without `BUFFERS` you cannot tell a cold run from a
+    warm one, and you will draw the wrong conclusion, as the hash-versus-merge comparison above
+    shows.
+
+    ### Semi-joins, anti-joins, and what the planner does with them
+
+    The planner recognises `EXISTS` and `IN` as **semi-joins**: stop at the first match, never
+    duplicate the outer row. `NOT EXISTS` becomes an **anti-join**: emit outer rows with no match.
+    Both are strictly better than the join-plus-`DISTINCT` form, which materialises duplicates and
+    then removes them.
+
+    Verified on the seeded data: `EXISTS` and `IN` both produced `Parallel Hash Semi Join`, at 210 ms
+    and 171 ms — the same plan, and the difference is noise. The `JOIN` plus `count(DISTINCT)` form
+    took 237 ms with a different plan that must de-duplicate. `NOT IN` gets **no** anti-join
+    optimisation when nulls are possible, because the semantics genuinely differ — so it is both
+    slower and wrong.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Fan-out inflating aggregates | A revenue figure that is a suspiciously round multiple too high | `count(*)` before and after the join; measured 5,002 → 15,000 and 3.0× on `SUM` |
+    | `NOT IN` returning nothing | A filter that "stopped working" with no code change | A `NULL` entered the subquery column. Use `NOT EXISTS` |
+    | Nested loop on a bad estimate | Query normally 20 ms, occasionally 4 minutes | Estimated versus actual rows differ by orders of magnitude; `ANALYZE`, or add extended statistics |
+    | `count(*)` after a `LEFT JOIN` | Customers with zero orders counted as one | `count(child.id)`, not `count(*)` |
+    | Correlated subquery in `WHERE` | Runtime scales with the outer row count | Measured: 5 min 7 s versus 330 ms for the window-function rewrite |
+    | Plan changes overnight | Same query, same data, different plan | Autovacuum ran `ANALYZE` and the estimates moved; check `pg_stat_user_tables.last_autoanalyze` |
+    | Sort spilling to disk | A query that is fine at 10k rows and slow at 100k | `Sort Method: external merge Disk: 11096kB` in the plan; raise `work_mem` for that session or reduce the sorted set |
+
+    ### Frontier and primary sources
+
+    - **Selinger et al. (1979), "Access Path Selection in a Relational Database Management System."**
+      *Takeaway:* cost-based optimisation with dynamic-programming join ordering is the design every
+      modern planner still uses, including PostgreSQL's.
+    - **PostgreSQL 16 documentation, "Using EXPLAIN."** *Takeaway:* the per-loop timing and the
+      estimated-versus-actual row comparison are the two things to read first; everything else is
+      detail.
+    - **Graefe (1993), "Query Evaluation Techniques for Large Databases."** *Takeaway:* the survey
+      that names and compares every join and aggregation algorithm you will meet — read it once and
+      plan shapes stop being surprising.
+    - **PostgreSQL `pg_hint_plan` and the planner's cost GUCs.** *Takeaway:* `enable_seqscan=off` and
+      friends are diagnostic tools that let you *ask* the planner what the alternative would cost —
+      not production settings.
+
+    ### Stretch challenge
+
+    Take the five slowest queries from a real system — use `pg_stat_statements`, which
+    `P1-W07-M5` sets up — and for each produce: the plan before, the estimated-versus-actual row
+    ratio at every node, a hypothesis for why the planner chose what it chose, a rewrite, and the
+    plan after with warm-cache timings for both.
+
+    Then the part that separates this from a tuning exercise: for one of the five, make the query
+    *faster* without changing the SQL or adding an index — only by changing what the planner knows.
+    `ANALYZE` with a higher statistics target, `CREATE STATISTICS` for correlated columns, or a
+    corrected `random_page_cost` for your storage. Document which knowledge changed the plan. That
+    is the difference between someone who tunes queries and someone who understands the optimizer.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Take the five slow queries in `labs/p1/week-07/queries/slow/`. For each: capture
+`EXPLAIN (ANALYZE, BUFFERS)` before, rewrite it, capture the plan after, and record warm-cache
+timings for both. Your write-up must name the plan node that changed, not just the time.
+</Card>
+
+## The whiteboard
+
+T1 is the row-multiplication sketch with the fan-out `SUM`. Hero animation **A11** shows two tables'
+rows physically combining, one join type at a time, with the row count updating so the multiplication
+is visible.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p1-w07-m3-blank.svg) · [Editable source](/assets/diagrams/p1-w07-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    Commit the 25 queries with their answers and, for five of them, the `EXPLAIN ANALYZE` output
+    before and after a rewrite. In an interview: "I check `count(*)` before and after every join,
+    because a join to a child table changes the grain — I have seen it inflate a revenue sum by
+    exactly 3×." That is a specific, memorable, verifiable thing to have learned.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **One:** grep your reporting queries for `NOT IN (SELECT` — every one is a latent zero-rows bug
+    if that column ever becomes nullable. **Two:** find aggregate queries that join to a child table
+    and check the grain; the wrong ones are usually the reports finance disagrees with. **Three:**
+    run `EXPLAIN (ANALYZE, BUFFERS)` on your slowest endpoint's query and compare estimated to actual
+    rows — if they differ by 10× or more, the fix is statistics, not caching.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Revenue too high by an integer-ish factor | Fan-out join changed the grain | Aggregate the child in a CTE first; verify with `count(*)` |
+| A filter suddenly returns nothing | `NOT IN` with a `NULL` in the subquery | `NOT EXISTS` |
+| Customers with no orders counted as one | `count(*)` after a `LEFT JOIN` | `count(child.id)` |
+| `WHERE count(*) > 5` is a syntax error | `WHERE` runs before grouping | `HAVING` |
+| `DISTINCT` "fixed" the duplicates | It masks a grain problem and breaks when a column is added | Fix the grain |
+| Query occasionally takes minutes | Nested loop chosen on a bad row estimate | Compare estimated to actual rows; `ANALYZE` or add extended statistics |
+| Slow only on large inputs | Sort spilling to disk | `Sort Method: external merge` in the plan; raise `work_mem` or sort less |
+| Correlated subquery times out | It runs once per outer row | Rewrite with a window function — measured 5 min 7 s → 330 ms |
+
+## Assessment
+
+**Concept questions**
+
+1. Give the logical execution order of a `SELECT`. *(FROM/JOIN → WHERE → GROUP BY → HAVING → SELECT → ORDER BY → LIMIT.)*
+2. Why does joining to a child table break `SUM`? *(It changes the grain, repeating the parent value once per child row — measured 3.0× inflation.)*
+3. Why does `NOT IN` with a `NULL` return nothing? *(It expands to a chain of `<>` comparisons; one against `NULL` is unknown, so the predicate is never true.)*
+4. Difference between `count(*)` and `count(col)` after a `LEFT JOIN`? *(`count(*)` counts the null-filled row; `count(col)` correctly returns 0.)*
+5. When does the planner choose a nested loop? *(Small outer side with an indexed inner side — measured 9.5 ms for 55 rows.)*
+6. What does `loops=3` mean for `actual time`? *(The node ran three times; the reported time is per loop, so multiply.)*
+7. Why compare estimated to actual rows in a plan? *(A large discrepancy means the planner chose from bad information; the fix is statistics, not rewriting.)*
+8. `EXISTS` or `IN` — which is faster? *(Neither; PostgreSQL plans both as a semi-join. Measured 210 ms and 171 ms for the same plan — noise.)*
+
+**Coding challenge.** Answer 25 supplied questions against the seeded database. Hidden tests check the result sets exactly, and three of the questions are designed so the naive join gives a plausible but wrong answer.
+
+**Interview questions**
+
+- *Junior:* "What is the difference between `INNER JOIN` and `LEFT JOIN`?"
+- *Mid:* "This report's revenue is triple the accounting figure. Walk me through your diagnosis."
+- *Senior:* "A query is usually 20 ms and occasionally 4 minutes with the same parameters. What is happening?"
+
+**Draw it from memory.** Draw three parent rows joined to seven child rows, show the resulting seven output rows, and write both the correct and the inflated `SUM` beside them.
+
+## Sources & further reading
+
+**Primary docs**
+
+- [PostgreSQL 16: Queries](https://www.postgresql.org/docs/16/queries.html) — read the join and `GROUP BY` sections; the examples are unusually precise about grain.
+- [PostgreSQL 16: Using EXPLAIN](https://www.postgresql.org/docs/16/using-explain.html) — read it twice. It is the highest return per page in the entire manual.
+- [PostgreSQL 16: Functions and Operators — comparison](https://www.postgresql.org/docs/16/functions-comparison.html) — read the `NULL` semantics table before you next write `NOT IN`.
+
+**Papers and their takeaways**
+
+- **[Selinger et al. (1979).](https://doi.org/10.1145/582095.582099)** *Takeaway:* cost-based join ordering with dynamic programming is why the planner sometimes rewrites your query into something unrecognisable, and why it is usually right.
+- **[Graefe (1993), "Query Evaluation Techniques for Large Databases."](https://doi.org/10.1145/152610.152611)** *Takeaway:* every plan node you will ever see is one of a small, well-understood set of algorithms with known cost profiles.
+- **[Date, "A Critique of the SQL Language."](https://doi.org/10.1145/984549.984551)** *Takeaway:* SQL's three-valued logic is a genuine design flaw with consequences you must work around, not a subtlety you are failing to appreciate.
+
+**Go deeper**
+
+- [*SQL Performance Explained*, Markus Winand (and use-the-index-luke.com)](https://use-the-index-luke.com/) — read the chapters on joins and on `ORDER BY`. It is the clearest published explanation of how index structure and query shape interact, and it sets up `P1-W08-M3` perfectly.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-07/p1-w07-m3">
+  Attempt the lab first. Seriously.
+</Card>

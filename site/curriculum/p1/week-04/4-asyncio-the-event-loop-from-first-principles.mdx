@@ -1,0 +1,854 @@
+---
+title: "`asyncio`: the event loop from first principles"
+description: "Week 4 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 4 · Module 4 · `P1-W04-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Explain what `await` actually does — hand control back to the loop — and why that makes one thread serve thousands of connections.
+2. Turn 40 sequential HTTP calls taking 2.184 s into 0.081 s with `gather`, a measured **27×**.
+3. Bound concurrency with a `Semaphore` and predict the throughput from Little's law before you run it.
+4. Write a **151-line event loop** over `selectors` that runs your own coroutines, and never think `await` is magic again.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/P1-W04-M4.svg" alt="Hand-drawn sketch: asyncio: the event loop from first principles" className="block dark:hidden" />
+  <img src="/assets/diagrams/P1-W04-M4-dark.svg" alt="Hand-drawn sketch: asyncio: the event loop from first principles" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: P1-W04-M4
+tier: T3
+one-sentence-goal: `await` is a coroutine handing control back to the loop, so the loop can run something else during the wait — one thread, many conversations.
+elements:
+  - top: the waiter analogy drawn twice. LEFT: one waiter standing at table 1 with a stopwatch, three other tables drawn with waiting customers, labelled "BLOCKING: 4 tables x 50 ms = 200 ms". RIGHT: one waiter mid-stride, all four tables with orders in progress, labelled "ASYNC: 4 tables in ~50 ms"
+  - centre: the loop drawn as a hand-drawn circle with four stations around it, numbered: (1) "run ready callbacks", (2) "fire due timers", (3) "select() — BLOCK here until I/O is ready", (4) "wake the tasks whose Futures resolved" — with the arrow returning to (1)
+  - inside the circle, a small stack of task cards, one drawn half-out with "suspended at `await`, resumes here" written on it and an amber note "the coroutine's local variables are still alive. that is the whole cost: no stack, just a frame."
+  - a red cross-out over a station labelled "time.sleep(1) / requests.get()" with the note in red "BLOCKS THE LOOP. every other task stops. use asyncio.sleep / an async client / to_thread."
+  - right band: a hand-drawn measured table, "40 requests x 50 ms server" — sequential 2.184 s / threads(20) 0.155 s / asyncio gather 0.081 s / floor 0.050 s, with "27.02x" circled in green
+  - lower band: the Little's-law staircase, semaphore size vs throughput, points written in: "1 -> 19 req/s, 5 -> 94, 20 -> 371, 50 -> 885, 200 -> 2,681, 500 -> 4,799", with the formula "throughput = concurrency / latency" written beside it
+  - bottom-right corner: a dangling arrow "…and what is inside `select()`? -> write the loop yourself, Layer 3"
+numbers-to-write-in: sequential 2.184 s -> gather 0.081 s (27.02x) · floor 0.050 s · semaphore 20 -> 371 req/s · semaphore 500 -> 4,799 req/s · mini loop: 20 requests in 0.064 s on one thread
+alt: A hand-drawn diagram contrasting a blocking waiter serving four tables one at a time with an async waiter keeping four orders in flight, the event loop drawn as a four-station cycle with a suspended task card, a crossed-out station showing a blocking call stopping the whole loop, and measured tables for gather speedup and semaphore-bounded throughput.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term is defined where it first appears.
+
+### The one idea
+
+Most programs spend most of their time waiting — for a network reply, a database, a file. While your program waits, the CPU does nothing.
+
+`asyncio` lets **one thread** keep many operations in flight. When a piece of code reaches a point where it must wait, it *hands control back* to a scheduler, which runs something else until the wait is over. The word for handing control back is **`await`**, and that is the entire concept.
+
+### The analogy
+
+A restaurant with one waiter and four tables.
+
+**Blocking:** the waiter takes table 1's order, walks it to the kitchen, and *stands there* until the food is ready. Then serves it, then goes to table 2. Four tables × 50 minutes each = 200 minutes, and the waiter was motionless for most of it.
+
+**Async:** the waiter takes table 1's order, hands it to the kitchen, and immediately goes to table 2 — because there is nothing useful to do while a steak cooks. All four orders are cooking at once. Four tables in about 50 minutes.
+
+There is still **one waiter**. Nothing was parallelised; the *waiting* was overlapped. That is why async is enormous for I/O and useless for computation — a waiter cannot cook four steaks at once by walking faster.
+
+And one rule follows immediately: **the waiter must never do something that takes a long time without handing off.** If the waiter starts chopping vegetables, every table waits. That is what calling a blocking function inside async code does.
+
+### The vocabulary, defined
+
+- **Blocking** — a call that does not return until it is finished, during which the thread does nothing else. `time.sleep`, `requests.get`, a plain file read.
+- **Non-blocking** — a call that returns immediately, saying either "here is the result" or "not ready yet".
+- **Coroutine function** — a function defined with `async def`. Calling it runs **no code**; it returns a coroutine object.
+- **Coroutine object** — the paused, runnable thing that `async def` returns. It does nothing until awaited or scheduled.
+- **`await`** — "start this, and if it needs to wait, suspend me and let the loop run something else; resume me here when it is done."
+- **Awaitable** — anything you can `await`: a coroutine, a Task, or a Future.
+- **Event loop** — the scheduler. It keeps a list of ready work, runs it, and blocks in the operating system until some I/O is ready.
+- **Task** — a coroutine that the loop is actively driving. `asyncio.create_task(coro)` schedules one.
+- **Future** — a placeholder for a value that will exist later.
+- **`asyncio.gather(*aws)`** — run several awaitables concurrently and wait for all of them.
+- **`TaskGroup`** — the modern (3.11+) way to run several tasks with proper cleanup if one fails.
+- **Cancellation** — telling a task to stop. It raises `CancelledError` at its next `await`.
+
+### Smallest working example
+
+```python
+import asyncio
+import time
+
+
+async def fetch(name: str, seconds: float) -> str:
+    print(f"  {name} start")
+    await asyncio.sleep(seconds)          # suspend HERE; the loop runs something else
+    print(f"  {name} done")
+    return f"{name} result"
+
+
+async def sequential() -> None:
+    t = time.perf_counter()
+    await fetch("A", 1)
+    await fetch("B", 1)
+    await fetch("C", 1)
+    print(f"sequential: {time.perf_counter() - t:.2f} s")
+
+
+async def concurrent() -> None:
+    t = time.perf_counter()
+    await asyncio.gather(fetch("A", 1), fetch("B", 1), fetch("C", 1))
+    print(f"concurrent: {time.perf_counter() - t:.2f} s")
+
+
+asyncio.run(sequential())
+asyncio.run(concurrent())
+```
+
+```
+  A start
+  A done
+  B start
+  B done
+  C start
+  C done
+sequential: 3.00 s
+  A start
+  B start
+  C start
+  A done
+  B done
+  C done
+concurrent: 1.00 s
+```
+
+Look at the interleaving. In the sequential version each task finishes before the next begins. In the concurrent version all three start, then all three finish. **Same functions, same thread — the difference is `gather`.**
+
+### Line-by-line walkthrough
+
+- `async def fetch(...)` — a coroutine function. Calling `fetch("A", 1)` alone runs nothing and returns a coroutine object; if you forget to await it, Python warns "coroutine was never awaited" and nothing happens.
+- `await asyncio.sleep(seconds)` — the suspension point. The coroutine's state (its local variables, its position) is saved, control returns to the loop, and the loop resumes it when the timer fires. **`time.sleep` here would block the entire loop** and the concurrent version would take 3 seconds again.
+- `await fetch("A", 1)` in `sequential` — await means *wait for this one*. Three sequential awaits are three sequential operations. `await` on its own is **not** concurrency.
+- `asyncio.gather(a, b, c)` — schedule all three as tasks and wait for all of them. This is where the concurrency comes from.
+- `asyncio.run(main())` — create a loop, run the coroutine to completion, close the loop. One `asyncio.run` per program, at the top.
+
+### The single rule that matters most
+
+**Never block the loop.** There is one thread. If any coroutine spends 200 ms computing or calls a blocking function, *every other task is frozen* for those 200 ms.
+
+| Blocking (never inside `async def`) | Async replacement |
+|---|---|
+| `time.sleep(1)` | `await asyncio.sleep(1)` |
+| `requests.get(url)` | `await client.get(url)` with `httpx.AsyncClient` or `aiohttp` |
+| `open(path).read()` | `await asyncio.to_thread(path.read_text)` |
+| `psycopg2` / `sqlite3` | `asyncpg`, `aiosqlite`, or `await asyncio.to_thread(...)` |
+| a 500 ms computation | `await asyncio.to_thread(fn)`, or a process pool |
+
+`asyncio.to_thread(fn, *args)` (3.9+) runs a blocking function in a thread pool and awaits the result. It is the escape hatch for the library that has no async version, and it is one line.
+
+### Guided practice
+
+<Steps>
+<Step title="Break the loop on purpose">
+
+```python
+import asyncio, time
+
+async def good():
+    await asyncio.sleep(1)
+
+async def bad():
+    time.sleep(1)                    # BLOCKING inside async
+
+async def main():
+    t = time.perf_counter(); await asyncio.gather(good(), good(), good())
+    print(f"3x good: {time.perf_counter()-t:.2f} s")     # 1.00 s
+    t = time.perf_counter(); await asyncio.gather(bad(), bad(), bad())
+    print(f"3x bad:  {time.perf_counter()-t:.2f} s")     # 3.00 s
+
+asyncio.run(main())
+```
+
+Three seconds. `gather` scheduled all three, and the first one refused to give the loop back until its `time.sleep` finished. **`gather` cannot rescue code that never yields.**
+</Step>
+<Step title="Turn on debug mode and let it tell you">
+
+```bash
+PYTHONASYNCIODEBUG=1 python3 myapp.py
+```
+
+or `asyncio.run(main(), debug=True)`. The loop then warns whenever a single callback occupies it for more than 100 ms:
+
+```
+Executing <Task ...> took 1.003 seconds
+```
+
+That message names the coroutine that blocked. Turn this on the first time an async program is mysteriously slow; it usually answers the question immediately.
+</Step>
+<Step title="Rescue a blocking call">
+
+```python
+import asyncio, time
+
+def slow_sync(n):                    # a library you cannot change
+    time.sleep(n)
+    return n
+
+async def main():
+    t = time.perf_counter()
+    results = await asyncio.gather(*(asyncio.to_thread(slow_sync, 1) for _ in range(3)))
+    print(results, f"{time.perf_counter()-t:.2f} s")     # [1, 1, 1] 1.00 s
+
+asyncio.run(main())
+```
+
+`to_thread` moves the blocking call into a worker thread so the loop stays free. It costs a thread each, so it is for tens of calls, not thousands.
+</Step>
+<Step title="Use TaskGroup instead of gather">
+
+```python
+import asyncio
+
+async def work(i):
+    await asyncio.sleep(0.1)
+    if i == 2:
+        raise ValueError(f"task {i} failed")
+    return i
+
+async def main():
+    try:
+        async with asyncio.TaskGroup() as tg:            # 3.11+
+            tasks = [tg.create_task(work(i)) for i in range(5)]
+    except* ValueError as eg:                            # except* handles ExceptionGroup
+        print("failures:", [str(e) for e in eg.exceptions])
+    print("results:", [t.result() for t in tasks if not t.cancelled() and not t.exception()])
+
+asyncio.run(main())
+```
+
+When one task raises, `TaskGroup` **cancels the others and waits for them to finish cancelling** before leaving the block. With bare `gather`, the siblings keep running in the background and you have leaked tasks. Prefer `TaskGroup` for anything where the tasks belong together.
+</Step>
+</Steps>
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **What does calling an `async def` function do?** — nothing. It returns a coroutine object; the body runs only when it is awaited or made a task.
+2. **Does `await` make things concurrent?** — no. `await` waits for one thing. `gather`, `TaskGroup` and `create_task` create concurrency.
+3. **Why is `time.sleep(1)` fatal inside a coroutine?** — it blocks the only thread, so every other task is frozen for a second. Use `asyncio.sleep`.
+4. **How many threads does asyncio use?** — one, for your coroutines. `to_thread` and `run_in_executor` add a pool for blocking calls.
+5. **What runs when your coroutine is suspended at an `await`?** — the event loop runs other ready tasks, and when nothing is ready it blocks in the OS waiting for I/O.
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions. Measured with CPython 3.13.2, aiohttp 3.14.3, httpx 0.28.1, uvloop 0.22.1 on an Apple M3 Pro, macOS 15, against a local server with a fixed 50 ms delay.
+
+### The numbers
+
+**40 requests against a 50 ms endpoint** (Module 1's matrix):
+
+| Model | Time | Speedup |
+|---|---|---|
+| sequential | 2.184 s | 1.00× |
+| threads (20) | 0.155 s | 14.09× |
+| **asyncio `gather`** | **0.081 s** | **27.02×** |
+| *floor: one round trip* | *0.050 s* | *43.7×* |
+
+**Scaling with unbounded `gather`** (connector limit 100):
+
+| Requests | Time | Throughput | Per request |
+|---|---|---|---|
+| 1 | 78.1 ms | 12.8 req/s | 78.07 ms |
+| 10 | 54.4 ms | 183.9 req/s | 5.44 ms |
+| 100 | 63.4 ms | **1,577 req/s** | 0.63 ms |
+| 500 | 292.5 ms | 1,709 req/s | 0.59 ms |
+| 1,000 | 567.4 ms | **1,762 req/s** | 0.57 ms |
+
+Throughput plateaus at about **1,760 req/s** — and that is not asyncio's limit, it is the connector's. The pool allows 100 simultaneous connections against a 50 ms server, so `100 / 0.05 = 2,000 req/s` is the ceiling, and we measure 88% of it. **Your concurrency limit sets your throughput, and it is usually a configuration value you forgot you set.**
+
+### Little's law: predict the throughput before you run it
+
+```
+throughput = concurrency / latency
+```
+
+Measured with an explicit `Semaphore`, 500 requests against the same 50 ms endpoint. The Time and
+Throughput columns are **measured**; the prediction column is **derived** from the formula above
+and holds on any machine — the point of the table is that they agree:
+
+| Semaphore | Time (measured) | Throughput (measured) | Little's law (derived) |
+|---|---|---|---|
+| 1 | 26,346 ms | 19.0 req/s | 1 / 0.052 = 19.2 |
+| 5 | 5,291 ms | 94.5 req/s | 5 / 0.052 = 96 |
+| **20** | **1,347 ms** | **371.2 req/s** | 20 / 0.054 = **370** |
+| 50 | 565 ms | 884.7 req/s | 50 / 0.056 = 893 |
+| 200 | 187 ms | 2,681 req/s | — |
+| 500 | 104 ms | 4,799 req/s | — |
+
+The middle rows match the prediction to within about 1%. That means **you can size a concurrency limit arithmetically**: to sustain 500 requests/second against a service with 80 ms latency you need `500 × 0.08 = 40` in flight. No experimentation required for the first estimate.
+
+The top rows depart from the model because at very high concurrency the server, the connector and the loop itself become the constraint — which is exactly the signal that you have passed the useful limit.
+
+### Bounded concurrency is not optional
+
+`asyncio.gather(*(fetch(u) for u in urls))` with 10,000 URLs creates **10,000 tasks and 10,000 sockets immediately**. You will exhaust file descriptors (macOS defaults to 256 — Week 2, Module 1), overwhelm the target, and get rate-limited or blocked.
+
+```python
+import asyncio
+import aiohttp
+
+
+async def fetch_all(urls: list[str], concurrency: int = 20) -> list[str]:
+    sem = asyncio.Semaphore(concurrency)
+
+    async def one(session: aiohttp.ClientSession, url: str) -> str:
+        async with sem:                                   # at most `concurrency` inside
+            async with session.get(url) as resp:
+                resp.raise_for_status()
+                return await resp.text()
+
+    connector = aiohttp.TCPConnector(limit=concurrency, limit_per_host=concurrency)
+    timeout = aiohttp.ClientTimeout(total=30, connect=5, sock_read=10)
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        return await asyncio.gather(*(one(session, u) for u in urls))
+```
+
+Four details that separate this from the snippet people paste:
+
+- **One `ClientSession` for all requests.** A session owns the connection pool; creating one per request means a fresh TCP handshake (and TLS handshake) every time, which for HTTPS is typically 2–3 extra round trips. This single mistake is the most common cause of "async is not faster for me".
+- **The `Semaphore` bounds *tasks in flight*; `TCPConnector(limit=)` bounds *connections*.** They are different things and you usually want both — the semaphore also bounds memory held by suspended tasks, which the connector does not.
+- **Explicit timeouts, all four fields.** Without `sock_read`, a server that accepts your connection and then sends one byte per minute holds your task forever. The default `aiohttp` total timeout is 300 s, which is almost never what you want.
+- **`raise_for_status()`.** Otherwise a 500 response is a successful `str` and you have Week 2's silent-empty-pipeline bug.
+
+### `gather` versus `TaskGroup` versus `as_completed`
+
+```python
+# gather: all results, in order. On error, siblings KEEP RUNNING (leaked) unless you handle it.
+results = await asyncio.gather(*aws)
+results = await asyncio.gather(*aws, return_exceptions=True)   # errors as values, nothing raised
+
+# TaskGroup (3.11+): structured. One failure cancels the siblings and WAITS for them.
+async with asyncio.TaskGroup() as tg:
+    tasks = [tg.create_task(work(i)) for i in range(10)]
+# on exit: all done, or ExceptionGroup raised and everything cleaned up
+
+# as_completed: process results as they arrive, not in order
+for coro in asyncio.as_completed(aws):
+    result = await coro
+```
+
+**Prefer `TaskGroup`.** The problem with `gather` is that when one awaitable raises, `gather` propagates immediately while the sibling tasks continue running in the background — writing to the database, holding connections, eventually raising "Task exception was never retrieved" into your logs at an unrelated moment. `TaskGroup` implements **structured concurrency**: tasks cannot outlive the block that created them.
+
+`return_exceptions=True` is the right tool when partial failure is acceptable and you want every result, and it is the one case where `gather` is clearly correct.
+
+### Cancellation and timeouts
+
+```python
+async with asyncio.timeout(5):            # 3.11+; the modern form
+    data = await fetch(url)
+
+# older equivalent
+data = await asyncio.wait_for(fetch(url), timeout=5)
+```
+
+Cancellation works by **raising `CancelledError` inside the task at its next `await`**. Three consequences:
+
+**A task with no `await` cannot be cancelled.** A coroutine in a tight computational loop ignores cancellation entirely, because there is no suspension point at which to deliver the exception. That is the same "never block the loop" rule wearing a different hat.
+
+**Cleanup must be in `finally`.** `CancelledError` is a `BaseException` (since 3.8), so `except Exception` does *not* catch it — deliberately, so that a broad handler cannot accidentally swallow a cancellation.
+
+```python
+async def worker():
+    conn = await pool.acquire()
+    try:
+        await do_work(conn)
+    finally:
+        await pool.release(conn)          # runs on cancellation too
+```
+
+**Never swallow `CancelledError`.** If you must catch it for cleanup, re-raise:
+
+```python
+try:
+    await something()
+except asyncio.CancelledError:
+    await cleanup()
+    raise                                  # ALWAYS re-raise
+```
+
+A task that catches cancellation and continues is unkillable, and `TaskGroup` exit or `asyncio.run` shutdown will hang on it.
+
+`asyncio.shield(aw)` protects an awaitable from cancellation — use it for an operation that must complete (a commit, a payment capture) even if the caller gives up. It is easy to misuse; the shielded work keeps running and nobody is waiting for it.
+
+### Trade-offs table
+
+| Decision | Choose X when… | Choose Y when… |
+|---|---|---|
+| asyncio vs threads for I/O | **Threads** when the library has no async version, or concurrency is in the tens — no rewrite, and `to_thread` bridges the gap | **asyncio** for high fan-out: 27.02× versus threads' 14.09× measured, and a suspended coroutine costs a frame rather than a 512 KB stack |
+| `gather` vs `TaskGroup` | **`gather(..., return_exceptions=True)`** when partial failure is fine and you want every result | **`TaskGroup`** otherwise — structured concurrency means a failure cancels and *awaits* the siblings, so nothing leaks |
+| `Semaphore` vs connector limit | **Connector limit** bounds sockets and is what the server sees | **`Semaphore`** bounds tasks and therefore memory. Use both; they constrain different resources |
+| `asyncio.timeout` vs per-call timeouts | **`asyncio.timeout`** for a deadline on a whole operation including retries — one budget, one place | **Client timeouts** (`connect`, `sock_read`) as a floor, because a client with no timeout can hold a task forever regardless of the outer deadline |
+| `to_thread` vs an async library | **`to_thread`** for occasional blocking calls, or a library with no async port | **Native async client** on any hot path: a thread per call caps you at pool size and costs 126 µs to create (Module 2) |
+
+### Reference implementation — a downloader that behaves
+
+```python
+"""downloader.py — bounded, retrying, cancellable, resumable-ready async downloads."""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hashlib
+import logging
+import random
+from dataclasses import dataclass
+from pathlib import Path
+
+import aiohttp
+
+log = logging.getLogger("downloader")
+
+
+@dataclass(frozen=True, slots=True)
+class Job:
+    url: str
+    dest: Path
+    sha256: str | None = None
+
+
+class Downloader:
+    def __init__(self, *, concurrency: int = 20, attempts: int = 4,
+                 total_timeout: float = 60.0) -> None:
+        self._sem = asyncio.Semaphore(concurrency)
+        self._attempts = attempts
+        self._timeout = aiohttp.ClientTimeout(total=total_timeout, connect=5, sock_read=15)
+        self._connector = aiohttp.TCPConnector(limit=concurrency, limit_per_host=concurrency)
+
+    async def __aenter__(self) -> "Downloader":
+        self._session = aiohttp.ClientSession(connector=self._connector, timeout=self._timeout)
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self._session.close()
+
+    async def _fetch_once(self, job: Job) -> int:
+        tmp = job.dest.with_suffix(job.dest.suffix + ".part")
+        digest = hashlib.sha256()
+        written = 0
+        async with self._session.get(job.url) as resp:
+            resp.raise_for_status()
+            with tmp.open("wb") as f:                     # small writes; see the note below
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    f.write(chunk)
+                    digest.update(chunk)
+                    written += len(chunk)
+        if job.sha256 and digest.hexdigest() != job.sha256:
+            tmp.unlink(missing_ok=True)
+            raise ValueError(f"checksum mismatch for {job.url}")
+        tmp.replace(job.dest)                             # atomic publish (Week 2, Module 3)
+        return written
+
+    async def fetch(self, job: Job) -> int:
+        delay = 0.25
+        async with self._sem:
+            for attempt in range(1, self._attempts + 1):
+                try:
+                    return await self._fetch_once(job)
+                except asyncio.CancelledError:
+                    with contextlib.suppress(FileNotFoundError):
+                        job.dest.with_suffix(job.dest.suffix + ".part").unlink()
+                    raise                                  # NEVER swallow cancellation
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                    if attempt == self._attempts:
+                        log.error("giving up on %s after %d attempts: %s",
+                                  job.url, attempt, exc)
+                        raise
+                    sleep_for = random.uniform(0, delay)   # FULL JITTER (Module 5)
+                    log.warning("attempt %d/%d failed for %s: %s; retrying in %.2fs",
+                                attempt, self._attempts, job.url, exc, sleep_for)
+                    await asyncio.sleep(sleep_for)
+                    delay = min(delay * 2, 30.0)
+            raise AssertionError("unreachable")
+
+    async def run(self, jobs: list[Job]) -> list[int]:
+        async with asyncio.TaskGroup() as tg:              # structured: nothing leaks
+            tasks = [tg.create_task(self.fetch(j)) for j in jobs]
+        return [t.result() for t in tasks]
+```
+
+Note the file write: `f.write(chunk)` is **blocking**, and for a 64 KB chunk to a local SSD it is on the order of tens of microseconds, which is acceptable. For large files or a network filesystem it is not, and the right answer is `aiofiles` or `await asyncio.to_thread(f.write, chunk)`. Knowing *which* blocking calls are short enough to tolerate is a judgement you should make explicitly, not by accident.
+
+### What breaks in the real world
+
+A service migrated its outbound HTTP calls from `requests` to `httpx.AsyncClient` and measured **no improvement at all** — p50 unchanged, p99 slightly worse.
+
+Two causes, and both are the standard ones.
+
+First, the client was constructed per request: `async with httpx.AsyncClient() as c: await c.get(url)`. Every call therefore paid a fresh TCP handshake and TLS negotiation — two to three extra round trips before any data moved. Against an upstream 40 ms away that is 80–120 ms added to every request, which swamped the concurrency gain.
+
+Second, and worse, the response handler called a synchronous library to parse and validate the payload: about 15 ms of pure CPU per response. With 200 requests in flight, each 15 ms block froze *all* of them. The service's p99 was dominated by queueing behind other requests' parsing, which is why it got worse rather than better — async had increased the number of requests queued behind each block.
+
+Both were found in ten minutes with `asyncio.run(main(), debug=True)`, which printed `Executing <Task ...> took 0.015 seconds` for every response. The fixes were a module-level shared client with an explicit connection pool, and `await asyncio.to_thread(parse, payload)` for the CPU work — later replaced by a faster parser, which removed the thread hop entirely.
+
+The generalisable lesson: **async makes blocking worse, not better.** In a threaded server, one slow handler blocks one request. In an async server it blocks all of them.
+
+<Accordion title="Design checkpoint — one question, with a model answer">
+
+**Question.** A colleague's async crawler does `await asyncio.gather(*(fetch(u) for u in urls))` over 50,000 URLs. It crashes with "too many open files", and when it does run it gets the crawler's IP blocked. They propose wrapping it in `try/except OSError` and retrying. What do you propose?
+
+**Model answer.** The exception is a symptom of an unbounded design; catching it retries the same unbounded behaviour with fewer resources. Three changes, in order.
+
+**Bound the concurrency.** `gather` over 50,000 coroutines creates 50,000 tasks and opens sockets as fast as the loop can, exhausting the file-descriptor limit — 256 by default on macOS, 1,024 on most Linux distributions (Week 2, Module 1). A `Semaphore` plus `TCPConnector(limit=..., limit_per_host=...)` caps it. Size it with Little's law: if the target's median latency is 200 ms and you want 100 requests/second, `100 × 0.2 = 20` in flight. We measured the model holding to within about 1% at semaphore sizes of 20 and 50.
+
+**Respect the target.** Being blocked is not a resource problem, it is a politeness problem, and no amount of retrying fixes it. Per-host concurrency (`limit_per_host`), a token-bucket rate limiter (Module 5), honouring `Retry-After` on 429, a real `User-Agent` with contact details, and `robots.txt`. A crawler that gets blocked has a design defect, not a transient error.
+
+**Stream, do not materialise.** Building a 50,000-element list of coroutines also holds every result in memory. Process in batches, or use a worker pattern with a bounded queue:
+
+```python
+async def crawl(urls, concurrency=20):
+    queue: asyncio.Queue[str] = asyncio.Queue(maxsize=concurrency * 4)
+
+    async def worker():
+        while True:
+            url = await queue.get()
+            try:
+                await handle(await fetch(url))
+            finally:
+                queue.task_done()
+
+    async with asyncio.TaskGroup() as tg:
+        workers = [tg.create_task(worker()) for _ in range(concurrency)]
+        for url in urls:                        # a generator: never materialised
+            await queue.put(url)                # blocks when full: back-pressure
+        await queue.join()
+        for w in workers:
+            w.cancel()
+```
+
+That is constant memory regardless of URL count, gives back-pressure for free, and the `TaskGroup` guarantees no worker outlives the block.
+
+**What I would add before shipping:** per-request timeouts including `sock_read`, `raise_for_status()` so a 403 is not silently stored as content, a metric for in-flight count and 429 rate, and a checkpoint of completed URLs so a restart does not redo 40,000 fetches. That last one is Module 5's resumability, and for a 50,000-URL crawl it is the difference between a restart costing seconds and costing hours.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a measured number. Figures from CPython 3.13.2, aiohttp
+3.14.3, uvloop 0.22.1 on an Apple M3 Pro (11 cores), macOS 15, against a local server with a
+fixed 50 ms delay. If you cannot reproduce a number on your own machine, treat the claim as
+unproven and tell us.
+</Warning>
+
+### There is no magic: a 151-line event loop
+
+An event loop is three data structures and a `select()` call. Here is the core, and it runs real coroutines.
+
+```python
+class Future:
+    """The one primitive: a value that is not there yet, plus callbacks for when it is."""
+    def __init__(self):
+        self._done, self._result, self._callbacks = False, None, []
+
+    def set_result(self, value):
+        self._done, self._result = True, value
+        for cb in self._callbacks:
+            LOOP.call_soon(cb, self)
+        self._callbacks.clear()
+
+    def add_done_callback(self, cb):
+        LOOP.call_soon(cb, self) if self._done else self._callbacks.append(cb)
+
+    def __await__(self):
+        if not self._done:
+            yield self               # hand the Future OUT to whoever is driving us
+        return self._result
+
+
+class Task:
+    """Drives one coroutine to completion, one `await` at a time."""
+    def __init__(self, coro):
+        self.coro, self.future = coro, Future()
+        LOOP.call_soon(self._step)
+
+    def _step(self, _=None):
+        try:
+            fut = self.coro.send(None)          # run until the next yield (= the next await)
+        except StopIteration as stop:
+            self.future.set_result(stop.value)
+            return
+        fut.add_done_callback(self._step)       # resume when that Future resolves
+
+
+class Loop:
+    def __init__(self):
+        self.ready = deque()
+        self.sel = selectors.DefaultSelector()
+        self.timers = []
+
+    def sock_recv(self, sock, n):
+        fut = Future()
+        def on_readable():
+            self.sel.unregister(sock)
+            fut.set_result(sock.recv(n))
+        self.sel.register(sock, selectors.EVENT_READ, on_readable)
+        return fut
+
+    def run(self, main):
+        root = Task(main)
+        while not root.future._done:
+            while self.ready:                             # 1. run everything ready
+                cb, args = self.ready.popleft()
+                cb(*args)
+            now = time.monotonic()                        # 2. fire due timers
+            while self.timers and self.timers[0][0] <= now:
+                _, fut = self.timers.pop(0)
+                fut.set_result(None)
+            timeout = 0 if self.ready else (              # 3. block until I/O or next timer
+                max(0.0, self.timers[0][0] - time.monotonic()) if self.timers
+                else (None if self.sel.get_map() else 0))
+            for key, _ in self.sel.select(timeout):       # 4. wake the waiting tasks
+                key.data()
+        return root.future.result()
+```
+
+Running 20 concurrent HTTP GETs against the 50 ms server, on one thread, with this loop:
+
+```
+20 requests, 3590 bytes, 0.064 s on ONE thread
+sleep(0.2) took 0.202 s
+```
+
+**0.064 s for 20 requests that would take 1.0 s sequentially.** The complete file, including the socket helpers and the demo, is 151 lines.
+
+Three things this makes concrete:
+
+- **`await` compiles to `yield`.** A coroutine is a generator with a different flag. `coro.send(None)` runs it to its next yield; the value yielded is the Future it is waiting on. The `__await__` method's `yield self` is where control leaves your code.
+- **The loop is not "running in the background".** It is a `while` loop, and step 3 is a blocking `select()`. When every task is suspended, the process is sitting in one syscall — which is why an idle async server uses no CPU.
+- **A suspended task costs a coroutine frame**, a few hundred bytes, not a thread stack. That is the whole reason one process can hold 100,000 open connections.
+
+### uvloop: measure before you adopt
+
+`uvloop` reimplements the loop over libuv (the C library behind Node.js). The 2–4× figure everyone repeats is a **cited finding** — Selivanov's own magic.io benchmarks (2016), which measure raw socket echo throughput on small payloads. **Measured** on this workload instead:
+
+| Requests | asyncio | uvloop | Difference |
+|---|---|---|---|
+| 100 | 63.4 ms | 62.9 ms | 0.8% |
+| 500 | 292.5 ms | 287.2 ms | 1.8% |
+| 1,000 | 567.4 ms | 555.4 ms | **2.1%** |
+
+**Two percent.** The published benchmarks are real and honestly reported — they measure raw socket echo throughput on tiny payloads, where the loop's own overhead is the whole cost. Both numbers are true; they answer different questions. Here the workload is dominated by a 50 ms server, so loop overhead is a rounding error.
+
+The rule this teaches generalises well past uvloop: **a component's benchmark measures the component; your benchmark measures your system.** uvloop is worth adopting when profiling shows time inside the loop's select/callback machinery — typically at tens of thousands of requests per second with sub-millisecond upstreams. At 1,760 req/s against a 50 ms upstream, it is not your problem. (uvloop is also POSIX-only, so adopting it means your Windows developers run a different loop from production.)
+
+### Back-pressure: the failure mode unbounded async produces
+
+A producer that is faster than its consumer, with an unbounded queue between them, is a memory leak with extra steps.
+
+```python
+queue = asyncio.Queue()                      # UNBOUNDED: the producer never waits
+queue = asyncio.Queue(maxsize=1000)          # bounded: `await queue.put()` blocks when full
+```
+
+The bounded version propagates slowness backwards: the consumer is slow, the queue fills, `put` suspends the producer, and the producer stops reading from *its* source. That is the same mechanism as a Unix pipe (Week 2, Module 1) and it is the only thing standing between a slow downstream and an OOM.
+
+The signal to export is **queue depth**, not throughput. Throughput looks healthy right up until the moment memory runs out; a queue that is persistently near `maxsize` tells you the consumer is the bottleneck, hours before it matters.
+
+The same argument applies to `gather` over a large collection: 50,000 tasks are created immediately and all of them hold memory. Worker tasks pulling from a bounded queue is the shape that has an upper bound on resources.
+
+### Cancellation edge cases that corrupt state
+
+Cancellation is the hardest part of asyncio to get right, and three specific cases account for most production bugs.
+
+**1. Cancellation between the operation and the record of it.**
+
+```python
+async def transfer(src, dst, amount):
+    await src.debit(amount)
+    # <- CancelledError delivered HERE: money debited, never credited
+    await dst.credit(amount)
+```
+
+There is a suspension point between the two awaits, and cancellation is delivered at suspension points. The fix is the same as in any distributed system: make the pair idempotent and recoverable (a transaction, or a durable outbox), or `asyncio.shield` the critical section and accept that it runs to completion.
+
+**2. Cleanup that itself awaits, in a cancelled task.**
+
+```python
+finally:
+    await conn.close()          # this await can ALSO be cancelled
+```
+
+If the task is being cancelled with a deadline, the cleanup's `await` may itself raise `CancelledError` and the connection leaks. `asyncio.shield` inside the `finally`, or a synchronous close, is the fix. This is why `TaskGroup` waits for cancelled children rather than abandoning them.
+
+**3. Swallowing `CancelledError`.**
+
+```python
+try:
+    await work()
+except Exception:               # SAFE: CancelledError is a BaseException since 3.8
+    ...
+except BaseException:           # DANGEROUS: catches cancellation
+    ...                         # if you do this, you MUST re-raise
+```
+
+A task that swallows cancellation is unkillable; `TaskGroup.__aexit__` and `asyncio.run`'s shutdown will both hang waiting for it. `asyncio.run` cancels remaining tasks at shutdown and waits, so one uncooperative task hangs process exit.
+
+Debug mode reports the related symptom:
+
+```bash
+PYTHONASYNCIODEBUG=1 python3 app.py
+```
+
+```
+Executing <Task ... coro=<handle() at app.py:42>> took 0.015 seconds
+Task was destroyed but it is pending!
+```
+
+The first is a blocked loop; the second is a task that was garbage-collected while still running, which means someone created a task and dropped the reference. **Always keep a reference to `create_task` results** — the loop holds only a weak one, and a task can be collected mid-flight. `TaskGroup` handles this for you, which is another reason to prefer it.
+
+### Where async stops scaling
+
+| Constraint | Typical limit | Symptom |
+|---|---|---|
+| File descriptors | 256 (macOS default), 1,024 (Linux default) | `OSError: [Errno 24] Too many open files` |
+| Ephemeral ports | ~28,000 per source/dest pair | connect failures under load; TIME_WAIT accumulation |
+| Memory per task | ~1–3 KB for a suspended coroutine plus its buffers | RSS grows with in-flight count, not with throughput |
+| Loop callback rate | roughly 10⁵–10⁶ callbacks/second, single-threaded | CPU at 100% on one core; the other cores idle |
+| One core | the loop is one thread | throughput plateaus while cores are free |
+
+The last row is the one that surprises people: **an async service is single-threaded, so it uses one core.** The standard answer is to run one process per core behind a load balancer — `SO_REUSEPORT`, or gunicorn with `uvicorn` workers — which is why every production ASGI deployment has a worker count. Async solves the concurrency problem, not the parallelism problem; Module 1's distinction, arriving where it matters.
+
+### Production failure modes and how you detect them
+
+| Failure | Signature | Detection |
+|---|---|---|
+| A blocking call in a coroutine | latency for *all* requests tracks one slow operation | `PYTHONASYNCIODEBUG=1`; "Executing took N seconds" names the coroutine |
+| A client created per request | async migration shows no improvement | one shared session at module or app scope; check for `async with Client()` inside a handler |
+| `gather` leaks siblings on failure | "Task exception was never retrieved" at unrelated times | `TaskGroup`, or `gather(..., return_exceptions=True)` |
+| Task garbage-collected mid-flight | "Task was destroyed but it is pending!" | keep a reference; `TaskGroup` does it for you |
+| Unbounded queue | RSS grows steadily; throughput looks fine | export `queue.qsize()`; set `maxsize` |
+| No `sock_read` timeout | a task hangs forever on a stalled connection | set all four timeout fields; a `total` timeout alone leaves the socket open |
+| Swallowed `CancelledError` | shutdown hangs; `TaskGroup` never exits | never catch `BaseException` without re-raising |
+| Cancellation between two operations | half-applied state — debited, not credited | idempotency plus recovery, or `shield` the pair |
+| Throughput plateaus with idle cores | one loop, one thread | one process per core behind a balancer |
+| Adopted uvloop, no change | loop overhead was never the bottleneck | measure first; 2.1% here |
+
+### Frontier and research pointers
+
+- **Van Rossum, G. & Selivanov, Y. — PEP 3156 ("asyncio"), PEP 492 ("async/await"), PEP 525/530 (async generators and comprehensions).** One-sentence takeaway: `async`/`await` is syntax over generators, and PEP 492's rationale is explicit that a coroutine is a generator with a flag — which is why the 151-line loop works.
+- **Van Rossum, G. — PEP 654 ("Exception Groups and `except*`") and PEP 3156's task model.** One-sentence takeaway: concurrent code fails in several ways at once, so a single exception is the wrong model, and `TaskGroup` needs `ExceptionGroup` to report honestly.
+- **Sústrik, M. (2016). "Structured Concurrency" / Smith, N. J. (2018). "Notes on structured concurrency, or: Go statement considered harmful."** One-sentence takeaway: a task that can outlive the block that created it makes control flow unanalysable, which is the argument that produced `TaskGroup` and Trio's nurseries.
+- **Ousterhout, J. (1996). "Why Threads Are A Bad Idea (for most purposes)."** One-sentence takeaway: event loops avoid the race and deadlock classes entirely by having one thread, at the cost of never being allowed to block — which is the whole trade this module makes.
+- **Little, J. D. C. (1961). "A Proof for the Queuing Formula L = λW." *Operations Research* 9(3).** One-sentence takeaway: in-flight requests equal arrival rate times latency, which is why a semaphore of 20 against a 54 ms service gives 371 req/s and why you can size concurrency arithmetically.
+- **Welsh, M., Culler, D. & Brewer, E. (2001). "SEDA: An Architecture for Well-Conditioned, Scalable Internet Services." *SOSP*.** One-sentence takeaway: staged pipelines with bounded queues between them degrade gracefully under overload, where an unbounded design collapses — the formal case for back-pressure.
+
+### Stretch challenge
+
+Write your own event loop, then measure it against the real one.
+
+1. Implement a loop with `Future`, `Task`, `call_soon`, `sleep`, and socket read/connect over `selectors`. Target about 120 lines. **Verify it** by running 20 concurrent HTTP GETs against a fixed-delay server on one thread; ours did 20 requests in **0.064 s** where sequential would be 1.0 s.
+2. Add `gather` and a working `cancel()`. Cancellation is the hard part: you must throw `CancelledError` into the coroutine at its suspension point (`coro.throw(...)`) and handle the case where the task has already completed.
+3. **Benchmark yours against `asyncio` and `uvloop`** on the same workload at 10, 100 and 1,000 concurrent requests. Report requests/second for each. Where does yours lose, and is it the scheduling or the I/O readiness handling?
+4. Add a naive `select()` and compare with `epoll`/`kqueue` (which `selectors.DefaultSelector` picks for you) at 10, 100, 1,000 and 5,000 sockets. `select` is O(n) per call with a hard limit of 1,024 descriptors; `epoll` is O(1) in the number of *ready* descriptors. Plot the divergence — this is the measurement behind the C10K problem.
+5. Instrument your loop to record, per iteration, how long it spent in callbacks versus in `select()`. Run a workload with one deliberately blocking coroutine and show the callback time spike. That is what `PYTHONASYNCIODEBUG` does, and building it yourself makes the diagnostic obvious forever.
+
+The open question with no single right answer: your loop, `asyncio` and `uvloop` will differ by some factor on step 3, and we measured uvloop at only 2.1% ahead of asyncio on a realistic workload. Given that, what workload would actually justify adopting uvloop in production — and how would you demonstrate the need before the migration rather than after? Bring the profile that would convince you.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Implement an event loop in about 120 lines that runs your own coroutines over `selectors`, and prove it by fetching 20 URLs concurrently on one thread.
+</Card>
+
+Acceptance: `Future`, `Task`, `call_soon`, `sleep` and socket I/O all work; 20 concurrent requests against a 50 ms server complete in well under the 1.0 s a sequential version would take (ours: 0.064 s); `sleep(0.2)` takes 0.2 s and not 0; the loop blocks in `select()` when nothing is ready rather than spinning; and you can explain what `coro.send(None)` returns and why.
+
+## The whiteboard
+
+The T1 sketch is the waiter analogy with the four-station loop. The T3 animations are A07 (blocking versus async timelines, side by side) and A08 (the loop rotating, tasks entering the queue, awaiting, resuming).
+
+<Tip>
+**Draw it yourself.** From memory: the two waiters, the four stations of the loop in order,
+the suspended task card with its saved locals, and the crossed-out blocking call. Then compare.
+[Blank version](/assets/diagrams/P1-W04-M4-blank.svg) · [Editable source](/assets/diagrams/P1-W04-M4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Portfolio line:** *"A 151-line event loop built on `selectors` that runs real coroutines — 20 concurrent HTTP requests on one thread in 0.064 s — benchmarked against `asyncio` and `uvloop`, with the `select` versus `epoll` scaling curve at 10 to 5,000 sockets."* Building the thing rather than using it is what makes this stand out.
+
+**The interview angle.** "How does `async`/`await` work?" is a common senior screen and most answers stop at "it lets you do things concurrently". The one that lands is mechanical: *a coroutine is a generator with a flag, `await` compiles to `yield`, and the loop drives it with `coro.send(None)` until it yields a Future. The Future gets a callback that resumes the task, and the loop blocks in `select()` when everything is suspended — which is why an idle async server uses no CPU. I built one in 151 lines; there is no magic in it.*
+
+The follow-up worth preparing: "why is `time.sleep` bad in a coroutine?" — one thread, so it freezes every task, not just this one. And async makes blocking *worse* than threading does, because in a threaded server one slow handler blocks one request.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+Three places this shows up in a normal engineering week:
+
+1. **An async migration that did not get faster.** Two causes cover almost every case: a client created per request (fresh TCP and TLS handshakes, 2–3 extra round trips each) and synchronous CPU work in a handler. `PYTHONASYNCIODEBUG=1` names the second in one run, and the first is a grep for `async with Client()` inside a handler.
+
+2. **Sizing any concurrency limit.** Little's law gives you the first estimate arithmetically: `concurrency = target_throughput × latency`. We measured it holding to within 1% — a semaphore of 20 against a 54 ms service delivered 371 req/s against a predicted 370. Start there, then measure.
+
+3. **Reviewing async code for leaks.** Three specific things: `TaskGroup` rather than bare `gather` so a failure cannot leave siblings running; a reference kept to every `create_task` result, because the loop only holds a weak one; and `maxsize` on every `asyncio.Queue`, because an unbounded queue turns a slow consumer into an OOM.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| "coroutine was never awaited" and nothing happened | called an `async def` without awaiting it | `await coro`, or `asyncio.create_task(coro)` |
+| `gather` is no faster than sequential | a blocking call inside a coroutine | `PYTHONASYNCIODEBUG=1`; use `asyncio.sleep`, an async client, or `to_thread` |
+| Async migration shows no improvement | a new client per request, so a fresh TCP/TLS handshake each time | one shared session for the process |
+| "Too many open files" | unbounded `gather` over thousands of URLs | `Semaphore` plus `TCPConnector(limit=...)`; raise `ulimit -n` as well |
+| "Task exception was never retrieved" at odd times | `gather` propagated one error while siblings kept running | `TaskGroup` |
+| "Task was destroyed but it is pending!" | no reference kept to a `create_task` result | keep the reference, or use `TaskGroup` |
+| Shutdown hangs | a task swallowed `CancelledError` | never catch `BaseException` without re-raising |
+| A task hangs forever on a live connection | a `total` timeout only; no `sock_read` | set `connect`, `sock_read` and `total` |
+| Half-applied state after a timeout | cancellation delivered between two awaits | idempotency plus recovery, or `shield` the critical pair |
+| RSS grows steadily, throughput fine | unbounded `asyncio.Queue` | `maxsize`, and export `qsize()` as a metric |
+| Throughput plateaus with idle cores | one loop, one thread | one process per core behind a load balancer |
+
+## Sources & further reading
+
+**Primary docs**
+
+- **[Python `asyncio` documentation (3.13) — "Coroutines and Tasks", "Developing with asyncio", and the `TaskGroup`/`timeout` sections.](https://docs.python.org/3/library/asyncio.html)** Read "Developing with asyncio" in full; it is short and it contains the debug-mode flags that answer most performance questions.
+- **[PEP 492, "Coroutines with async and await syntax."](https://peps.python.org/pep-0492/)** Read the rationale section for the explicit statement that coroutines are generators with a flag — the fact the whole Layer 3 loop rests on.
+- **[PEP 654, "Exception Groups and `except*`" (3.11).](https://peps.python.org/pep-0654/)** Read this before using `TaskGroup`, since its failure reporting is built on `ExceptionGroup`.
+- **[`aiohttp` client documentation — `ClientSession`, `TCPConnector`, `ClientTimeout`.](https://docs.aiohttp.org/en/stable/client.html)** Read the "Client Quickstart" warning about session lifetime; it is the single most commonly ignored paragraph in async Python.
+- **[`selectors` module documentation (3.13).](https://docs.python.org/3/library/selectors.html)** Read it alongside `man 2 epoll` or `man 2 kqueue`; `DefaultSelector` picks the best available and the docs say which.
+
+**Papers**
+
+- **[Little, J. D. C. (1961). "A Proof for the Queuing Formula L = λW." *Operations Research* 9(3), 383–387.](https://doi.org/10.1287/opre.9.3.383)** One-sentence takeaway: in-flight work equals arrival rate times latency, which is how you size a concurrency limit arithmetically instead of by trial and error.
+- **[Welsh, M., Culler, D. & Brewer, E. (2001). "SEDA: An Architecture for Well-Conditioned, Scalable Internet Services." *SOSP*, 230–243.](https://doi.org/10.1145/502034.502057)** One-sentence takeaway: bounded queues between stages let a service degrade gracefully under overload rather than collapsing, which is the formal argument for back-pressure.
+- **[Ousterhout, J. (1996). "Why Threads Are A Bad Idea (for most purposes)."](https://web.stanford.edu/~ouster/cgi-bin/papers/threads.pdf)** One-sentence takeaway: single-threaded event loops remove races and deadlocks by construction, at the cost of a discipline — never block — that the language cannot enforce.
+- **[Kegel, D. (1999–2014). "The C10K problem."](http://www.kegel.com/c10k.html)** One-sentence takeaway: serving ten thousand simultaneous connections requires O(1) readiness notification (`epoll`/`kqueue`) rather than O(n) `select`, which is the measurement in the stretch challenge.
+- **[Smith, N. J. (2018). "Notes on structured concurrency, or: Go statement considered harmful."](https://vorpus.org/blog/notes-on-structured-concurrency-or-go-statement-considered-harmful/)** One-sentence takeaway: a spawn primitive that lets tasks outlive their creator makes control flow and error propagation unanalysable — the argument that produced nurseries and, later, `TaskGroup`.
+
+**Go deeper**
+
+- **[Ramalho, L., *Fluent Python*, 2nd ed., Chapters 19–21.](https://www.fluentpython.com/)** Chapter 21's build-up from callbacks to coroutines is the clearest printed explanation of why `await` looks the way it does.
+- **Selivanov, Y. — "uvloop: Blazing fast Python networking" (2016) and the magic.io benchmarks.** Read it *with* this module's 2.1% result in mind: the benchmarks are honest and they measure loop overhead, which is rarely your bottleneck.
+- **[Hettinger, R. / and the `asyncio` source itself: `Lib/asyncio/base_events.py`, `run_once()`.](https://github.com/python/cpython/blob/main/Lib/asyncio/base_events.py)** After building the 151-line loop, read `run_once` — it is the same four steps with production concerns bolted on, and it becomes readable rather than intimidating.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-04/p1-w04-m4">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

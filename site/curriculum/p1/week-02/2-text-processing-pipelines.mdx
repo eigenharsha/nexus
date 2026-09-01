@@ -1,0 +1,635 @@
+---
+title: "Text processing & pipelines"
+description: "Week 2 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 2 · Module 2 · `P1-W02-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Build a pipeline one stage at a time, checking the intermediate output at every step.
+2. Write a regex that means what you intended — anchors, classes, groups, greedy versus lazy — and explain the difference between BRE, ERE and PCRE.
+3. Answer "top 20 endpoints by p95 latency" from a 1 GB log with shell tools, and make it **4.9× faster** by choosing the right shape.
+4. Recognise catastrophic backtracking before it takes your service down, having measured a regex go from 37 ms to 31 seconds over ten extra characters.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/P1-W02-M2.svg" alt="Hand-drawn sketch: Text processing & pipelines" className="block dark:hidden" />
+  <img src="/assets/diagrams/P1-W02-M2-dark.svg" alt="Hand-drawn sketch: Text processing & pipelines" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: P1-W02-M2
+tier: T3
+one-sentence-goal: A pipeline is a stream transformed in stages, and the shape you choose — sort-then-aggregate versus single-pass — is worth 5x before any tuning.
+elements:
+  - left: a hand-drawn "1 GB access.log / 8,954,064 lines" cylinder
+  - top path (drawn with lots of boxes): awk -> sort -k1,1 -k2,2g -> awk -> sort -gr -> head, labelled in red "135.4 s", amber note "sort has to hold 8.9M records and O(n log n) them"
+  - bottom path (two boxes only): awk single-pass histogram -> sort | head, labelled in green "27.7 s", green tick, note "4.9x — one pass, 12 counters, no global sort"
+  - between them a circled label "SHAPE beats TUNING"
+  - a side box: "LC_ALL=C sort  20.4 s   vs   default locale  86.2 s   = 4.2x", with "one environment variable" underlined in amber
+  - lower-right: a small hand-drawn backtracking tree for ^(a+)+$ against "aaaa...b", branches multiplying, with the measured ladder written beside it: "n=20 37 ms / n=25 1.1 s / n=30 31.3 s", red skull-and-crossbones next to "doubles per character"
+  - a red cross-out over "grep | grep | grep | awk | awk" with the note "each pipe is a fork. count your stages."
+  - dangling arrow: "…and when should this be Python? -> Layer 3"
+numbers-to-write-in: 135.4 s -> 27.7 s (4.9x) · LC_ALL=C 20.4 s vs 86.2 s (4.2x) · ReDoS 0.037 s at n=20 to 31.3 s at n=30
+alt: A hand-drawn comparison of two shell pipelines over the same one-gigabyte log file — a five-stage sort-based pipeline taking 135 seconds and a two-stage single-pass awk pipeline taking 28 seconds — with a side note showing that setting LC_ALL=C makes sort four times faster, and a small backtracking tree illustrating catastrophic regex behaviour with measured timings.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term is defined where it first appears.
+
+### The one idea
+
+Unix tools are small programs that read a stream of text lines and write a stream of text lines. A **pipe** connects one program's output to the next one's input. Because every tool speaks the same format — lines of text — any tool can feed any other, and you build an answer by composing four or five of them instead of writing a program.
+
+The skill is not memorising flags. It is **building the pipeline one stage at a time and looking at what comes out of each stage**.
+
+### The analogy
+
+A factory line. Raw material enters at one end. Each station does exactly one thing to whatever arrives and passes it along. Nobody at any station knows what the finished product is.
+
+The important property of a real factory line, which pipes share: if one station is slow, the stations upstream of it eventually have to stop, because the conveyor between them fills up. That is **back-pressure**, and it is why `huge_file_generator | slow_consumer` does not fill your disk — the producer blocks.
+
+### The vocabulary, defined
+
+- **stdin / stdout / stderr** — the three streams every program starts with. Input, output, and diagnostics.
+- **Pipe (`|`)** — connects the stdout of the left command to the stdin of the right one. Both run **at the same time**, not one after the other.
+- **Redirection (`>`, `>>`, `<`)** — connect a stream to a file. `>` overwrites, `>>` appends, `<` feeds a file in as stdin.
+- **Filter** — a program that reads stdin and writes stdout. `grep`, `sort`, `cut`, `sed`, `awk` are all filters.
+- **Field** — a column in a line, split on some separator. `awk` calls them `$1`, `$2`, …; `$0` is the whole line; `NF` is the number of fields.
+- **Regular expression (regex)** — a pattern language for matching text.
+- **Anchor** — `^` matches the start of a line, `$` the end. Without anchors, a pattern matches anywhere.
+- **Character class** — `[abc]` matches one of a, b or c. `[^abc]` matches anything else. `[0-9]` is a range.
+- **Quantifier** — how many times: `*` zero or more, `+` one or more, `?` zero or one, `{2,5}` between two and five.
+- **Greedy** — a quantifier that takes as much as it can, then backs off. `.*` is greedy. `.*?` is **lazy** — it takes as little as possible.
+- **Group** — `(...)` groups a sub-pattern so a quantifier applies to all of it, and captures what it matched.
+
+### Building a pipeline, one stage at a time
+
+Here is the discipline. We want the ten most common HTTP endpoints in a log. Build it up, looking at the output each time.
+
+```bash
+head -3 access.log
+```
+
+```
+10.0.208.176 - - [12/Aug/2025:02:14:42 +0000] "GET /api/v1/products HTTP/1.1" 200 22825 "-" "Mozilla/5.0" 3.377
+```
+
+Count the fields: `$1` is the IP, `$4` the timestamp, `$6` is `"GET`, `$7` is the path, `$9` is the status code, and the last field (`$NF`) is the latency in seconds.
+
+**Stage 1 — extract the path.** Always `head` the output while building; never run a new stage on the whole file first.
+
+```bash
+head -1000 access.log | awk '{print $7}' | head -3
+```
+
+```
+/api/v1/products
+/api/v1/orders
+/health
+```
+
+**Stage 2 — group identical values together.** `uniq` only collapses *adjacent* duplicates, so it needs sorted input. Forgetting this is the single most common pipeline bug.
+
+```bash
+head -1000 access.log | awk '{print $7}' | sort | head -3
+```
+
+**Stage 3 — count each group.**
+
+```bash
+head -1000 access.log | awk '{print $7}' | sort | uniq -c | head -3
+```
+
+```
+  81 /api/v1/auth/login
+  90 /api/v1/cart
+  76 /api/v1/checkout
+```
+
+**Stage 4 — order by count, biggest first, and take ten.**
+
+```bash
+head -1000 access.log | awk '{print $7}' | sort | uniq -c | sort -rn | head -10
+```
+
+`sort -rn`: `-n` compares numerically (so 90 sorts above 100 only if you forget it), `-r` reverses. Now remove the `head -1000` and run it on the real file.
+
+### Line-by-line walkthrough
+
+- `awk '{print $7}'` — awk splits each line on whitespace and runs the program in braces for every line. `$7` is the seventh field. No loop needed; awk supplies one.
+- `sort` — sorts lines lexicographically. Required before `uniq`.
+- `uniq -c` — collapse runs of identical adjacent lines, prefixing each with its count.
+- `sort -rn` — sort numerically, descending. `-n` matters: lexicographically, `9` is greater than `100`.
+- `head -10` — first ten lines, then stop. `head` closes the pipe when it has enough, which sends `SIGPIPE` upstream and stops the earlier stages early. That is why `huge | head` is fast.
+
+### The three most useful filters
+
+**`grep` — keep lines matching a pattern.**
+
+```bash
+grep '500' access.log | head -3           # any line containing 500 anywhere
+grep -c '" 500 ' access.log               # count only; note the spaces
+grep -v '/health' access.log | head -3    # INVERT: lines NOT matching
+grep -E '/api/v1/(cart|checkout)' access.log | head -3   # -E for alternation
+```
+
+`grep '500'` also matches a response size of 15000 and an IP ending in 500. Anchoring or adding surrounding context (`'" 500 '`) is the difference between a count and a guess.
+
+**`cut` — take fixed fields.** Simple, fast, and only correct when the separator is exact.
+
+```bash
+cut -d' ' -f7 access.log | head -3
+```
+
+`cut` treats *every* delimiter as a separator, so two spaces make an empty field. `awk` collapses runs of whitespace. That difference is why `awk '{print $7}'` is usually the safer choice for logs.
+
+**`sed` — substitute.**
+
+```bash
+echo "hello world" | sed 's/world/there/'      # hello there
+sed -E 's|/api/v1/([a-z]+).*|\1|' access.log | head -3   # capture group -> \1
+```
+
+`s/pattern/replacement/`, with any character as the delimiter — using `|` avoids escaping every `/` in a path.
+
+### Guided practice
+
+<Steps>
+<Step title="Count status codes">
+
+```bash
+awk '{print $(NF-3)}' access.log | sort | uniq -c | sort -rn
+```
+
+Work out `$(NF-3)` by counting backwards from the end of a sample line rather than forwards from the start — log lines have variable-width user-agent strings, so counting from the right is more robust.
+</Step>
+<Step title="Find the slowest requests">
+
+```bash
+awk '$NF > 15 {print $NF, $7}' access.log | sort -rn | head -20
+```
+
+The `$NF > 15` before the braces is a **pattern**: awk runs the action only on lines where it is true. Pattern-then-action is awk's whole model, and it replaces `grep | awk` with one process.
+</Step>
+<Step title="Write a regex and test it in isolation">
+
+```bash
+echo "GET /api/v1/orders/12345 HTTP/1.1" | grep -oE '/api/v[0-9]+/[a-z]+'
+```
+
+```
+/api/v1/orders
+```
+
+`-o` prints only the matched part, which is how you check a regex does what you think before putting it in a pipeline. Build regexes against three lines, not a million.
+</Step>
+<Step title="See greedy versus lazy">
+
+```bash
+echo '"GET /a" "POST /b"' | grep -oE '".*"'      # one match: the whole thing
+echo '"GET /a" "POST /b"' | grep -oE '"[^"]*"'   # two matches, as intended
+```
+
+`.*` is greedy: it matched from the first quote to the *last*. The fix is not usually a lazy quantifier — it is a **negated character class**, `[^"]*`, which cannot cross a quote at all. Remember this; it comes back in Layer 3 as the fix for a denial-of-service bug.
+</Step>
+</Steps>
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **Why does `uniq` need `sort` first?** — `uniq` only collapses *adjacent* duplicates. Unsorted input gives one group per run, not per value.
+2. **What does `sort -rn` do that `sort -r` does not?** — `-n` compares numerically. Without it, `9` sorts above `100`.
+3. **`grep 500` matched a line with no 500 status. Why?** — no anchors and no context: it matched `15000` in the size field. Add surrounding characters or anchors.
+4. **Why is `huge_file | head -3` fast?** — `head` exits after three lines, closing the pipe; upstream stages get `SIGPIPE` and stop.
+5. **`.* ` versus `[^"]*` inside quotes — which do you want?** — the negated class. It cannot cross the closing quote, so it cannot over-match and it cannot backtrack.
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions. Measured on macOS 15 (BSD userland), zsh 5.9, `awk` = onetrueawk (BSD), GNU coreutils 9.5 where noted, Python 3.13.2. The test file is a synthetic nginx `access.log`: **1,000,000,005 bytes, 8,954,064 lines, 12 distinct endpoints.**
+
+### Three regex dialects, and why your pattern broke
+
+| Dialect | Used by | `+` `?` `\|` `()` | Lookahead / backrefs |
+|---|---|---|---|
+| **BRE** (Basic) | `grep`, `sed` by default | need backslashes: `\+` `\?` `\\|` `\(\)` | backrefs yes, lookahead no |
+| **ERE** (Extended) | `grep -E`, `sed -E`, `awk` | bare: `+ ? \| ( )` | no lookahead, no backrefs (POSIX) |
+| **PCRE** | `grep -P` (GNU only), Python, Perl, JS, Go's `regexp` is *not* PCRE | bare | lookahead, lookbehind, backrefs, lazy `*?` |
+
+Practical rules: **always use `-E`.** BRE's backslash requirements are a source of bugs and nothing else. `grep -P` does not exist on macOS's BSD grep, so a script using it is not portable — use `ripgrep` (`rg`, 14.x) which is PCRE2-capable everywhere, or restructure the pattern.
+
+Also know this: **Go's `regexp` and Rust's `regex` are RE2-family**, meaning they guarantee linear time and therefore *cannot* support backreferences or lookahead. That is not a missing feature; it is the price of the guarantee, and Layer 3 shows what you are buying.
+
+### The regex constructs worth knowing cold
+
+```
+^  $           anchors: start and end of line
+\b             word boundary (GNU/PCRE)
+[abc] [^abc]   class, negated class
+[[:digit:]]    POSIX class — portable; \d is PCRE-only
+.              any character except newline
+*  +  ?        greedy quantifiers
+{2,5}          bounded repetition
+*? +? ??       lazy versions (PCRE only)
+( )            capture group;  (?: )  non-capturing (PCRE)
+|              alternation
+\1             backreference to group 1
+```
+
+The one habit that prevents most regex bugs: **prefer a negated character class over `.*`**. `"[^"]*"` is both more precise and, as Layer 3 shows, immune to the failure mode that takes services down.
+
+### The 1 GB question, two ways
+
+**Task:** top-20 endpoints by p95 latency from a 1 GB nginx log.
+
+**Shape A — extract, sort, aggregate.** The obvious approach: to get a percentile you need order, and `sort` gives you order.
+
+```bash
+awk '{print $7, $NF}' access.log \
+  | sort -k1,1 -k2,2g \
+  | awk '{c[$1]++; v[$1"|"c[$1]]=$2}
+         END {for (k in c) {i=int(c[k]*0.95); if(i<1)i=1; printf "%s %s %d\n", k, v[k"|"i], c[k]}}' \
+  | sort -k2 -gr | head -20
+```
+
+**Measured: 2 minutes 15 seconds (135.4 s wall, 67.7 s user + 58.7 s system).**
+
+**Shape B — single-pass histogram.** A percentile does not actually need a total order; it needs a *distribution*. Bucket latencies to 10 ms and count.
+
+```bash
+LC_ALL=C awk '{ b = int($NF * 100); h[$7,b]++; n[$7]++ }
+  END { for (k in n) { t = 0; lim = n[k] * 0.95
+          for (i = 0; i <= 2500; i++) { c = h[k,i]
+            if (c) { t += c; if (t >= lim) { printf "%-28s p95=%.2fs n=%d\n", k, i/100, n[k]; break } } } } }' \
+  access.log | sort -t= -k2 -gr | head -20
+```
+
+**Measured: 27.7 s wall (26.7 s user).** Same answer to 10 ms resolution.
+
+**4.9× faster, and the win is structural, not micro-optimisation.** Shape A sorts 8.9 million records — O(n log n), plus spilling to temporary files because the data exceeds `sort`'s memory buffer. Shape B makes one pass, holds 12 endpoints × up to 2,500 buckets = at most 30,000 counters, and never sorts anything large. The p95 is approximate to the bucket width, which for latency SLOs is exactly as precise as anyone needs.
+
+This is the module's central lesson: **choose the shape before you tune the flags.**
+
+### `LC_ALL=C` — the 4.2× environment variable
+
+```bash
+# 203,741,964 bytes, 8,954,064 short lines
+$ time LC_ALL=C sort -k1,1 pairs.txt > /dev/null
+15.43s user  2.30s system  20.4s total
+
+$ time sort -k1,1 pairs.txt > /dev/null
+58.88s user 17.80s system  86.2s total
+```
+
+**4.2× slower in a UTF-8 locale.** In `en_US.UTF-8`, `sort` must decode each byte sequence into characters and apply Unicode collation rules — locale-aware ordering where `a` sorts near `A` and accented characters sort next to their base letters. In the `C` locale it compares bytes.
+
+Set `LC_ALL=C` when you are sorting machine data — identifiers, paths, IPs, keys — where you want deterministic byte order and do not want a human-language collation. Do **not** set it when the output is a sorted list of names shown to a human, because byte order puts `Zebra` before `apple` and every accented name at the end.
+
+The second reason to set it is **determinism**: the same pipeline on two machines with different locales produces different sort orders, so a diff-based test or a content hash breaks for no visible reason. Any script whose output is compared byte for byte should pin `LC_ALL=C`.
+
+### `find` + `xargs`, done safely
+
+```bash
+# WRONG: breaks on any filename containing a space, newline or quote
+find . -name '*.log' | xargs rm
+
+# RIGHT: NUL-delimited, so no filename can be misparsed
+find . -name '*.log' -print0 | xargs -0 rm
+
+# ALSO RIGHT, and simpler when the command takes one file at a time
+find . -name '*.log' -exec rm {} +      # `+` batches; `\;` forks once per file
+
+# parallel, when the work per file is real
+find . -name '*.log' -print0 | xargs -0 -P 8 -n 20 gzip
+```
+
+`-print0`/`-0` uses the NUL byte as the separator. NUL is the only byte that cannot appear in a filename, which is exactly why it is the right delimiter. Every other separator — space, newline, tab — is legal in a filename on Unix, and "a file with a space in the name deleted the wrong thing" is a real class of incident.
+
+`-exec ... +` batches as many files as fit on one command line, so it forks once per batch rather than once per file. At the measured 1.29 ms per fork from Module 1, on 10,000 files that is 13 seconds versus about 0.1 seconds.
+
+### `jq` for JSON, in four patterns
+
+```bash
+jq -r '.services[].name' manifest.json                 # -r: raw strings, no quotes
+jq -c '.[] | select(.status == "failed")' events.json   # -c: one compact object per line
+jq -s 'group_by(.endpoint) | map({e: .[0].endpoint, n: length})' events.jsonl  # -s: slurp
+jq -r '[.ts, .level, .msg] | @tsv' logs.jsonl | column -t   # @tsv: back to line-oriented
+```
+
+The last pattern is the important one: **`@tsv` is the bridge** between the JSON world and the line-oriented world, so `jq` becomes just another filter that `awk`, `sort` and `cut` can consume. `jq` 1.7 is the current release; note that 1.6 (still shipped by some distros) has different `@base64d` and `ltrimstr` behaviour.
+
+### Trade-offs table
+
+| Decision | Choose X when… | Choose Y when… |
+|---|---|---|
+| `grep \| awk` vs `awk` alone | **`grep` first** when it eliminates most lines cheaply — `grep -F` on a fixed string is faster per byte than awk's field splitting, so filtering 99% away first genuinely wins | **`awk` alone** when you need the fields anyway; `awk '$9 == 500 {print $7}'` is one process instead of two and does not re-split |
+| Sort-then-aggregate vs single-pass | **Sort** when you need an exact order-statistic, a stable global ordering, or the group count is unbounded | **Single-pass associative array** when the number of distinct keys is small enough to hold in memory. Measured: **135.4 s → 27.7 s** for 12 keys over 8.9 M lines |
+| `sed` vs `awk` vs `perl -pe` | **`sed`** for a single substitution on a stream | **`awk`** as soon as you need fields, arithmetic or state; **`perl -pe`** when you need PCRE features on macOS where `grep -P` does not exist |
+| Shell pipeline vs Python | **Shell** when the job is filter → transform → aggregate over lines and fits on one screen | **Python** when you need joins across datasets, structured errors, tests, or more than about 30 lines of awk. See Layer 3 for the measured crossover |
+
+### Reference implementation — a log-analysis script that is actually reusable
+
+```bash
+#!/usr/bin/env bash
+# nx-logtop — top-N endpoints by p95 latency from an nginx-style access log.
+# usage: nx-logtop [-n 20] [-p 95] [-b 100] FILE
+set -Eeuo pipefail
+export LC_ALL=C                 # deterministic ordering, and 4.2x faster sorting
+
+topn=20 pct=95 bucket=100       # bucket=100 -> 10 ms resolution
+while getopts ':n:p:b:' opt; do
+  case $opt in
+    n) topn=$OPTARG ;;
+    p) pct=$OPTARG ;;
+    b) bucket=$OPTARG ;;
+    *) printf 'usage: %s [-n N] [-p PCT] [-b BUCKETS_PER_SEC] FILE\n' "${0##*/}" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[[ $# -eq 1 ]] || { printf 'expected exactly one FILE\n' >&2; exit 2; }
+[[ -r $1 ]]    || { printf 'cannot read %s\n' "$1" >&2; exit 2; }
+
+awk -v pct="$pct" -v bkt="$bucket" '
+  # $7 = path, $NF = latency seconds. Skip malformed lines rather than crashing.
+  NF < 10 || $NF !~ /^[0-9.]+$/ { skipped++; next }
+  { h[$7, int($NF * bkt)]++; n[$7]++ }
+  END {
+    if (skipped) printf("skipped %d malformed lines\n", skipped) > "/dev/stderr"
+    for (k in n) {
+      target = n[k] * pct / 100; run = 0
+      for (i = 0; i <= bkt * 60; i++) {
+        c = h[k, i]
+        if (c) { run += c; if (run >= target) { printf("%.3f\t%d\t%s\n", i / bkt, n[k], k); break } }
+      }
+    }
+  }' "$1" | sort -rn | head -n "$topn" | awk -v p="$pct" '
+    BEGIN { printf("%-30s %10s %12s\n", "endpoint", "count", "p" p "_sec") }
+    { printf("%-30s %10d %12.3f\n", $3, $2, $1) }'
+```
+
+Three things that make it production-grade rather than a one-liner: it **skips and counts malformed lines** instead of producing garbage or dying; it **reports the skip count to stderr** so a corrupt log is visible without polluting stdout; and it **pins `LC_ALL=C`** so two people running it on the same file get byte-identical output.
+
+### What breaks in the real world
+
+An on-call engineer ran an ad-hoc pipeline to find affected customers during an incident:
+
+```bash
+grep 'ERROR' app.log | grep -oE 'customer=[0-9]+' | cut -d= -f2 | sort -u > affected.txt
+wc -l affected.txt      # 412
+```
+
+412 customers were notified. Two days later the real number turned out to be 2,180.
+
+Three compounding bugs. First, `grep 'ERROR'` missed lines where the level was logged as `"level":"error"` — lowercase, and in a JSON-formatted subset of the logs that a newer service emitted. Second, `customer=[0-9]+` missed the newer format `customer_id: "c-8891"`, which is not digits. Third, and worst, **the log had been rotated mid-incident**, so `app.log` contained only the last 40 minutes; the earlier errors were in `app.log.1.gz` and were never read.
+
+The fixes are a checklist, not a cleverer regex:
+
+- **Check your input covers the window**: `ls -la app.log*`, and use `zgrep`/`zcat` over the rotated files.
+- **Count at every stage** while building: `grep -c` after each filter, and be suspicious when a number drops by more than you expected.
+- **Test the pattern against a known-positive line** from *each* log format present, not just the one you happened to open.
+- **Sanity-check the total**: 412 out of a known ~50,000 active customers during a total outage was implausible on its face, and nobody asked.
+
+The general lesson is that a shell pipeline gives you no error when it finds nothing. Silence is indistinguishable from success, which is why the postcondition check from Module 1 belongs here too.
+
+<Accordion title="Design checkpoint — one question, with a model answer">
+
+**Question.** Your team wants a daily report: for each of ~40 API endpoints, the request count, error rate and p50/p95/p99 latency, from roughly 30 GB of logs across 12 hosts. A colleague has a working 20-line shell pipeline that takes 90 minutes. What do you do?
+
+**Model answer.** Three changes, in order of value per hour spent, and only the third is a rewrite.
+
+**First, fix the shape.** If the pipeline sorts to compute percentiles, replace it with a single-pass bucketed histogram. On our 1 GB benchmark that was **135.4 s → 27.7 s, a 4.9× improvement**, and it is a bigger win at 30 GB because sorting spills to disk. 40 endpoints × 4 percentiles × 2,500 buckets is 400,000 counters — trivially in memory. Expect roughly 90 minutes → 20 minutes from this change alone.
+
+**Second, parallelise across hosts and files, and pin the locale.** The 12 hosts are embarrassingly parallel: compute per-host histograms independently, then merge the counter tables. Histograms merge by addition, which is exactly why this shape parallelises and sorting does not. `export LC_ALL=C` on the remaining sorts is a measured 4.2× on the sort stages for one line of code. With 8-way parallelism, expect 20 minutes → about 4.
+
+**Third — and only now — consider whether it should be shell at all.** The questions to ask: does anyone need to *join* this against another dataset (deploy times, customer tiers)? Does it need to be tested? Does the output feed something that will break silently if the format changes? If yes to any, this is a Python job with `polars` or `duckdb`, both of which will read the logs directly and do the whole aggregation in seconds, with typed columns and unit tests. DuckDB in particular reads compressed line-delimited files and does percentile aggregation in SQL, which is about 15 lines total.
+
+The thing I would *not* do is start by asking for a bigger machine. The 4.9× is free and the parallelism is nearly free; hardware is the last lever, not the first.
+
+The honest caveat: the shell version's real advantage is that any on-call engineer can read and modify it at 3 a.m. without an environment. That is worth something, and it is the argument for keeping the shell version as the incident tool even after building the Python one for the daily report.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a measured number. Figures produced on an Apple M3 Pro
+(11 cores, 18 GB), macOS 15, Python 3.13.2, BSD userland with GNU coreutils 9.5 where noted.
+The log file is 1,000,000,005 bytes / 8,954,064 lines. If you cannot reproduce a number on
+your own machine, treat the claim as unproven and tell us.
+</Warning>
+
+### Catastrophic backtracking, measured
+
+A backtracking regex engine — Python's `re`, Java's `java.util.regex`, JavaScript's `RegExp`, PCRE, and Perl — explores alternatives by trying and undoing. For most patterns that is fine. For a pattern with **nested quantifiers over an overlapping alternation**, the number of ways to split the input is exponential, and the engine tries all of them before concluding there is no match.
+
+The canonical example is `^(a+)+$` matched against `aaa…ab`. The trailing `b` guarantees failure, and the engine must exhaust every way of partitioning the `a`s among repetitions of the inner group.
+
+Measured with Python 3.13.2, `re.compile(r'^(a+)+$').match('a'*n + 'b')`:
+
+| n | seconds |
+|---|---|
+| 20 | 0.0371 |
+| 22 | 0.1398 |
+| 24 | 0.5550 |
+| 26 | 1.8806 |
+| 28 | 7.5117 |
+| **30** | **31.3158** |
+
+**Each additional character roughly doubles the time** — 0.037 s to 31.3 s over ten characters. Extrapolating, n = 40 is about 9 hours, and n = 50 is a bit over a year. A 40-character request field is not unusual.
+
+This is **ReDoS**, and it is a denial-of-service vector with no memory corruption and no crash: one request pins one CPU core indefinitely. Real incidents include Cloudflare's 2 July 2019 global outage — a single regex in a WAF rule containing `.*.*=.*` consumed CPU on every core across the edge fleet and took the network down for about 27 minutes; and Stack Overflow's 20 July 2016 outage, caused by a regex trimming trailing whitespace on a post with ~20,000 consecutive space characters.
+
+**The patterns to recognise in review:**
+
+- Nested quantifiers: `(a+)+`, `(a*)*`, `(.*)+`
+- A quantified group whose alternatives overlap: `(a|a)*`, `(\w|\d)+`
+- `.*` on both sides of something: `.*=.*`, `.*foo.*bar.*`
+- Any quantified group where the same character can be consumed by two different paths
+
+**The four fixes, in order of preference:**
+
+1. **Use a non-backtracking engine.** Go's `regexp` and Rust's `regex` are RE2-family: they compile to a finite automaton and run in O(n·m) time, guaranteed. That guarantee is precisely why they refuse to support backreferences and lookahead — those features are what make linear-time matching impossible. RE2 is also available in Python via the `google-re2` package.
+2. **Rewrite with negated character classes.** `"[^"]*"` cannot backtrack across a quote; `".*"` can. Most catastrophic patterns have a linear-time equivalent, and it is usually shorter.
+3. **Bound the input.** Reject anything over a few hundred characters before it reaches the regex. Cheap, blunt, effective.
+4. **Impose a timeout.** Java 9+ has none built in; Python has none; Node has none. This usually means running the match in a separate process or thread you can kill, which is heavy — treat it as the last resort it is.
+
+Static detection is available and worth wiring in: `semgrep` has ReDoS rules, and Node's `eslint-plugin-security` flags `detect-unsafe-regex`.
+
+### Where the 4.9× actually came from
+
+Breaking down the 135.4 s of Shape A:
+
+- **67.7 s user, 58.7 s system.** That system time is the tell: `sort` spilled to temporary files. GNU `sort` uses a default buffer around 1/8 of physical memory but caps per-thread; with 8.9 M records of ~30 bytes it merged multiple on-disk runs — the external merge sort from Week 1, running inside `sort(1)`.
+- **Four processes in the pipeline**, three of which see all 8.9 M records.
+- **The intermediate `pairs.txt` equivalent is 203 MB**, all of which is written and re-read.
+
+Shape B's 27.7 s is **26.7 s user, 0.44 s system** — essentially no I/O beyond reading the input once, and no temporary files. The system time going from 58.7 s to 0.44 s is the entire difference.
+
+The general principle, which generalises far beyond shell: **a percentile does not require a sort.** Histograms are mergeable (add the bucket counts), which makes them parallelisable and distributable; sorted lists are not. This is exactly why Prometheus histograms, HdrHistogram and t-digest exist, and why every metrics system computes quantiles from buckets rather than from raw samples. The cost is bounded, known error — 10 ms here — and it is almost always acceptable because the SLO is stated in tens of milliseconds anyway.
+
+t-digest (Dunning, 2019) is the refinement worth knowing: it keeps variable-width buckets that are narrow at the tails and wide in the middle, so p99 and p99.9 are accurate while the median is approximate — which is the opposite of a fixed-width histogram and matches what people actually ask of latency data.
+
+### GNU versus BSD: the differences that break scripts
+
+Every macOS developer writing a script that will run on Linux CI hits these. They are not obscure.
+
+| Task | GNU (Linux) | BSD (macOS) | Portable |
+|---|---|---|---|
+| In-place sed | `sed -i 's/a/b/' f` | `sed -i '' 's/a/b/' f` | `sed 's/a/b/' f > t && mv t f` |
+| Extended regex | `sed -r` or `-E` | `sed -E` only | `-E` (GNU has supported it since 4.2) |
+| `readlink -f` | works | **absent** | `python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))'` or `perl -MCwd -e ...` |
+| Date arithmetic | `date -d '2 days ago'` | `date -v-2d` | `python3 -c ...`, or install coreutils and use `gdate` |
+| `stat` format | `stat -c '%s' f` | `stat -f '%z' f` | `wc -c < f` |
+| `grep -P` (PCRE) | works | **absent** | `perl -ne`, or `rg` |
+| `xargs` with no input | runs the command once with no args unless `-r` | does not run | pass `-r` on GNU; BSD ignores unknown `-r`? **no** — guard with `[[ -s file ]]` instead |
+| `sort -h` (human sizes) | works | **absent** | `sort -k1,1 -n` on raw bytes |
+
+The pragmatic policy: **install GNU coreutils on macOS** (`brew install coreutils findutils gnu-sed grep`) and put the `gnubin` directories on `PATH` for development, so your local behaviour matches CI. Then have CI run `shellcheck --shell=bash` and, ideally, run the scripts on both. `shellcheck` 0.10 flags several of these directly.
+
+### When to stop shell-scripting: the measured thresholds
+
+Three numbers, all from this course's benchmarks:
+
+1. **1.29 ms per external command** (Module 1). Any per-record loop that shells out costs at least this per record. At 100,000 records, one `date` call per record is 129 seconds of pure process creation.
+2. **8.9 M lines in 27.7 s of awk** — about 320,000 lines/second single-threaded. awk is genuinely fast at what it does; it is not the bottleneck people assume.
+3. **The 4.2× locale effect on `sort`** — meaning a naive shell pipeline can be 4× off from a careful one with no structural change.
+
+The thresholds I would put in a team style guide:
+
+- **Under ~30 lines, linear control flow, mostly invoking other programs** → shell. This is what it is for and a rewrite is a net loss.
+- **You need a data structure other than "a line"** → stop. Shell has one type. Parallel arrays and delimiter-joined strings are how shell scripts become unmaintainable, and the delimiter eventually appears in the data.
+- **You need to join two datasets on a key** → stop, or use `duckdb`/`sqlite3` from the shell, which is a legitimate middle path: `duckdb -c "SELECT ... FROM read_csv_auto('logs/*.csv') ..."` keeps the one-liner ergonomics with a real query engine.
+- **It needs tests, retries, or structured error reporting** → Python. The retry logic in particular is where shell scripts accumulate their worst bugs, because there is no exception type to distinguish "connection refused" from "404".
+- **It is more than ~30 lines of awk** → the awk program has become a program, and it deserves a language with a debugger.
+
+### Production failure modes and how you detect them
+
+| Failure | Signature | Detection |
+|---|---|---|
+| ReDoS | one CPU core at 100%, one request never completes, no error | bound input length; use RE2; `semgrep` ReDoS rules in CI; alert on request duration outliers |
+| Pipeline silently empty | exit 0, zero rows, downstream "succeeded" | assert row counts at each stage; `[[ $(wc -l < out) -gt 0 ]] \|\| die` |
+| Sort order differs between machines | a content hash or golden-file test fails on one host | pin `LC_ALL=C` in any script whose output is compared |
+| Missed matches during an incident | your number is implausibly low | check log rotation (`ls -la app.log*`), check every log format present, count at every stage |
+| Filenames with spaces deleted the wrong thing | works until one file has a space or newline | `find -print0 \| xargs -0`, or `-exec ... +`; quote every expansion |
+| Script works on macOS, fails on CI | BSD vs GNU flag differences (`sed -i`, `readlink -f`, `date -d`) | `shellcheck` in CI; install GNU coreutils locally; test on both |
+| `sort` slows to a crawl and hammers the disk | data exceeds the in-memory buffer, spilling to temp files | 58.7 s system time was the tell above; restructure to a single pass, or `sort -S` |
+
+### Frontier and research pointers
+
+- **Thompson, K. (1968). "Programming Techniques: Regular Expression Search Algorithm." *CACM* 11(6).** One-sentence takeaway: compiling a regex to an NFA and simulating all states in parallel gives guaranteed linear-time matching — the algorithm every backtracking engine chose *not* to use.
+- **Cox, R. (2007). "Regular Expression Matching Can Be Simple And Fast."** One-sentence takeaway: backtracking engines are exponential on patterns that Thompson's 1968 construction handles in linear time, and this is why RE2 exists and why it deliberately lacks backreferences.
+- **Davis, J. C., Coghlan, C. A., Servant, F. & Lee, D. (2018). "The Impact of Regular Expression Denial of Service (ReDoS) in Practice: An Empirical Study at the Ecosystem Scale." *ESEC/FSE*.** One-sentence takeaway: they found thousands of super-linear regexes across npm and PyPI, and the vulnerable patterns propagate through dependencies faster than they are fixed.
+- **Dunning, T. & Ertl, O. (2019). "Computing Extremely Accurate Quantiles Using t-Digests." arXiv:1902.04023.** One-sentence takeaway: a mergeable sketch with variable-width bins gives high accuracy at the tails where SLOs live, at a fraction of the memory a sorted sample needs.
+- **Cormode, G. & Muthukrishnan, S. (2005). "An Improved Data Stream Summary: The Count-Min Sketch and its Applications." *Journal of Algorithms* 55(1).** One-sentence takeaway: approximate frequency counts in sublinear memory with a provable error bound — the formal version of "just use a histogram" when the key space is too big to hold.
+- **Cloudflare, "Details of the Cloudflare outage on July 2, 2019."** One-sentence takeaway: a single regex containing `.*.*=.*` in a WAF rule consumed CPU across the global edge and took down the network for 27 minutes, which is the reference incident for taking ReDoS seriously.
+
+### Stretch challenge
+
+Build a p99 latency report that is both fast and provably accurate.
+
+1. Implement three versions of "p50/p95/p99 per endpoint" over the 1 GB log: (a) full sort, (b) fixed-width histogram, (c) reservoir sample of 10,000 per endpoint.
+2. Measure wall time, peak RSS and the **error** of (b) and (c) against (a)'s exact answer, per endpoint, at each percentile.
+3. Now vary the bucket width in (b) from 1 ms to 100 ms and plot error versus time. Where does the error cross 1% of the true value, and does that point differ for p50 versus p99?
+4. Make (b) parallel: split the file into 8 chunks, compute histograms independently, merge by addition. Measure the speedup and confirm the merged answer is *identical* to the single-threaded one, not merely close.
+
+The open question with no single right answer: (c) is unbiased and gives you the raw samples for further analysis, but its p99 error is much worse than (b)'s for the same memory. t-digest claims to beat both at the tails. Given a fixed memory budget of 1 MB per endpoint, which would you ship for an SLO dashboard, and does your answer change if the consumer is an alerting rule rather than a human? Bring your error curves.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+From a 1 GB nginx-style log, produce the top-20 endpoints by p95 latency using only shell tools. Build it twice — sort-based and single-pass — and time both. Report the ratio.
+</Card>
+
+Acceptance: both pipelines produce the same top-20 in the same order (to bucket resolution); you report wall, user and system time for each and explain what the system-time difference means; and you demonstrate the `LC_ALL=C` effect on at least one sort stage with a measured before/after.
+
+## The whiteboard
+
+The T1 sketch is the two pipeline shapes side by side with their measured times. The T3 animation (A04) shows text flowing through `grep → sort → uniq`, transforming at each stage, with the record count shrinking.
+
+<Tip>
+**Draw it yourself.** From memory: the two pipeline shapes, the measured times on each, and
+the backtracking tree with its doubling ladder. Then compare.
+[Blank version](/assets/diagrams/P1-W02-M2-blank.svg) · [Editable source](/assets/diagrams/P1-W02-M2.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Portfolio line:** *"A log-analysis toolkit that computes per-endpoint latency percentiles from a 1 GB nginx log in 28 seconds — 4.9× faster than the obvious sort-based pipeline — with the measured comparison and an explanation of why histograms merge and sorted lists do not."* The explanation is the differentiator; the pipeline itself is 15 lines.
+
+**The interview angle.** "How would you find the slowest endpoints in a big log file?" is a common systems screen, and most candidates produce a sort-based pipeline. The answer that stands out adds the insight: *a percentile does not need a total order, only a distribution — so bucket the latencies and count, which is one pass, bounded memory, and mergeable across hosts. That is also exactly why Prometheus histograms work the way they do.*
+
+The follow-up worth preparing: "what would you do differently at 100 GB across 20 machines?" — per-host histograms merged by addition, because that shape is embarrassingly parallel and a global sort is not.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+Three places this shows up in a normal engineering week:
+
+1. **During an incident, at 3 a.m.** The pipeline you can write from memory is worth more than the dashboard you have to find. Practise `grep -c` at every stage and sanity-check the magnitude of every number — the war story above cost a company a two-day-late customer notification because nobody asked whether 412 was plausible.
+
+2. **Reviewing any regex that touches user input.** Look for nested quantifiers and `.*` on both sides of a token. A pattern like `^(\w+\s?)+$` on a username field is a one-request denial of service, measured above at 31 seconds for 30 characters. The fix is usually a negated character class and a length bound, both of which are one-line changes.
+
+3. **Any script whose output is compared.** Golden-file tests, content hashes, `diff`-based deploy gates: pin `LC_ALL=C`. Two machines with different locales produce different sort orders and the failure looks like data corruption. It is also a free 4.2× on the sort stages.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `uniq -c` gives many small groups | input was not sorted; `uniq` only collapses adjacent lines | `sort` before `uniq`, or use `awk '{c[$1]++}'` and skip both |
+| `sort` puts 9 above 100 | lexicographic comparison | `sort -n` (or `-g` for floats) |
+| `grep 500` matches lines with no 500 status | no anchors, no field context | anchor, add surrounding characters, or match the field with awk |
+| `.*` swallowed too much | greedy quantifier crossed a delimiter | use a negated class `[^"]*`; lazy `.*?` is second best and still backtracks |
+| One request pins a CPU forever | catastrophic backtracking | bound input length; RE2-family engine; rewrite with negated classes |
+| Pipeline output differs between two machines | locale-dependent collation | `export LC_ALL=C` |
+| `xargs` deleted the wrong file | a filename contained a space or newline | `find -print0 \| xargs -0`, or `-exec ... +` |
+| `sed -i` fails on macOS | BSD `sed` requires a backup-suffix argument | `sed -i '' ...` on macOS, or write to a temp file and `mv` |
+| `sort` is slow and the disk is busy | spilled to temporary files; 58.7 s system time was the tell | restructure to single-pass, raise `-S`, or `LC_ALL=C` |
+| Incident count is implausibly low | log rotation, or a second log format you did not match | `ls -la app.log*`; use `zgrep`; test the pattern against every format present |
+
+## Sources & further reading
+
+**Primary docs**
+
+- **[`man 1 awk` and Kernighan's *The AWK Programming Language*, 2nd ed. (2024).](https://awk.dev/)** Read the second edition specifically — it is the first update in 36 years, by the original authors, and it covers the associative-array patterns this module is built on.
+- **[`man 7 regex` (Linux) and POSIX.1-2024 XBD §9 "Regular Expressions".](https://man7.org/linux/man-pages/man7/regex.7.html)** Read this for the exact BRE/ERE split, which is the source of most "why does my grep pattern need backslashes" confusion.
+- **[GNU coreutils manual, `sort` — the `--buffer-size`, `--parallel` and locale notes.](https://www.gnu.org/software/coreutils/manual/html_node/sort-invocation.html)** Read this for why `LC_ALL=C` matters and how `sort` decides to spill to disk.
+- **[`jq` 1.7 manual, sections on `--raw-output`, `--slurp` and `@tsv`.](https://jqlang.org/manual/)** Read the `@tsv` section — it is the bridge that makes `jq` compose with the rest of the toolkit.
+- **[RE2 syntax documentation (`github.com/google/re2/wiki/Syntax`).](https://github.com/google/re2/wiki/Syntax)** Read the list of *unsupported* constructs; it is the clearest available statement of what linear-time matching costs you.
+
+**Papers**
+
+- **[Thompson, K. (1968). "Programming Techniques: Regular Expression Search Algorithm." *CACM* 11(6), 419–422.](https://doi.org/10.1145/363347.363387)** One-sentence takeaway: simulating all NFA states in parallel matches any regex in time linear in the input, which is the algorithm backtracking engines abandoned for features.
+- **[Davis, J. C. et al. (2018). "The Impact of ReDoS in Practice: An Empirical Study at the Ecosystem Scale." *ESEC/FSE*, 246–256.](https://doi.org/10.1145/3236024.3236027)** One-sentence takeaway: super-linear regexes are widespread in npm and PyPI and propagate transitively, so "our code is careful" is not sufficient.
+- **[Dunning, T. & Ertl, O. (2019). "Computing Extremely Accurate Quantiles Using t-Digests." arXiv:1902.04023.](https://arxiv.org/abs/1902.04023)** One-sentence takeaway: variable-width mergeable bins give tail accuracy where SLOs live, at far less memory than keeping samples.
+- **[Cormode, G. & Muthukrishnan, S. (2005). "An Improved Data Stream Summary: The Count-Min Sketch and its Applications." *Journal of Algorithms* 55(1), 58–75.](https://doi.org/10.1016/j.jalgor.2003.12.001)** One-sentence takeaway: you can count frequencies in sublinear memory with a provable one-sided error bound, which is the right tool when the key space is too large for an awk array.
+
+**Go deeper**
+
+- **[Cox, R. "Regular Expression Matching Can Be Simple And Fast" (2007) and its two sequels.](https://swtch.com/~rsc/regexp/regexp1.html)** The single best explanation of why `grep` is fast and Perl is not, with the graph everyone reproduces; read all three parts before you next write a regex against user input.
+- **[Cloudflare Engineering Blog, "Details of the Cloudflare outage on July 2, 2019."](https://blog.cloudflare.com/details-of-the-cloudflare-outage-on-july-2-2019/)** A full public post-mortem of a global outage caused by one regex, including the exact pattern and the CPU graphs; it is the most persuasive 2,000 words on this topic in existence.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-02/p1-w02-m2">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

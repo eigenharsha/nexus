@@ -1,0 +1,143 @@
+---
+title: "Designing an application protocol"
+description: "Reference solution — Week 10"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P2-W10-M4`
+
+### The benchmark, done honestly
+
+The trap is protobuf's lazy parsing. Bare `ParseFromString` measures 0.47 µs/msg; the same parse
+with three field accesses measures **1.84 µs**. Both numbers are real; only the second is useful.
+
+```python
+t0 = time.perf_counter(); acc = 0
+for b in blobs:
+    e = event_pb2.Event(); e.ParseFromString(b)
+    acc += e.status + len(e.user) + len(e.tags)      # force materialisation
+t1 = time.perf_counter()
+```
+
+| Format | Bytes/msg | Encode | Decode (bare) | Decode + field access |
+|---|---|---|---|---|
+| JSON (default separators) | 126.8 | 4.23 µs | 3.17 µs | — |
+| JSON (compact) | 113.8 | 4.27 µs | 3.57 µs | **4.44 µs** |
+| MsgPack | 81.1 | 2.21 µs | 2.01 µs | **1.19 µs** |
+| Protobuf (upb) | **47.8** | 1.79 µs | 0.47 µs | **1.84 µs** |
+| JSON + per-message gzip | 115.9 | — | — | — |
+
+### The `PROTOCOL.md` skeleton that earns 3/3
+
+```markdown
+# CHAT/2 wire protocol
+
+## 1. Framing
+Every message: 4-byte big-endian unsigned length N (offsets 0-3), then N bytes of UTF-8 JSON.
+Maximum N: 1048576. A larger declared length MUST be rejected without allocation and the
+connection closed with ERROR code MSG_TOO_LARGE.
+
+## 2. Message envelope
+{"t": <string>, "v": <int, HELLO only>, ...fields}
+`t` is required on every message. Unknown `t` -> ERROR UNKNOWN_TYPE; the connection stays open.
+Unknown fields MUST be ignored.
+
+## 3. Versioning
+Client sends HELLO with `v`. Missing `v` means v1. Server replies WELCOME with
+`v = min(client_v, server_v)`. Both sides then speak that version for the session.
+Capabilities are a separate list: {"caps": ["reactions", "attachments"]}.
+
+## 4. State machine
+CONNECTED --HELLO--> AUTHENTICATED --JOIN--> IN_ROOM(n>=1) --LEAVE(all)--> AUTHENTICATED
+Any message other than HELLO in CONNECTED -> ERROR NOT_AUTHENTICATED.
+JOIN/MSG/LEAVE in AUTHENTICATED with no room -> ERROR NOT_IN_ROOM.
+
+## 5. Messages
+| t | dir | fields | reply | errors |
+|---|-----|--------|-------|--------|
+| HELLO | C->S | nick, v, caps? | WELCOME | BAD_NICK, UNSUPPORTED_VERSION, ALREADY_HELLO |
+| JOIN  | C->S | room | JOINED (broadcast) | NOT_AUTHENTICATED, BAD_ROOM, ROOM_FULL |
+| MSG   | C->S | room, text | none (fire and forget) | NOT_IN_ROOM, TEXT_TOO_LONG |
+| MSG   | S->C | room, from, text, ts | -- | -- |
+| LEAVE | C->S | room | LEFT (broadcast) | NOT_IN_ROOM |
+| PING  | both | nonce | PONG with same nonce | -- |
+
+## 6. Heartbeats
+Server sends PING every 15 s of inactivity. A client that does not PONG within 45 s
+(3 intervals) is disconnected with ERROR HEARTBEAT_TIMEOUT.
+
+## 7. Error codes
+NOT_AUTHENTICATED, ALREADY_HELLO, BAD_NICK, BAD_ROOM, ROOM_FULL, NOT_IN_ROOM,
+TEXT_TOO_LONG, MSG_TOO_LARGE, UNKNOWN_TYPE, UNSUPPORTED_VERSION, HEARTBEAT_TIMEOUT, INTERNAL.
+Errors are {"t":"ERROR","code":<string>,"message":<human string>}.
+`code` is stable and machine-readable; `message` is not stable and MUST NOT be parsed.
+```
+
+## Why this solution and not the obvious one
+
+**`code` is stable, `message` is not.** Stating this explicitly is what lets you improve error
+messages forever without breaking a client that switched on the text. Every protocol that omits this
+line eventually has a client parsing English.
+
+**Version at the connection, capabilities separately.** A single version number forces features into
+a total order; capability flags let three client platforms ship features in whatever order they
+manage. The `HELLO`/`WELCOME` negotiation costs one round trip that you were paying anyway.
+
+**Unknown `t` produces an ERROR but does not disconnect.** Disconnecting on an unknown message type
+makes every additive change a breaking change for old servers. Responding with an error and
+continuing lets a newer client probe for support.
+
+**Wrong turns worth knowing about.**
+
+1. *Benchmarking protobuf without touching a field.* You will report 0.47 µs, conclude protobuf is
+   4× faster than MsgPack at decoding, and be wrong by a factor of 4.
+2. *Gzipping every small message.* Measured: 113.8 B becomes 115.9 B. Compression needs size or a
+   shared dictionary.
+3. *`extra="forbid"` on a Pydantic model parsing network input.* Correct for config, catastrophic
+   for a protocol — this is the war story in the module.
+4. *Un-jittered exponential backoff.* The herd never disperses; the recovering server is knocked over
+   repeatedly.
+
+## Measured numbers this solution produces
+
+- JSON compact **113.8 B/msg**, MsgPack **81.1 B**, Protobuf **47.8 B** — protobuf is 2.4× smaller.
+- Decode with field access: **4.44 / 1.19 / 1.84 µs**. MsgPack is fastest to decode in Python.
+- Compact JSON separators save **13 B/msg (10%)** for one keyword argument.
+- Per-message gzip on a 113.8 B message: **115.9 B** — a net loss.
+- At 50,000 msg/s: JSON 5.69 MB/s versus Protobuf 2.39 MB/s, or about **$770/month** difference in
+  cross-region egress at $0.09/GB.
+
+## Grading notes
+
+**What 3/3 looks like**
+
+- *Correctness* — the benchmark forces field materialisation and says so; the `PROTOCOL.md` state
+  machine covers every invalid transition.
+- *Code quality* — one framing module reused by client and server; the protocol layer does not know
+  about sockets.
+- *Performance* — the cost table extended to the student's own message shape and target rate, with a
+  monthly currency figure.
+- *Explanation* — a peer implemented a working client from `PROTOCOL.md` without asking a question.
+  That is the actual acceptance test and it should be recorded in the README.
+
+**The three most common ways submissions lose points**
+
+1. **The lazy-parse number reported.** 0.47 µs for protobuf decode is the single most common error in
+   this benchmark, and it inverts the conclusion.
+2. **`PROTOCOL.md` documents only the happy path.** No error codes, no ordering constraints, no
+   statement about unknown fields.
+3. **A format chosen on preference.** "We used protobuf because it is faster" without the bandwidth
+   and CPU arithmetic for the actual message rate.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

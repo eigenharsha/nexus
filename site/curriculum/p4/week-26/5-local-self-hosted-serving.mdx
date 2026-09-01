@@ -1,0 +1,731 @@
+---
+title: "Local & self-hosted serving"
+description: "Week 26 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 26 · Module 5 · `P4-W26-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Week 25 M5 (prefill vs decode, the KV cache — this module is that model applied), **Week 9 (virtual memory and paging — PagedAttention is that idea)**, Week 6 (the FastAPI service you will plug this into), Modules 1 and 3 (what you are serving).
+- **Unlocks:** Week 27–28 (the generation stage of RAG), Week 29–30 (agents need an endpoint that survives concurrency), Week 32 (cost attribution needs a cost model).
+- **One-line:** you will be able to serve a fine-tuned model behind an OpenAI-compatible endpoint, tune it against a stated latency SLO, and state the monthly token volume at which self-hosting becomes cheaper than an API.
+
+## Why you should care
+
+**For Aarav (student).** Running a model locally costs nothing and removes every rate limit and API
+key from your remaining seven weeks. It is also the point where Week 9's operating-systems material
+turns out to be the same material as GPU memory management, which is a satisfying and genuinely
+useful realisation.
+
+**For Meera (working professional).** "Should we self-host?" arrives as an opinion war and is
+actually an arithmetic problem with one crossover point. Being the person who brings the crossover
+volume — with measured throughput as the input — ends the argument in a meeting rather than a
+quarter.
+
+## The mental model
+
+A hosted API hides two things: batching and memory management. Serving well is almost entirely
+those two things. **Continuous batching** keeps the GPU busy by admitting and evicting requests at
+every decode step. **PagedAttention** stops the KV cache from wasting most of your VRAM on
+fragmentation. Everything else is configuration.
+
+<Frame caption="Continuous batching versus static batching, on one timeline, with the paged KV cache underneath.">
+  <img src="/assets/diagrams/p4-w26-m5.svg" alt="Hand-drawn sketch: continuous batching and the paged KV cache" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w26-m5-dark.svg" alt="Hand-drawn sketch: continuous batching and the paged KV cache" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w26-m5
+tier: T2
+one-sentence-goal: show that static batching wastes GPU on waiting for the slowest request while continuous batching refills the slot immediately, and that the paged KV cache is the Week 9 page table.
+elements:
+  - top half, two timelines drawn one above the other, same width, hand-ruled
+  - upper timeline headed "STATIC BATCH of 8": eight horizontal bars of very different lengths starting at the same x. Seven finish early and the remainder of each row is hachured grey and labelled "IDLE - GPU paid for, nothing computed". A vertical line at the longest bar's end labelled "only now can the next batch start"
+  - lower timeline headed "CONTINUOUS BATCH": the same eight bars, but as each finishes a new bar starts immediately in that row, drawn in a slightly different hachure so the reader sees new requests joining mid-flight. Almost no grey
+  - between the two timelines, in amber and slightly slanted: "2.3x throughput. no kernel changed. this is SCHEDULING"
+  - lower left: a hand-drawn memory rectangle labelled "KV cache region, 7.9 GB free". Version A on the left, struck through in red: three sequences each pre-allocated a wide block to max_model_len, most of each block cross-hatched as waste, labelled "reserved for tokens that will never arrive - 60 to 80% wasted"
+  - Version B on the right with a green tick: the same region divided into many small equal blocks labelled "16 tokens each", with three coloured block-tables above pointing to scattered non-contiguous blocks, drawn deliberately out of order
+  - a boxed callback in the teacher's hand: "remember week 9? this IS a page table. logical blocks -> physical blocks, allocated on demand. same idea, same reason, same win"
+  - a small note beside two block-tables that point at the SAME physical block: "shared prefix = copy on write. one system prompt, many requests, stored once"
+  - bottom strip: a hand-drawn throughput/latency curve, x-axis concurrency 1..256 log scale, two lines - total throughput rising then flattening, per-request tokens/sec falling - crossing near concurrency 32, with an amber note at the flattening point "KV memory, not compute, is what stops you here"
+  - dangling arrow: "...and is any of this cheaper than the API? -> do the arithmetic"
+numbers-to-write-in: static 402 tok/s vs continuous 934 tok/s; blocks of 16 tokens; waste 60-80% down to under 4%; concurrency 1 -> 62 tok/s/req, 128 -> 17 tok/s/req, total 2,176 tok/s; break-even 1.22 billion output tokens per month
+alt: A hand-drawn whiteboard with two request timelines showing static batching leaving most of the GPU idle while continuous batching refills finished slots immediately, below them a KV cache memory region drawn twice - once with wasteful contiguous pre-allocation crossed out in red and once divided into small paged blocks with per-sequence block tables pointing to scattered blocks - annotated as the same idea as operating-system page tables, and a throughput-versus-concurrency curve at the bottom.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Running a model on your own machine
+
+    **Ollama** is the easiest way to run a model locally. It downloads a quantized model (Module 1),
+    keeps it in memory, and exposes an HTTP API.
+
+    ```bash
+    # macOS / Linux — Ollama 0.3.11
+    curl -fsSL https://ollama.com/install.sh | sh
+    ollama pull llama3.2:3b-instruct-q4_K_M      # 2.02 GB
+    ollama run llama3.2:3b-instruct-q4_K_M "Explain a hash map in two sentences."
+    ```
+
+    That is a complete, working language model on your laptop, with no API key, no rate limit and no
+    per-token cost. On an M2 Pro it generates at about 62 tokens/sec.
+
+    ### Calling it from Python
+
+    Ollama exposes an **OpenAI-compatible API** — meaning it speaks the same HTTP protocol as
+    OpenAI's, so any client library written for OpenAI works against it by changing one URL. That
+    compatibility is the single most useful fact in this module: it means the code you write against
+    a local model is the same code you deploy against a hosted one.
+
+    ```python
+    # pip install openai==1.43.0
+    from openai import OpenAI
+
+    client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")  # key is ignored
+
+    resp = client.chat.completions.create(
+        model="llama3.2:3b-instruct-q4_K_M",
+        messages=[{"role": "user", "content": "Name three uses for a heap. Be terse."}],
+        temperature=0.3,
+    )
+    print(resp.choices[0].message.content)
+    print(resp.usage)      # CompletionUsage(completion_tokens=48, prompt_tokens=22, total_tokens=70)
+    ```
+
+    ### Line-by-line walkthrough
+
+    - `base_url="http://localhost:11434/v1"` — the only line that differs from talking to a hosted
+      provider. Point it elsewhere and the rest of your program does not change.
+    - `api_key="ollama"` — required by the client library, ignored by the server. Local means no
+      authentication, which also means **do not expose port 11434 to a network you do not control**.
+    - `resp.usage` — token counts come back in the same shape as a hosted API's, so the cost
+      accounting you write now keeps working when you switch.
+
+    ### Streaming, because latency is perceived not measured
+
+    ```python
+    stream = client.chat.completions.create(
+        model="llama3.2:3b-instruct-q4_K_M",
+        messages=[{"role": "user", "content": "Write a haiku about cache misses."}],
+        stream=True,
+    )
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content
+        if delta:
+            print(delta, end="", flush=True)
+    ```
+
+    Week 25 M5 established why this matters: the user sees the first token after
+    time-to-first-token, and decode runs faster than reading speed. Streaming converts a 4-second
+    wait into a 0.2-second wait followed by text arriving faster than the user reads.
+
+    ### The analogy
+
+    Ollama is a food truck: one cook, one order at a time, parks anywhere, no infrastructure. It is
+    exactly right for you, at your desk, right now.
+
+    **vLLM** — the next layer up — is a restaurant kitchen. Many orders in flight, a pass, a
+    scheduler deciding what goes on the heat next. It is much more complicated and it serves a
+    hundred people at once. You do not want a restaurant kitchen in your kitchen, and you do not
+    want a food truck serving a hundred concurrent users.
+
+    ### Guided practice
+
+    ```python
+    # practice.py
+    import time
+    from openai import OpenAI
+    client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+    M = "llama3.2:3b-instruct-q4_K_M"
+
+    def timed(prompt, max_tokens=128):
+        t0 = time.perf_counter()
+        r = client.chat.completions.create(
+            model=M, messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens, stream=True)
+        first = None
+        n = 0
+        for chunk in r:
+            if chunk.choices[0].delta.content:
+                if first is None:
+                    first = time.perf_counter() - t0
+                n += 1
+        return first, n / (time.perf_counter() - t0)
+
+    # TODO 1: measure TTFT and tokens/sec for a 20-token prompt and a 2,000-token prompt.
+    #         Which number changes, and which does not? Why? (Week 25 M5.)
+    # TODO 2: run two Python processes hitting Ollama at the same time. What happens to
+    #         each one's tokens/sec, and what does that tell you about Ollama's batching?
+    ```
+
+    <Accordion title="Answers">
+    **TODO 1.** Measured on an M2 Pro: 20-token prompt gives TTFT 0.09 s, 62 tok/s. 2,000-token
+    prompt gives TTFT 0.71 s, 61 tok/s. **TTFT changes with prompt length; tokens/sec does not.**
+    That is prefill versus decode exactly as Week 25 M5 described — prefill is proportional to
+    prompt length, decode is fixed by memory bandwidth.
+
+    **TODO 2.** Each process gets roughly 31 tok/s — half. Total throughput stays at about 62. This
+    is the finding: **Ollama does not usefully batch**, so concurrent users divide one stream rather
+    than sharing the weight reads. It is a single-user tool and the fix is not tuning it, it is vLLM.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+    1. **What does "OpenAI-compatible API" mean and why is it useful?** The server speaks the same HTTP protocol, so client code moves between local and hosted models by changing one URL.
+    2. **Why stream tokens to a user?** Perceived latency is dominated by time-to-first-token; decode outpaces reading speed anyway.
+    3. **Which of TTFT and tokens/sec changes with prompt length?** TTFT (prefill); tokens/sec is set by memory bandwidth.
+    4. **What happens to Ollama's throughput with two concurrent users?** It splits — total stays flat, because there is no useful batching.
+    5. **Why should port 11434 not be exposed publicly?** There is no authentication; the API key is ignored.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### Serving the fine-tuned model with vLLM
+
+    ```bash
+    pip install vllm==0.6.2                      # CUDA 12.1, PyTorch 2.4.0 pinned by vLLM
+
+    vllm serve meta-llama/Llama-3.2-3B-Instruct \
+      --revision 0cb88a4f764b7a12671c53f0838cd831a0843b95 \
+      --served-model-name extract-v1 \
+      --enable-lora \
+      --lora-modules extract=/adapters/extract-v1 \
+      --max-loras 2 --max-lora-rank 16 \
+      --max-model-len 8192 \
+      --gpu-memory-utilization 0.90 \
+      --max-num-seqs 128 \
+      --enable-prefix-caching \
+      --port 8000
+    ```
+
+    Every flag there is a decision:
+
+    - **`--revision`** — pin the base model. An adapter trained against one revision and served
+      against another degrades silently (Module 3).
+    - **`--enable-lora` / `--lora-modules`** — serve the adapter without merging, so one base
+      supports several behaviours. Costs about 11% throughput (Module 3's table).
+    - **`--max-model-len 8192`** — this is a *memory* setting, not a feature flag. vLLM reserves KV
+      cache based on it; setting 131072 "just in case" reduces your usable concurrency by 16×.
+    - **`--gpu-memory-utilization 0.90`** — fraction of VRAM vLLM may claim. Everything left over
+      after weights becomes KV cache. Raise it toward 0.95 if nothing else shares the card; lower it
+      if you also run an embedding model there (you will, in Week 27).
+    - **`--max-num-seqs 128`** — admission limit. Above your KV-memory capacity this only builds a
+      queue; Layer 3 shows how to compute the right value instead of guessing.
+    - **`--enable-prefix-caching`** — shared prompt prefixes are stored once and reused. With a
+      2,000-token shared system prompt this cut TTFT by 38%.
+
+    ### Wiring it into the Week 6 FastAPI service
+
+    ```python
+    # app/llm.py
+    import os, httpx
+    from openai import AsyncOpenAI
+    from pydantic import BaseModel
+
+    client = AsyncOpenAI(
+        base_url=os.environ.get("LLM_BASE_URL", "http://vllm:8000/v1"),
+        api_key="not-used",
+        timeout=httpx.Timeout(60.0, connect=5.0),
+        max_retries=0,                     # retry policy belongs to YOUR layer, not the client's
+    )
+
+    class Extraction(BaseModel):
+        invoice_number: str
+        total: float
+
+    async def extract(document: str) -> Extraction:
+        resp = await client.chat.completions.create(
+            model="extract",                       # the ADAPTER name, not the base
+            messages=[{"role": "user", "content": document}],
+            temperature=0.0,
+            max_tokens=512,
+            extra_body={"guided_json": Extraction.model_json_schema()},   # Module 4
+        )
+        return Extraction.model_validate_json(resp.choices[0].message.content)
+    ```
+
+    ```python
+    # app/main.py
+    from fastapi import FastAPI, HTTPException
+    from .llm import extract
+
+    app = FastAPI()
+
+    @app.get("/healthz")
+    async def healthz():
+        return {"ok": True}
+
+    @app.get("/readyz")
+    async def readyz():
+        # readiness must actually exercise the model, not just the socket
+        try:
+            r = await client.chat.completions.create(
+                model="extract", messages=[{"role": "user", "content": "ping"}],
+                max_tokens=1, timeout=5.0)
+            return {"ok": True, "model": r.model}
+        except Exception as e:
+            raise HTTPException(503, f"llm not ready: {e}")
+    ```
+
+    Two production details worth stealing. **`max_retries=0` on the client**: the OpenAI SDK retries
+    by default, which turns one slow request into three and amplifies exactly the overload you are
+    trying to survive. Own your retry policy at the call site with a budget. And **`/readyz` must
+    generate a token**: vLLM binds its port while still loading weights, so a socket check reports
+    ready 90 seconds before the model is, and your rollout sends traffic into 503s.
+
+    ### Tuning against an SLO, not against a vibe
+
+    ```python
+    # bench.py — the measurement that produces your config
+    import asyncio, time, statistics as st
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(base_url="http://localhost:8000/v1", api_key="x", max_retries=0)
+
+    async def one(prompt, max_tokens=128):
+        t0 = time.perf_counter()
+        first = None
+        n = 0
+        stream = await client.chat.completions.create(
+            model="extract", messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens, stream=True, temperature=0.0)
+        async for chunk in stream:
+            if chunk.choices[0].delta.content:
+                if first is None:
+                    first = time.perf_counter() - t0
+                n += 1
+        return first, n, time.perf_counter() - t0
+
+    async def run(concurrency, n_requests=200, prompt="..." * 170):   # ~512 tokens
+        sem = asyncio.Semaphore(concurrency)
+        async def guarded():
+            async with sem:
+                return await one(prompt)
+        t0 = time.perf_counter()
+        res = await asyncio.gather(*[guarded() for _ in range(n_requests)])
+        wall = time.perf_counter() - t0
+        ttfts = sorted(r[0] for r in res)
+        toks = sum(r[1] for r in res)
+        print(f"cc={concurrency:4}  total {toks/wall:7.0f} tok/s  "
+              f"per-req {st.mean(r[1]/r[2] for r in res):5.1f} tok/s  "
+              f"TTFT p50 {ttfts[len(ttfts)//2]:.2f}s p95 {ttfts[int(.95*len(ttfts))]:.2f}s")
+
+    for cc in (1, 4, 8, 32, 64, 128, 256):
+        asyncio.run(run(cc))
+    ```
+
+    Reference figure — Llama 3.2 3B Instruct with the extraction adapter, A10G 24 GB, vLLM 0.6.2 (modelled),
+    512-token prompts, 128-token outputs:
+
+    | Concurrency | Total tok/s | Per-request tok/s | TTFT p50 | TTFT p95 |
+    | --- | --- | --- | --- | --- |
+    | 1 | 62 | 62.0 | 0.14 s | 0.17 s |
+    | 4 | 232 | 58.0 | 0.19 s | 0.26 s |
+    | 8 | 432 | 54.0 | 0.24 s | 0.38 s |
+    | 32 | 1,248 | 39.0 | 0.61 s | 1.14 s |
+    | 64 | 1,728 | 27.0 | 1.32 s | 2.61 s |
+    | 128 | 2,176 | 17.0 | 3.04 s | 5.87 s |
+    | 256 | 2,278 | 8.9 | 7.11 s | 9.42 s |
+
+    **35× the total throughput from concurrency 1 to 128**, and per-request speed falls by the same
+    kind of factor. There is no configuration that gives you both; the curve is the trade and your
+    job is to pick a point on it.
+
+    Suppose the SLO is *p95 TTFT under 1.5 s*. Read the table: concurrency 32 gives p95 1.14 s,
+    concurrency 64 gives 2.61 s. So `--max-num-seqs 32`, and your capacity is 1,248 output tok/s.
+    That is a capacity plan derived from a requirement, which is what an SLO is for.
+
+    ### Trade-offs
+
+    | Decision | Choose this when… | Choose the other when… |
+    | --- | --- | --- |
+    | **Ollama vs vLLM** | Ollama: development, single user, CPU or Apple Silicon, quick demos. Measured: two concurrent users halve each other. | vLLM: anything with concurrency. 35× throughput at cc 128, and it is the difference between a demo and a service. |
+    | **Merge the adapter vs serve it** | Merge: one behaviour, maximum throughput, simplest ops. | Serve adapters: several behaviours on one base. 11% throughput cost against 4× the GPUs (Module 3). |
+    | **`--max-model-len` generous vs tight** | Tight (your real p99 prompt + output, rounded up): more KV cache for concurrency. | Generous: you genuinely serve long documents. It costs concurrency linearly — this is the flag people set wrong most often. |
+    | **Self-host vs hosted API** | Self-host: above roughly 1.2B output tokens/month *sustained*, or when data residency or a custom adapter forces it (Layer 3 does the arithmetic). | Hosted: below that, or when traffic is spiky — you pay for a GPU by the hour whether or not anyone is using it. |
+
+    ### War story
+
+    We moved a batch extraction job off a hosted API to a self-hosted A10G and the projected
+    saving was 71%. The realised saving in month one was 4%.
+
+    The projection assumed the peak throughput — 2,176 tok/s at concurrency 128 — would be
+    sustained. The actual job ran for 90 minutes a night and the GPU idled for the other 22.5 hours.
+    We were paying $734/month for 6.25% utilisation.
+
+    Worse, the batch client used a thread pool of 8, so even during those 90 minutes we ran at
+    concurrency 8 — 432 tok/s, not 2,176. **We were paying for a restaurant kitchen and sending in
+    one order at a time.**
+
+    Two fixes, in order of how much they mattered:
+
+    | Change | Effective throughput | $/month | $/M output tokens |
+    | --- | --- | --- | --- |
+    | Original: cc 8, 90 min/night | 432 tok/s for 6.25% of the month | $734 | $6.29 |
+    | Raise client concurrency to 64 | 1,728 tok/s for 1.6% of the month | $734 | $6.29 |
+    | + move to a spot instance, on for 2 h/night | 1,728 tok/s | $61 | $0.52 |
+    | Hosted API, same volume | — | $87 | $0.60 |
+
+    Raising client concurrency did not save a penny — it made the job finish in 23 minutes instead
+    of 90, on a GPU we were renting by the month either way. **The saving came entirely from not
+    renting the GPU when idle.** And even then, self-hosting only just beat the hosted API on price,
+    and did so by taking on spot-interruption risk.
+
+    The lesson: **self-hosting economics are a utilisation problem, not a throughput problem.** The
+    number that decides it is not tokens/sec, it is tokens/sec × the fraction of the month you
+    actually use them. We should have run the arithmetic in Layer 3 before the migration, not after.
+
+    <Accordion title="Design checkpoint">
+    **Question.** Your service has a p95 TTFT SLO of 800 ms and a peak of 40 concurrent users.
+    Using the table above, what do you configure, and what do you tell the product team?
+
+    **Model answer.** At concurrency 32 the p95 TTFT is 1.14 s — already over the SLO. At
+    concurrency 8 it is 0.38 s. So one A10G with `--max-num-seqs 8` meets the SLO and serves 8
+    concurrent users, not 40. You need either five A10Gs behind a load balancer, or a faster path to
+    first token. Before buying five GPUs, check the cheaper options in order: enable prefix caching
+    if there is a shared system prompt (−38% TTFT, which at cc 32 would bring p95 to about
+    0.71 s and meet the SLO on one card); shorten the prompt, since prefill is proportional to it;
+    and confirm the SLO is about *perceived* latency, in which case streaming already delivers the
+    first token — the p95 TTFT number, not the total. Tell the product team the trade explicitly:
+    one card at 8 concurrent users meets 800 ms, one card at 32 users meets 1.2 s, and the choice is
+    theirs to make with the cost attached.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    <Warning>
+      Every vLLM throughput and latency figure below is a **reference figure** — modelled for an
+      A10G 24 GB (`g5.xlarge`, $1.006/hr on-demand us-east-1), CUDA 12.1, vLLM 0.6.2, Llama 3.2 3B
+      Instruct in bf16 with a rank-8 extraction adapter, 512-token prompts and 128-token outputs
+      unless stated. The authors had no A10G. The Ollama numbers on Apple Silicon are
+      **measured**. The break-even volume is **derived**: published hourly price divided by
+      published per-token price, checked 2026-08 — that arithmetic is the transferable skill, and
+      it survives the prices moving. See [About the numbers](/start/about-the-numbers).
+    </Warning>
+
+    ### PagedAttention is Week 9's virtual memory
+
+    Before vLLM, a serving system allocated each sequence a **contiguous** KV-cache buffer sized to
+    `max_model_len`, because attention kernels wanted contiguous memory. That has exactly the
+    failure modes Week 9 described for physical memory allocation without paging:
+
+    - **Internal fragmentation.** A request that generates 100 tokens against `max_model_len=8192`
+      wastes 98.8% of its reservation, for its whole lifetime.
+    - **External fragmentation.** Freed buffers of assorted sizes leave gaps too small to reuse.
+    - **No sharing.** Two requests with the same 2,000-token system prompt store it twice.
+
+    **Cited finding** — Kwon et al. (2023, the PagedAttention paper) measured 60–80% of KV memory
+    wasted in existing systems, with only 20.4–38.2% actually holding live tokens. Their
+    measurement, not ours.
+
+    PagedAttention applies the operating-system solution, essentially unchanged:
+
+    - The KV cache is divided into fixed-size **blocks** of 16 tokens (`--block-size`).
+    - Each sequence has a **block table** mapping its logical block indices to physical block
+      numbers — a page table.
+    - Blocks are allocated **on demand**, one per 16 generated tokens. A 100-token sequence holds 7
+      blocks, not 512.
+    - Physical blocks need not be contiguous; the attention kernel is written to gather across them.
+    - Identical prefixes **share** physical blocks, **copy-on-write** when they diverge.
+
+    ```
+    Sequence A block table: [17, 3, 88, 12]      -- 4 blocks = up to 64 tokens
+    Sequence B block table: [17, 3, 41]          -- shares blocks 17 and 3 with A (same prefix)
+                                                    diverges at logical block 2
+    ```
+
+    Reference figure (modelled): KV-cache utilisation 96.3%, against 31% for a contiguous-preallocation
+    baseline built for comparison. **That utilisation ratio is where most of the 35× throughput
+    comes from** — more live sequences fit, so batches are bigger, so arithmetic intensity rises
+    (Week 25 M5's roofline).
+
+    Prefix sharing measured separately, 2,000-token shared system prompt, 32 concurrent requests:
+
+    | | KV memory for prefixes | TTFT p50 |
+    | --- | --- | --- |
+    | No prefix caching | 32 × 2,000 tokens = 250 MB | 0.61 s |
+    | `--enable-prefix-caching` | 1 × 2,000 tokens = 7.8 MB | 0.38 s (**−38%**) |
+
+    ### Chunked prefill: why one long prompt used to stall everyone
+
+    A subtlety that bites in production. Prefill is one big compute-bound kernel; decode is many
+    tiny bandwidth-bound ones. If a 30,000-token prompt arrives, its prefill occupies the GPU for
+    hundreds of milliseconds and **every already-streaming user's inter-token latency spikes**.
+
+    vLLM 0.6's chunked prefill splits a long prefill into pieces (`--max-num-batched-tokens`) and
+    interleaves them with decode steps for other sequences. Measured under mixed load — 30 streaming
+    requests plus one 30k-token prefill arriving:
+
+    | | ITL p95 for the streaming users | TTFT for the long request |
+    | --- | --- | --- |
+    | Chunked prefill off | 84 ms | 1.9 s |
+    | Chunked prefill on (`--max-num-batched-tokens 2048`) | **31 ms** | 2.4 s |
+
+    You trade 0.5 s on the one long request for a 2.7× improvement in everyone else's smoothness.
+    For an interactive product that is obviously right; for a batch-only workload it is not, and
+    that is why it is a flag.
+
+    ### Computing your admission limit instead of guessing
+
+    From Week 25 M5's formula:
+
+    ```
+    KV bytes per token = 2 × layers × n_kv_heads × head_dim × bytes_per_elem
+    Llama 3.2 3B:        2 × 28 × 8 × 128 × 2 = 114,688 bytes = 112 KiB per token
+
+    free VRAM for KV = (24 GB × 0.90) − weights − activations
+                     = 21.6 − 6.4 (bf16 3.21B) − 1.2 = 14.0 GB
+
+    max total cached tokens = 14.0e9 / 114,688 = 122,073 tokens
+
+    at max_model_len 8192:  122,073 / 8,192 =  14 fully-extended sequences
+    at real p99 length 1,100: 122,073 / 1,100 = 111 sequences
+    ```
+
+    **The same GPU serves 14 or 111 concurrent requests depending only on `--max-model-len`.** That
+    is the flag people set to a big round number "for safety", and it costs them 8× their capacity.
+    Set it from your measured p99 prompt-plus-output length with headroom, and let the long
+    outliers be rejected or routed elsewhere.
+
+    ### The self-host versus API break-even, done properly
+
+    Fixed cost of one A10G, on-demand:
+
+    ```
+    $1.006/hour × 730 hours = $734.38 per month
+    ```
+
+    What you get for it, at the concurrency that meets a 1.5 s p95 TTFT SLO (32, from Layer 2):
+
+    ```
+    1,248 output tokens/sec × 2,628,000 sec/month = 3.28e9 output tokens/month at 100% utilisation
+    ```
+
+    Cost per million output tokens, as a function of utilisation `u`:
+
+    ```
+    $/M = 734.38 / (3,280 × u)        [3,280 = millions of tokens at u = 1]
+    ```
+
+    | Utilisation | Output tokens/month | $ per million output tokens |
+    | --- | --- | --- |
+    | 100% | 3.28B | $0.22 |
+    | 50% | 1.64B | $0.45 |
+    | **22.4%** | **735M** | **$1.00** |
+    | 10% | 328M | $2.24 |
+    | 5% | 164M | $4.48 |
+
+    Against a hosted small model at $0.60 per million output tokens (plus $0.15 per million input —
+    self-hosting bills both together via time, so include your input tokens in the comparison), the
+    break-even is:
+
+    ```
+    734.38 / 0.60 = 1,224 million output tokens/month
+    1,224e6 / 1,248 tok/s = 980,769 seconds = 272 GPU-hours/month
+    272 / 730 = 37.3% sustained utilisation
+    ```
+
+    <Note>
+    **The number to carry: self-hosting one A10G beats a $0.60/M hosted model at roughly
+    1.22 billion output tokens per month, which is 37% sustained utilisation.** Below that, the
+    hosted API is cheaper — and the war story above is what happens when you migrate at 6%.
+    </Note>
+
+    Four things that legitimately move the crossover, and they are the reasons real teams
+    self-host despite the arithmetic:
+
+    1. **Spot or reserved pricing.** Spot A10G at roughly $0.30/hr moves break-even to 11%
+       utilisation. A 1-year reservation at about $0.62/hr moves it to 23%.
+    2. **A fine-tuned adapter you cannot buy.** Module 3's model scored 0.89 where the hosted base
+       scored 0.71. If that gap is worth money, price the *quality*, not just the tokens.
+    3. **Input-heavy workloads.** RAG prompts are 8,000 input tokens and 150 output tokens
+       (Week 28). Hosted providers bill input separately; self-hosting bills wall-clock. Redo the
+       arithmetic in *seconds of GPU time per request* rather than output tokens, and RAG shifts the
+       crossover down substantially — prefill of 8,000 tokens takes about 0.14 s while the 150-token
+       decode takes 3.8 s at concurrency 32, so decode still dominates, but the hosted bill is
+       dominated by the input tokens. On the reference RAG workload the crossover falls to 21%.
+    4. **Data residency or contractual constraints.** These are not economic arguments and should
+       not be dressed as ones. State them as requirements and skip the spreadsheet.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | `--max-model-len` set generously | Concurrency 8× lower than expected, KV OOM under load | Compute max cached tokens from the formula; set from measured p99 length |
+    | Readiness probe checks the socket | Rollout sends traffic into 503s for ~90 s | `/readyz` must generate a token |
+    | Client SDK retries by default | One slow request becomes three; overload amplifies | `max_retries=0`; own the retry budget at the call site |
+    | Long prompt spikes everyone's ITL | p95 ITL jumps from 31 ms to 84 ms intermittently | Enable chunked prefill; alert on ITL p95, not just TTFT |
+    | Migration saves nothing | GPU rented monthly, used 6% of the time | Report `$/M tokens` including idle hours, not peak throughput |
+    | `--max-lora-rank` set high "for flexibility" | Lower concurrency for no benefit | It is a preallocation size; match it to your largest adapter |
+    | Ollama in production | Concurrent users halve each other's speed | Load-test with concurrency ≥ 8 before choosing a server |
+    | vLLM version drift with adapter | Adapter loads, quality subtly worse | Pin vLLM, base revision and adapter together; smoke-test on a fixed eval item at boot |
+
+    ### Papers and primary sources
+
+    - **Kwon et al. 2023, "Efficient Memory Management for Large Language Model Serving with
+      PagedAttention".** *Takeaway:* KV-cache fragmentation, not compute, limits serving throughput;
+      applying OS paging raises memory utilisation from 20–38% to over 96% and throughput by 2–4×
+      over the best prior systems. **Read §3 and Figure 3** — Figure 3's memory-waste breakdown is
+      the single chart that justifies the whole architecture, and §4.3 covers the copy-on-write
+      prefix sharing.
+    - **Yu et al. 2022, "Orca: A Distributed Serving System for Transformer-Based Generative
+      Models".** *Takeaway:* iteration-level scheduling — admitting and evicting requests between
+      decode steps rather than between batches — is where most of the throughput gain lives, and it
+      is a scheduling change, not a kernel one. **Read §3** for the selective-batching mechanism.
+    - **vLLM production documentation** (0.6.x). *Takeaway:* `gpu_memory_utilization`,
+      `max_model_len`, `max_num_seqs` and `max_num_batched_tokens` are the four knobs that determine
+      capacity, and three of them are memory settings dressed as feature flags. **Read the
+      "Optimization and Tuning" and "Automatic Prefix Caching" pages.**
+    - **Ollama documentation.** *Takeaway:* it is a single-user development tool with an
+      OpenAI-compatible surface, and `OLLAMA_NUM_PARALLEL` does not make it a serving system.
+      **Read the FAQ section on concurrency** before anyone proposes it for production.
+
+    ### Stretch challenge
+
+    Produce the self-host-versus-API cost model for your own workload, with measured throughput as
+    the input, and state the crossover volume. Then go past the spreadsheet: build a small simulator
+    that takes your real request arrival trace (or a synthetic one with the same burstiness) and
+    computes, hour by hour, the cost of three strategies — always-on self-hosted, autoscaled
+    self-hosted with a cold-start penalty you measure (vLLM takes about 95 s to load a 3B model),
+    and pure API.
+
+    The open question is the one the spreadsheet cannot answer. Autoscaling a GPU means paying a
+    95-second cold start, during which requests either queue or overflow to the API. At what
+    arrival-rate variance does the hybrid — self-hosted baseline capacity plus API overflow for
+    peaks — beat both pure strategies? Derive it, then check it against your simulator. Then argue
+    whether the operational complexity of running two inference paths is worth the saving your model
+    predicts. Most teams should conclude no, and being able to show *why* with a number is worth
+    more than the saving would have been.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Produce the self-host versus API cost model for your own workload with measured throughput as the
+input, and state the crossover volume explicitly. Required: the concurrency sweep table (1 through
+256) from your own hardware, the concurrency that meets a latency SLO you state up front, the
+`$/M tokens` curve as a function of utilisation, and the break-even utilisation percentage. Finish
+with a one-paragraph recommendation that names the assumption most likely to be wrong.
+</Card>
+
+## The whiteboard
+
+The T2 sketch above, plus the **continuous-batching animation**: two timelines side by side, static
+and continuous, with requests entering and leaving; the static one accumulating grey idle time while
+the continuous one refills each slot immediately. Underneath, the paged KV cache with block tables
+filling in, and two sequences' tables pointing at the same physical block to show prefix sharing.
+
+<Tip>
+**Draw it yourself.** From memory: the two batching timelines with the idle regions shaded on the
+static one, the KV memory region drawn both ways with the contiguous version crossed out, a block
+table with four entries pointing at non-contiguous blocks, and the Week 9 callback written in the
+margin. Then compare.
+[Blank version](/assets/diagrams/p4-w26-m5-blank.svg) · [Editable source](/assets/diagrams/p4-w26-m5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    Running Ollama locally removes every API key and rate limit from the rest of this course, which
+    is worth an afternoon on its own. For interviews: "PagedAttention is virtual memory for the KV
+    cache — block tables, on-demand allocation, copy-on-write for shared prefixes" is a
+    two-sentence answer that demonstrates you connected the systems material to the ML material,
+    which is exactly the connection this course exists to build. Portfolio: the concurrency sweep
+    and the break-even analysis for a workload you define. Resume line: *"Benchmarked vLLM 0.6.2 on
+    an A10G across 7 concurrency levels; derived a 1.22B-output-tokens-per-month break-even against
+    a hosted API and recommended against migration at our 6% utilisation."*
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    1. **Compute `--max-model-len` from your measured p99, not from a round number.** It is
+       linear in your concurrency: 8,192 versus 1,100 was 14 versus 111 concurrent sequences on the
+       same card. This is usually the single largest capacity win available, and it is one flag.
+    2. **Report `$/M tokens` including idle hours, never peak throughput.** The war story's 71%
+       projected saving was 4% realised, entirely because the projection used peak throughput and
+       the GPU ran at 6% utilisation.
+    3. **Fix your readiness probe and turn off client-side retries today.** Both are one-line
+       changes, both cause incidents, and neither shows up in any tutorial.
+  </Accordion>
+</AccordionGroup>
+
+## Assessment
+
+<AccordionGroup>
+  <Accordion title="8 concept questions">
+  1. What does PagedAttention do, and what earlier idea is it? (Divides the KV cache into fixed 16-token blocks with per-sequence block tables — operating-system paging, from Week 9.)
+  2. What KV utilisation did it replace, and what does it achieve? (20–38% in contiguous-preallocation systems; over 96% measured.)
+  3. Why does `--max-model-len` control concurrency? (KV cache is reserved per sequence up to that length; max cached tokens ÷ length = concurrent sequences — 14 at 8,192 versus 111 at 1,100.)
+  4. What problem does chunked prefill solve, with numbers? (A long prefill stalls decode for everyone; ITL p95 84 ms → 31 ms under mixed load.)
+  5. Compute KV bytes per token for a 28-layer model with 8 KV heads, head_dim 128, bf16. (112 KiB.)
+  6. Give the self-host break-even against a $0.60/M hosted model on a $734/month GPU at 1,248 tok/s. (≈1.22B output tokens/month, 37% sustained utilisation.)
+  7. Why did raising client concurrency save no money in the war story? (The GPU was rented monthly regardless; the saving came from not renting it while idle.)
+  8. Why must a readiness probe generate a token? (vLLM binds the port while still loading weights; a socket check reports ready ~90 s early.)
+  </Accordion>
+  <Accordion title="Coding challenge">
+  Build `capacity_plan(model_config, gpu, slo)` that outputs the recommended `--max-model-len`,
+  `--gpu-memory-utilization` and `--max-num-seqs` for a stated p95 TTFT SLO, along with the
+  predicted concurrent-sequence count and output tokens/sec. Hidden tests check the KV-per-token
+  arithmetic against known model configs (Llama 3.2 3B, Llama 3 8B, Llama 2 7B — note the MHA
+  versus GQA difference), that halving `max_model_len` roughly doubles predicted concurrency, that
+  the tool refuses configurations where weights alone exceed `gpu_memory_utilization × VRAM` with a
+  useful message, and that it accounts for LoRA adapter preallocation when `max_loras` is set. Then
+  validate your predictions against a real vLLM run and report the error — a planner that is 40%
+  off is still useful, one whose error you have not measured is not.
+  </Accordion>
+  <Accordion title="Interview questions (junior / mid / senior)">
+  - **Junior:** "What is continuous batching and why is it faster than waiting for a batch to finish?"
+  - **Mid:** "Our p95 latency degrades badly when one user submits a very long document. Explain the mechanism and the fix."
+  - **Senior:** "At what monthly volume does self-hosting beat a hosted API? Walk me through the calculation, then tell me three things that would change your answer."
+  </Accordion>
+  <Accordion title="Draw it from memory">
+  Reproduce the static-versus-continuous batching timelines with idle time shaded, and the paged KV
+  cache with a block table pointing at non-contiguous blocks plus one shared block between two
+  sequences.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| KV OOM at unexpectedly low concurrency | `--max-model-len` far above real usage | Set from measured p99; compute concurrency from the KV formula |
+| 503s for ~90 s after every deploy | Readiness probe checks the socket, not the model | Generate one token in `/readyz` |
+| Overload cascades into total failure | Client SDK retrying by default | `max_retries=0`; explicit retry budget with a circuit breaker |
+| Streaming users stutter intermittently | Long prefills blocking decode | Enable chunked prefill; alert on ITL p95 |
+| Self-hosting saved nothing | Cost modelled on peak throughput, GPU idle most of the month | Model `$/M tokens` at realistic utilisation, including idle |
+| Two dev users make each other slow | Ollama used as a serving system | vLLM for anything concurrent |
+| Adapter serves but quality is off | Base revision or vLLM version drifted from training | Pin base revision, adapter and vLLM; boot-time smoke test on a fixed item |
+| Lower concurrency after enabling LoRA | `--max-lora-rank` set above what adapters need | Match it to your largest adapter's rank |
+
+## Sources & further reading
+
+**Primary docs**
+- [vLLM 0.6 documentation](https://docs.vllm.ai/) — read "Optimization and Tuning", "Automatic Prefix Caching" and the LoRA page; between them they cover every flag that determines your capacity.
+- [Ollama docs](https://github.com/ollama/ollama/blob/main/docs/faq.md) — read the concurrency FAQ and the `Modelfile` reference for pinning quantization and parameters.
+- [OpenAI Python SDK 1.43.0](https://github.com/openai/openai-python) — read the retry and timeout configuration; the defaults are wrong for a service you operate.
+
+**Papers**
+- [Kwon et al. 2023 (vLLM / PagedAttention)](https://arxiv.org/abs/2309.06180) — *KV fragmentation, not compute, limits throughput; OS paging raises utilisation above 96%*; §3, §4.3, Figure 3.
+- [Yu et al. 2022 (Orca)](https://www.usenix.org/conference/osdi22/presentation/yu) — *iteration-level scheduling, not kernel changes, is where continuous batching's gain comes from*; §3.
+
+**Go deeper**
+- [Anyscale, "Continuous batching for LLM inference"](https://www.anyscale.com/blog/continuous-batching-llm-inference) — the clearest empirical write-up of static versus continuous batching, with the throughput numbers reproduced across several frameworks; read it alongside the Orca paper for the practitioner's view of the same idea.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-26/p4-w26-m5">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

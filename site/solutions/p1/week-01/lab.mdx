@@ -1,0 +1,203 @@
+---
+title: "Lab — Sorting & Search Toolkit in C"
+description: "Reference solution — Week 1"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `LAB-P1-W01`
+
+The `basic` and `standard` tracks are covered in the module solution pages for M4 (sorts, search, instrumentation) and M5 (sanitizer discipline). This page is about the `hard` track, which is where the lab actually gets interesting: **sort 200 MB under a 16 MB ceiling.**
+
+### The shape of the answer
+
+External merge sort is two phases.
+
+**Split.** Read the input in chunks that fit the budget, sort each chunk in memory, write it to a temporary run file. A 200 MB input with a 16 MB chunk gives 12 runs (11 full plus a remainder).
+
+**Merge.** Open all 12 runs, keep a small read buffer for each, and repeatedly emit the smallest head element. Refill a run's buffer when it empties. Write output through its own buffer.
+
+```c
+typedef struct {
+    FILE *f;
+    int *buf;
+    size_t cap, n, pos;
+    long long remaining;      /* elements not yet read from the file */
+} Run;
+
+static int run_fill(Run *r) {
+    if (r->remaining == 0) return 0;
+    size_t want = r->cap;
+    if ((long long)want > r->remaining) want = (size_t)r->remaining;
+    size_t got = fread(r->buf, sizeof(int), want, r->f);
+    r->n = got; r->pos = 0; r->remaining -= (long long)got;
+    return got > 0;
+}
+```
+
+The split phase:
+
+```c
+size_t chunk_elems = budget / sizeof(int);
+int *buf = malloc(chunk_elems * sizeof(int));
+int nruns = 0; size_t got;
+while ((got = fread(buf, sizeof(int), chunk_elems, in)) > 0) {
+    qsort(buf, got, sizeof(int), cmpi);
+    snprintf(name, sizeof name, "%s/run_%03d.bin", tmpdir, nruns);
+    FILE *o = fopen(name, "wb");
+    fwrite(buf, sizeof(int), got, o);
+    fclose(o);
+    nruns++;
+}
+free(buf);                       /* <- this line is criterion 2. See below. */
+```
+
+The merge loop, in its simplest (linear-scan) form:
+
+```c
+for (;;) {
+    int best = -1;
+    for (int i = 0; i < nruns; i++) {
+        if (runs[i].pos >= runs[i].n && !run_fill(&runs[i])) continue;
+        if (best < 0 || runs[i].buf[runs[i].pos] < runs[best].buf[runs[best].pos]) best = i;
+    }
+    if (best < 0) break;
+    ob[on++] = runs[best].buf[runs[best].pos++];
+    if (on == ocap) { fwrite(ob, sizeof(int), on, out); on = 0; }
+}
+if (on) fwrite(ob, sizeof(int), on, out);
+```
+
+Cleanup on every exit path, including `SIGINT` — criterion 5:
+
+```c
+static char g_tmpdir[PATH_MAX];
+static void cleanup(void) {
+    DIR *d = opendir(g_tmpdir); struct dirent *e;
+    while (d && (e = readdir(d))) if (!strncmp(e->d_name, "run_", 4)) unlinkat(dirfd(d), e->d_name, 0);
+    if (d) closedir(d);
+}
+static void on_sigint(int sig) { (void)sig; cleanup(); _exit(130); }
+/* in main: */ atexit(cleanup); signal(SIGINT, on_sigint); signal(SIGTERM, on_sigint);
+```
+
+`atexit` covers normal and `exit()` paths; the signal handler covers Ctrl-C and `SIGTERM`. Note the handler calls `_exit`, not `exit` — `exit` runs `atexit` handlers and stdio flushing, neither of which is async-signal-safe. `unlinkat` and `_exit` are.
+
+## Why this solution and not the obvious one
+
+### Wrong turn 1: budgeting each phase separately
+
+This is the trap the lab is built around, and the reference implementation shipped with it before it was caught.
+
+The split phase allocates `budget / sizeof(int)` elements — 64 MB when the budget is 64 MB. The merge phase allocates `nruns + 1` buffers of `budget / (nruns + 1)` each — also 64 MB total. Each phase respects the budget. **Peak RSS was 127.8 MB**, twice the budget, because the split buffer's pages had been touched and the allocator had not returned them to the OS by the time the merge buffers were allocated.
+
+Measured:
+
+| Budget | Runs | Split | Merge | Total | Peak RSS |
+|---|---|---|---|---|---|
+| 64 MB | 3 | 5,091 ms | 617 ms | 5,709 ms | **127.8 MB** |
+| 16 MB | 12 | 5,611 ms | 1,132 ms | 6,742 ms | **33.1 MB** |
+
+The 16 MB run measures 33.1 MB — still 2× its budget, for the same reason, which is why the acceptance criterion allows 2.2× and asks you to *explain* the number rather than hit it exactly.
+
+There are three real fixes and you should know all three:
+
+1. **Free the split buffer before allocating merge buffers**, and force the allocator to return the pages: `free(buf)` then `malloc_trim(0)` on glibc, or use `mmap`/`munmap` directly for the large buffer so the release is unconditional. The reference uses `mmap` in the `solution/` tree for exactly this reason.
+2. **Reuse one buffer for both phases.** Allocate `budget` bytes once at startup and carve both the split chunk and the merge buffers out of it — an arena, exactly as in Module 3. This is the cleanest answer and it makes the budget arithmetic trivially auditable.
+3. **Budget the maximum over phases, not per phase.** If you keep separate allocations, size the split chunk at `budget/2` so the two phases can coexist.
+
+Whichever you pick, the README must show `getrusage` output and account for every megabyte. "It fit" is a 1 on the rubric; "here is where the 33.1 MB went: 12 run buffers × 1.31 MB = 15.7 MB, output buffer 1.31 MB, stdio internal buffers 12 × 4 KB, plus 15.5 MB of untrimmed split-phase pages" is a 3.
+
+### Wrong turn 2: the O(k) merge scan
+
+The merge loop above scans all `k` run heads for every output element. That is O(n·k) total. Measured:
+
+- 3 runs: merge phase **617 ms**
+- 12 runs: merge phase **1,132 ms**
+
+4× the runs cost 1.8× the merge time — sublinear only because the 3-run case is dominated by I/O. Extrapolate to a 4 GB input under the same 16 MB budget: 256 runs, and the scan cost dominates completely.
+
+The fix is a binary min-heap keyed on each run's head element, giving O(log k) per output element:
+
+```c
+/* heap of run indices, ordered by runs[i].buf[runs[i].pos] */
+static void sift_down(int *heap, int size, int i, Run *runs) {
+    for (;;) {
+        int l = 2*i + 1, r = l + 1, m = i;
+        if (l < size && runs[heap[l]].buf[runs[heap[l]].pos] < runs[heap[m]].buf[runs[heap[m]].pos]) m = l;
+        if (r < size && runs[heap[r]].buf[runs[heap[r]].pos] < runs[heap[m]].buf[runs[heap[m]].pos]) m = r;
+        if (m == i) return;
+        int t = heap[i]; heap[i] = heap[m]; heap[m] = t;
+        i = m;
+    }
+}
+```
+
+Pop the root, emit its head, advance that run, and either sift the root back down (if the run still has data) or swap in the last heap element and shrink. Report both timings; at k = 12 the heap may well *lose* to the linear scan, because 12 comparisons of contiguous data beat log₂12 ≈ 3.6 comparisons with pointer chasing. **Measure it and say which won at which k.** That finding — "the asymptotically better structure lost at k = 12 and won at k = 64" — is the most interesting sentence you can put in this README, and it is the same lesson as the n ≈ 96 crossover in Module 4.
+
+### A third thing worth knowing: `qsort` is the right call here
+
+The `standard` track asks you to write merge sort. The `hard` track's split phase should use `qsort` (or your own merge sort — either is fine) because the chunk already fits in memory and the phase is I/O-bound: split took 5,091 ms of which the sort is a minority. Rewriting the in-memory sort to save 200 ms while the merge phase costs 617 ms is optimising the wrong phase. Profile before you tune, even in a lab.
+
+## The measured numbers this solution produces
+
+Apple M3 Pro (11 cores, 18 GB), macOS 15, Apple clang 15.0.0 `-O2`, APFS on internal SSD, 50,000,000 `int32` = 200,000,000 bytes, machine under load:
+
+| Approach | Budget | Runs | Split | Merge | Total | Peak RSS |
+|---|---|---|---|---|---|---|
+| In-memory `qsort` | — | — | — | — | **5,460 ms** | **192.0 MB** |
+| External | 64 MB | 3 | 5,091 ms | 617 ms | **5,709 ms** | 127.8 MB |
+| External | 16 MB | 12 | 5,611 ms | 1,132 ms | **6,742 ms** | **33.1 MB** |
+
+The headline: **5.8× less memory for 23% more time.** That is the trade, stated in one line, and it is why every database, every log processor and every `sort(1)` implementation on earth does this.
+
+Two secondary observations worth reporting:
+
+- The **split phase barely changes** between budgets (5,091 vs 5,611 ms) because it is dominated by reading 200 MB and writing 200 MB. Only the merge phase pays for having more runs.
+- The **in-memory version is not much faster** (5,460 vs 5,709 ms at a 64 MB budget) because at these sizes the whole job is I/O plus one `qsort`. The external version only loses meaningfully once k grows enough for the merge to matter.
+
+Verification, which is criterion 1:
+
+```bash
+cmp sorted.bin reference_sorted.bin && echo IDENTICAL
+./verify sorted.bin        # "sorted OK, 50000000 elements"
+```
+
+`verify` reads the output sequentially and asserts non-decreasing order plus the exact element count. Do not verify by re-sorting and comparing — that hides a bug where both paths share the same broken comparator.
+
+## Grading notes
+
+**3/3 on correctness** means byte-identical output for the 50 M fixture *and* correct handling of the three edge inputs: an empty file, a file smaller than one chunk, and a file whose size is not a multiple of the chunk size. All three are in the test fixture and all three break naive implementations.
+
+**3/3 on memory** means the ceiling held and the README accounts for every megabyte of the measured peak, naming which phase and which allocation each one belongs to.
+
+**3/3 on performance** means both merge strategies (linear scan and heap) measured at at least two values of k, with the crossover reported.
+
+**3/3 on explanation** means the README defends the 23%-for-5.8× trade, explains the budget-accounting bug rather than hiding it, and describes one wrong turn honestly.
+
+The five most common ways submissions lose points:
+
+1. **Orphaned `run_*.bin` after Ctrl-C.** Criterion 5 is checked by killing the process mid-merge. `atexit` alone does not cover signals; a signal handler that calls `exit` (not `_exit`) is also wrong, and calling `fclose` from a handler is undefined behaviour in a signal context.
+2. **Peak RSS measured with `ru_maxrss` on Linux without unit conversion.** `ru_maxrss` is **kilobytes on Linux and bytes on macOS**. A submission reporting 33,000 MB or 0.03 MB has this bug, and it is worth a specific mention because it is guaranteed to bite anyone testing on both.
+3. **Reading the whole file to count elements first.** `fseek(f, 0, SEEK_END)` on a 200 MB file is fine; a loop that reads it once to count and again to sort doubles the I/O and the total time.
+4. **Assuming `fread` returns the full request.** It returns fewer elements at end of file, and a partial short read on a pipe. The loop must use the returned count, not the requested one.
+5. **No comparison to the in-memory baseline.** Without the 5,460 ms / 192 MB row there is no trade-off to discuss, and the whole ticket was about the trade-off.
+
+<Tip>
+**The portfolio version of this lab** is the README, not the code. A stranger reading it should
+learn something: the measured table, the budget-accounting bug you hit and fixed, the k at which
+the heap started winning, and the one-line summary of the trade. That is a page an interviewer
+will actually read to the end.
+</Tip>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

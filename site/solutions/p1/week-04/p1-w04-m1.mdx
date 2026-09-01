@@ -1,0 +1,156 @@
+---
+title: "Concurrency vs parallelism vs the GIL"
+description: "Reference solution — Week 4"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W04-M1`
+
+The benchmark matrix, and the discipline that makes it mean something.
+
+```python
+"""matrix.py — {CPU-bound, I/O-bound} x {sequential, threads, processes, asyncio}.
+Run against a LOCAL fixture server with a fixed 50 ms delay: a public API adds
+variable latency and rate limits and the numbers stop meaning anything."""
+from __future__ import annotations
+
+import asyncio, os, sys, time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+import httpx
+
+CPU_N, N_TASKS = 200_000, 40
+URL = "http://127.0.0.1:8099/slow/{}"
+
+
+def count_primes(n: int) -> int:          # pure Python: holds the GIL throughout
+    count = 0
+    for x in range(2, n):
+        d, is_prime = 2, True
+        while d * d <= x:
+            if x % d == 0:
+                is_prime = False
+                break
+            d += 1
+        count += is_prime
+    return count
+
+
+def fetch_sync(i: int) -> int:            # MODULE LEVEL: must be picklable for a process pool
+    with httpx.Client(timeout=10) as c:
+        return c.get(URL.format(i)).status_code
+
+
+async def io_async() -> list[int]:
+    async with httpx.AsyncClient(timeout=10) as c:      # ONE client, reused
+        rs = await asyncio.gather(*(c.get(URL.format(i)) for i in range(N_TASKS)))
+        return [r.status_code for r in rs]
+
+
+def bench(label: str, fn) -> float:
+    t = time.perf_counter(); fn(); el = time.perf_counter() - t
+    print(f"{label:26s} {el:8.3f} s")
+    return el
+
+
+def main() -> None:
+    print(f"cores={os.cpu_count()} python={sys.version.split()[0]} "
+          f"load={os.getloadavg()[0]:.1f}")
+    print("\n--- CPU-BOUND (8 tasks) ---")
+    s = bench("sequential",    lambda: [count_primes(CPU_N) for _ in range(8)])
+    t = bench("threads (8)",   lambda: list(ThreadPoolExecutor(8).map(count_primes, [CPU_N]*8)))
+    p = bench("processes (8)", lambda: list(ProcessPoolExecutor(8).map(count_primes, [CPU_N]*8)))
+    print(f"  threads {s/t:.2f}x  processes {s/p:.2f}x  (efficiency {s/p/8:.0%} on 8 workers)")
+
+    print(f"\n--- I/O-BOUND ({N_TASKS} requests x 50 ms) ---")
+    with httpx.Client(timeout=10) as c:
+        s = bench("sequential",  lambda: [c.get(URL.format(i)) for i in range(N_TASKS)])
+        t = bench("threads (20)", lambda: list(
+            ThreadPoolExecutor(20).map(lambda i: c.get(URL.format(i)), range(N_TASKS))))
+    p = bench("processes (8)",  lambda: list(ProcessPoolExecutor(8).map(fetch_sync, range(N_TASKS))))
+    a = bench("asyncio (gather)", lambda: asyncio.run(io_async()))
+    print(f"  threads {s/t:.2f}x  processes {s/p:.2f}x  asyncio {s/a:.2f}x")
+
+
+if __name__ == "__main__":                # required: the process pool re-imports this module
+    main()
+```
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: a CPU task that is too small.**
+
+The first version of this benchmark used `count_primes(30_000)` — about 23 ms per task. The results were:
+
+```
+sequential 0.183 s   threads 0.195 s (0.94x)   processes 0.198 s (0.93x)
+```
+
+Processes appeared **useless**, which is the opposite of the truth. The reason is that a process pool costs about **50 ms to exist** on this machine with `spawn` (Module 3 measures it), and 8 × 23 ms of work is 183 ms total — the overhead was a third of the runtime.
+
+Raising the task to `count_primes(200_000)` — 2.4 s total — gives processes **2.74×** and threads **0.86×**, which is the real shape.
+
+**The benchmark must be large enough that the fixed costs are noise.** A rule of thumb: total work should exceed pool-creation cost by at least 20×. If your matrix shows processes at 1.0×, check the task size before concluding anything.
+
+**Wrong turn 2: benchmarking against a public API.**
+
+Using `httpsbin.org` or any real service makes the I/O row meaningless. Network latency varies by tens of milliseconds run to run, the service rate-limits you at exactly the concurrency you are trying to measure, and the "sequential versus concurrent" comparison becomes a comparison of two samples of internet weather.
+
+The fixture server has a **fixed 50 ms delay and no CPU work**, so it cannot become the bottleneck and the theoretical floor is known exactly: one round trip, 0.050 s, hence a maximum speedup of 43.7× for 40 requests. Measuring 27.02× against a known floor is a *result*; measuring 27× against an unknown one is an anecdote.
+
+**A third thing worth knowing: reuse the client, or you measure handshakes.**
+
+`httpx.Client()` inside the loop opens a new TCP connection per request. Against a local server that is cheap; against anything with TLS it is 2–3 extra round trips, and the sequential row gets slower while the concurrent row gets *much* slower because you have also lost connection pooling. One client, created outside the timed region, for every row.
+
+## The measured numbers this solution produces
+
+Apple M3 Pro (11 cores, 18 GB), macOS 15, CPython 3.13.2, httpx 0.28.1, machine under substantial load (load average ~44):
+
+**CPU-bound, 8 × primes below 200,000:**
+
+| Model | Time | Speedup |
+|---|---|---|
+| sequential | 2.392 s | 1.00× |
+| threads (8) | **2.777 s** | **0.86×** |
+| processes (8) | **0.874 s** | **2.74×** (34% efficiency) |
+| asyncio | 2.429 s | 0.98× |
+
+**I/O-bound, 40 requests × 50 ms:**
+
+| Model | Time | Speedup |
+|---|---|---|
+| sequential | 2.184 s | 1.00× |
+| threads (20) | 0.155 s | **14.09×** |
+| processes (8) | 0.613 s | 3.57× |
+| asyncio (`gather`) | **0.081 s** | **27.02×** |
+| *floor (one round trip)* | *0.050 s* | *43.7×* |
+
+Supporting figures used in the module: switch interval 5 ms; Amdahl at 95% parallel gives 10.3× on 20 workers and 16.8× on 100.
+
+## Grading notes
+
+**3/3 on correctness** means eight cells, a local fixture server, one reused HTTP client per row, a pure-Python CPU task with no library calls, and a task large enough that pool startup is noise.
+
+**3/3 on performance** means every cell reports time, speedup, worker count **and** efficiency, plus your machine's core count and load average.
+
+**3/3 on explanation** means both counter-intuitive cells are explained: threads slower than sequential on CPU work (GIL serialisation *plus* switching cost — it is not merely "no faster"), and processes worse than threads on I/O (concurrency capped at pool size, 54 ms startup each).
+
+The four most common ways submissions lose points:
+
+1. **A CPU task too small to escape pool overhead**, producing "processes don't help" — the opposite of the finding.
+2. **Benchmarking against a public API.** The I/O row becomes unreproducible and usually rate-limited.
+3. **Speedup reported without efficiency or load average.** "We got 2.7×" is not reproducible; "2.74× on 8 workers, 34% efficiency, load average 44" is.
+4. **Missing `if __name__ == "__main__":`.** On macOS and Windows — and on Linux from 3.14 — the script either raises a confusing bootstrap error or spawns processes recursively.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

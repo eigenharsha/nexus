@@ -1,0 +1,121 @@
+---
+title: "Generation, decoding & inference cost"
+description: "Reference solution — Week 25"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P4-W25-M5`
+
+### The task
+
+Implement KV-cached generation, measure the speedup, verify the cache-size formula against real
+byte counts, and compute your machine's roofline tokens/sec versus measured.
+
+### The solution that works
+
+```python
+# solve_m5.py — the three measurements that matter
+import torch, time
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+name, dev = "gpt2", "cuda"
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16).to(dev).eval()
+ids = tok("Once upon a time", return_tensors="pt").input_ids.to(dev)
+
+@torch.no_grad()
+def run(n, cached):
+    past, cur, out = None, ids, ids
+    torch.cuda.synchronize(); t0 = time.perf_counter()
+    for _ in range(n):
+        if cached:
+            r = model(cur, past_key_values=past, use_cache=True); past = r.past_key_values
+        else:
+            r = model(out, use_cache=False)
+        cur = r.logits[:, -1, :].argmax(-1, keepdim=True)
+        out = torch.cat([out, cur], 1)
+    torch.cuda.synchronize()
+    return n / (time.perf_counter() - t0), past
+
+# 1. cache speedup
+for n in (32, 128, 256):
+    a, _ = run(n, True); b, _ = run(n, False)
+    print(f"n={n:4}  cached {a:6.1f}  uncached {b:6.1f}  ratio {a/b:.1f}x")
+
+# 2. formula vs reality
+_, past = run(512, True)
+real = sum(k.numel()*k.element_size() + v.numel()*v.element_size() for k, v in past)
+c = model.config
+formula = 2 * c.n_layer * c.n_head * (c.n_embd // c.n_head) * 2 * (ids.size(1) + 512)
+print(real, formula, real == formula)
+
+# 3. roofline
+weight_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+BW = 600e9
+print(f"roofline {BW/weight_bytes:.1f} tok/s")
+```
+
+### Measured numbers this produces
+
+GPT-2 small, fp16, A10G — **reference figures** (modelled; see [About the numbers](/start/about-the-numbers)). The KV-cache size below it is **derived** and exact:
+
+| n | cached tok/s | uncached tok/s | ratio |
+| --- | --- | --- | --- |
+| 32 | 96 | 61 | 1.6× |
+| 128 | 94 | 26 | 3.6× |
+| 256 | 92 | 14 | 6.6× |
+| 512 | 89 | 7.1 | 12.5× |
+
+Cache formula versus what the runtime reports: `2 × 12 × 12 × 64 × 2 × 516 = 19,021,824` bytes,
+and `19,021,824` observed. Exact, as it must be — if yours is off by a factor of two you have forgotten that
+both K *and* V are stored.
+
+Roofline for Llama 2 7B fp16 on the same card is **derived**: `13.5 GB ÷ 600 GB/s = 44.3 tok/s`.
+Against that, the reference figures are 41.2 tok/s with vLLM 0.6.2 — **93% of roofline** — and
+27.8 tok/s under HuggingFace `generate`, **63% of roofline**; and that 30-point gap is entirely Python overhead and
+unfused kernels, not physics.
+
+### Why this solution and not the obvious one
+
+**The obvious measurement reports one speedup number.** The speedup is not a number, it is a
+*function of output length*, because the uncached path does quadratic work and the cached path does
+linear work. Reporting "the KV cache gives a 6.6× speedup" is true only at `n=256` and will mislead
+whoever reads it. Report the curve.
+
+**The obvious roofline check compares against peak FLOP/s.** Decode does not care about FLOP/s at
+all — it is at 1 FLOP per byte on a machine whose ridge point is 208. Divide bytes by bandwidth.
+Anyone quoting a TFLOP number to explain decode speed has not internalised Layer 3.
+
+### The two wrong turns worth knowing about
+
+**Wrong turn 1: `is_causal=True` during decode.** With one query and `T` cached keys, the causal
+kernel masks everything except column 0, so the model attends solely to the first token and emits
+the same token forever. The fix is `is_causal=(T > 1)`; the test is asserting cached decode matches
+full recompute for 8 steps exactly.
+
+**Wrong turn 2: timing without `torch.cuda.synchronize()`.** CUDA calls are asynchronous, so
+without synchronisation you time the *launch*, not the work. The symptom is spectacular and
+obviously wrong numbers — 4,000 tokens/sec for a 7B model — which at least fails loudly. The worse
+case is a mixed measurement where only one of your two variants happens to synchronise, giving a
+plausible but fabricated ratio.
+
+### Grading notes
+
+**3/3 Performance** requires the speedup *curve* (not a point), an exact byte-count match against
+the formula, and the roofline percentage with an explanation of any gap below 60%. **Most common
+point loss:** a single speedup number. **Second:** roofline computed from FLOP/s. **Third:**
+reporting tokens/sec without stating batch size, context length, dtype and framework — four numbers
+that change the answer by more than 10× between them.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

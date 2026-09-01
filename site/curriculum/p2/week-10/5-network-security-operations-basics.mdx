@@ -1,0 +1,838 @@
+---
+title: "Network security & operations basics"
+description: "Week 10 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 10 · Module 5 · `P2-W10-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** `P2-W10-M1` (the layers, and where TLS sits), `P2-W10-M2` (round trips are the cost),
+  `P2-W10-M3` (sockets and timeouts).
+- **Unlocks:** Week 24 (a Kubernetes Ingress is TLS termination plus a reverse proxy), and Week 31
+  (the trust-boundary reasoning here is exactly the prompt-injection argument later).
+- **One-line:** after this you can serve and verify TLS correctly, debug a handshake from the command
+  line, and say precisely what TLS does and does not protect you from.
+
+## What you'll be able to do
+
+1. State what TLS guarantees — and what it does not.
+2. Generate a certificate, serve HTTPS locally, and verify it correctly from a client.
+3. Explain certificate chains, and why "disable verification" is a security incident and not a fix.
+4. Debug a handshake with `openssl s_client` and read the output.
+5. Explain how a reverse proxy changes client IP, timeouts and keep-alives, and what to fix.
+
+## Why you should care
+
+**Aarav (student).** `verify=False` appears in an enormous amount of tutorial code and in a
+disturbing amount of production code. Understanding *precisely* what it turns off — and being able to
+demonstrate the interception it enables — is the difference between "I know HTTPS is important" and
+"I know what HTTPS is".
+
+**Meera (working professional).** Three things you will use within a month: `openssl s_client` for
+debugging a handshake that fails only from one environment, the certificate-expiry monitoring you
+almost certainly do not have, and the reverse-proxy list — client IP, timeouts, keep-alive
+mismatches — which is the source of a large fraction of "it works locally" incidents.
+
+## The mental model
+
+TLS gives you three properties, and it is worth being able to state them separately because they
+fail separately:
+
+1. **Confidentiality** — an observer on the path cannot read the contents.
+2. **Integrity** — an observer cannot modify the contents without detection.
+3. **Authentication** — you are talking to the party named in the certificate.
+
+The third is the one that carries all the weight and the one people turn off. Encryption without
+authentication is worthless: if you do not check *who* you are talking to, you may have a perfectly
+encrypted channel to an attacker. That is not a subtle failure mode; it is the entire attack.
+
+And TLS is a *transport* guarantee. It says nothing about whether the server is trustworthy, whether
+its code is correct, or whether the data it sends you is true. Week 31's prompt-injection material is
+the same distinction: a channel being authenticated does not make its contents safe.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p2-w10-m5.svg" alt="Hand-drawn sketch: network security and operations basics" className="block dark:hidden" />
+  <img src="/assets/diagrams/p2-w10-m5-dark.svg" alt="Hand-drawn sketch: network security and operations basics" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p2-w10-m5
+tier: T2
+one-sentence-goal: Encryption without authentication is a private conversation with an attacker.
+elements:
+  - top-left: client and server stick figures with a padlocked tube between them, three labels on the tube - "confidentiality", "integrity", "authentication" - with authentication circled in blue and "this is the one that does the work" in amber
+  - top-right: the same picture with a third figure spliced into the middle, two padlocked tubes instead of one, the word "verify=False" written above the splice and a big red X over the client's padlock; hand-written "still encrypted. still 100% compromised."
+  - middle band: the chain of trust drawn as three stacked cards - root CA (in the OS trust store, drawn as a small safe), intermediate, leaf - with arrows "signs" between them and a red cross-out over a fourth card labelled "self-signed" plus amber "...unless YOU put it in the trust store on purpose"
+  - lower-left: two handshake timelines to scale - TLS 1.2 with 2 RTT (measured 53 ms) and TLS 1.3 with 1 RTT (measured 32.5 ms), and a third stub labelled 0-RTT with a small red warning "replayable - idempotent requests only"
+  - lower-right: a reverse proxy box between client and app, with three amber sticky notes on it - "client IP is now the proxy's", "two timeouts, not one", "keep-alive must be LONGER upstream than downstream"
+  - dangling arrow: "...and in week 24 this box is called an Ingress"
+numbers-to-write-in: measured TLS 1.3 handshake 32.5 ms vs TLS 1.2 53 ms on the same path; TLS 1.3 negotiated TLS_AES_256_GCM_SHA384; self-signed cert verification fails by default and succeeds with an explicit cafile
+alt: A whiteboard sketch contrasting a properly authenticated TLS connection with a man-in-the-middle splice enabled by disabling verification, above a chain-of-trust diagram from root CA to leaf certificate, a to-scale comparison of TLS 1.2 and TLS 1.3 handshake round trips with measured milliseconds, and a reverse-proxy box annotated with the three things it changes.
+*/}
+
+<Tabs>
+
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The words, defined
+
+- **Plaintext / ciphertext** — data before / after encryption.
+- **Symmetric encryption** — one shared key encrypts and decrypts. Fast. The problem is agreeing on
+  the key.
+- **Asymmetric (public-key) encryption** — a key *pair*: what one key encrypts, only the other can
+  decrypt. Slow, but you can publish one half.
+- **Certificate** — a public key plus identity information (which hostnames it is valid for, when it
+  expires), signed by someone else.
+- **Certificate Authority (CA)** — an organisation whose signature your operating system already
+  trusts.
+- **Chain of trust** — leaf certificate signed by an intermediate, signed by a root that is in your
+  OS or browser's trust store.
+- **Handshake** — the exchange at the start of a TLS connection that authenticates the server and
+  agrees a symmetric key.
+- **MITM (man in the middle)** — an attacker positioned between two parties, relaying and possibly
+  modifying traffic.
+
+### What actually happens in a TLS handshake
+
+Simplified but not wrong, for TLS 1.3:
+
+1. **ClientHello** — the client sends the TLS versions and ciphers it supports, a random number, its
+   key-exchange share, and the hostname it wants (**SNI** — Server Name Indication, sent in
+   plaintext).
+2. **ServerHello** — the server picks a version and cipher, sends its own random number and
+   key-share. Both sides can now compute the same shared secret. Everything after this point is
+   encrypted.
+3. **Certificate + CertificateVerify** — the server sends its certificate chain and a signature
+   proving it holds the private key for that certificate.
+4. **Finished** — both sides confirm the handshake was not tampered with.
+
+The client then does the part that matters:
+
+- Is the certificate signed by a chain ending in a CA I trust?
+- Is it currently valid (`notBefore` ≤ now ≤ `notAfter`)?
+- Does the hostname I asked for appear in the certificate's Subject Alternative Name?
+- Has it been revoked?
+
+**If any of those fail, the connection must be aborted.** Turning off that check is what
+`verify=False` does.
+
+### Do it: serve HTTPS locally
+
+Generate a self-signed certificate. This takes under a tenth of a second:
+
+```bash
+openssl req -x509 -newkey rsa:2048 \
+  -keyout key.pem -out cert.pem -days 365 -nodes \
+  -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+openssl x509 -in cert.pem -noout -subject -dates -ext subjectAltName
+```
+
+Output:
+
+```
+subject=CN=localhost
+notBefore=Aug 31 20:45:40 2026 GMT
+notAfter=Aug 31 20:45:40 2027 GMT
+X509v3 Subject Alternative Name:
+    DNS:localhost, IP Address:127.0.0.1
+```
+
+The `subjectAltName` (SAN) is not optional. Browsers and modern TLS libraries ignore the `CN` field
+entirely and match the hostname against the SAN list. A certificate with only a `CN` and no SAN is
+rejected by Chrome, Firefox and Go's TLS stack. If you have ever generated a cert and been confused
+that it "still doesn't work", this is usually why.
+
+### Now serve it, and try three clients
+
+```python
+# tlsdemo.py — one server, three ways of connecting to it.
+import ssl, socket, threading, http.server, time, urllib.request
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.send_header("Content-Type", "text/plain")
+        self.end_headers(); self.wfile.write(b"secret\n")
+    def log_message(self, *a): pass
+
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain("cert.pem", "key.pem")
+srv = http.server.HTTPServer(("127.0.0.1", 8443), H)
+srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+threading.Thread(target=srv.serve_forever, daemon=True).start(); time.sleep(0.3)
+
+print("1) default verification:")
+try:
+    urllib.request.urlopen("https://127.0.0.1:8443/", timeout=5).read()
+    print("   ...succeeded?!")
+except Exception as e:
+    print("  ", type(e).__name__, "->", str(e)[:120])
+
+print("2) verification disabled:")
+bad = ssl._create_unverified_context()
+print("  ", urllib.request.urlopen("https://127.0.0.1:8443/", context=bad, timeout=5).read())
+
+print("3) correct: trust THIS certificate explicitly:")
+good = ssl.create_default_context(cafile="cert.pem")
+print("  ", urllib.request.urlopen("https://localhost:8443/", context=good, timeout=5).read())
+
+print("4) what was negotiated:")
+c = ssl.create_default_context(cafile="cert.pem")
+with socket.create_connection(("localhost", 8443)) as s:
+    with c.wrap_socket(s, server_hostname="localhost") as ss:
+        print("   ", ss.version(), ss.cipher())
+```
+
+Actual output:
+
+```
+1) default verification:
+   URLError -> <urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate (_ssl.c:1028)>
+2) verification disabled:
+   b'secret\n'
+3) correct: trust THIS certificate explicitly:
+   b'secret\n'
+4) what was negotiated:
+    TLSv1.3 ('TLS_AES_256_GCM_SHA384', 'TLSv1.3', 256)
+```
+
+Read those four results carefully, because they are the whole module.
+
+**Case 1** is TLS working. Your certificate is signed by nobody your OS trusts, so the client refuses.
+That error is not a bug to work around; it is the system doing its job.
+
+**Case 2** is the disaster. The connection succeeded, the traffic is encrypted with AES-256, and it
+is completely insecure — because you never checked who you were talking to. Any attacker who can
+position themselves on the path can present *their own* certificate, your client will accept it, and
+they will read and modify everything. Encryption without authentication buys you nothing at all.
+
+**Case 3** is correct. You told the client "trust this specific certificate", and it verified against
+it and matched the hostname `localhost` against the SAN. Note that case 3 uses `localhost`, not
+`127.0.0.1` — the hostname must match the SAN, and this cert has both, so either works here.
+
+**Case 4** shows what was negotiated: TLS 1.3 with `TLS_AES_256_GCM_SHA384`. Being able to print this
+is how you answer "are we actually on TLS 1.3 in production?" rather than assuming.
+
+### The chain of trust, in one picture
+
+```
+Your OS ships with ~150 root CA certificates in a trust store.
+        |
+        |  signs
+        v
+   Intermediate CA  (the root is kept offline; intermediates do the daily work)
+        |
+        |  signs
+        v
+   Leaf certificate for example.com   <- the server sends this, plus the intermediate
+```
+
+The server sends the leaf and any intermediates; the client already has the root. The client walks
+the chain upward until it reaches something in its trust store.
+
+Two practical consequences:
+
+- **Forgetting to send the intermediate is the single most common TLS misconfiguration.** It often
+  works in browsers — which cache intermediates from previous sites — and fails in `curl`, in Java,
+  and in Go. Symptom: "it works in Chrome but our service can't connect." Check with
+  `openssl s_client -showcerts`.
+- **Your OS's trust store is the root of everything.** Anyone who can add a certificate to it can
+  intercept all your TLS traffic. That is exactly how corporate TLS-inspection proxies work, and how
+  interception tools like mitmproxy work — with your permission.
+
+### Guided practice
+
+Debug a handshake from the command line:
+
+```bash
+openssl s_client -connect example.com:443 -servername example.com </dev/null 2>&1 | head -40
+```
+
+Find these four things in the output, then check your answers:
+
+1. The negotiated protocol version
+2. The certificate chain depth
+3. Whether verification succeeded
+4. The certificate's expiry date
+
+<Accordion title="What to look for">
+
+1. **`Protocol  : TLSv1.3`** near the bottom, in the session summary block.
+2. **The `Certificate chain` block at the top**, with entries numbered `0 s:...` (the leaf),
+   `1 s:...` (the intermediate), and so on. Depth is the highest number.
+3. **`Verify return code: 0 (ok)`** at the bottom. Anything non-zero is a failure, and the common
+   codes are `20` (unable to get local issuer certificate — usually a missing intermediate),
+   `10` (certificate has expired) and `21` (unable to verify the first certificate).
+4. Pipe through `openssl x509` to get the dates cleanly:
+
+```bash
+openssl s_client -connect example.com:443 -servername example.com </dev/null 2>/dev/null \
+  | openssl x509 -noout -dates -subject -ext subjectAltName
+```
+
+**`-servername` is mandatory.** Without it, `s_client` sends no SNI, and a server hosting many sites
+on one IP will hand you the wrong certificate (usually the default one), producing a "hostname
+mismatch" that does not exist in reality. Roughly half of the "certificate is wrong" reports that
+reach an SRE are this.
+
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+<Accordion title="1. What are TLS's three guarantees?">
+Confidentiality (nobody can read it), integrity (nobody can modify it undetected), and
+authentication (you are talking to the named party). The third is the one that makes the other two
+worth anything.
+</Accordion>
+<Accordion title="2. Why is `verify=False` worse than no encryption at all?">
+It is not weaker cryptographically — it is worse *operationally*, because the padlock and the
+encrypted channel create confidence that is entirely unjustified. An attacker on the path presents
+their own certificate and reads everything, and nothing looks wrong.
+</Accordion>
+<Accordion title="3. Why does a certificate need a subjectAltName?">
+Modern clients ignore the `CN` field and match the requested hostname against the SAN list only. A
+cert with only a CN is rejected.
+</Accordion>
+<Accordion title="4. Why does a site work in Chrome but fail in curl?">
+Usually a missing intermediate certificate. Browsers cache intermediates from other sites and can
+often fetch them; `curl`, Java and Go generally cannot. Check with `openssl s_client -showcerts`.
+</Accordion>
+<Accordion title="5. Why must `openssl s_client` be given `-servername`?">
+Without SNI, a server hosting multiple sites on one IP returns its default certificate, producing a
+hostname mismatch that is an artefact of your command rather than a real problem.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### Measured: what TLS costs
+
+From Module 1's `curl` breakdown on a real path with roughly 22 ms RTT:
+
+| Phase | TLS 1.3 | TLS 1.2 |
+|---|---|---|
+| TCP connect | 24.5 ms (1 RTT) | 26.8 ms (1 RTT) |
+| TLS handshake | **32.5 ms** (~1 RTT) | **53.3 ms** (~2 RTT) |
+| Total to encrypted channel | 57.0 ms | 80.1 ms |
+
+Measured by forcing the version:
+
+```bash
+curl -s -o /dev/null -w 'connect=%{time_connect} appconnect=%{time_appconnect}\n' \
+  --tlsv1.2 --tls-max 1.2 https://example.com
+# connect=0.026768 appconnect=0.080091   -> 53.3 ms of TLS 1.2 handshake
+```
+
+TLS 1.3 removed a full round trip by having the client speculatively send its key share in the
+ClientHello. On this path that is a **20.8 ms saving on every new connection**, or about 39% of the
+handshake. On a 200 ms intercontinental path it is 200 ms.
+
+Which leads to the operational conclusion: **connection reuse is worth more than any TLS tuning.**
+The handshake happens once per connection. A client that reuses connections pays 57 ms once; a client
+that does not pays it on every request.
+
+### Certificate lifecycle in production
+
+**Automate issuance and renewal or you will have an outage.** The standard is ACME (RFC 8555), and
+the standard implementations are `certbot`, `lego`, and — for Kubernetes — `cert-manager`. Let's
+Encrypt issues 90-day certificates deliberately, to force automation.
+
+The operational checklist, which is short and non-negotiable:
+
+1. **Renew at one third of remaining lifetime.** For a 90-day certificate, renew at day 60. That
+   gives 30 days of failure budget for a renewal problem.
+2. **Alert on expiry, independently of the renewal system.** A blackbox probe that checks
+   `notAfter` from *outside* your infrastructure. The failure mode you are guarding against is "the
+   renewal cron stopped running six weeks ago and nothing noticed", and a check that lives inside the
+   same system cannot catch it.
+3. **Serve the full chain.** `fullchain.pem`, not `cert.pem`. This is the single most common
+   misconfiguration.
+4. **Know your reload story.** Does your server pick up a new certificate without a restart? nginx
+   needs `nginx -s reload`; Go's `http.Server` needs a `GetCertificate` callback; Envoy hot-reloads.
+   Test it in staging before you need it at 3 a.m.
+5. **Monitor for the certificate you did not deploy.** Certificate Transparency logs are public; a
+   monitor like `crt.sh` alerts you if anyone issues a certificate for your domain.
+
+### Verifying correctly in clients
+
+The mistakes are language-specific but the shape is identical: someone hit a certificate error and
+made it go away.
+
+```python
+# Python — requests
+requests.get(url, verify=False)          # NEVER
+requests.get(url, verify="/path/to/ca-bundle.pem")   # correct for a private CA
+requests.get(url)                        # correct for a public CA
+
+# Python — raw ssl
+ctx = ssl.create_default_context()       # verification ON, hostname checking ON
+ctx = ssl._create_unverified_context()   # NEVER outside a test with a comment
+```
+
+```javascript
+// Node
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';   // NEVER — it is process-global
+new https.Agent({ ca: fs.readFileSync('ca.pem') }) // correct for a private CA
+```
+
+```go
+// Go
+&tls.Config{InsecureSkipVerify: true}    // NEVER
+// correct: build a RootCAs pool from your CA bundle
+pool := x509.NewCertPool(); pool.AppendCertsFromPEM(caPEM)
+&tls.Config{RootCAs: pool}
+```
+
+The legitimate cases for disabling verification number roughly two: a unit test against a fixture
+server, and an interactive debugging session you will not commit. Everything else — a private CA, a
+self-signed internal service, a corporate proxy — is solved by **adding the right CA to the trust
+chain**, not by removing the check.
+
+Make it enforceable: add `verify=False`, `InsecureSkipVerify`, `NODE_TLS_REJECT_UNAUTHORIZED` and
+`_create_unverified_context` to a CI grep or a lint rule. Bandit (`B501`) catches the Python case;
+`gosec` (`G402`) catches the Go one. This takes ten minutes and closes the category permanently.
+
+### Timeouts are a security control
+
+This is the part of "network security" that nobody labels as security, and it causes more outages
+than certificate problems.
+
+A request with no timeout is an unbounded resource commitment. An attacker — or an unlucky peer —
+that opens connections and sends one byte per second ties up one worker each. That is **Slowloris**,
+and it needs no bandwidth and no cleverness. The defence is entirely timeouts:
+
+```python
+# Every one of these is a separate timeout and you need all of them.
+requests.get(url, timeout=(3.05, 27))   # (connect timeout, read timeout)
+
+# In an HTTP server, four distinct budgets:
+#   header read timeout   -- how long to receive the request headers
+#   body read timeout     -- how long to receive the body
+#   handler timeout       -- how long your code may take
+#   write/idle timeout    -- how long to send the response, and how long an idle keep-alive lives
+```
+
+The default in most HTTP clients is **no timeout at all**. `requests` without `timeout=` will wait
+forever. `urllib` without `timeout=` will wait forever. This is the single most common way a
+dependency's slowness becomes your outage: your thread pool fills with requests to a service that
+will never answer.
+
+Two rules worth adopting:
+
+- **Set a timeout on every outbound call, everywhere, with no exceptions.** If you cannot pick a
+  number, that is a signal you do not understand the call's latency profile, which is itself worth
+  knowing.
+- **Your timeout must be shorter than your caller's timeout.** Otherwise you do work whose result
+  nobody is waiting for. This is "timeout budget" and it should decrease as you go deeper in the call
+  stack.
+
+### Reverse proxies change three things
+
+Once there is a load balancer, ingress or sidecar between the client and your app — and there always
+is — three things change, and all three cause incidents:
+
+**1. The client IP is now the proxy's.** Your app sees the proxy's address. The real client IP
+arrives in `X-Forwarded-For` or the standardised `Forwarded` header (RFC 7239). Two failure modes:
+
+- Rate limiting or geo-blocking on the observed IP rate-limits *the proxy*, which means one client
+  can exhaust everyone's budget — or nobody is ever limited.
+- Trusting `X-Forwarded-For` blindly lets a client spoof its own IP by sending the header. The header
+  is a *list*, appended to by each hop; you must count backwards from the right by the number of
+  proxies you actually control. Every framework has a "trusted proxies" setting; configure it.
+
+**2. There are now two timeouts, not one.** The proxy has its own idle and read timeouts. If the
+proxy's is 60 s and your app's is 120 s, the client gets a 504 at 60 s while your app happily keeps
+working — burning capacity on a response nobody will receive. Timeouts must decrease outward-in:
+client ≥ proxy ≥ app.
+
+**3. Keep-alive must be longer upstream than downstream.** If your app closes an idle connection at
+5 s and the proxy's keep-alive is 60 s, the proxy will eventually reuse a connection at the exact
+moment the app closes it, and the client sees a sporadic 502. This produces the classic "0.01% of
+requests fail with 502 and we cannot reproduce it" ticket. **Rule: the upstream (app) idle timeout
+must be strictly longer than the downstream (proxy) idle timeout.** AWS ALB defaults to 60 s, so a
+common correct setting is 65–75 s on the app.
+
+### Trade-offs
+
+| Decision | Choose this when… | Choose the other when… | The number |
+|---|---|---|---|
+| **TLS termination at the edge** | You want central certificate management and cheap internal hops | You have a compliance requirement for encryption in transit everywhere | Internal plaintext saves one handshake (measured 32.5 ms) and some CPU per hop |
+| **End-to-end TLS / mTLS** | Zero-trust internal network; you must authenticate services to each other | Operational simplicity matters more than internal authentication | Certificate rotation for N services; a service mesh automates it at the cost of a sidecar per pod |
+| **TLS 1.3 only** | You control both ends | You have legacy clients | Saves 1 RTT (measured 20.8 ms on a 22 ms path); TLS 1.2 support is still needed for older embedded clients |
+| **0-RTT resumption** | Latency is critical and requests are idempotent | Any state-changing request could ride on it | Saves a further RTT, but 0-RTT data is replayable by design — GET-only |
+| **Public CA** | Public endpoints | Internal-only services | Public CAs require public DNS validation; an internal PKI avoids that but you must distribute the root |
+
+### What breaks in the real world
+
+A payments integration failed in production and worked in staging. The error was a certificate
+verification failure, and it appeared only from the production VPC.
+
+The initial fix, applied at 2 a.m., was `verify=False`. It worked. The integration resumed. The
+ticket was closed.
+
+What had actually happened: production egressed through a corporate proxy that performed TLS
+inspection, presenting its own certificate signed by an internal CA that was in the base image's
+trust store but not in the Python container's `certifi` bundle. The correct fix was three lines in
+the Dockerfile to add the corporate CA to `certifi`'s bundle, or setting `REQUESTS_CA_BUNDLE`.
+
+The `verify=False` stayed in the code for **fourteen months**, and by then it had been copied into
+four other services by developers who found it and assumed it was the house pattern. It was found in
+a security review, not by monitoring, because nothing about it is observable from outside: the
+traffic is encrypted, the requests succeed, the dashboards are green.
+
+Two lessons. **A certificate error means something in the path is not who you think it is, and the
+correct response is always to find out what.** And **`verify=False` is not a local decision** — it
+becomes the example that the next person copies.
+
+### Design checkpoint
+
+<Accordion title="Design certificate management for 40 internal microservices with mTLS. What are the failure modes and how do you avoid an outage?">
+
+The naive answer — issue 40 certificates from an internal CA and put renewal in a cron job — has four
+failure modes that will all eventually fire.
+
+**1. Renewal fails silently.** A service's certificate expires and every peer refuses it. With mTLS
+this fails in *both* directions and can look like a network partition. Mitigate: renew at one third
+of remaining lifetime; alert on days-to-expiry from an external prober; and make expiry a paging
+alert, because unlike most alerts you know the exact time it will fire.
+
+**2. Reload requires a restart.** Rotating 40 certificates means 40 restarts, and coordinating that
+is exactly the sort of thing you do not want on a deadline. Require hot reload — a `GetCertificate`
+callback in Go, SDS in Envoy — as an acceptance criterion, and test it.
+
+**3. The CA certificate itself expires.** This is the one that takes down everything simultaneously,
+and it is missed because the CA is typically issued for 5–10 years and nobody sets a reminder that
+long. Mitigate: an intermediate CA with a shorter life, a documented root-rotation procedure with
+overlapping validity, and a calendar entry with the actual date.
+
+**4. Clock skew.** A certificate is valid from `notBefore`; a host whose clock is 10 minutes fast
+rejects a freshly issued certificate. Mitigate: issue with a small backdated `notBefore` (5–10
+minutes) and monitor NTP everywhere.
+
+**The answer that scales:** do not do this by hand. A service mesh (Istio, Linkerd) or SPIFFE/SPIRE
+issues short-lived certificates — often 24 hours or less — automatically, with hot reload built in.
+Short lifetimes are counterintuitively *safer*: if rotation breaks, you find out within a day, when
+one service fails, rather than in a year, when everything fails at once. Cert-manager plus a private
+issuer gives you most of this on Kubernetes without adopting a full mesh.
+
+The number that decides it: 40 services × 4 environments × certificates rotating every 90 days is
+about 640 rotations a year. Any process with a human in it will fail some of them.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim carries a measured or cited number. TLS timings were measured with `curl` against
+`example.com` from a residential connection in India (~22 ms RTT); local handshake results come from
+Python 3.13.2 with OpenSSL 3.6.3.
+</Warning>
+
+### TLS 1.3: what was removed and why
+
+TLS 1.3 (RFC 8446, 2018) is best understood as a subtraction. It removed:
+
+- **RSA key exchange** — because it provides no forward secrecy. With RSA key transport, an attacker
+  who records traffic today and obtains the server's private key later can decrypt all of it
+  retroactively. TLS 1.3 mandates ephemeral Diffie-Hellman, so each session's key is discarded.
+- **CBC-mode ciphers and RC4** — the source of BEAST, Lucky13, POODLE. Only AEAD ciphers remain.
+- **Compression** — the source of CRIME.
+- **Renegotiation** — the source of a 2009 protocol-level authentication-splicing flaw.
+- **Static key exchange, custom DH groups, and most of the cipher-suite combinatorics** — the
+  handshake was choosing among hundreds of combinations, and downgrade attacks lived in that space.
+
+The result is 5 cipher suites instead of dozens, and **1 RTT instead of 2** — measured above at
+32.5 ms versus 53.3 ms on a 22 ms path.
+
+The design lesson generalises well beyond TLS: **most of the vulnerabilities were in the flexibility,
+not in the cryptography.** Every negotiable option is an opportunity for a downgrade attack. When you
+design a protocol (Module 4), remember that the extension point you add for hypothetical future
+needs is also an attack surface today.
+
+### 0-RTT and the replay problem
+
+TLS 1.3's 0-RTT lets a returning client send application data in its *first* flight, using a
+pre-shared key from a previous session. On a 200 ms path that saves 200 ms.
+
+It has an unavoidable weakness: **0-RTT data can be replayed.** An attacker who captures the 0-RTT
+flight can resend it. The server cannot distinguish the replay from the original, because there is no
+fresh server-provided randomness in that first flight — that is exactly what was skipped to save the
+round trip.
+
+RFC 8446 §8 is explicit that this cannot be fully solved, only mitigated (single-use session tickets,
+freshness checks with tight time windows, application-layer replay detection). The practical rule:
+
+- **0-RTT is for idempotent requests only** — GETs of public resources.
+- Cloudflare's deployment, for example, restricts 0-RTT to GET requests with no query parameters.
+- Never allow a state-changing request over 0-RTT. "A replayed GET is harmless" is a claim about
+  *your* GETs, and it is worth verifying that none of them have side effects.
+
+### mTLS and what it actually authenticates
+
+In ordinary TLS the client verifies the server. In **mutual TLS**, the server also requires and
+verifies a client certificate. The client's identity becomes a cryptographic fact rather than a
+bearer token.
+
+Why this matters for service-to-service authentication: a bearer token (an API key, a JWT) can be
+stolen and replayed from anywhere. A client certificate's private key never leaves the client, and
+the TLS handshake proves possession without transmitting it.
+
+The costs are real and worth stating:
+
+- **Certificate distribution and rotation for every client.** This is the whole operational burden,
+  and it is why SPIFFE/SPIRE and service meshes exist.
+- **Handshake cost.** mTLS adds a client `Certificate` and `CertificateVerify` to the handshake —
+  more bytes, and an extra signature verification on the server. Server-side CPU per handshake
+  roughly doubles.
+- **It authenticates the workload, not the request.** An mTLS-authenticated service can still make a
+  request it should not be allowed to make. mTLS is authentication; you still need authorisation.
+
+That last point is the one people conflate, and it is the same confusion that appears in Week 31: a
+trusted channel does not make its contents trustworthy.
+
+### At scale: the CPU cost of TLS
+
+Handshakes are asymmetric-crypto operations and they are expensive; bulk encryption is symmetric and
+is nearly free on modern hardware with AES-NI (x86) or the ARM crypto extensions.
+
+Measure your own hardware:
+
+```bash
+openssl speed -seconds 3 rsa2048 ecdsap256      # handshake signature costs
+openssl speed -evp aes-256-gcm                  # bulk throughput
+```
+
+Orders of magnitude on modern server hardware: a few thousand RSA-2048 signature operations per
+second per core, roughly an order of magnitude more for ECDSA P-256, and bulk AES-GCM in the
+gigabytes per second per core. So:
+
+- **Bulk encryption is not your problem.** At AES-GCM speeds, a 10 Gbit/s link needs a small fraction
+  of one core.
+- **Handshakes are your problem.** At 10,000 new connections per second with RSA-2048, you need
+  several cores doing nothing else. This is why session resumption and keep-alive are load-bearing,
+  why ECDSA certificates are preferred for high-volume endpoints, and why TLS-terminating load
+  balancers exist as a product category.
+
+The architectural conclusion: **connection churn is the cost driver, not bytes.** A client that opens
+a new connection per request costs you a handshake each time; one that reuses costs you one. Module
+1's measured 55 ms of handshake per request is the client-side view of the same fact.
+
+### Production failure modes
+
+| Failure | Signature | Detection |
+|---|---|---|
+| **Missing intermediate certificate** | Works in browsers, fails in `curl`/Java/Go | `openssl s_client -showcerts`; serve `fullchain.pem` |
+| **Certificate expired** | Total outage at an exact timestamp | External blackbox expiry probe; renew at ⅓ of lifetime |
+| **`verify=False` in production** | Nothing. It is invisible from outside | CI grep / Bandit B501 / gosec G402; audit the whole repo |
+| **`X-Forwarded-For` spoofing** | Rate limits bypassed; audit logs show attacker-chosen IPs | Configure trusted proxies; count from the right by the number of hops you control |
+| **Keep-alive mismatch with the LB** | Sporadic 502s at a low rate, unreproducible | App idle timeout must exceed the proxy's (ALB default 60 s → set 65–75 s) |
+| **Timeout inversion** | 504s from the proxy while the app is still working | Timeouts must decrease outward-in: client ≥ proxy ≥ app |
+| **Slowloris** | Worker pool exhausted at very low bandwidth | Header and body read timeouts; a connection limit per source |
+| **Clock skew rejecting fresh certificates** | A newly issued certificate is rejected by some hosts | Backdate `notBefore` by ~10 minutes; monitor NTP |
+| **0-RTT replay** | A duplicated request with a side effect | Restrict 0-RTT to idempotent GETs, or disable it |
+
+### Frontier and further pointers
+
+- **E. Rescorla, RFC 8446 (TLS 1.3), especially §2 (protocol overview), §8 (0-RTT and replay) and
+  Appendix D.** Takeaway: TLS 1.3's security gain came mostly from *removing* options — RSA key
+  transport, CBC, compression, renegotiation — because the flexibility, not the cryptography, was
+  where the attacks lived.
+- **M. Georgiev et al., "The Most Dangerous Code in the World: Validating SSL Certificates in
+  Non-Browser Software," ACM CCS 2012.** Takeaway: a systematic study found broken or disabled
+  certificate validation across a wide range of widely used SDKs, payment libraries and cloud
+  clients — the `verify=False` problem is not a beginner mistake, it is an industry-wide default
+  failure, usually caused by APIs that make the insecure option easy.
+- **RFC 6962 (Certificate Transparency).** Takeaway: requiring every issued certificate to appear in
+  a public append-only log turns mis-issuance from undetectable into detectable, which is why
+  monitoring CT logs for your own domains is now standard practice.
+- **SPIFFE/SPIRE specification.** Takeaway: giving every workload a short-lived, automatically
+  rotated cryptographic identity makes mTLS operationally feasible at hundreds of services — the
+  answer to the design checkpoint's rotation problem.
+
+### Stretch challenge
+
+Intercept your own traffic, then defeat the interception.
+
+1. Install `mitmproxy` and add its CA to a *test* trust store (not your system one — use a container
+   or a dedicated profile). Route a client through it and confirm you can read the plaintext of your
+   own HTTPS requests. This is the moment the module becomes real.
+2. Now write a client that **correctly refuses** the interception: pin the expected CA (or the
+   expected leaf public key) and verify. Confirm it fails against the proxy and succeeds directly.
+3. Implement **certificate pinning with a backup pin** and think through the failure mode: what
+   happens when your certificate rotates and the pin does not? Design the rollout — how many pins,
+   how far in advance, and what the recovery path is if you get it wrong. (This is not hypothetical;
+   pinning has caused real multi-day outages when the backup pin was not deployed first.)
+4. Finally, write down honestly **when pinning is worth it**. It defends against a compromised or
+   coerced CA and against corporate interception. It costs you the ability to rotate freely and it
+   can brick clients you cannot update. Most services should not pin. Argue for your own case with
+   the specific threat you are defending against, and if you cannot name the threat, do not pin.
+
+There is no single right answer to (4), and "we decided not to pin, for these reasons" is a complete
+and correct deliverable.
+
+</Tab>
+
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Intercept your own traffic with a local MITM proxy and read your own plaintext. Then make the client
+correctly refuse it — and prove both, with the transcript of each.
+</Card>
+
+Before that, run the four-case TLS demo above and confirm you get the same four results: verification
+failure by default, success with verification disabled, success with an explicit CA, and TLS 1.3
+negotiated. Then run `openssl s_client -connect <a service you use>:443 -servername <host>` and read
+the chain, the verify code and the expiry.
+
+## The whiteboard
+
+<Tip>
+**Draw it yourself.** Draw the three TLS guarantees with authentication circled, then the MITM splice
+with the padlock crossed out, then the chain of trust from root to leaf, then the reverse-proxy box
+with its three sticky notes. Then write from memory: what must a client check before trusting a
+certificate?
+[Blank version](/assets/diagrams/p2-w10-m5-blank.svg) · [Editable source](/assets/diagrams/p2-w10-m5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Built a local TLS lab demonstrating the four verification outcomes (default
+rejection of a self-signed certificate, the `verify=False` bypass, correct explicit-CA trust, and the
+negotiated TLS 1.3 cipher suite), then intercepted my own HTTPS traffic with a MITM proxy and
+implemented a client that correctly refuses it. Measured the TLS 1.3 handshake at 32.5 ms against
+TLS 1.2's 53.3 ms on the same path."
+
+**The demonstration that lands:** show the interception, then show the refusal. Being able to say "I
+have read my own HTTPS traffic in plaintext, and here is the single line of code that made it
+possible" is far more persuasive than any explanation of why `verify=False` is bad.
+
+**Interview:** "What does TLS guarantee?" — three properties, and immediately say which one carries
+the weight and what happens when it is disabled. Then mention that encryption without authentication
+is strictly worse than no encryption, because of the false confidence.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Grep your organisation's repos this week.** `verify=False`, `InsecureSkipVerify`,
+`NODE_TLS_REJECT_UNAUTHORIZED`, `_create_unverified_context`, `-k` in a committed `curl`. Every hit
+is either a test (fine, add a comment saying so) or an incident waiting to be found by someone else.
+Then add the lint rule so the category stays closed.
+
+**2. Check your timeout ladder.** Client, proxy, app, and every downstream call. They must decrease
+outward-in, and the app's idle keep-alive must be *longer* than the load balancer's (65–75 s against
+an ALB's 60 s default). This one check resolves the "sporadic unreproducible 502s" ticket that most
+teams have open.
+
+**3. Add an external certificate-expiry probe.** Not from inside your infrastructure — from outside,
+checking `notAfter` on every public endpoint, alerting at 21 days. It takes an afternoon and it
+prevents the outage whose exact timestamp you could have known in advance.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `CERTIFICATE_VERIFY_FAILED` "fixed" by disabling verification | Something in the path is not who you think — usually an inspection proxy or a private CA | Add the correct CA to the trust bundle; never remove the check |
+| Works in Chrome, fails in `curl`/Java/Go | Missing intermediate certificate | Serve `fullchain.pem`; verify with `openssl s_client -showcerts` |
+| "Hostname mismatch" that is not real | `openssl s_client` invoked without `-servername` | Always pass `-servername`, so SNI is sent |
+| Certificate rejected despite a correct CN | No `subjectAltName` | Modern clients ignore CN entirely; add a SAN |
+| Sporadic 502s at a low rate | App idle timeout shorter than the proxy's | App keep-alive must exceed the proxy's (e.g. 75 s against a 60 s ALB) |
+| Rate limiting has no effect | Limiting on the proxy's IP rather than the client's | Configure trusted proxies and read `X-Forwarded-For` correctly, counting from the right |
+| Thread pool exhausted at trivial bandwidth | No header/body read timeouts (Slowloris) | Set all four server timeouts; limit connections per source |
+| Total outage at an exact minute | Certificate expiry | External expiry probe; renew at ⅓ of lifetime; alert at 21 days |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="Concept questions (8)">
+1. What are TLS's three guarantees and which one fails first when misconfigured? *(Confidentiality, integrity, authentication — authentication is the one people disable and the one everything else depends on.)*
+2. Why is `verify=False` worse than plaintext? *(Same exposure to an on-path attacker, plus false confidence from a working padlock; nothing about it is observable in monitoring.)*
+3. What does a client check before trusting a certificate? *(Chain to a trusted root, validity dates, hostname against the SAN, and revocation status.)*
+4. Why did TLS 1.3 remove RSA key exchange? *(No forward secrecy — recorded traffic becomes decryptable if the server key is later compromised.)*
+5. What is the measured handshake difference between TLS 1.2 and 1.3? *(53.3 ms versus 32.5 ms on a 22 ms path — one saved round trip, about 39%.)*
+6. Why is 0-RTT restricted to idempotent requests? *(The first flight contains no server-provided freshness, so it can be replayed and the server cannot tell.)*
+7. Which idle timeout must be longer, the app's or the load balancer's? *(The app's — otherwise the proxy reuses a connection the app is closing, producing sporadic 502s.)*
+8. What does mTLS authenticate, and what does it not? *(The workload's identity, cryptographically; it says nothing about whether that workload is authorised to make the request.)*
+</Accordion>
+<Accordion title="Coding challenge">
+Build a TLS-terminating reverse proxy: accept TLS, verify an optional client certificate, forward to
+a plaintext backend, and correctly set `X-Forwarded-For` and `X-Forwarded-Proto`. Hidden tests: a
+client with no certificate is refused when mTLS is required; a spoofed `X-Forwarded-For` from the
+client is not trusted; a slow-header client is disconnected within the header timeout; and an expired
+certificate is rejected with a distinguishable error.
+</Accordion>
+<Accordion title="Interview questions">
+- **Junior:** "What does HTTPS actually protect against?" *(On-path reading and modification, plus impersonation of the named server — and the third only holds if the client verifies.)*
+- **Mid:** "A service works in staging and fails with a certificate error in production. Walk me through it." *(Do not disable verification. `openssl s_client -showcerts -servername` from the failing environment; compare the chain against staging; the usual causes are a TLS-inspecting egress proxy, a missing intermediate, or a container trust store that differs from the host's.)*
+- **Senior:** "Design certificate management for 40 internal services with mTLS." *(Short-lived automatically rotated certificates via SPIRE or a mesh; hot reload as an acceptance criterion; external expiry alerting; a documented CA-rotation procedure with overlapping validity; and clock-skew tolerance. Justify short lifetimes as making rotation failures fail small and early.)*
+</Accordion>
+<Accordion title="Draw it from memory">
+Draw the MITM splice with the disabled verification, the chain of trust, and the reverse-proxy box
+with its three consequences. Then write the client's four verification checks. Five minutes.
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+
+- [RFC 8446 (TLS 1.3), particularly §2, §4.4.2 (certificate verification) and §8 (0-RTT and replay).](https://www.rfc-editor.org/rfc/rfc8446)
+  **Read this for:** the authoritative statement of what the client must verify, and the explicit
+  acknowledgement that 0-RTT replay cannot be fully prevented.
+- [RFC 5280 (X.509 certificate and CRL profile) and RFC 6125 (hostname verification).](https://www.rfc-editor.org/rfc/rfc5280) **Read this
+  for:** why `subjectAltName` supersedes `CN`, and the exact matching rules including wildcards.
+- [RFC 8555 (ACME) and the cert-manager documentation.](https://www.rfc-editor.org/rfc/rfc8555) **Read this for:** the challenge types and the
+  renewal semantics you will be automating, including why renewal at one third of lifetime is the
+  recommended default.
+
+**Papers**
+
+- [M. Georgiev, S. Iyengar, S. Jana, R. Anubhai, D. Boneh and V. Shmatikov, "The Most Dangerous Code
+  in the World: Validating SSL Certificates in Non-Browser Software," ACM CCS 2012.](https://doi.org/10.1145/2382196.2382204) **Takeaway:**
+  certificate validation was broken or disabled across a wide range of production SDKs and payment
+  libraries, and the root cause was API design that made the insecure choice the easy one.
+- [D. Adrian et al., "Imperfect Forward Secrecy: How Diffie-Hellman Fails in Practice" (Logjam),
+  ACM CCS 2015.](https://doi.org/10.1145/2810103.2813707) **Takeaway:** protocol flexibility — in this case negotiable export-grade DH groups —
+  enabled a downgrade attack, which is the direct justification for TLS 1.3 removing negotiable
+  parameters.
+- [B. Laurie, "Certificate Transparency," ACM Queue 2014 (and RFC 6962).](https://doi.org/10.1145/2668152.2668154) **Takeaway:** public
+  append-only logging of every issued certificate converts CA mis-issuance from an undetectable event
+  into a detectable one, which is why monitoring CT logs for your own domains is now baseline
+  practice.
+
+**Go deeper**
+
+- [I. Ristić, *Bulletproof TLS and PKI* (2nd ed., 2022).](https://www.feistyduck.com/books/bulletproof-tls-and-pki/) **Why:** the single most practical book on
+  running TLS in production — cipher selection, chain construction, common misconfigurations, and the
+  operational failure modes in this module, all with concrete configuration.
+- [The `mitmproxy` documentation and tutorial.](https://docs.mitmproxy.org/stable/) **Why:** the fastest way to *see* what interception
+  looks like, which converts an abstract argument about `verify=False` into an experience you will
+  not forget.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p2/week-10/p2-w10-m5">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,147 @@
+---
+title: "`dlt`: declarative pipelines"
+description: "Reference solution — Week 15"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P2-W15-M4`
+
+Force three upstream schema changes and record what `dlt` 1.4.1 does with each.
+
+### The three changes, observed
+
+**Baseline:** `id BIGINT, customer VARCHAR, amount DOUBLE`, `merge` on `id`.
+
+| Change | What `dlt` did | Error? |
+| --- | --- | --- |
+| **New field** `currency` appears | column added; existing rows backfilled with `NULL` | none |
+| **Type change** — `amount` arrives as the string `"40.50"` | **coerced to `40.5`; column stays `DOUBLE`** | none |
+| **Fields removed** — `amount`, `currency` absent | **columns kept; the new row gets `NULL`** | none |
+
+**The type-change row is the one people get wrong.** `dlt` coerces silently when it can. Usually
+that is what you want — an API that starts quoting its numbers has not broken anything meaningful —
+but it means the failure mode is "works, works, works, then fails on one record" when a value
+arrives that cannot be coerced.
+
+**The removed-field row is the dangerous one.** A removed upstream field is **indistinguishable from
+a null value**. Your column quietly fills with nulls, and — exactly as in module 3's war story —
+`AVG()` silently excludes them and the number just shifts.
+
+### The four contract modes, measured in isolation
+
+A new column `loyalty_tier` arriving on the second run:
+
+| Mode | New column | The row | Error |
+| --- | --- | --- | --- |
+| `evolve` (default) | added | loaded | none |
+| `freeze` | rejected | **not loaded** | **`DataValidationError`** |
+| `discard_value` | dropped | loaded | none |
+| `discard_row` | — | **silently dropped** | none |
+
+The `freeze` message, verbatim:
+
+```
+Contract on columns with mode freeze is violated. Trying to add column
+loyalty_tier to table orders but columns are frozen.
+```
+
+<Warning>
+**Each mode must be tested in its own working directory.** My first attempt ran them sequentially in
+one pipeline, and `discard_value` failed with a `freeze` error — because the previous test's failed
+load package was still on disk and `dlt` retried it first. **A failed `dlt` package persists and is
+retried on the next run.** That is a feature (it is how resumption works) and a trap. The escape
+hatch is `pipeline.drop_pending_packages()`; the fix for tests is isolation.
+</Warning>
+
+**`discard_row` deserves the warning it gets.** The record vanishes: no error, no warning, no count,
+and the run reports success. If a source starts adding a field to 30% of its records you silently
+lose 30% of your data with every health signal green. **If you use it, you must also assert on row
+counts**, because nothing else will tell you.
+
+### The recommended default
+
+```python
+schema_contract={
+    "tables": "evolve",       # a new table is additive and harmless
+    "columns": "freeze",      # a new column means the source changed. tell me.
+    "data_type": "freeze",    # a type change means the source changed. tell me.
+}
+```
+
+For anything a business decision depends on. For exploratory work on an unknown API, `evolve` — the
+point there is to discover the schema. **The graded content is that you chose, and said why.**
+
+### Nested JSON
+
+```
+orders:        id, customer, _dlt_load_id, _dlt_id
+orders__items: sku, qty, _dlt_parent_id, _dlt_list_idx, _dlt_id
+```
+
+Three generated columns: `_dlt_id` is a surrogate key per row; `_dlt_parent_id` is the child's link
+to the parent's `_dlt_id`; `_dlt_list_idx` preserves the array's position. **JSON arrays are ordered
+and SQL tables are not**, so without `_dlt_list_idx` the ordering is permanently lost.
+
+Control the depth with `max_table_nesting=1` — a GitHub issue payload nests four levels and produces
+a dozen tables, most of which are never joined.
+
+## Why this solution and not the obvious one
+
+**Why the experiment uses a list of dicts, not a real API.** You need to change one field at a time
+and re-run instantly. A real API gives you neither.
+
+**Why dump `information_schema.columns` after each run, not just `SELECT *`.** The column list is the
+interesting half. The row values will not tell you that a column was added and backfilled — you have
+to look at the schema.
+
+**Why the war story is about semantics rather than schema.** The billing provider changed `amount`
+from USD to the customer's local currency and added `amount_usd`. `dlt` handled all of it perfectly:
+new columns added, the type unchanged, values valid, row counts normal, null rates fine. **Every
+assertion the team had would have passed.** A schema check catches *shape*; nothing catches
+*meaning*. The defences are `columns: freeze` (so the new columns fail the run and a human reads the
+changelog) and a **distribution assertion** on `amount` against a trailing window.
+
+**Why "add a column, do not repurpose one" is the correct fix for a semantic change.** Let `amount`
+keep meaning what it always meant and land the new semantics in `amount_local`. Every historical
+query stays correct, and the migration becomes a deliberate act by the consumer rather than an
+invisible reinterpretation of five months of history.
+
+## Grading notes
+
+**3/3 on Correctness** — all three changes forced and the resulting *schema* recorded, not just the
+rows; all four contract modes tested in isolated working directories.
+
+**3/3 on Explanation** — a stated default with a justification, and the observation that
+`discard_row` loses records silently.
+
+**The three most common ways submissions lose points:**
+
+1. **Testing contract modes sequentially in one pipeline.** The pending-package retry contaminates
+   the result, and the wrong answer looks entirely plausible.
+2. **Missing that the type change was coerced.** People expect an error, see none, and conclude the
+   change did not happen. Dump the schema.
+3. **Not stating a recommended default.** "Here is what each mode does" is the observation; "here is
+   which I would ship and why" is the deliverable.
+
+**A fourth, environmental:** naming the DuckDB file after the dataset. `duckdb("shop.duckdb")` with
+`dataset_name="shop"` gives `Binder Error: Ambiguous reference to catalog or schema "shop"`, because
+DuckDB names the catalogue after the file. I hit this while producing these measurements. Call the
+file `warehouse.duckdb`.
+
+**On the stretch challenge (semantic-change detector).** The genuinely hard part is the
+false-positive rate: real pipelines have seasonality, and a KS test on `amount` will fire at
+month-end. A submission that reports a detection rate without a false-positive rate has built half a
+detector — and the half it is missing is the one that determines whether anyone leaves it enabled.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

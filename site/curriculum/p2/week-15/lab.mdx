@@ -1,0 +1,361 @@
+---
+title: "Lab — Incremental financial-records pipeline"
+description: "Week 15 lab · three tracks · self-graded"
+icon: "flask-conical"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**`LAB-P2-W15`** — one lab, three tracks. Beginners start at `basic` and climb.
+Working professionals start at `standard`. `hard` is where the interview stories come from.
+</Note>
+
+<Info>
+**This is the single most job-applicable artifact in Phase 2.** Not the most intellectually
+interesting — that is probably week 14 — but the one you can point at in an interview or a
+performance review and say "I built this and it runs unattended". Most companies have a process
+that is currently a person running a notebook. This is what replaces it.
+</Info>
+
+## The ticket
+
+> **DATA-118 — Month-end close takes four days and nobody trusts the numbers**
+>
+> *Reported by: Finance, priority P1*
+>
+> Every month, an analyst downloads transaction exports from our payment provider's portal, pastes
+> them into a spreadsheet, manually matches merchant names against a second sheet maintained by
+> hand, and produces the revenue-by-category report. It takes four days. Twice this year the report
+> has been wrong — once because a duplicate export was pasted in twice, once because a merchant was
+> recategorised mid-month and the old category was applied retroactively to the whole month.
+>
+> We want this automated. Requirements from Finance:
+>
+> - It must run unattended and tell us when it fails.
+> - Re-running it must not change the answer or duplicate anything.
+> - If it dies halfway through, restarting must not lose or double-count records.
+> - **Last March's report must still give last March's answer**, even though merchants have been
+> recategorised since. This is the one that has cost us credibility.
+> - We need to know the numbers are right *before* we publish them, not after Finance finds a
+>   discrepancy.
+>
+> Deliverable: a repo, a `PIPELINE.md` with a dataflow diagram, and a run report artifact.
+
+<Info>
+**Time box.** `basic` 4–5 hours. `standard` 14–18 hours. `hard` a further 10–12 hours. The
+`standard` track is the deliverable — if you do one thing from week 15, do that.
+</Info>
+
+<Tabs>
+  <Tab title="basic">
+    **A `dlt` pipeline from a provided REST API into DuckDB, full refresh.**
+
+    The mock API is in `labs/p2/week-15/mock_api/` — a FastAPI app serving cursor-paginated
+    transactions and a merchants endpoint. Run it with `uvicorn mock_api.main:app --port 8080`.
+
+    ```python
+    # starter/pipeline.py
+    import dlt
+    import requests
+
+    API = "http://localhost:8080"
+
+    @dlt.resource(name="transactions", write_disposition="replace")
+    def transactions():
+        cursor = None
+        while True:
+            params = {"limit": 500}
+            if cursor:
+                params["after"] = cursor
+            # TODO 1: GET {API}/transactions with params, a timeout, and raise_for_status
+            # TODO 2: yield the "data" list from the response body
+            # TODO 3: read "next_cursor"; return when it is absent
+            pass
+
+    @dlt.resource(name="merchants", write_disposition="replace")
+    def merchants():
+        # TODO 4: fetch {API}/merchants and yield the "data" list
+        pass
+
+    pipeline = dlt.pipeline(
+        pipeline_name="finance",
+        destination=dlt.destinations.duckdb("warehouse.duckdb"),
+        dataset_name="finance",
+    )
+    print(pipeline.run([transactions(), merchants()]))
+    ```
+
+    **Acceptance criteria**
+
+    - `pytest labs/p2/week-15/tests/test_basic.py` green.
+    - The pipeline loads all 50,000 transactions and all 2,000 merchants.
+    - `SELECT count(*) FROM finance.transactions` returns 50,000 **after running it twice** —
+      `replace` makes this true, and confirming it is the point of the exercise.
+    - A query joining transactions to merchants and grouping by category returns 8 rows.
+    - The `_dlt_loads` table shows two successful loads.
+
+    <Info>~60% of the code is written for you. TODOs are marked. Answers provided.</Info>
+
+    <Warning>
+    Do not name your DuckDB file after your dataset. `dlt.destinations.duckdb("finance.duckdb")`
+    with `dataset_name="finance"` produces `Binder Error: Ambiguous reference to catalog or schema
+    "finance"`, because DuckDB names the catalogue after the file. I hit this while building the
+    module-4 examples. Call the file `warehouse.duckdb`.
+    </Warning>
+  </Tab>
+
+  <Tab title="standard">
+    **A production-shaped incremental pipeline: scrape plus API, deduplicated, incrementally merged,
+    schema-evolving, scheduled, quality-checked, crash-safe.**
+
+    ### What it must do
+
+    | Requirement | Concretely |
+    | --- | --- |
+    | **Two sources** | the REST API (transactions, merchants) **and** a scraped HTML page of FX rates, parsed into a table |
+    | **Incremental** | a second run with no upstream changes issues **zero** data requests and loads zero rows |
+    | **Idempotent** | running twice produces byte-identical table contents; assert it with a checksum |
+    | **Crash-safe** | `kill -9` at any point; the next run completes with the same final checksum as an uninterrupted run |
+    | **Schema evolution** | the mock API has a `?schema_version=2` flag that adds a field, changes a type and removes a field. Handle all three, and *document what your contract does with each* |
+    | **Normalized** | nested `line_items` arrays land in a child table joined to the parent |
+    | **Deduplicated** | the API deliberately returns overlapping windows; the final table has no duplicate `txn_id` |
+    | **Quality-checked** | five assertions that **fail the run**: row count, duplicates, null rate, orphan foreign keys, freshness |
+    | **Scheduled** | a cron entry or GitHub Actions workflow, with failure alerting to somewhere real |
+    | **Run report** | a JSON artifact per run: rows extracted, rows loaded, assertions passed, duration, schema version |
+
+    ### The structure to aim for
+
+    ```
+    finance-pipeline/
+      pipeline/
+        sources/
+          api.py            # dlt source: transactions (incremental), merchants (replace)
+          fx_scraper.py     # requests + lxml, with a snapshot test
+        quality.py          # the five assertions
+        report.py           # run report artifact
+        __main__.py         # entry point: run, assert, report
+      tests/
+        snapshots/          # saved HTML for the scraper
+        test_idempotency.py # run twice, compare checksums
+        test_resume.py      # crash mid-run, resume, compare checksums
+        test_quality.py     # each assertion fires on the data that should trigger it
+      .github/workflows/pipeline.yml
+      PIPELINE.md           # dataflow diagram + design decisions
+      Makefile
+    ```
+
+    ### Acceptance criteria
+
+    - `make verify` green: `pytest`, `ruff check`, `mypy --strict`.
+    - **`test_idempotency.py`** runs the pipeline twice and asserts the final checksum
+      (`SELECT count(*), sum(amount), min(txn_id), max(txn_id) FROM transactions`) is identical.
+    - **`test_resume.py`** runs the pipeline with an injected failure partway through, then runs it
+      to completion, and asserts the checksum matches an uninterrupted run. **This is the test that
+      distinguishes a pipeline from a script.**
+    - **Each of the five quality assertions has a test proving it fires** on data engineered to
+      trigger it. An assertion that has never failed is an assertion you do not know works.
+    - The scraper has at least three snapshot fixtures, and a test asserting that a **missing
+      required field raises** rather than returning `None`.
+    - `PIPELINE.md` contains a dataflow diagram (Mermaid is fine) and a written answer to: *what does
+      your schema contract do when the source adds a column, and why did you choose that?*
+
+    <Info>Spec and tests only. You write the implementation.</Info>
+
+    <Warning>
+    **The crash test is where most submissions fall down**, and usually for the same reason: the
+    records and the cursor are committed separately. If your extract writes rows and *then* saves the
+    watermark as a second operation, a crash between them either loses a page or duplicates it. Put
+    them in one transaction, or make the load idempotent and accept re-fetching. `dlt` does this for
+    you — but you must not defeat it by keeping your own state in a separate file.
+    </Warning>
+  </Tab>
+
+  <Tab title="hard">
+    **5 million rows, partitioned Parquet output, an SCD2 dimension, a backfill script, and a
+    written proof of exactly-once merge semantics.**
+
+    ### Additional requirements
+
+    | Requirement | The constraint that makes it hard |
+    | --- | --- |
+    | **5,000,000 transactions** | the `standard` solution's approach will likely OOM or take an unacceptable time; you will have to stop materialising things |
+    | **Partitioned Parquet output** | write `warehouse/transactions/dt=YYYY-MM-DD/*.parquet` alongside DuckDB. **Justify your partition key with a file-count and average-file-size calculation** |
+    | **SCD Type 2 on `dim_merchant`** | merchants change category over time; a March report must use March's categories |
+    | **Backfill script** | `backfill --from 2024-01-01 --to 2024-06-30`, re-processing a date range without touching data outside it, and safe to re-run |
+    | **Cost and latency analysis** | measured: per-run duration, peak RSS, output size, and the projected monthly cost on S3 + a small instance |
+    | **A written proof of exactly-once** | not a claim — an argument |
+
+    ### The exactly-once proof
+
+    This is the deliverable that carries the marks. You must write, in `PIPELINE.md`, an argument
+    with this shape:
+
+    1. **State the guarantee precisely.** Not "exactly once" but something like: *"For any sequence
+       of runs, including runs interrupted at any point, the final state of `fact_transactions`
+       contains exactly one row per distinct `txn_id` present in the source, with the values from the
+       most recent source version of that record."*
+    2. **Enumerate the failure points.** After extract, after normalize, after the staging write,
+       during the delete, during the insert, after commit but before the state write. **For each,
+       state what the next run does and why the invariant is restored.**
+    3. **Identify the assumption you depend on.** Every exactly-once argument rests on one: that the
+       destination's transaction is atomic, that `txn_id` is genuinely unique in the source, that the
+       source never mutates a record without changing its cursor value. **Name them explicitly** —
+       an unnamed assumption is where the guarantee actually fails.
+    4. **State what you do not guarantee.** Deletes at the source almost certainly do not propagate.
+       Say so.
+
+    <Warning>
+    The most common failure in this proof is asserting exactly-once while depending on a primary key
+    that is not unique. **Test it**: `SELECT txn_id, count(*) FROM fact_transactions GROUP BY 1
+    HAVING count(*) > 1` must return zero rows after an adversarial sequence of interrupted runs.
+    A proof is not a substitute for the assertion.
+    </Warning>
+
+    ### The SCD2 requirement in detail
+
+    The mock API's merchants endpoint returns a `category` that changes over time. Your
+    `dim_merchant` must be SCD Type 2, and this query must return **March's categories** when run
+    today:
+
+    ```sql
+    SELECT m.category, sum(f.amount) AS revenue
+    FROM fact_transactions f
+    JOIN dim_date d      ON d.date_key = f.date_key
+    JOIN dim_merchant m  ON m.merchant_id = f.merchant_id
+                        AND d.date BETWEEN m.valid_from AND m.valid_to
+    WHERE d.date BETWEEN '2024-03-01' AND '2024-03-31'
+    GROUP BY 1;
+    ```
+
+    Two traps, both measured in module 5:
+
+    - Use **`IS DISTINCT FROM`**, not `!=`, to detect changed attributes. `NULL != 'x'` is `NULL`,
+      so a change from null is silently missed.
+    - Use **`DATE '9999-12-31'`**, not `NULL`, for the open `valid_to`. `BETWEEN` with a null upper
+      bound matches nothing, and every point-in-time query silently returns zero rows.
+
+    <Warning>There is a constraint here that the `standard` solution fails.</Warning>
+  </Tab>
+</Tabs>
+
+## Ship it
+
+<Card title="This is the part people skip" icon="rocket" horizontal>
+A public repo plus **`PIPELINE.md`** containing a dataflow diagram, the schema-contract decision and
+its justification, the data-quality assertions and what each one catches, and — for `hard` — the
+exactly-once argument with its assumptions named.
+</Card>
+
+**`PIPELINE.md` is the artifact, not the code.** It is what you send someone before an interview and
+what a hiring manager actually reads. Structure it:
+
+<Steps>
+  <Step title="The dataflow diagram, first and above the fold">
+    Mermaid is fine. Sources on the left, the transformation stages, the destination, and the
+    quality gate drawn as a gate the data must pass. Someone should understand the system in
+    fifteen seconds without reading a word.
+  </Step>
+  <Step title="The decisions, with their alternatives">
+    "I chose `columns: freeze` because this feeds a financial report and a silent new column is how
+    revenue numbers go wrong. For the exploratory FX source I used `evolve`." Every decision, its
+    alternative, and why.
+  </Step>
+  <Step title="The failure modes you handle, and the ones you do not">
+    "Deletes at the source do not propagate. A weekly full reconciliation would catch it; I have not
+    built one." **Naming what you did not do is more credible than implying you did everything**,
+    and an interviewer will trust the rest of the document more for it.
+  </Step>
+  <Step title="The measured numbers">
+    Duration, rows, peak memory, output size. Without them the document is a description; with them
+    it is a report.
+  </Step>
+</Steps>
+
+## Verify yourself
+
+```bash
+cd labs/p2/week-15
+uv venv && uv pip install -r requirements.txt
+# dlt==1.4.1, duckdb==1.1.3, pyarrow==18.1.0, requests==2.32.3,
+# beautifulsoup4==4.12.3, lxml==5.3.0, pytest==8.3.4
+
+uvicorn mock_api.main:app --port 8080 &     # the source
+make verify
+```
+
+```make
+verify: lint types test idempotency resume quality report
+
+lint:
+	ruff check pipeline tests
+
+types:
+	mypy --strict pipeline
+
+test:
+	pytest -q --tb=short
+
+idempotency:
+	python -m pipeline --reset
+	python -m pipeline && python tools/checksum.py > /tmp/a.txt
+	python -m pipeline && python tools/checksum.py > /tmp/b.txt
+	diff /tmp/a.txt /tmp/b.txt
+
+resume:
+	python -m pipeline --reset
+	-python -m pipeline --crash-after 1500      # expected to fail
+	python -m pipeline && python tools/checksum.py > /tmp/c.txt
+	diff /tmp/a.txt /tmp/c.txt
+
+quality:
+	python -m pipeline.quality --strict
+
+report:
+	@test -f PIPELINE.md || (echo "PIPELINE.md missing — the writeup is part of the lab" && exit 1)
+	@grep -q "graph\|flowchart" PIPELINE.md || (echo "PIPELINE.md has no dataflow diagram" && exit 1)
+```
+
+<Tip>
+The `resume` target is the interesting one: it deliberately kills the pipeline mid-run, restarts it,
+and diffs the resulting checksum against the uninterrupted run. **If that `diff` is empty, you have
+built a pipeline.** If it is not, you have built a script that usually works.
+</Tip>
+
+## Rubric
+
+| Dimension | 0 | 1 | 2 | 3 |
+| --- | --- | --- | --- | --- |
+| Correctness | fails tests | loads data | idempotent and incremental | crash-safe with a checksum test proving it |
+| Code quality | works | readable | `mypy --strict` clean, sources separated from loading | a reviewer would approve unchanged; secrets in config, not code |
+| Performance | untested | duration measured | peak memory and output size measured | scales to 5M rows with a cost analysis |
+| Explanation | none | a README | `PIPELINE.md` with a diagram and decisions | schema-contract choice justified, failure modes named including the unhandled ones, exactly-once argued with assumptions stated |
+
+**What a 3 in Explanation actually requires.** Not "the pipeline is idempotent". Something like:
+*"Idempotency comes from `merge` on `txn_id` plus `dlt` committing the load and its state in one
+DuckDB transaction. I verified it by killing the process at 1,500 records and confirming the final
+checksum matched an uninterrupted run. It depends on `txn_id` being unique in the source, which I
+assert on every run — if that assumption breaks, `merge` silently overwrites rows and the guarantee
+is gone. Deletes at the source do not propagate; a weekly reconciliation would catch that and I have
+not built one."*
+
+## Common ways submissions lose points
+
+| What happens | Why it costs marks | What to do instead |
+| --- | --- | --- |
+| Records and cursor committed separately | A crash between them loses or duplicates a page | One transaction, or an idempotent load; prove it with the resume test |
+| Watermark advanced on partial failure | Records permanently skipped; every run reports success | Advance only on complete success; overlap the window |
+| Assertions log warnings instead of failing | Bad data flows to the report; nobody reads the log | `assert` / `raise`; the run must go red |
+| No test that an assertion fires | An assertion that has never failed may not work | Engineer data that triggers each one |
+| Scraper returns `None` on a missing field | Silent nulls; `AVG` excludes them and the number just shifts | Raise at the extraction boundary |
+| SCD2 using `!=` | Changes from `NULL` silently missed | `IS DISTINCT FROM` |
+| SCD2 with `NULL` for open `valid_to` | Point-in-time queries return nothing | `DATE '9999-12-31'` |
+| Partition by `merchant_id` or `txn_id` | Thousands of tiny files; queries slow down over time | Partition by date; sort within the partition for other filters |
+| `PIPELINE.md` with no diagram | The document nobody reads is the one with no picture | Mermaid diagram above the fold |
+| Exactly-once claimed, not argued | The claim is the easy part | Enumerate the failure points and name the assumptions |
+
+<Card title="Reference solution" icon="lock" href="/solutions/p2/week-15/lab">
+  Hidden page. Open it after you have a failing attempt of your own.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

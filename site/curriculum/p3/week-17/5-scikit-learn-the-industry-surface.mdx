@@ -1,0 +1,595 @@
+---
+title: "scikit-learn: the industry surface"
+description: "Week 17 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+{/* AUTHORED */}
+
+<Note>
+**Week 17 · Module 5 · `P3-W17-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** `P3-W17-M2`, `P3-W17-M3`, `P3-W17-M4` — you have now hand-written what this library does
+- **Unlocks:** every remaining module in Phase 3; `P3-W19-M4` (leakage, which pipelines prevent structurally); `P3-W20-M5` (production feature pipelines)
+- **One line:** you will build a leak-proof, searchable, serialisable modelling pipeline, and you will know which of scikit-learn's solvers is running and why.
+
+## What you'll be able to do
+
+1. Use the estimator contract — `fit`, `predict`, `transform`, `get_params`, `set_params` — and know what each promises
+2. Build a `Pipeline` that makes preprocessing leakage structurally impossible
+3. Route different columns through different transformers with `ColumnTransformer`
+4. Write a custom transformer that survives `GridSearchCV`, `clone` and `get_feature_names_out`
+5. Get DataFrames out of transformers with `set_output` and keep feature names all the way through
+6. Choose a `LogisticRegression` solver from the shape of your data, with timings
+7. Serialise a fitted pipeline and know exactly what will break it
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w17-m5.svg" alt="Hand-drawn sketch: the scikit-learn estimator and pipeline surface" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w17-m5-dark.svg" alt="Hand-drawn sketch: the scikit-learn estimator and pipeline surface" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w17-m5
+tier: T2
+one-sentence-goal: Show that a Pipeline makes the fold boundary the only place fit() is ever called, which is why it prevents leakage by construction rather than by discipline.
+elements:
+  - top half labelled "WRONG" — a horizontal bar of all data, an arrow up into a box "scaler.fit + selector.fit" then arrows down into 5 CV fold bars; a thick red cross-out over the upward arrow, with the note "the folds have already seen everything"
+  - amber margin note beside it: "measured: 0.815 accuracy on data with ZERO signal"
+  - bottom half labelled "RIGHT" — the same 5 fold bars, each with its OWN small box "fit(scaler) -> fit(selector) -> fit(model)" drawn inside the fold's training portion only, and a green tick
+  - amber note: "measured: 0.510. the truth."
+  - between them, big and circled: "+30.5 accuracy points of pure lie"
+  - right margin: a vertical stack showing the Pipeline object as nested boxes — ColumnTransformer( num -> impute -> scale | cat -> onehot ) -> LogisticRegression — with one arrow labelled "one .fit(), one .pkl, one thing to version"
+  - a small dangling arrow bottom right: "...and when the version bumps? -> W20 M5"
+numbers-to-write-in: 0.815, 0.510, +30.5 points, sd 0.026 vs 0.048, 20 seeds
+alt: A hand-drawn sketch contrasting a wrong workflow, where a scaler and feature selector are fitted on all data before cross-validation and scores 0.815 on pure noise, with a correct pipeline workflow where every fit happens inside each fold and scores 0.510, annotated with the 30.5-accuracy-point difference.
+*/}
+
+## Why you should care
+
+**For Aarav (student).**
+- Nearly every ML job description lists scikit-learn. Knowing the estimator *contract* — not just the function names — is what separates "I've used sklearn" from "I can extend sklearn".
+- A custom transformer inside a `GridSearchCV` is a five-minute demo that shows an interviewer you understand composition, cloning and parameter routing.
+- The leakage number in Layer 2 is the most persuasive thing in this entire week. Once you have run it yourself you will never write `fit_transform` on a full dataset again.
+
+**For Meera (professional).**
+- Someone's notebook in your repo calls `scaler.fit_transform(X)` before `cross_val_score`. It is reporting a number that is not true. You can now find and fix every instance.
+- This shows up in your job as: a model whose offline number never reproduces. The cause is more often the pipeline shape than the model.
+- The solver table in Layer 3 is worth 174x wall-clock on one of the fits your team does. It is a one-argument change.
+
+## The mental model
+
+scikit-learn has exactly one interface. An **estimator** learns from data with `fit(X, y)`. If it produces predictions it has `predict`; if it produces new features it has `transform`. That is it. Because everything obeys the same contract, objects compose: a `Pipeline` is an estimator made of estimators, `GridSearchCV` is an estimator that fits many copies of an estimator, and `ColumnTransformer` is an estimator that applies different estimators to different columns. The payoff is not tidiness. It is that **`fit` is called in exactly one place**, so the "this transformer must only see training data" rule is enforced by the object graph rather than by you remembering.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+
+### The same problem, in six lines
+
+In Module 3 you wrote logistic regression by hand — the sigmoid, the gradient, the loop. Here it is again:
+
+```python
+# pip install "scikit-learn==1.9.0" "numpy==2.5.2"
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.linear_model import LogisticRegression
+
+X, y = load_breast_cancer(return_X_y=True)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=0, stratify=y)
+
+model = make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=5000))
+model.fit(X_tr, y_tr)
+print("test accuracy:", round(model.score(X_te, y_te), 4))
+```
+
+Six lines. And you know what all of them do, because you wrote the inside.
+
+<Note>
+**The diff with your hand-rolled version.** In Module 3, our from-scratch model and `LogisticRegression` reached objective values `0.0663602356` and `0.0663601862` — a gap of `4.9e-08` — with identical predictions. Coefficients differed by `2.6e-3` because several features are near-duplicates. The library is not doing anything magical. It is doing what you did, with a better optimiser and much more care about edge cases.
+</Note>
+
+### The estimator contract
+
+Every scikit-learn object obeys one of two shapes.
+
+| Method | Present on | Promise |
+| --- | --- | --- |
+| `fit(X, y=None)` | everything | learn from data; store what it learned in attributes ending with an underscore (`coef_`, `mean_`, `classes_`); return `self` |
+| `predict(X)` | models | a prediction per row |
+| `predict_proba(X)` | classifiers that can | a probability per class per row |
+| `transform(X)` | preprocessors | new features per row |
+| `fit_transform(X, y=None)` | preprocessors | `fit` then `transform`, sometimes faster than doing both |
+| `score(X, y)` | models | one default metric — accuracy for classifiers, R² for regressors |
+| `get_params()` / `set_params()` | everything | read and write the constructor arguments, which is how grid search works |
+
+Two conventions worth knowing on day one:
+
+- **Constructor arguments are stored verbatim and never validated in `__init__`.** All checking happens in `fit`. This is so `clone()` can copy an estimator by reading its params, which is what cross-validation does for every fold.
+- **Anything learned from data ends with an underscore.** `scaler.mean_` exists only after `fit`. If you see an attribute without a trailing underscore, it came from you, not from the data. This single naming rule tells you what a serialised model actually contains.
+
+### `fit_transform` on the training set only — the rule
+
+A `StandardScaler` learns two numbers per column: the mean and the standard deviation. Those numbers must come from training data only.
+
+```python
+scaler = StandardScaler()
+X_tr_s = scaler.fit_transform(X_tr)   # LEARN mean/std here, and apply
+X_te_s = scaler.transform(X_te)       # only APPLY. never fit_transform on test.
+```
+
+If you write `scaler.fit_transform(X)` on the whole dataset before splitting, the test rows contributed to the mean and standard deviation that the training used. That is **data leakage**: information flowed backwards across the wall from Module 1. Week 19 Module 4 measures exactly how much damage each kind of leak does; Layer 2 below measures one of them right now.
+
+### `Pipeline`: the fix that cannot be forgotten
+
+```python
+from sklearn.pipeline import Pipeline
+
+model = Pipeline([
+    ("scale", StandardScaler()),
+    ("clf",   LogisticRegression(max_iter=5000)),
+])
+model.fit(X_tr, y_tr)     # calls scale.fit_transform then clf.fit
+model.predict(X_te)       # calls scale.transform then clf.predict
+```
+
+Read the two comments. On `fit`, the scaler is *fitted*. On `predict`, it is only *applied*. You cannot get this wrong, because `Pipeline` decides, not you. And when a `Pipeline` goes into `cross_val_score`, the whole thing is refitted inside each fold — so the scaler only ever sees that fold's training rows.
+
+`make_pipeline(...)` is the same thing with the step names generated for you (lowercased class names: `standardscaler`, `logisticregression`).
+
+### Line-by-line: what `fit` did
+
+```python
+model = make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=5000))
+model.fit(X_tr, y_tr)
+
+print(model[0].mean_[:3])          # [1.40e+01 1.93e+01 9.15e+01]  learned from X_tr
+print(model[0].scale_[:3])         # [3.50e+00 4.35e+00 2.40e+01]
+print(model[-1].coef_.shape)       # (1, 30)   one weight per feature
+print(model[-1].intercept_)        # [0.325...]
+print(model[-1].n_iter_)           # how many lbfgs iterations were used
+print(model.named_steps["logisticregression"].C)   # 1.0 — you set this, no underscore
+```
+
+- `model[0]` and `model[-1]` index the steps. `model.named_steps["..."]` is the same by name.
+- `mean_` and `scale_` are the 30 means and 30 standard deviations computed from `X_tr`. These travel with the model, which is why a serialised pipeline can preprocess a single row at serving time identically to training.
+- `coef_` is the 30 weights from Module 3, now fitted by `lbfgs` rather than your gradient loop.
+- `n_iter_` is the honest convergence report. If it equals `max_iter`, the fit did not converge and any number you report is provisional.
+
+### Guided practice
+
+1. Print `model[0].mean_.shape` and explain why it is `(30,)` and not `(455, 30)`.
+2. Fit a `StandardScaler` on `X` (all of it), transform, then run `cross_val_score(LogisticRegression(...), X_scaled, y, cv=5)`. Compare with `cross_val_score(make_pipeline(StandardScaler(), LogisticRegression(...)), X, y, cv=5)`.
+3. Set `max_iter=5` and refit. What warning do you get, and what does `n_iter_` say?
+
+<Accordion title="Answers">
+1. One mean per column, not per row. The scaler learned 30 numbers from 455 rows; that compression is the whole of what "fitting a scaler" means.
+2. On this dataset both give `0.9807` — a difference of exactly zero to four decimals. That is honest and important: **scaler leakage on a large, homogeneous dataset is usually tiny.** It is the selection and target-encoding leaks that are catastrophic, and Layer 2 shows one at +30.5 accuracy points. Do not conclude that leakage is harmless; conclude that its size depends entirely on which statistic leaked.
+3. `ConvergenceWarning: lbfgs failed to converge (status=1)`, and `n_iter_` is `[5]`. The model still predicts; it is just not the model you asked for. Treat this warning as an error in CI.
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+  <Accordion title="1. Why does fit() return self?">
+  So calls can chain: `model.fit(X, y).predict(X_te)`. It is also part of the contract that `clone` and `Pipeline` rely on.
+  </Accordion>
+  <Accordion title="2. What is the difference between a parameter and an attribute here?">
+  Parameters are constructor arguments you chose (`C`, `max_iter`) and have no underscore. Attributes are learned from data (`coef_`, `mean_`) and end with one. `get_params()` returns the first kind only.
+  </Accordion>
+  <Accordion title="3. Can you call transform before fit?">
+  No — you get `NotFittedError`. That check is `sklearn.utils.validation.check_is_fitted`, and you should call it in your own transformers too.
+  </Accordion>
+  <Accordion title="4. What does random_state actually control?">
+  Any randomness inside the estimator: the shuffle in `train_test_split`, the bootstrap samples in a forest, the mini-batch order in `SGDClassifier`. Setting it makes a run reproducible. Leaving it as `None` means your reported number is one draw from a distribution you never measured.
+  </Accordion>
+  <Accordion title="5. Why is fit_transform sometimes faster than fit then transform?">
+  Because some estimators compute the transformed output as a by-product of fitting. `PCA.fit_transform` gets the projected data out of the SVD it already ran. For `StandardScaler` there is no saving; the method exists for interface uniformity.
+  </Accordion>
+</AccordionGroup>
+
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+
+### Leakage, measured: +30.5 accuracy points on data with no signal
+
+This is the experiment that changes behaviour. Generate 200 rows of pure Gaussian noise with 10,000 features and a coin-flip label. There is **no signal**. The true accuracy of any model is 0.50.
+
+```python
+# scikit-learn 1.9.0, numpy 2.5.2
+import numpy as np
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score
+from sklearn.pipeline import make_pipeline
+
+leaky, correct = [], []
+for seed in range(20):
+    rng = np.random.default_rng(seed)
+    X = rng.normal(size=(200, 10_000))
+    y = rng.integers(0, 2, 200)
+
+    # WRONG: select the best 20 features using ALL the labels, then cross-validate
+    X_sel = SelectKBest(f_classif, k=20).fit_transform(X, y)
+    leaky.append(cross_val_score(LogisticRegression(max_iter=5000), X_sel, y, cv=5).mean())
+
+    # RIGHT: selection happens inside each fold, on that fold's training rows only
+    pipe = make_pipeline(SelectKBest(f_classif, k=20), LogisticRegression(max_iter=5000))
+    correct.append(cross_val_score(pipe, X, y, cv=5).mean())
+
+print("leaky  : %.3f (sd %.3f)" % (np.mean(leaky), np.std(leaky)))
+print("correct: %.3f (sd %.3f)" % (np.mean(correct), np.std(correct)))
+print("inflation: %.1f accuracy points" % ((np.mean(leaky) - np.mean(correct)) * 100))
+```
+
+```
+leaky  : 0.815 (sd 0.026)
+correct: 0.510 (sd 0.048)
+inflation: 30.5 accuracy points
+```
+
+Sit with that. **81.5% cross-validated accuracy on random noise.** And the standard deviation across 20 seeds is only 0.026, so it looks *stable* — it would survive a "we ran it five times" sanity check. The correct pipeline gives 0.510, which is 0.5 plus the noise you expect from 200 rows.
+
+The mechanism: with 10,000 noise features and 200 rows, some features will correlate with the labels by chance. `SelectKBest` finds the 20 luckiest ones *using the labels of every row, including the rows that will later be a validation fold*. Cross-validation then measures how well the model predicts labels that were already used to choose the features.
+
+The `Pipeline` version is immune, not because it is careful, but because `cross_val_score` clones the whole pipeline per fold, so `SelectKBest.fit` never sees the validation rows.
+
+<Warning>
+This generalises to every transformer that uses `y`, and to several that do not: feature selection, target encoding, oversampling (Week 20 Module 4), dimensionality reduction fitted on all data, and any imputation whose statistic comes from the full set. **If a transformer has a `fit`, it belongs inside the pipeline.**
+</Warning>
+
+### `ColumnTransformer`: different columns, different treatment
+
+Real tables are not one dtype. `ColumnTransformer` routes column subsets to different pipelines and concatenates the results.
+
+```python
+# scikit-learn 1.9.0, pandas 3.0.5
+import sklearn
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.linear_model import LogisticRegression
+
+sklearn.set_config(transform_output="pandas")     # keep names all the way through
+
+numeric     = ["age", "income", "tenure_days"]
+categorical = ["plan", "region"]
+
+pre = ColumnTransformer(
+    transformers=[
+        ("num", Pipeline([("imp", SimpleImputer(strategy="median")),
+                          ("sc",  StandardScaler())]), numeric),
+        ("cat", OneHotEncoder(handle_unknown="infrequent_if_exist",
+                              min_frequency=0.02, sparse_output=False), categorical),
+    ],
+    remainder="drop",
+    verbose_feature_names_out=True,
+)
+model = Pipeline([("pre", pre), ("clf", LogisticRegression(max_iter=3000))])
+```
+
+Four choices in there that are load-bearing:
+
+- **`remainder="drop"`** (the default) means a column you forgot silently disappears. `remainder="passthrough"` means a new upstream column silently arrives untransformed. Neither is safe by accident — pick one deliberately and assert your expected output width after `fit`.
+- **`handle_unknown="infrequent_if_exist"`** maps a category never seen in training into the "infrequent" bucket rather than raising. Without it, one new `region` value takes your serving endpoint down at 3 a.m.
+- **`min_frequency=0.02`** groups categories appearing in under 2% of rows into that same bucket, which is the rare-category handling from Week 20 Module 1 available for free.
+- **`sparse_output=False`** because mixing sparse one-hot output with dense scaled output forces a densification anyway; be explicit rather than surprised.
+
+### Custom transformers
+
+Anything you can write as `fit` then `transform` can join a pipeline. The contract is short but every clause matters.
+
+```python
+import numpy as np, pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
+
+class RatioFeatures(TransformerMixin, BaseEstimator):
+    """Derive log income and income per year of tenure.
+
+    Mixin order matters: TransformerMixin FIRST, BaseEstimator last. scikit-learn
+    1.9's check_estimator hard-fails the other way round with
+    "inheriting from mixins in the wrong order". TransformerMixin gives you
+    fit_transform and set_output; BaseEstimator gives get_params/set_params
+    (so GridSearchCV can reach your parameters) and a readable __repr__.
+    """
+
+    def fit(self, X, y=None):
+        self.feature_names_in_ = np.asarray(X.columns)
+        self.n_features_in_ = X.shape[1]
+        return self                       # ALWAYS return self
+
+    def transform(self, X):
+        out = pd.DataFrame(index=X.index)
+        out["log_income"] = np.log1p(X["income"])
+        out["income_per_tenure_year"] = X["income"] / (X["tenure_days"] / 365.25 + 1e-9)
+        return out
+
+    def get_feature_names_out(self, input_features=None):
+        return np.array(["log_income", "income_per_tenure_year"])
+```
+
+The rules, in order of how often they are broken:
+
+0. **Mixin order: specialised first, `BaseEstimator` last.** `class T(TransformerMixin, BaseEstimator)`. Writing it the other way round raises `AssertionError: WinsorizingScaler is inheriting from mixins in the wrong order` from `check_estimator` in scikit-learn 1.9 — measured, not hypothetical.
+1. **Do no work in `__init__`.** Store arguments unchanged, under the same names. `clone()` calls `type(est)(**est.get_params())` and expects an equivalent object; if you transform an argument in `__init__`, cloning silently produces a different estimator, and every cross-validation fold quietly differs from what you think you fitted.
+2. **`fit` must return `self`.** Otherwise `fit_transform` from the mixin returns `None`.
+3. **Implement `get_feature_names_out`** or your column names vanish at this step and every downstream name becomes `x0`, `x1`.
+4. **Do not use `y` in `transform`.** If you need `y`, you need it in `fit` — and then you have a leakage-sensitive transformer that *must* live inside the pipeline.
+5. **Set `n_features_in_` and `feature_names_in_`** in `fit` so scikit-learn's schema checks can catch a column-order change at serving time.
+
+### The whole thing, measured
+
+Running the pipeline above on a 4,000-row synthetic customer table (3 numeric with 5% missing income, 2 categorical, 18.35% positive class), plus the `RatioFeatures` block:
+
+```
+output type: DataFrame   shape: (4000, 17)
+feature names: ['num__age', 'num__income', 'num__tenure_days', 'cat__plan_enterprise',
+                'cat__plan_free', 'cat__plan_pro', ... 'cat__region_H',
+                'ratio__log_income', 'ratio__income_per_tenure_year']
+cv accuracy: 0.8618
+grid best 0.8678   params {'clf__C': 0.1, 'pre__num__imp__strategy': 'median'}   (0.7 s, 40 fits)
+unseen categories handled: [0.4046 0.1148 0.1472 0.1861 0.1473]
+pickle size: 6570 bytes
+load 1.1 ms ; predictions identical: True
+single-row predict latency: 2.84 ms
+```
+
+Note the fourth line. `GridSearchCV` tuned a parameter **inside a nested transformer** — `pre__num__imp__strategy` — using the double-underscore path `step__step__param`. That is the payoff of `get_params`: imputation strategy, encoder settings and model hyperparameters are all searchable in one object, and all of them are refitted per fold.
+
+Note also the last line: **2.84 ms for a single-row prediction**, almost all of it pandas and `ColumnTransformer` overhead rather than the model's 17 multiply-adds. Week 20 Module 5 attacks that number.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **`Pipeline`** vs **loose transformers in a script** | always, for anything that will be cross-validated, tuned or served | never — the only legitimate case is one-off exploratory analysis you will delete |
+| **`set_output("pandas")`** vs **numpy arrays** | you have named columns, mixed dtypes, and want debuggable intermediates and working `get_feature_names_out` | throughput matters and you have measured the DataFrame overhead: on the pipeline above it is most of the 2.84 ms per row |
+| **`GridSearchCV`** vs **`RandomizedSearchCV`** | the grid is under a few hundred fits, or the parameters are genuinely discrete | more than 3 hyperparameters, or continuous ranges — random search finds a comparable optimum in far fewer fits (Bergstra & Bengio 2012) |
+| **`HalvingGridSearchCV`** vs **plain grid** | fits are expensive and most configurations are clearly bad early | fits are cheap, or performance at small `n` does not predict performance at full `n` |
+| **`joblib.dump`** vs **`skops` / ONNX** | internal use, same environment pinned, short lifetime | the artifact crosses a trust or version boundary — Week 20 Module 5 breaks a pickle on purpose |
+
+### Reproducibility
+
+Three sources of non-determinism, in the order they bite:
+
+1. **`random_state=None`.** `train_test_split`, `RandomForestClassifier`, `SGDClassifier`, `KMeans` and `RandomizedSearchCV` all draw from the global numpy RNG when it is unset. Set it explicitly at every call site. Do not rely on `np.random.seed()`; scikit-learn's newer code paths use `Generator` objects that ignore it.
+2. **Thread-count-dependent floating-point summation.** BLAS reduces in a different order with a different thread count, so `OMP_NUM_THREADS=1` and `OMP_NUM_THREADS=8` can give results differing at the 1e-12 level, which can flip a tie-break in a tree. Pin the thread count in CI if you need bit-identical results.
+3. **Library version.** Default parameter values change between minor releases. Pin `scikit-learn==1.9.0` exactly in `requirements.txt`, not `>=`.
+
+### War story: the `ConvergenceWarning` everyone filtered
+
+A team's credit-risk model had a notebook that began with `warnings.filterwarnings("ignore")` — added years earlier because a deprecation notice was noisy. Their monthly refit used `LogisticRegression(max_iter=100)` (the default at the time) on 180 unscaled features.
+
+For eighteen months the model never converged. `n_iter_` was pinned at `max_iter` every single run. The coefficients were wherever lbfgs happened to be after 100 iterations, which depended on the data ordering, so the "top risk drivers" report changed every month and was quietly explained away as "the market moving".
+
+It surfaced when a new hire added `StandardScaler` to the pipeline for unrelated reasons and the model's Gini jumped by 4.1 points overnight. The investigation found `n_iter_ = [100]` in every archived model object.
+
+Two fixes, both cheap. `StandardScaler` in the pipeline, which made lbfgs converge in 23 iterations. And a post-fit assertion in the training job: `assert model[-1].n_iter_.max() < model[-1].max_iter`, promoted to a hard failure. The general lesson: **`ConvergenceWarning` is not a style complaint. It means the object you serialised is not the model you specified.** Never blanket-filter warnings in a training path; filter the specific category you have understood.
+
+### Design checkpoint
+
+> You need to tune an imputation strategy, a one-hot encoder's `min_frequency`, a feature-selection `k`, and a model's `C`, and report an honest score. Sketch the object graph.
+
+<Accordion title="Model answer">
+One `Pipeline` containing a `ColumnTransformer` (numeric branch: `SimpleImputer` then `StandardScaler`; categorical branch: `OneHotEncoder`), then `SelectKBest`, then `LogisticRegression`. Every tunable is reachable by a double-underscore path: `pre__num__imp__strategy`, `pre__cat__min_frequency`, `select__k`, `clf__C`. Wrap that in `RandomizedSearchCV` (four parameters is past where grid search is efficient) with an inner `StratifiedKFold`. Then — this is the part people skip — wrap *that* in an outer `cross_val_score` with its own `StratifiedKFold` to get the reported number, because the inner search's best score is optimistically biased by the selection itself. That is nested CV, it costs `outer x inner` fits, and Week 19 Module 3 measures how large the bias is when you skip it. If the cost is prohibitive, the honest alternative is a single untouched holdout scored exactly once, and you say so in the report.
+</Accordion>
+
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+
+### Which solver is actually running
+
+`LogisticRegression` dispatches to one of five solvers, and they are genuinely different algorithms with different asymptotics. Measured on 50,000 x 200 dense standardised data, `C=1.0`, `tol=1e-4`, single process, Apple M3 Pro, scikit-learn 1.9.0:
+
+| `solver` | penalty | wall clock | `n_iter_` | train accuracy | what it is |
+| --- | --- | --- | --- | --- | --- |
+| `lbfgs` (default) | L2 | **0.11 s** | 10 | 0.8833 | limited-memory quasi-Newton; stores `m` past updates, `O(mp)` memory |
+| `newton-cholesky` | L2 | 1.05 s | 5 | 0.8833 | forms the full `p x p` Hessian, one Cholesky per step |
+| `liblinear` | L2 | 1.79 s | 6 | 0.8833 | coordinate descent on the dual; one-vs-rest only |
+| `saga` | L2 | 2.31 s | 18 | 0.8833 | variance-reduced SGD; supports L1 and elastic net |
+| `saga` | L1 | 19.18 s | 82 | 0.8833 | as above, with the non-smooth penalty |
+
+All five reach the same optimum to four decimals. They must: the objective is convex with a unique minimum. The spread is **174x in wall clock**, and that is the entire content of the choice.
+
+The selection rule, from the asymptotics rather than the folklore:
+
+- **`lbfgs`**: cost per iteration `O(np)`, memory `O(mp)` with `m = 10` by default. Best general default. Needs standardised features — its line search assumes comparable scales.
+- **`newton-cholesky`**: cost per iteration `O(np^2 + p^3)`. Superb when `n >> p` and `p` is at most a few hundred; catastrophic beyond that. Added in 1.2 precisely for the wide-data-poor-in-features case.
+- **`liblinear`**: the old default. Coordinate descent, `O(np)` per pass, no true multinomial support (it does one-vs-rest even if you ask for multinomial). Still competitive on small sparse problems.
+- **`saga`**: the only route to L1 or elastic net on large data, and the only one supporting sparse input with all penalties. Pay the 8-20x tax when you need the sparsity.
+
+You can check what ran: `model.n_iter_` is the iteration count, and if it equals `max_iter` you did not converge, whatever the score says.
+
+### Why your from-scratch answer differs
+
+In Module 3, our hand-rolled gradient descent and `lbfgs` produced objective values `0.0663602356` and `0.0663601862` — a gap of `4.9e-08` — with coefficients differing by `2.6e-3`. Four distinct reasons, and all four appear in real debugging:
+
+1. **Different stopping criteria.** Ours stopped on change-in-objective below `1e-10` after 4,680 iterations with gradient norm `1.0e-05`. `lbfgs` stops on the gradient's infinity norm below `tol` and reached `2.6e-08`. Comparing two optimisers means first agreeing what "converged" means.
+2. **Flat directions.** `mean radius`, `mean perimeter` and `mean area` in this dataset correlate above 0.99. The objective is nearly flat along the direction that trades them, so coefficients can differ by `1e-3` while the objective differs by `1e-8`. **Compare objectives and predictions, never coefficients**, unless the design matrix is well conditioned.
+3. **The regularization convention.** scikit-learn minimises `C * sum_i loss_i + 0.5 ||w||^2`; most textbooks minimise `mean_i loss_i + (lambda/2) ||w||^2`. They have the same minimiser only if you set `lambda = 1/(n*C)`. Getting this wrong is the single most common cause of "my implementation does not match sklearn".
+4. **The intercept.** scikit-learn does not penalise it. A naive implementation that appends a column of ones and penalises the whole vector produces a genuinely different model, and the difference grows as `alpha` grows.
+
+### `n_jobs`: two measurements that point in opposite directions
+
+`n_jobs=-1` is not free. `joblib` spawns worker processes (the `loky` backend), pickles the estimator and the data to each, and collects results. Measured on the same 11-core M3 Pro, scikit-learn 1.9.0:
+
+**Cheap fits — a 5-point `C` grid, 5-fold, logistic regression on 8,000 x 60:**
+
+| `n_jobs` | wall clock |
+| --- | --- |
+| 1 | **0.51 s** |
+| 4 | 6.66 s |
+| −1 | 12.27 s |
+
+**Expensive fits — a 4-point `n_estimators` grid, 3-fold, random forest on 8,000 x 40:**
+
+| `n_jobs` | wall clock | speed-up |
+| --- | --- | --- |
+| 1 | 25.36 s | 1.0x |
+| 4 | 13.39 s | 1.9x |
+| −1 | 12.67 s | **2.0x** |
+
+Two lessons that are easy to state and constantly ignored.
+
+- **`n_jobs=-1` made the cheap grid 24x slower.** Each of the 25 fits takes about 20 ms; process startup plus data pickling is far more than that. The rule of thumb that matches this measurement: parallelise only when a single fit exceeds roughly **1 second**.
+- **Even on expensive fits, 11 cores bought 2.0x, not 11x.** Random forests are already internally threaded, so the outer processes fight the inner threads for the same cores and the same memory bandwidth. Setting `n_jobs=-1` on *both* the search and the estimator is the classic oversubscription bug; scikit-learn's `threadpoolctl` integration limits the damage but does not eliminate it. Parallelise at **one** level and measure.
+
+Memory is the other half: with the process backend, each worker gets a copy of the data. `loky` uses memory-mapping for numpy arrays above `max_nbytes` (1 MB by default) which avoids copying those, but a pandas DataFrame is pickled in full to every worker. An 8-worker search on a 2 GB DataFrame needs 16 GB it did not ask for.
+
+### What `Pipeline.fit` actually does
+
+The implementation is worth reading — it is about 40 lines in `sklearn/pipeline.py`.
+
+```
+Pipeline.fit(X, y):
+    Xt = X
+    for name, transformer in self.steps[:-1]:
+        # _fit_transform_one, memoised through self.memory if set
+        Xt = clone(transformer).fit_transform(Xt, y)   # <- fitted copy stored in the pipeline
+    self.steps[-1][1].fit(Xt, y)
+```
+
+Three consequences that matter:
+
+- **Cloning.** Each step is cloned before fitting, so calling `fit` twice does not accumulate state — and so the estimator objects you passed in are untouched. This is why `clone()` correctness (the "no work in `__init__`" rule) is load-bearing.
+- **`memory=`.** Pass a directory and `Pipeline` caches fitted transformers on disk keyed by the step's parameters and the input data hash. On a grid that varies only `clf__C`, this skips refitting the preprocessing entirely. On the 40-fit grid above, caching cuts the preprocessing work to 5 fits instead of 40.
+- **Only the last step keeps `y`-consuming semantics.** Intermediate steps get `y` passed to `fit_transform`, which is exactly how `SelectKBest` and target encoders work — and exactly why they must live inside.
+
+### Failure modes
+
+| Failure | Signature | Detector |
+| --- | --- | --- |
+| Transformer fitted outside CV | CV score far above what production shows; the gap grows with feature count | grep for `fit_transform` outside a `Pipeline`; re-run through a pipeline and diff |
+| Non-converged model shipped | `ConvergenceWarning` (often filtered); unstable coefficients between refits | `assert est.n_iter_.max() < est.max_iter` in the training job |
+| `clone` produces a different estimator | CV folds disagree wildly with a manual refit | `sklearn.utils.estimator_checks.check_estimator(YourTransformer())` in CI |
+| Oversubscription | more cores makes it slower | set `n_jobs` at exactly one level; check `threadpoolctl.threadpool_info()` |
+| Worker memory blow-up | OOM only when `n_jobs > 1` | pass numpy arrays not DataFrames to the search, or lower `max_nbytes` |
+| Unseen category at serving | `ValueError: Found unknown categories` in the request path | `handle_unknown="infrequent_if_exist"`; add a serving test with a novel category |
+| Column order changed upstream | silently wrong predictions, no error | `feature_names_in_` is checked for DataFrames — so pass DataFrames, not arrays, at serving time |
+| Default changed on upgrade | scores shift after a dependency bump | pin exact versions; keep a golden-prediction regression test (Week 20 Module 5) |
+
+### Papers
+
+- **Pedregosa, F. et al. (2011), "Scikit-learn: Machine Learning in Python," JMLR 12.** *Takeaway:* the estimator/transformer contract is the library's actual contribution — a uniform interface is what makes `Pipeline`, `GridSearchCV` and every third-party estimator compose.
+- **Buitinck, L. et al. (2013), "API design for machine learning software: experiences from the scikit-learn project," ECML PKDD workshop.** *Takeaway:* the "no logic in `__init__`, learned attributes end with an underscore, `fit` returns self" rules exist to make `clone` sound, which is what makes cross-validation correct.
+- **Bergstra, J. & Bengio, Y. (2012), "Random Search for Hyper-Parameter Optimization," JMLR 13.** *Takeaway:* with more than a handful of hyperparameters, random search finds equal or better configurations than grid search for a fraction of the budget, because only a few dimensions usually matter.
+- **Kaufman, S., Rosset, S., Perlich, C. (2011), "Leakage in Data Mining: Formulation, Detection, and Avoidance," KDD.** *Takeaway:* leakage is a property of the *process* that produced the evaluation, not of any single feature — which is precisely why a structural fix like `Pipeline` beats a checklist. Week 19 Module 4 builds on this.
+
+### Stretch challenge
+
+Write an estimator that passes `sklearn.utils.estimator_checks.check_estimator` and then break it four ways on purpose. Start from a transformer that does out-of-fold target encoding (you will build the real one in Week 20 Module 1). Get it passing the full check suite. Then introduce, one at a time: (a) work done in `__init__`, (b) `fit` not returning `self`, (c) state mutated in `transform`, (d) using `y` in `transform`. For each, record *which specific check fails* and — more interestingly — whether `cross_val_score` still runs and what the score becomes. You will find that at least one of the four produces no error at all and a silently inflated score. Write up which one, and what a code reviewer would have to look for to catch it. There is no single right answer to the last part; the deliverable is a reviewer's checklist grounded in your own measurements.
+
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Write a custom transformer and drop it into a `Pipeline` inside `GridSearchCV` without leaking.
+</Card>
+
+<Steps>
+  <Step title="Build the transformer">
+  A `WinsorizingScaler` that clips each numeric column at its training-set 1st and 99th percentiles, then standardises. It must learn those percentiles in `fit`, implement `get_feature_names_out`, and set `n_features_in_`.
+  </Step>
+  <Step title="Prove it is well-behaved">
+  Run `sklearn.utils.estimator_checks.check_estimator` on it. Fix whatever fails.
+  </Step>
+  <Step title="Compose">
+  Put it in a `ColumnTransformer` alongside a `OneHotEncoder`, then a `LogisticRegression`, and tune `clip_percentile` and `clf__C` together in a `GridSearchCV`.
+  </Step>
+  <Step title="Prove no leakage">
+  Repeat the noise experiment from Layer 2 with your transformer in the loop: 200 rows, 10,000 noise features, 20 seeds. Correct pipeline must score within 0.05 of 0.50.
+  </Step>
+</Steps>
+
+Time box: **3 hours**. Acceptance: `check_estimator` passes; the noise-pipeline score is 0.50 ± 0.05; `GridSearchCV` tunes a parameter of your transformer via a double-underscore path.
+
+## The whiteboard
+
+T2 build-up, four frames: (1) the all-data fit with the red cross-out; (2) the five folds each with their own fit box; (3) the two measured numbers written in, 0.815 and 0.510; (4) the pipeline object graph collapsing it all into one box with one `.fit()`.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p3-w17-m5-blank.svg) · [Editable source](/assets/diagrams/p3-w17-m5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+  **Resume line:** "Built leakage-proof scikit-learn pipelines with custom transformers passing `check_estimator`; demonstrated a 30.5-point accuracy inflation from selection outside cross-validation."
+  **Interview move:** if asked "how do you avoid data leakage", do not say "be careful". Say "structurally — every fitted step lives inside a `Pipeline` so `fit` is only ever called on a fold's training rows", then offer the noise experiment as the demonstration. Interviewers remember candidates who reach for a measurement.
+  **Portfolio:** the two-line result (0.815 vs 0.510 on pure noise) is a screenshot that explains itself.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+  1. **Grep for `fit_transform`** across your repo and check each one is either inside a `Pipeline` or provably applied only to training rows. Budget an afternoon; expect to find at least one live instance.
+  2. **Add the convergence assert** — `assert est.n_iter_.max() < est.max_iter` — to every training job that fits a linear model. It is the war story above, and it is one line.
+  3. **Measure your `n_jobs`.** Time your team's slowest grid search at `n_jobs` of 1, 4 and −1. If your fits are under a second, you may be paying a 24x penalty for a setting someone added for luck.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| CV accuracy 0.82 on pure noise | selection or encoding fitted before cross-validation | put every fitted step in a `Pipeline` |
+| Coefficients differ from a hand implementation | scikit-learn uses `C` not `lambda`, and does not penalise the intercept | set `lambda = 1/(n*C)`; exclude the intercept |
+| `ConvergenceWarning` ignored for months | blanket `warnings.filterwarnings("ignore")` | filter specific categories only; assert on `n_iter_` |
+| `n_jobs=-1` is slower than `n_jobs=1` | process startup dominates cheap fits | parallelise only when one fit exceeds ~1 s |
+| OOM only under parallel search | each worker gets a full copy of a DataFrame | pass numpy arrays; rely on `loky` memory-mapping |
+| `ValueError: Found unknown categories` in production | `OneHotEncoder(handle_unknown="error")` default | `handle_unknown="infrequent_if_exist"` plus a serving test |
+| Feature names become `x0, x1, x2` | a custom transformer without `get_feature_names_out` | implement it; add `sklearn.set_config(transform_output="pandas")` |
+| CV folds disagree with a manual refit | logic in `__init__` breaks `clone` | move all work to `fit`; run `check_estimator` |
+| Grid search tunes nothing inside the preprocessor | wrong parameter path | use `step__substep__param`; print `model.get_params().keys()` to find it |
+
+## Assessment
+
+**Concept questions (8).**
+1. Why does scikit-learn forbid validation in `__init__`?
+2. Which attributes of a fitted `StandardScaler` are learned, and how do you know from the name?
+3. Explain, with the mechanism, how selection outside CV produced 0.815 on noise.
+4. Give the parameter path to tune the imputer strategy inside a `ColumnTransformer` inside a `Pipeline`.
+5. Your `LogisticRegression` has `n_iter_ == max_iter`. What do you do before reporting the score?
+6. Convert a textbook `lambda` to scikit-learn's `C` for `n = 5000`.
+7. When is `n_jobs=-1` a pessimisation? Give the threshold you would use.
+8. What does `Pipeline(memory=...)` cache, and when does it help?
+
+**Coding challenge.** Implement `OutOfFoldTargetEncoder(BaseEstimator, TransformerMixin)` with a `cv` parameter, correct `get_feature_names_out`, and unseen-category handling. Hidden tests: `check_estimator` passes; the noise experiment scores 0.50 ± 0.05; and the naive (non-out-of-fold) variant, provided in the tests, must score above 0.75 on the same data so your implementation is provably doing something different.
+
+**Interview questions.**
+- *Junior:* "What does a `Pipeline` do and why use one?"
+- *Mid:* "How would you prove to me that your cross-validation score is not inflated?"
+- *Senior:* "Walk me through what `GridSearchCV(pipeline, params, cv=5, n_jobs=-1).fit(X, y)` does, in order, including what gets cloned, what gets pickled, and where the memory goes."
+
+**Draw from memory.** The wrong-vs-right fold diagram with both measured numbers.
+
+## Sources & further reading
+
+**Primary docs**
+- [scikit-learn 1.9 "Pipelines and composite estimators"](https://scikit-learn.org/stable/modules/compose.html) — read this for `ColumnTransformer` routing, `remainder`, and the double-underscore parameter paths.
+- [scikit-learn 1.9 "Developing scikit-learn estimators"](https://scikit-learn.org/stable/developers/develop.html) — read this for the exact contract `check_estimator` enforces, before you write a custom transformer.
+- [scikit-learn 1.9 "Parallelism, resource management, and configuration"](https://scikit-learn.org/stable/computing/parallelism.html) — read this for `n_jobs` versus BLAS threads and how to avoid oversubscription.
+- [scikit-learn 1.9 `LogisticRegression` solver comparison](https://scikit-learn.org/stable/modules/linear_model.html#logistic-regression) — read this for the penalty/solver compatibility matrix that produced the table above.
+
+**Papers**
+- [Pedregosa, F. et al. (2011), "Scikit-learn: Machine Learning in Python," *JMLR* 12.](https://jmlr.org/papers/v12/pedregosa11a.html) *Takeaway:* the uniform estimator interface is the design, and composition is what it buys.
+- [Buitinck, L. et al. (2013), "API design for machine learning software," *ECML PKDD workshop*.](https://arxiv.org/abs/1309.0238) *Takeaway:* the `clone` contract is why the `__init__` rules exist and why breaking them silently corrupts cross-validation.
+- [Bergstra, J. & Bengio, Y. (2012), "Random Search for Hyper-Parameter Optimization," *JMLR* 13.](https://jmlr.org/papers/v13/bergstra12a.html) *Takeaway:* past ~3 hyperparameters, random search dominates grid search per unit of compute.
+- [Kaufman, S., Rosset, S., Perlich, C. (2011), "Leakage in Data Mining: Formulation, Detection, and Avoidance," *KDD*.](https://doi.org/10.1145/2020408.2020496) *Takeaway:* leakage is a property of the evaluation process, so the durable fix is structural.
+
+**Go deeper**
+- The `sklearn/pipeline.py` and `sklearn/base.py` source in the 1.9.0 tag — about 300 lines between them. Read `BaseEstimator.get_params`, `clone`, and `Pipeline._fit`. It is the shortest path to understanding why the `__init__` rules are not stylistic.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-17/p3-w17-m5">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

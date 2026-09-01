@@ -1,0 +1,160 @@
+---
+title: "Lab — Incremental financial-records pipeline"
+description: "Reference solution — Week 15"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `LAB-P2-W15`
+
+The pipeline code is assembled from the module pages. **The two things being assessed are the crash
+test and `PIPELINE.md`**, and this page is about those.
+
+### The crash test, which is the whole lab
+
+```make
+idempotency:
+	python -m pipeline --reset
+	python -m pipeline && python tools/checksum.py > /tmp/a.txt
+	python -m pipeline && python tools/checksum.py > /tmp/b.txt
+	diff /tmp/a.txt /tmp/b.txt
+
+resume:
+	python -m pipeline --reset
+	-python -m pipeline --crash-after 1500      # expected to fail
+	python -m pipeline && python tools/checksum.py > /tmp/c.txt
+	diff /tmp/a.txt /tmp/c.txt
+```
+
+```python
+# tools/checksum.py — the assertion that matters.
+print(con.execute("""
+    SELECT count(*), sum(amount), min(txn_id), max(txn_id),
+           count(DISTINCT txn_id)
+    FROM transactions
+""").fetchone())
+```
+
+**If that final `diff` is empty, you have built a pipeline.** If it is not, you have built a script
+that usually works. Nothing else in the lab distinguishes the two.
+
+`count(DISTINCT txn_id)` alongside `count(*)` is deliberate: if they differ, the merge key is wrong
+and you have duplicates that a plain row count would not reveal.
+
+### Where submissions fail the crash test
+
+Almost always the same cause: **the records and the cursor are committed separately.** `dlt` does
+this correctly for you — it writes the load and its state in one destination transaction — and the
+usual way to defeat it is to keep your own state in a separate file "for convenience". Once the state
+lives outside the transaction, a crash between the two writes either loses a page or duplicates one,
+and which depends on the order.
+
+If you must keep state elsewhere, the load has to be genuinely idempotent — a real primary key and an
+upsert — and **you must test that re-running a page changes nothing**, because you have given up the
+transactional guarantee.
+
+### The five data-quality assertions
+
+Each catches a distinct failure, and **each needs a test proving it fires**:
+
+| Assertion | Catches | The test |
+| --- | --- | --- |
+| `count(*) > 0` | the source returned nothing | run against an empty API response |
+| `count(*) = count(DISTINCT key)` | wrong merge key (module 1's war story) | inject a duplicate |
+| null rate below threshold | a removed upstream field (module 4's measurement) | remove a field from the mock |
+| zero orphan foreign keys | dimension loaded after facts, or failed | load facts first deliberately |
+| `max(updated_at) > now() - 26h` | **the pipeline ran and loaded nothing** | freeze the mock's clock |
+
+**The freshness one is the most valuable**, because it is the failure that "did the job succeed?"
+monitoring cannot see by construction. A pipeline that runs successfully every night and loads
+nothing is green on every dashboard.
+
+**An assertion that has never failed is an assertion you do not know works.** Hence a test per
+assertion, on data engineered to trigger it.
+
+### The exactly-once argument (`hard` track)
+
+Not a claim — an argument with four parts:
+
+**1. State the guarantee precisely.**
+> For any sequence of runs, including runs interrupted at any point, the final state of
+> `fact_transactions` contains exactly one row per distinct `txn_id` present in the source, holding
+> the values from the most recent source version of that record.
+
+**2. Enumerate the failure points.** After extract, after normalize, after the staging write, during
+the delete, during the insert, after commit but before the state write. **For each, say what the
+next run does and why the invariant is restored.** The critical one: `dlt`'s merge is
+`CREATE staging; DELETE matching keys; INSERT; DROP staging` inside one transaction, so a crash
+anywhere within it rolls back entirely and the next run replays the whole load package.
+
+**3. Name the assumptions.** Every exactly-once argument rests on some, and **an unnamed assumption
+is where the guarantee actually fails**:
+- the destination's transaction is atomic (true for DuckDB and Postgres; **not** for a filesystem
+  destination writing several files);
+- `txn_id` is genuinely unique in the source — **assert this every run**;
+- the source never mutates a record without advancing its cursor value.
+
+**4. State what you do not guarantee.** Deletes at the source do not propagate: `merge` handles
+inserts and updates, and a deleted record is simply absent, which is not a signal. Say so.
+
+<Warning>
+The commonest failure in this proof is asserting exactly-once while depending on a primary key that
+is not unique. **Test it**: after an adversarial sequence of interrupted runs,
+`SELECT txn_id, count(*) FROM fact_transactions GROUP BY 1 HAVING count(*) > 1` must return zero
+rows. **A proof is not a substitute for the assertion.**
+</Warning>
+
+### `PIPELINE.md`
+
+Four sections, in this order:
+
+1. **The dataflow diagram, above the fold.** Mermaid is fine. Sources, stages, destination, and the
+   quality gate drawn as a gate. Fifteen seconds, no reading.
+2. **The decisions, with their alternatives.** "`columns: freeze` for the API source because it feeds
+   a financial report and a silent new column is how revenue numbers go wrong; `evolve` for the
+   exploratory FX scrape."
+3. **The failure modes you handle — and the ones you do not.** "Deletes at the source do not
+   propagate. A weekly full reconciliation would catch it; I have not built one." **Naming what you
+   did not do makes the rest of the document more credible**, not less.
+4. **The measured numbers.** Duration, rows, peak RSS, output size. Without them it is a
+   description; with them it is a report.
+
+## Grading notes
+
+**3/3 on Correctness** — the resume test's `diff` is empty; every quality assertion has a test
+proving it fires; the scraper raises on a missing required field.
+
+**3/3 on Code quality** — sources separated from loading; secrets in config, not code; `mypy
+--strict` clean.
+
+**3/3 on Explanation** — `PIPELINE.md` with a diagram, the schema-contract choice justified, and the
+unhandled failure modes named.
+
+**The three most common ways submissions lose points:**
+
+1. **No resume test, or a resume test that asserts completion rather than the checksum.** This is the
+   requirement that separates a pipeline from a script and it is the one most often skipped.
+2. **Assertions that log warnings instead of failing the run.** Bad data reaches the report, and the
+   warning goes to a log nobody reads.
+3. **`PIPELINE.md` with no diagram.** The document nobody reads is the one with no picture, and the
+   `make report` target checks for a `graph` or `flowchart` keyword precisely because of this.
+
+**A fourth, environmental:** naming the DuckDB file after the dataset produces `Binder Error:
+Ambiguous reference to catalog or schema`. Call it `warehouse.duckdb`.
+
+**On the `hard` track's partition justification.** A submission that partitions by `txn_id` or
+`merchant_id` without computing the resulting file count has missed the point of the requirement.
+The arithmetic — files per day, average file size, `LIST` request count — is the deliverable, and the
+answer it produces is almost always "partition by date and sort within the partition".
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

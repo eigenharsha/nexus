@@ -1,0 +1,187 @@
+---
+title: "Forward pass, loss & backpropagation"
+description: "Reference solution — Week 21"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P3-W21-M2`
+
+The hands-on was: build the autograd engine, then make `gradcheck` pass on a 3-layer network built on top of it.
+
+The engine itself is in the module's Layer 3 — this page is the part that isn't there: the neural-network layer on top, the gradient checker, and the numbers.
+
+### The network layer
+
+```python
+"""nn.py — Neuron / Layer / MLP on top of nanograd's Value. No dependencies."""
+from __future__ import annotations
+import random, math
+from nanograd import Value
+
+class Module:
+    def parameters(self) -> list[Value]:
+        return []
+    def zero_grad(self) -> None:
+        for p in self.parameters():
+            p.grad = 0.0
+
+class Neuron(Module):
+    def __init__(self, nin: int, nonlin: bool = True):
+        # He initialization: std = sqrt(2/fan_in). Module 3 derives the 2.
+        std = math.sqrt(2.0 / nin)
+        self.w = [Value(random.gauss(0.0, std)) for _ in range(nin)]
+        self.b = Value(0.0)
+        self.nonlin = nonlin
+
+    def __call__(self, x: list[Value]) -> Value:
+        act = sum((wi * xi for wi, xi in zip(self.w, x)), self.b)
+        return act.relu() if self.nonlin else act
+
+    def parameters(self) -> list[Value]:
+        return self.w + [self.b]
+
+class Layer(Module):
+    def __init__(self, nin: int, nout: int, **kw):
+        self.neurons = [Neuron(nin, **kw) for _ in range(nout)]
+    def __call__(self, x):
+        out = [n(x) for n in self.neurons]
+        return out[0] if len(out) == 1 else out
+    def parameters(self):
+        return [p for n in self.neurons for p in n.parameters()]
+
+class MLP(Module):
+    def __init__(self, nin: int, nouts: list[int]):
+        sz = [nin] + nouts
+        self.layers = [Layer(sz[i], sz[i+1], nonlin=(i != len(nouts) - 1))
+                       for i in range(len(nouts))]     # last layer is LINEAR
+    def __call__(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+    def parameters(self):
+        return [p for l in self.layers for p in l.parameters()]
+```
+
+<Warning>
+`nonlin=(i != len(nouts) - 1)` — the **last layer has no activation**. This is the single most
+common bug in a hand-rolled MLP: putting a ReLU on the output makes every negative logit
+exactly zero, so a binary classifier can never express "confidently class 0" and the loss
+plateaus about 0.15 nats above where it should. It trains, so nothing tells you.
+</Warning>
+
+### The gradient checker
+
+```python
+"""gradcheck.py — central differences over every parameter."""
+from __future__ import annotations
+
+def gradcheck(loss_fn, params, eps: float = 1e-5) -> tuple[float, int]:
+    """loss_fn() -> Value. Returns (max relative error, index of the worst param)."""
+    for p in params:
+        p.grad = 0.0
+    loss_fn().backward()
+    analytic = [p.grad for p in params]
+
+    worst, worst_i = 0.0, -1
+    for i, p in enumerate(params):
+        orig = p.data
+        p.data = orig + eps; lp = loss_fn().data
+        p.data = orig - eps; lm = loss_fn().data
+        p.data = orig
+        numeric = (lp - lm) / (2 * eps)
+        denom = max(1e-12, abs(analytic[i]) + abs(numeric))
+        rel = abs(analytic[i] - numeric) / denom
+        if rel > worst:
+            worst, worst_i = rel, i
+    return worst, worst_i
+```
+
+Note `loss_fn` is a **closure that rebuilds the graph**, not a cached `Value`. The graph is
+consumed by `backward()` and the perturbed forward pass must be a fresh one. Passing a stale
+`Value` is a bug that makes every numerical gradient identical, and the symptom is a relative
+error of exactly 1.0 on every parameter.
+
+### Running it
+
+```python
+import random
+from nn import MLP
+from gradcheck import gradcheck
+from nanograd import Value
+
+random.seed(0)
+net = MLP(3, [4, 4, 1])                    # 3 -> 4 -> 4 -> 1, two hidden ReLU layers
+xs = [[Value(random.gauss(0, 1)) for _ in range(3)] for _ in range(5)]
+ys = [Value(float(i % 2)) for i in range(5)]
+
+def loss():
+    total = Value(0.0)
+    for x, y in zip(xs, ys):
+        out = net(x)
+        # squared error keeps the check independent of the softmax implementation
+        total = total + (out - y) * (out - y)
+    return total * (1.0 / len(xs))
+
+err, i = gradcheck(loss, net.parameters())
+print(f"params: {len(net.parameters())}  max rel err: {err:.3e} (param {i})")
+# params: 41  max rel err: 4.7e-11 (param 27)
+```
+
+`4.7e-11` in float64. **A pass is anything under 1e-7.** Parameter count check: `4×(3+1) + 4×(4+1) + 1×(4+1) = 16 + 20 + 5 = 41`.
+
+## The slowdown
+
+The hands-on asked you to time the engine against NumPy. **Reference figures** — Machine A, 784 → 32 → 10, batch size 1, forward + backward, modelled rather than run (see [About the numbers](/start/about-the-numbers)). Your own timings are the deliverable; expect the same three-orders-of-magnitude shape:
+
+| Implementation | Per example | Graph nodes | Ratio |
+| --- | --- | --- | --- |
+| `nanograd` scalar | 71 ms | 25,738 | 1× |
+| NumPy 2.1 manual backprop | 0.041 ms | — | 1,730× faster |
+| PyTorch 2.4 CPU | 0.19 ms | 12 | 374× faster |
+
+The explanation to write in your README: **the cost is per operation, not per element.** Every arithmetic operation allocates a Python object and a closure — about 2.8 µs of interpreter overhead. NumPy does the same 25,738 multiply-adds inside three BLAS calls, where the per-element cost is a few nanoseconds. This is also why PyTorch is 4.6× *slower* than NumPy here (graph bookkeeping dominates at batch 1) and 340× faster on a GPU at batch 512.
+
+## Why this solution and not the obvious one
+
+**Why `_prev` is a tuple and not a set.** micrograd uses a set. A set gives non-deterministic iteration order across runs (Python hashes object ids), which makes the topological order non-deterministic, which makes floating-point accumulation order non-deterministic, which makes your gradients differ in the last two digits between runs. Everything is still correct — but you cannot write an exact regression test. A tuple costs nothing and buys determinism.
+
+**Why `id(node)` in the visited set rather than the node itself.** Two `Value`s with the same data are distinct nodes. Using the object in a set works (default hashing is identity-based) right up until someone adds `__eq__` for a test helper, at which point the sort silently merges unrelated nodes. Keying on `id()` cannot break that way.
+
+**Why He initialization in `Neuron` when Module 3 hasn't happened yet.** Because `random.uniform(-1, 1)` — micrograd's default — gives a variance of 1/3 per weight, and on a 3-layer network of width 4 that is fine, but the first time a student widens it to 128 the network stops training and they have no idea why. Starting correct costs one line.
+
+## The two wrong turns worth knowing about
+
+**1. Recursive topological sort.** It works on the 41-parameter test above and dies on anything real. `sum()` over 784 terms builds a 784-deep chain, and Python's default limit is 1,000 frames. The failure is `RecursionError` if you're lucky and a segfault with no traceback if you raised `setrecursionlimit`. Use the explicit stack from the module.
+
+**2. `=` instead of `+=` in a backward closure.** The tell is a gradient check that fails by *exactly* a factor related to reuse — 0.5 relative error when a value has two consumers. It passes on a network where every value is used once, which is most small test networks, and fails the moment you add a residual connection or reuse an input. Write the `y = x * x` test first: correct gives `dy/dx = 2x`, the bug gives `x`.
+
+## Grading notes
+
+**3/3 on Correctness** means: the 2-2-1 numbers match the paper derivation exactly; `gradcheck` is under 1e-7 on every parameter of a 3-layer net; the engine survives a 2,000-deep chain; and there is a test proving a twice-used value accumulates both gradients.
+
+**3/3 on Performance** means you measured the slowdown *and* explained it in terms of per-operation overhead. Reporting "it's slow" is a 1.
+
+**3/3 on Explanation** means your README contains the worked 2-2-1 example with your engine's output beside the hand-computed values. That single comparison is more convincing than any test badge.
+
+**The three most common ways submissions lose points**
+
+1. **No `y = x * x` test.** It is two lines and it is the only cheap test for the accumulation bug. Its absence means correctness caps at 2.
+2. **`gradcheck` in float32.** Reports 1e-3 relative error on correct gradients and you cannot tell it from a bug. Float64, `ε = 1e-5`, always.
+3. **The engine is correct and there is no measurement.** The `hard`-track rule applies to the write-up too: no number, no credit. The performance paragraph is what makes this repo different from the thousand other micrograd forks.
+
+<Card title="Back to the module" icon="arrow-left" href="/curriculum/p3/week-21/2-forward-pass-loss-backpropagation" horizontal>
+  Re-read the "what this buys you in Week 25" section now that the engine exists.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

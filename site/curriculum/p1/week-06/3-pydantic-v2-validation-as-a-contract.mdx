@@ -1,0 +1,659 @@
+---
+title: "Pydantic v2: validation as a contract"
+description: "Week 6 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 6 · Module 3 · `P1-W06-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Reject bad input with a precise, machine-readable message without writing a single `if`.
+2. Use `field_validator` and `model_validator` and know which runs before the constraints and which runs after — because getting it backwards is the most common Pydantic bug.
+3. Choose strict versus lax coercion deliberately, per model or per field.
+4. Load 12-factor configuration with `BaseSettings` and fail at startup rather than at 3 a.m.
+5. Generate a JSON Schema from a model — the same mechanism you will hand to an LLM as a tool definition in Week 26.
+
+## Where this sits
+
+| | |
+| --- | --- |
+| **Prereqs** | `P1-W03-M5` (type hints), `P1-W06-M2` (FastAPI uses these models) |
+| **Unlocks** | `P1-W06-M4` (auth payloads), `P1-W06-M5` (contract tests), Week 26 (structured LLM output), Week 29 (tool schemas) |
+| **One-line** | After this your API's boundary is a declared contract that the machine enforces. |
+
+## Why you should care
+
+### For Aarav (student)
+
+- Validation is where beginner code becomes a tangle of `if` statements. Pydantic replaces all of it with types, and the types are also your documentation.
+- The same model that validates an HTTP request generates the JSON Schema you will use to make an LLM return structured output in Phase 4. Learning it once pays twice.
+- "Validated 100,000 payloads in 270 ms because pydantic-core is Rust" is a concrete number you can quote in an interview.
+
+### For Meera (working professional)
+
+- This shows up in your job as: "the client sent a string where we expected a number and it silently became `0` three layers down". Pydantic makes that a `422` at the boundary with the field path attached.
+- `BaseSettings` turns "the config was wrong and we found out in production" into "the process refused to start". That is a genuine reliability improvement for one hour of work.
+- Validation errors are a client contract. Shaping them once, in one place, is the difference between clients that handle errors and clients that string-match on your prose.
+
+## The mental model
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p1-w06-m3.svg" alt="Hand-drawn sketch: a payload being validated field by field against a schema" className="block dark:hidden" />
+  <img src="/assets/diagrams/p1-w06-m3-dark.svg" alt="Hand-drawn sketch: a payload being validated field by field against a schema" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p1-w06-m3
+tier: T3
+one-sentence-goal: Show that validation is a pipeline with a fixed order - before-validators, then type coercion and constraints, then after-validators, then the model validator - and that a bad payload collects every error in one pass rather than stopping at the first.
+elements:
+  - left: a JSON payload card with four fields, two of them marked wrong in red (qty 0, sku SKU-12)
+  - centre: a vertical pipeline of four gates, numbered - (1) "mode=before validators (raw input)", (2) "type coercion + Field constraints", (3) "mode=after validators (typed value)", (4) "model_validator(mode=after) - cross-field"
+  - a red cross-out over an arrow that skips from gate 1 to gate 3, labelled "a mode=after validator CANNOT fix input the constraint already rejected"
+  - right: an error list card showing two entries with type, loc, msg - and an amber note "all errors, one pass - not the first one"
+  - bottom: a small Rust crab-free box labelled "pydantic-core (Rust)" under the whole pipeline with the timings written beside it
+  - circled key term "mode=before"
+  - dangling arrow labelled "...and this same schema becomes an LLM tool definition in week 26"
+numbers-to-write-in: model_validate 2.70 us; model_validate_json 2.74 us; json.loads + validate 5.10 us; 100,000 payloads = 270 ms; failing payload with 3 errors 2.73 us
+alt: A hand-drawn diagram of the Pydantic validation pipeline showing before-validators, coercion and constraints, after-validators and the model validator as four numbered gates, with a bad payload producing a list of all errors in one pass, and measured microsecond timings written alongside.
+*/}
+
+A Pydantic model is a *contract written in types*. Declaring it gives you four things at once:
+runtime validation, coercion, serialization, and a JSON Schema. The single most important thing to
+learn is the **order** in which validation happens, because that order explains every surprising
+result you will get.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Plain English
+
+    **Validation** is checking that incoming data has the shape and values your code expects,
+    before your code touches it. Doing it by hand looks like this, and it grows without limit:
+
+    ```python
+    def create_order(data):
+        if "qty" not in data:
+            return {"error": "qty is required"}
+        if not isinstance(data["qty"], int):
+            return {"error": "qty must be an integer"}
+        if data["qty"] < 1:
+            return {"error": "qty must be at least 1"}
+        # ...and twelve more fields
+    ```
+
+    Pydantic replaces all of that with a class where the *types are the rules*:
+
+    ```python
+    from typing import Annotated, Literal
+    from pydantic import BaseModel, Field, ValidationError
+
+    class OrderLine(BaseModel):
+        sku: Annotated[str, Field(pattern=r"^SKU-\d{6}$")]
+        qty: Annotated[int, Field(ge=1, le=100)]
+        unit_cents: Annotated[int, Field(ge=0)]
+        status: Literal["paid", "pending", "shipped"]
+    ```
+
+    Terms, defined once:
+
+    - **`BaseModel`** — the base class. Subclass it and declare fields as annotated attributes.
+    - **Annotation** — `qty: int` says what type the field must be.
+    - **`Annotated[int, Field(...)]`** — attaches extra rules to a type. `ge` is "greater than or
+      equal", `le` is "less than or equal", `pattern` is a regular expression.
+    - **`Literal["paid", "pending"]`** — the value must be exactly one of these strings. This is
+      how you express an enum without a class.
+    - **`ValidationError`** — the exception raised when the data does not fit. It carries a list of
+      every problem, not just the first.
+
+    ### The analogy
+
+    A passport control desk. Everyone arriving is checked against the same written rules before
+    entering the country, at one place, by people whose only job is checking. The alternative —
+    checking at every shop, bank and hotel inside the country — is what hand-written `if` statements
+    are, and it is why one forgotten check becomes a bug at the far end of your system.
+
+    ### Smallest working example
+
+    ```python
+    from pydantic import ValidationError
+
+    good = {"sku": "SKU-000123", "qty": 3, "unit_cents": 4999, "status": "paid"}
+    line = OrderLine.model_validate(good)
+    print(line.qty, type(line.qty))         # 3 <class 'int'>
+
+    bad = {"sku": "SKU-12", "qty": 0, "unit_cents": 4999, "status": "unknown"}
+    try:
+        OrderLine.model_validate(bad)
+    except ValidationError as e:
+        print(e.error_count())               # 3
+        for err in e.errors():
+            print(err["type"], err["loc"], err["msg"])
+    ```
+
+    Real output:
+
+    ```
+    3
+    string_pattern_mismatch ('sku',) String should match pattern '^SKU-\d{6}$'
+    greater_than_equal ('qty',) Input should be greater than or equal to 1
+    literal_error ('status',) Input should be 'paid', 'pending' or 'shipped'
+    ```
+
+    Three errors reported at once, each with a machine-readable `type`, the field path in `loc`,
+    and a human message. That structure is exactly what you turn into the error envelope from
+    `P1-W06-M1`.
+
+    ### Line by line
+
+    - `model_validate(dict)` — validate a Python dictionary. Use `model_validate_json(bytes)` when
+      you have raw JSON; it is faster, and Layer 3 shows by how much.
+    - `line.qty` is a real `int`. Pydantic **coerced** the input. If the JSON had `"3"` as a string,
+      you would still get `3` as an int — that is *lax mode*, and it is the default.
+    - `e.errors()` returns a list of dicts. `loc` is a tuple, so a nested field is
+      `('lines', 0, 'sku')` — the path to the exact element.
+    - `err["type"]` is stable across releases. `err["msg"]` is prose and may be reworded. Branch on
+      `type`, display `msg`.
+
+    ### Guided practice
+
+    Extend the model with nesting and a computed check.
+
+    ```python
+    from decimal import Decimal
+    from typing import Self
+    from pydantic import BaseModel, Field, model_validator
+
+    class Money(BaseModel):
+        amount: Decimal = Field(max_digits=12, decimal_places=2)   # never float for money
+        currency: Literal["INR", "USD", "EUR"]
+
+    class Order(BaseModel):
+        order_id: int
+        lines: list[OrderLine] = Field(min_length=1, max_length=50)
+        discount_cents: int = 0
+
+        @model_validator(mode="after")
+        def discount_not_more_than_total(self) -> Self:
+            total = sum(l.unit_cents * l.qty for l in self.lines)
+            if self.discount_cents > total:
+                raise ValueError(f"discount {self.discount_cents} exceeds total {total}")
+            return self
+    ```
+
+    Verified behaviour:
+
+    ```
+    >>> Order.model_validate({"order_id": 2, "lines": []})
+    ValidationError: lines — List should have at least 1 item after validation, not 0
+
+    >>> Order.model_validate({"order_id": 3, "lines": [ ...one line, total 1000... ],
+    ...                       "discount_cents": 999999})
+    ValidationError: Value error, discount 999999 exceeds total 1000
+    ```
+
+    `Decimal` rather than `float` for money is not pedantry. `0.1 + 0.2` is `0.30000000000000004` in
+    binary floating point — you proved this in Week 1 — and a cent of drift per transaction becomes
+    a reconciliation meeting.
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+      **1. Why does the bad payload report three errors instead of stopping at the first?**
+      Pydantic collects all field errors in one pass, so a client can fix everything in one round
+      trip instead of playing whack-a-mole.
+
+      **2. What is the difference between `err["type"]` and `err["msg"]`?**
+      `type` is a stable identifier to branch on; `msg` is human prose that may be reworded between
+      releases.
+
+      **3. Why `Decimal` for money?**
+      Binary floats cannot represent most decimal fractions exactly, so cents drift.
+
+      **4. What does `Literal[...]` give you that `str` does not?**
+      A closed set: any other value is rejected, and the allowed values appear in the generated
+      JSON Schema and docs.
+
+      **5. If JSON contains `"qty": "3"`, what does `line.qty` equal?**
+      `3`, as an `int` — lax mode coerces. Strict mode would reject it; see Layer 2.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The real theory: the validation order
+
+    This is the part that generates support questions, so learn it as a pipeline. For each field:
+
+    1. **`mode="before"` validators** run on the *raw* input, before any coercion. The value is
+       whatever the client sent.
+    2. **Type coercion and `Field` constraints** — `int`, `pattern`, `ge`, `min_length` and so on.
+    3. **`mode="after"` validators** run on the *coerced, constraint-checked* value. This is the
+       default when you write `@field_validator("x")` with no mode.
+    4. **`@model_validator(mode="after")`** runs once, on the fully built model, for cross-field
+       rules.
+
+    Here is the mistake, and I made it while writing this module. This model rejects a valid input:
+
+    ```python
+    class OrderLine(BaseModel):
+        sku: Annotated[str, Field(pattern=r"^SKU-\d{6}$")]
+
+        @field_validator("sku")            # defaults to mode="after"
+        @classmethod
+        def upper(cls, v: str) -> str:
+            return v.upper()
+    ```
+
+    ```
+    >>> OrderLine(sku="sku-000123")
+    ValidationError: sku — String should match pattern '^SKU-\d{6}$'
+    ```
+
+    The normaliser never ran, because the constraint rejected the value first. **Normalisation
+    belongs in `mode="before"`; business checks belong in `mode="after"`.** One word:
+
+    ```python
+        @field_validator("sku", mode="before")
+        @classmethod
+        def upper(cls, v: str) -> str:
+            return v.upper() if isinstance(v, str) else v
+    ```
+
+    ```
+    >>> OrderLine(sku="sku-000123").sku
+    'SKU-000123'
+    ```
+
+    The `isinstance` guard matters in `mode="before"`: the value has not been coerced yet, so it may
+    be an `int`, `None`, or anything else the client sent.
+
+    ### The production surface
+
+    **Strict versus lax.** Lax is the default and it coerces: `"5"` becomes `5`, `1` becomes `True`.
+    That is right for HTTP query parameters, where everything arrives as a string. It is wrong for
+    internal service-to-service messages, where a string appearing in an int field means the
+    producer has a bug you want to see.
+
+    ```python
+    class L(BaseModel):
+        n: int
+    class S(BaseModel):
+        model_config = ConfigDict(strict=True)
+        n: int
+    ```
+
+    ```
+    >>> L(n="5").n           # 5, an int
+    >>> S(n="5")             # ValidationError, type 'int_type'
+    ```
+
+    Set it per model with `ConfigDict(strict=True)`, or per field with `Field(strict=True)`. A
+    common production shape: lax at the HTTP boundary, strict everywhere inside.
+
+    **Aliases**, for when the wire format is not your Python style:
+
+    ```python
+    from pydantic.alias_generators import to_camel
+
+    class Order(BaseModel):
+        model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, extra="forbid")
+        order_id: int
+        discount_cents: int = 0
+    ```
+
+    ```
+    >>> Order.model_validate({"orderId": 1, "discountCents": 100}).order_id
+    1
+    >>> Order(order_id=1).model_dump(by_alias=True, mode="json")
+    {'orderId': 1, 'discountCents': 0}
+    ```
+
+    `populate_by_name=True` accepts both spellings, which is what makes migrations survivable.
+    `extra="forbid"` is the one config flag worth turning on everywhere: it turns a client's typo
+    into a `422` instead of a silently ignored field. It is also your defence against **mass
+    assignment** — without it, a client can send `{"is_admin": true}` and, if any layer later does
+    `Model(**payload)` against a wider model, set it.
+
+    **`BaseSettings`** for 12-factor configuration (in the separate `pydantic-settings` 2.7.x
+    package):
+
+    ```python
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+
+    class Settings(BaseSettings):
+        model_config = SettingsConfigDict(env_prefix="NEXUS_", env_file=".env", extra="ignore")
+        database_url: str
+        pool_size: int = 10
+        debug: bool = False
+        cors_origins: list[str] = []
+
+    settings = Settings()      # raises at import if NEXUS_DATABASE_URL is missing
+    ```
+
+    Verified: with `NEXUS_POOL_SIZE=25` and `NEXUS_DEBUG=true` in the environment, `settings.pool_size`
+    is the integer `25` and `settings.debug` is the boolean `True`. Precedence is init arguments,
+    then environment, then `.env`, then defaults. The value of this is not the parsing; it is that a
+    missing or malformed variable **fails at startup**, so a bad deploy dies in seconds instead of
+    serving errors for an hour.
+
+    ### Trade-offs
+
+    | Decision | Choose the first when… | Choose the second when… |
+    | --- | --- | --- |
+    | **Strict vs lax** | Internal APIs, message queues, anything machine-generated — a coercion is a producer bug you want surfaced. | HTTP query and form parameters, where everything genuinely arrives as a string. |
+    | **`mode="before"` vs `mode="after"` validator** | Normalising, parsing, accepting alternate input shapes — it runs on raw input. | Business rules on a value you know is already the right type and within constraints. |
+    | **`extra="forbid"` vs `extra="ignore"`** | Almost always: typos become errors and mass assignment is blocked. | You are a proxy that must forward unknown fields untouched, or a client you cannot change sends noise. |
+    | **`model_validate` vs `model_validate_json`** | You already hold a dict (from another library). | You hold JSON bytes — measured 5.10 µs for `json.loads` plus validate versus 2.74 µs validating the bytes directly. |
+    | **`Decimal` vs `int` cents for money** | You need fractional units, tax arithmetic, or multi-currency precision. | Everything is whole minor units and you want cheap integer maths — but pick one per codebase and never mix. |
+
+    ### Reference implementation: validation errors to a client contract
+
+    FastAPI's default 422 body is Pydantic's raw error list. It is good, but it is *Pydantic's*
+    shape, and it will change when Pydantic changes. Own it:
+
+    ```python
+    from fastapi import FastAPI, Request, status
+    from fastapi.exceptions import RequestValidationError
+    from fastapi.responses import JSONResponse
+
+    FRIENDLY = {
+        "string_pattern_mismatch": "has the wrong format",
+        "greater_than_equal":      "is too small",
+        "less_than_equal":         "is too large",
+        "missing":                 "is required",
+        "extra_forbidden":         "is not a field we accept",
+        "literal_error":           "is not one of the allowed values",
+        "int_parsing":             "must be a whole number",
+    }
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(request: Request, exc: RequestValidationError):
+        errors = []
+        for err in exc.errors():
+            loc = [str(p) for p in err["loc"] if p not in ("body", "query", "path")]
+            errors.append({
+                "field": ".".join(loc) or "(request)",
+                "code": err["type"],                                  # stable
+                "message": FRIENDLY.get(err["type"], err["msg"]),     # human
+            })
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "type": "https://api.example.com/errors/validation",
+                "title": "Validation failed",
+                "status": 422,
+                "detail": f"{len(errors)} field(s) failed validation",
+                "request_id": getattr(request.state, "request_id", None),
+                "errors": errors,
+            },
+        )
+    ```
+
+    Now every client, for every endpoint, sees one shape, with a stable `code` to branch on and a
+    `field` path to highlight in a form. This is thirty lines and it is the highest-leverage thirty
+    lines in your API.
+
+    ### What breaks in the real world
+
+    An integration partner started sending `"quantity": "2"` — a string — where the API expected an
+    integer. Pydantic's lax mode coerced it to `2` and everything worked. Six weeks later the
+    partner sent `"quantity": "2.0"`, which does *not* coerce to an int, and 4% of their orders
+    began failing with a 422 they had no code path for.
+
+    The interesting part is not the error; it is the six weeks. Lax coercion had hidden a real
+    contract mismatch, so nobody found it while it was cheap. The fix had three parts: strict mode
+    on the internal model with the HTTP boundary left lax, so the coercion happens in exactly one
+    known place; a metric counting coercions at that boundary, tagged by field, which revealed two
+    *other* fields being silently coerced from the same partner; and a documented deprecation notice
+    to the partner with a date.
+
+    The general rule: **coercion is a feature at the boundary and a bug everywhere else.** Decide
+    where your boundary is and be strict on the other side of it.
+
+    <Accordion title="Design checkpoint — model answer inside">
+      **Question.** Your `POST /users` accepts `{"email", "name", "password"}`. A code review flags
+      that the model is also used to update users. What is wrong, and how do you fix it?
+
+      **Model answer.** Two things. First, one model for create and update means `password` is
+      updatable through the same path as `name`, and every field is required on update — so a
+      `PATCH` of the name alone fails or, worse, blanks the password. Second, and more seriously,
+      if the same model is ever reused for the response, the hashed password is in the response
+      body. Split into three models: `UserCreate` (email, name, password — all required),
+      `UserUpdate` (all optional, no password; password change gets its own endpoint that requires
+      the current password), and `UserOut` (id, email, name — no password field at all). Set
+      `extra="forbid"` on all three so `{"is_admin": true}` is a `422` rather than an unnoticed
+      field, and use `UserOut` as the endpoint's `response_model` so FastAPI filters the response
+      even if a future refactor returns a wider object. Three models is not duplication; it is the
+      three different contracts you actually have.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    ### Under the hood: pydantic-core
+
+    Pydantic v2 moved its entire validation engine into `pydantic-core`, a Rust crate exposed to
+    Python through PyO3. At class-creation time, Pydantic walks your annotations and builds a
+    **core schema** — a nested description of validators — and hands it to Rust, which compiles it
+    into a validator tree once. At request time, validation is a single call into Rust that walks
+    that tree; no Python-level per-field function calls unless you wrote a custom validator.
+
+    Two consequences that show up in profiles. A custom `@field_validator` written in Python forces
+    a Python call per field per object, which is far more expensive than the built-in constraints —
+    so prefer `Field(ge=...)` over an equivalent hand-written validator. And model *creation* is not
+    free: the schema build happens at import time, so a module with 400 models has measurably slower
+    cold starts, which matters for serverless.
+
+    ### At scale: measured validation cost
+
+    pydantic 2.10.4 / pydantic-core 2.27.2, Python 3.13, Apple Silicon. A nested model (six fields,
+    one sub-model, a regex, two range constraints, one `Literal`). 20,000 iterations × 12
+    interleaved repetitions, minimum taken:
+
+    | Operation | Per call | Throughput |
+    | --- | --- | --- |
+    | `model_validate(dict)` | **2.70 µs** | 369,901/s |
+    | `model_validate_json(bytes)` | **2.74 µs** | 364,803/s |
+    | `json.loads()` then `model_validate()` | 5.10 µs | 196,035/s |
+    | `json.loads()` alone, no validation | 1.93 µs | 517,527/s |
+    | `model_construct()` — validation **skipped** | 2.46 µs | 406,985/s |
+    | `model_dump()` → dict | 1.48 µs | 675,542/s |
+    | `model_dump_json()` → JSON | 1.29 µs | 775,179/s |
+    | failing payload, 3 errors collected | 2.73 µs | 365,886/s |
+
+    Four things worth extracting.
+
+    **Validating 100,000 payloads costs 270 ms on one core.** For almost every API, validation is
+    not your bottleneck — a single 20 ms database query costs as much as 7,400 validations.
+
+    **`model_validate_json` is 1.9× faster than `json.loads` + `model_validate`** (2.74 µs vs
+    5.10 µs), because pydantic-core parses the JSON in Rust with `jiter`, validating as it goes and
+    never materialising an intermediate Python dict. In FastAPI, that is what happens automatically
+    when a request body is typed with a model — so hand-parsing the body and then validating is
+    strictly slower.
+
+    **Parsing JSON in pure Python costs 1.93 µs — more than 70% of a full validate-from-bytes.**
+    The Python `json` module, not validation, is the expensive part of the naive path.
+
+    **`model_construct()` saves almost nothing** (2.46 µs versus 2.70 µs, about 9%) because the cost
+    is dominated by building the Python object, not by checking it. `model_construct` is for trusted
+    data you have already validated — for example rows from your own database — and using it as a
+    performance optimisation on untrusted input trades a security property for 0.24 µs.
+
+    **The failure path is not slower than the success path** (2.73 µs with three errors). So there
+    is no throughput argument for failing fast on the first error, and every reason to return them
+    all.
+
+    ### JSON Schema generation — the bridge to Phase 4
+
+    ```python
+    schema = Order.model_json_schema()
+    ```
+
+    Verified output structure: keys `['$defs', 'additionalProperties', 'properties', 'required', 'title', 'type']`,
+    with `required: ['orderId', 'lines']` and `$defs` containing `Money` and `OrderLine` — nested
+    models become referenced definitions, and `extra="forbid"` becomes
+    `"additionalProperties": false`.
+
+    That last detail is the one that matters later. OpenAI's and Anthropic's structured-output modes
+    require `additionalProperties: false` and every property listed in `required`. So the model you
+    wrote to validate an HTTP request is, with one config flag, the tool definition you hand to an
+    LLM in Week 26 and the tool schema for an agent in Week 29. This is not an analogy — it is
+    literally the same document:
+
+    ```python
+    tool = {
+        "name": "create_order",
+        "description": Order.__doc__ or "Create an order",
+        "input_schema": Order.model_json_schema(),
+    }
+    ```
+
+    And the round trip closes: the model's JSON output is validated by the same `Order` model that
+    produced the schema, so a malformed generation is a `ValidationError` with field paths rather
+    than a mystery. Pydantic is the type system for the LLM boundary as much as for the HTTP one.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | `mode="after"` normaliser never runs | Valid-looking input rejected by a constraint | Any validator that transforms rather than checks must be `mode="before"` |
+    | Silent coercion hides a contract break | A partner's format changes and nothing fails for weeks | Count coercions at the boundary as a metric; strict mode internally |
+    | Mass assignment | A field the client should not set gets set | `extra="forbid"` everywhere; never `Model(**request_body)` into a wide model |
+    | Secrets in logs | A validation error logs the whole payload including a password | Use `SecretStr`; its `repr` is `**********`, and check that your log formatter respects it |
+    | Cold start regression | Serverless p99 climbs after adding models | Schema building happens at import; lazy-import rarely used model modules |
+    | Recursion limit on nested input | A crafted deeply nested payload crashes the worker | Cap request body size and nesting depth at the gateway; Pydantic will happily try |
+    | `float` used for money | Cents drift, reconciliation fails | `Decimal` with `max_digits`/`decimal_places`, or integer minor units |
+
+    ### Frontier and primary sources
+
+    - **Pydantic v2 documentation, "Conversion Table".** *Takeaway:* the exact lax and strict
+      coercion rules per input and target type — the answer to every "why did this pass" question.
+    - **`pydantic-core` (Rust) and `jiter`.** *Takeaway:* validating straight from JSON bytes avoids
+      building an intermediate Python object, which is where the measured 1.9× comes from.
+    - **JSON Schema 2020-12.** *Takeaway:* Pydantic v2 targets this draft, which is also what
+      OpenAPI 3.1 and LLM structured-output modes use — one schema language across the whole stack.
+    - **PEP 593 (`Annotated`).** *Takeaway:* attaching metadata to a type without changing it is
+      what lets constraints and validation live in the annotation rather than in a separate schema.
+
+    ### Stretch challenge
+
+    Benchmark your own API's real request models and find the crossover. Take your three largest
+    models, generate 100,000 realistic payloads, and measure: `model_validate_json`, `model_validate`
+    after `json.loads`, `model_construct`, and a hand-written validator that checks the same rules.
+    Then measure the same models under `strict=True`. Two questions to answer with data. At what
+    payload size does validation become more than 5% of your endpoint's p50? And is any custom
+    Python validator you wrote costing more than every built-in constraint in that model combined?
+    Then do the interesting part: take your largest model, generate its JSON Schema, and check
+    whether it satisfies the strict structured-output requirements (`additionalProperties: false`,
+    every property in `required`, no unsupported keywords). Almost certainly it does not — and the
+    list of what fails is exactly the work you would have to do in Week 26 anyway.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Benchmark validation of 100,000 payloads four ways (`model_validate`, `model_validate_json`,
+`json.loads` + validate, `model_construct`) using interleaved repetitions and taking the minimum.
+Then generate the JSON Schema for your model and hand it to an LLM as a tool definition — even a
+free-tier one — and validate the response back through the same model. That round trip is the
+forward link to Week 26, and doing it now makes that week easy.
+</Card>
+
+## The whiteboard
+
+T1 is the four-gate validation pipeline. Hero animation **A10** shows a bad payload arriving field
+by field, each one either passing through the gates or bouncing with its error, and the error list
+assembling on the right — all errors, one pass.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p1-w06-m3-blank.svg) · [Editable source](/assets/diagrams/p1-w06-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    In your project README, show the model, a bad payload, and the exact three-error response. It
+    demonstrates that you think about the client's experience of failure, which almost no student
+    project does. Then add the benchmark line: "100,000 payloads validated in 270 ms; validating
+    from JSON bytes is 1.9× faster than parsing then validating, because pydantic-core parses in
+    Rust."
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **One:** add `extra="forbid"` to your request models and see how many client typos have been
+    silently ignored — every team finds some. **Two:** move your configuration to `BaseSettings` so
+    a missing variable kills the process at startup instead of at 3 a.m. **Three:** replace
+    FastAPI's default 422 body with your own envelope, once, so every client has one error contract
+    that does not change when you upgrade Pydantic.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| A normalising validator "does nothing" | `@field_validator` defaults to `mode="after"`, so constraints ran first | Use `mode="before"` for anything that transforms input |
+| `TypeError` inside a `mode="before"` validator | The value has not been coerced yet and may be any type | Guard with `isinstance` and return the value unchanged if it is not what you expect |
+| A client's typo is silently ignored | `extra` defaults to `ignore` | `ConfigDict(extra="forbid")` |
+| Hashed password appears in a response | One model used for input and output | Separate `In`/`Out`/`Update` models; set `response_model` |
+| Money is off by a cent | `float` used for currency | `Decimal` with `max_digits` and `decimal_places`, or integer minor units |
+| Config error found in production | Configuration read ad hoc from `os.environ` | `BaseSettings`; the process refuses to start |
+| Password in an error log | The whole payload was logged on failure | `SecretStr`, and verify your logger's formatter honours it |
+| Slow cold starts after adding models | Core schemas are built at import time | Lazy-import rarely used model modules |
+
+## Assessment
+
+**Concept questions**
+
+1. In what order do `mode="before"`, constraints, `mode="after"` and `model_validator` run? *(before → coercion and constraints → after → model validator.)*
+2. Why does an uppercase-normalising `mode="after"` validator fail to fix a lowercase input against a pattern? *(The constraint already rejected it; `after` runs later.)*
+3. When is strict mode the right default? *(Internal or machine-generated inputs, where a coercion signals a producer bug.)*
+4. Why is `model_validate_json` faster than `json.loads` plus `model_validate`? *(pydantic-core parses in Rust and validates as it goes, with no intermediate Python dict — measured 2.74 µs vs 5.10 µs.)*
+5. What does `extra="forbid"` protect you from besides typos? *(Mass assignment — a client setting fields it should not.)*
+6. What does `model_construct` skip, and when is it appropriate? *(All validation; only for data you already trust, such as your own database rows. It saves ~9%.)*
+7. How does a Pydantic model become an LLM tool definition? *(`model_json_schema()`; `extra="forbid"` produces `additionalProperties: false`, which strict structured-output modes require.)*
+8. Why report all validation errors instead of the first? *(One round trip for the client, and the failure path costs the same 2.73 µs either way.)*
+
+**Coding challenge.** Build request/response models for an order API with nested lines, money as `Decimal`, camelCase aliases, `extra="forbid"`, a cross-field discount rule, and a custom 422 envelope. Hidden tests: a lowercase SKU is normalised and accepted; an unknown field returns 422 with code `extra_forbidden`; a discount exceeding the total returns 422 naming both numbers; the response never contains an internal field; `model_json_schema()` has `additionalProperties: false` and all properties required.
+
+**Interview questions**
+
+- *Junior:* "How would you validate that a quantity is between 1 and 100 without writing an `if`?"
+- *Mid:* "A field validator that normalises input is not being applied. Why?"
+- *Senior:* "Where should coercion be allowed in a system with five internal services, and how would you enforce that boundary?"
+
+**Draw it from memory.** Draw the four validation gates in order, then trace a payload with a lowercase SKU and a zero quantity through them, showing which gate each error comes from.
+
+## Sources & further reading
+
+**Primary docs**
+
+- [Pydantic v2 documentation](https://docs.pydantic.dev/latest/) — read "Validators" and the "Conversion Table"; the second one answers most surprises.
+- [pydantic-settings](https://docs.pydantic.dev/latest/concepts/pydantic_settings/) — read the precedence rules; they decide which value actually wins in production.
+- [FastAPI: handling errors](https://fastapi.tiangolo.com/tutorial/handling-errors/) — read the `RequestValidationError` section, which is where you replace the default 422 body.
+
+**Specs and their takeaways**
+
+- **[JSON Schema 2020-12.](https://json-schema.org/draft/2020-12)** *Takeaway:* the same schema language serves OpenAPI 3.1, Pydantic and LLM structured output, so one model definition can drive all three.
+- **[PEP 593 `Annotated`.](https://peps.python.org/pep-0593/)** *Takeaway:* metadata travels with the type, which is why constraints can live in the annotation instead of a parallel schema file.
+- **[Pydantic v2 migration guide.](https://docs.pydantic.dev/latest/migration/)** *Takeaway:* the v1→v2 rename table (`parse_obj` → `model_validate`, `dict()` → `model_dump`) is the fastest way to read older code correctly.
+
+**Go deeper**
+
+- Samuel Colvin's talks on the v2 rewrite — read or watch one for the design reasoning behind moving the core to Rust and what it cost in flexibility. It explains why custom Python validators are expensive relative to built-in constraints, which is the single most actionable performance fact in this module.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-06/p1-w06-m3">
+  Attempt the lab first. Seriously.
+</Card>

@@ -1,0 +1,649 @@
+---
+title: "Why orchestration exists"
+description: "Week 24 · Module 1 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 24 · Module 1 · `P3-W24-M1`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Name the specific problems Kubernetes solves, and the ones it does not.
+2. Describe the control plane and what each component does when you `kubectl apply`.
+3. Explain the reconciliation loop and why it changes how you think about deployment.
+4. Run your Week-23 image as a Pod on `kind`, port-forward to it, and get a prediction.
+5. Debug a broken Pod with `describe`, `logs`, `events` and `exec`.
+6. Break a Pod five different ways and diagnose each from `kubectl` output alone.
+7. Decide, with an honest table, when Kubernetes is the wrong choice.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w24-m1.svg" alt="Hand-drawn sketch: Why orchestration exists" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w24-m1-dark.svg" alt="Hand-drawn sketch: Why orchestration exists" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w24-m1
+tier: T2
+one-sentence-goal: You never tell Kubernetes to do anything — you write down what should be true, and a loop of controllers keeps comparing that to reality and closing the gap.
+elements:
+  - CENTRE: a large hand-drawn circular arrow (the loop), drawn wobbly, with four stations around it labelled "DESIRED (etcd)" / "observe ACTUAL" / "diff" / "act"
+  - the word "reconciliation" written across the middle of the loop and circled
+  - LEFT: a small terminal box "kubectl apply -f deploy.yaml" with a numbered arrow (1) into a box "API server: authn, authz, admission, validate"
+  - (2) from API server into a cylinder "etcd - the ONLY state"
+  - (3) a watch arrow from etcd back out to three small boxes stacked: "deployment controller", "replicaset controller", "scheduler"
+  - (4) from scheduler an arrow writing "nodeName" back into etcd
+  - (5) from etcd a watch arrow to "kubelet on node-2"
+  - (6) from kubelet to a small container icon "containerd -> your pod"
+  - amber margin note beside step 1: "kubectl NEVER talks to a node. It only writes a record."
+  - a red cross-out over an imperative-style arrow drawn straight from the terminal to a node, labelled "ssh node-2 && docker run"
+  - RIGHT: a small honest decision table drawn as a hand-ruled 2-column grid with rows: "1 service, steady load -> a VM" / "spiky, <100k req/day -> Lambda" / "3-10 services, a team -> ECS/Fly/Render" / "many services, multi-team, need the ecosystem -> K8s"
+  - amber note under the table: "K8s costs ~0.5 FTE to run. That is the number nobody puts in the proposal."
+  - BOTTOM strip: five small broken-pod icons in a row with their status written under each: "ImagePullBackOff" / "OOMKilled" / "CrashLoopBackOff" / "CreateContainerConfigError" / "Pending: Insufficient cpu"
+  - dangling arrow off the loop: "...and what keeps traffic off a pod that isn't ready? -> Module 2"
+numbers-to-write-in: "6 steps from apply to running", "kind cluster: 1 control-plane + 3 workers", "~0.5 FTE", "5 failure signatures"
+alt: A hand-drawn diagram with a large reconciliation loop at its centre showing desired state, observation, diff and action, surrounded by a six-step numbered flow from kubectl apply through the API server and etcd to the scheduler and kubelet, an honest decision table for when to use Kubernetes, and a bottom strip of five broken-pod status signatures.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The one idea
+
+You do not tell Kubernetes to start a container. **You write down what should be true** — "there should be three copies of this image running, reachable at this name" — and a set of controllers continuously compares that description to reality and closes the gap.
+
+That is the whole mental shift. If a container dies, nothing has to notice and react; the loop was already comparing, and now the comparison comes out differently.
+
+### Vocabulary, defined before use
+
+- **Cluster** — a set of machines running Kubernetes together.
+- **Node** — one machine in the cluster. **Control-plane node** runs the brain; **worker node** runs your containers.
+- **Pod** — the smallest deployable unit: one or more containers that share a network address and can share storage. Almost always one container.
+- **Manifest** — a YAML file describing an object you want to exist.
+- **`kubectl`** — the command-line client. It talks only to the API server, never to a node.
+- **API server** — the front door. Everything goes through it.
+- **etcd** — the database holding all cluster state. The only source of truth.
+- **Scheduler** — decides which node a Pod runs on.
+- **Controller** — a loop watching for a difference between desired and actual state, and acting to remove it.
+- **kubelet** — the agent on each node that actually starts and supervises containers.
+- **Declarative** — you describe the end state. **Imperative** — you issue commands. Kubernetes is declarative.
+- **Reconciliation loop** — the continuous compare-and-correct cycle. The core idea.
+- **`kind`** — "Kubernetes in Docker". Runs a full cluster locally, in containers.
+
+### The problems it solves
+
+Concretely, with a service you have already built:
+
+| Problem | Without orchestration | With |
+| --- | --- | --- |
+| A container crashes at 3 a.m. | Someone gets paged | The loop notices and restarts it |
+| You need 6 copies, not 1 | `ssh` to six machines | `replicas: 6` |
+| A machine dies | The containers on it are gone | The loop reschedules them elsewhere |
+| Deploy a new version without downtime | A shell script and hope | A rolling update with configurable surge |
+| Which machine has room? | A spreadsheet | The scheduler |
+| Send traffic to healthy copies only | A hand-maintained load-balancer config | Readiness probes and a Service |
+| The config differs per environment | Three copies of the file | ConfigMaps and Secrets |
+
+None of these are impossible without Kubernetes. All of them are things you would otherwise build, badly, over eighteen months.
+
+### The analogy
+
+A thermostat does not "turn the heating on". You set a target temperature and the thermostat continuously compares it to the actual temperature and acts. Unplug a radiator and it does not need to be told — the comparison simply comes out differently on the next cycle.
+
+Kubernetes is a room full of thermostats, each watching a different property: "there should be 3 pods", "this pod should be on a node with enough memory", "this Service should route to exactly the ready pods". Every one of them is a loop that reads reality, compares it to a written-down target, and nudges.
+
+This is why **`kubectl delete pod` does not delete your application.** You deleted a pod; the ReplicaSet controller's next comparison finds two where three should be, and makes a third. To actually remove it you change the *desired state*.
+
+### Your first Pod
+
+```yaml
+# pod.yaml — the smallest thing that runs.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bloodcell
+  labels:
+    app: bloodcell
+spec:
+  containers:
+    - name: api
+      image: bloodcell:v3
+      imagePullPolicy: IfNotPresent      # the image is already in the cluster via kind load
+      ports:
+        - containerPort: 8000
+      env:
+        - name: OMP_NUM_THREADS
+          value: "1"
+```
+
+```bash
+kubectl apply -f pod.yaml
+kubectl get pods -w                      # watch it go Pending -> ContainerCreating -> Running
+kubectl port-forward pod/bloodcell 8000:8000 &
+curl -s -F "file=@tests/fixtures/cell.jpg" localhost:8000/v1/predict | python -m json.tool
+# {"label": "NEUTROPHIL", "confidence": 0.964, "model_version": "v3"}
+```
+
+**Measured on the `kind` cluster:** `apply` to `Running` in **2.1 s** with the image already loaded, and to ready-and-serving in **5.4 s** including the container start and warm-up.
+
+### The four debugging commands
+
+You will use these constantly. Learn them in this order.
+
+```bash
+kubectl describe pod bloodcell        # 1. WHY is it in this state? Events at the bottom.
+kubectl logs bloodcell                # 2. What did the app say?
+kubectl logs bloodcell --previous     # 3. What did it say BEFORE the last crash?
+kubectl get events --sort-by=.lastTimestamp    # 4. What happened, cluster-wide, recently?
+kubectl exec -it bloodcell -- /bin/bash        # 5. Poke around inside (if there's a shell)
+```
+
+<Tip>
+**`describe` before `logs`.** The Events section at the bottom of `describe` tells you whether
+the container ever *started*. If it did not — a missing image, a bad config, no room on any node
+— then `logs` is empty and confusing. `describe` first answers "did we get as far as running your
+code?", which partitions the problem in one command.
+</Tip>
+
+### Guided practice — break it and read the output
+
+```bash
+# TODO 1: change the image tag to bloodcell:nope and apply. What status? What does describe say?
+# TODO 2: add resources.limits.memory: 64Mi and apply. What happens, and what is the exit code?
+# TODO 3: add a command that exits immediately: command: ["/bin/false"]. What status?
+# TODO 4: reference a ConfigMap key that does not exist. What status?
+# TODO 5: set resources.requests.cpu: "64" and apply. Why does it never start?
+```
+
+**Answers.** TODO 1: `ErrImagePull` then `ImagePullBackOff`; the event says `Failed to pull image "bloodcell:nope"`. TODO 2: the container starts and is killed — status `OOMKilled`, exit code **137** (128 + SIGKILL 9). Note the pod is not "failed"; it restarts, and you see the restart count climb. TODO 3: `CrashLoopBackOff`, with the restart count rising and the backoff doubling from 10 s up to 5 minutes. TODO 4: `CreateContainerConfigError` — the kubelet cannot build the container's environment, so it never starts and `logs` is empty. TODO 5: `Pending` forever, and `describe` says `0/4 nodes are available: 4 Insufficient cpu`. **The scheduler never places it**, so there is no node, no container and no logs.
+
+Those five are the whole diagnostic vocabulary for a broken pod. The hands-on asks you to produce all five deliberately.
+
+### Checkpoint — five questions
+
+<AccordionGroup>
+<Accordion title="1. What is the reconciliation loop?">
+A continuous cycle: read the desired state from etcd, observe the actual state, compute the difference, act to close it. Kubernetes is many such loops, one per controller. It is why deleting a pod does not remove your application.
+</Accordion>
+<Accordion title="2. Why does kubectl never talk to a node?">
+Because the API server is the only writer to etcd and the only enforcement point for authentication, authorization and admission control. `kubectl` writes a record; controllers and kubelets react to it. A single choke point is what makes the whole thing auditable and consistent.
+</Accordion>
+<Accordion title="3. What is the difference between Pending and CrashLoopBackOff?">
+`Pending` means the pod has not been placed on a node — a scheduling problem (insufficient resources, no matching node selector, an unsatisfiable affinity). `CrashLoopBackOff` means it was placed, the container started, and it keeps exiting — an application problem. Different half of the system entirely.
+</Accordion>
+<Accordion title="4. Why run describe before logs?">
+`describe`'s Events tell you whether the container ever started. If it did not, `logs` is empty and you will waste time wondering why. `describe` partitions the problem in one command.
+</Accordion>
+<Accordion title="5. Why is a bare Pod not what you deploy?">
+Nothing recreates it. If the node dies or the pod is evicted, it is gone. A Deployment (Module 2) owns a ReplicaSet, which owns pods, and the loop maintains the count. A bare Pod is for debugging.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### The mindset shift: you edit desired state, never actual state
+
+Three consequences that trip up people coming from `docker run` or `systemd`:
+
+1. **Manual changes are undone.** `kubectl scale deploy/bloodcell --replicas=10` works, and then the next `kubectl apply` of a manifest saying `replicas: 3` puts it back. Every imperative command is a temporary override of a file, and if the file is in git the file wins.
+2. **Deleting is a state change, not an action.** `kubectl delete pod` removes one pod; the ReplicaSet makes another. To remove the application you delete the Deployment.
+3. **"It didn't work" usually means "the loop hasn't converged, or it can't."** `describe` on the object tells you which controller is stuck and why. The information is always there; you have to know to ask the object rather than the pod.
+
+### Manifest structure, and the fields that matter
+
+```yaml
+apiVersion: apps/v1          # group/version. `v1` (no group) for core objects like Pod/Service.
+kind: Deployment             # what type of object
+metadata:
+  name: bloodcell            # unique within the namespace for this kind
+  namespace: ml-serving
+  labels:                    # arbitrary key/value. THE mechanism for grouping.
+    app: bloodcell
+    version: v3
+spec:                        # what you WANT
+  selector:
+    matchLabels: {app: bloodcell}     # which pods this Deployment owns
+  template:                  # the Pod spec to create
+    metadata:
+      labels: {app: bloodcell}        # MUST match the selector
+    spec:
+      containers: [...]
+status:                      # what IS. Written by controllers. Never edit it.
+  readyReplicas: 3
+```
+
+Two things about `selector` that cause real problems:
+
+- **It is immutable on a Deployment.** Changing `spec.selector` requires deleting and recreating the Deployment. Choose labels you can live with — `app: bloodcell` is fine, `version: v3` in the selector is not, because you will want to change it.
+- **A selector that matches pods it did not create will adopt them.** Two Deployments with overlapping selectors fight, each scaling the other's pods down. Namespace your labels or make them specific enough not to collide.
+
+### Namespaces, labels and selectors
+
+```bash
+kubectl create namespace ml-serving
+kubectl config set-context --current --namespace=ml-serving   # stop typing -n
+
+kubectl get pods -l app=bloodcell
+kubectl get pods -l 'app in (bloodcell, tfserving)'
+kubectl get pods -l app=bloodcell,version!=v3
+kubectl delete pods -l app=bloodcell,version=v2               # careful
+```
+
+Labels are how everything finds everything: a Service finds its pods by label selector, an HPA finds its Deployment by name but Prometheus finds its targets by label, and a NetworkPolicy selects by label. **A consistent labelling convention is the highest-leverage thing you set up early.** The community standard is worth adopting verbatim:
+
+```yaml
+labels:
+  app.kubernetes.io/name: bloodcell
+  app.kubernetes.io/instance: bloodcell-prod
+  app.kubernetes.io/version: "3.0.0"
+  app.kubernetes.io/component: api
+  app.kubernetes.io/part-of: ml-platform
+  app.kubernetes.io/managed-by: kustomize
+```
+
+### The debugging playbook
+
+| Symptom | First command | Usual cause |
+| --- | --- | --- |
+| `Pending` | `kubectl describe pod` → Events | Insufficient CPU/memory on every node; an unsatisfiable nodeSelector or affinity; an unbound PVC |
+| `ImagePullBackOff` | `kubectl describe pod` → Events | Wrong tag; private registry with no `imagePullSecret`; with `kind`, `imagePullPolicy: Always` on a locally-loaded image |
+| `CrashLoopBackOff` | `kubectl logs --previous` | The app exits — bad config, missing file, unhandled exception at startup |
+| `CreateContainerConfigError` | `kubectl describe pod` → Events | A referenced ConfigMap or Secret key does not exist |
+| `OOMKilled` (exit 137) | `kubectl describe pod` → Last State | The memory limit is below actual usage |
+| `Running` but not `Ready` | `kubectl describe pod` → readiness probe events | The probe path is wrong, the port is wrong, or the app genuinely is not ready |
+| `Running`, `Ready`, no traffic | `kubectl get endpoints <svc>` | The Service selector does not match the pod labels |
+| `Terminating` for minutes | `kubectl describe pod` | A finalizer, or the process ignoring SIGTERM until the grace period expires |
+
+```bash
+# The five commands, in the order you use them
+kubectl describe pod <name>                        # events at the bottom — start here
+kubectl logs <name> -c <container> --previous      # what it said before dying
+kubectl get events --sort-by=.lastTimestamp -A     # cluster-wide, recent
+kubectl exec -it <name> -- sh                      # only if there's a shell
+kubectl debug -it <name> --image=busybox:1.36 --target=api   # distroless: ephemeral container
+```
+
+<Warning>
+`kubectl debug --target=<container>` attaches an ephemeral container sharing the target's
+**process namespace**, so you can inspect its `/proc`, its file descriptors and its threads
+without a shell in the image. This is how you debug a distroless container, and it is worth
+practising **before** an incident rather than reading the docs during one.
+</Warning>
+
+### Running the Week-23 image properly
+
+```yaml
+# deployment.yaml — a Pod is for debugging; this is what you deploy.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bloodcell
+  namespace: ml-serving
+  labels: {app: bloodcell}
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: bloodcell}
+  template:
+    metadata:
+      labels: {app: bloodcell}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: api
+          image: bloodcell:v3
+          imagePullPolicy: IfNotPresent
+          ports: [{containerPort: 8000, name: http}]
+          env:
+            - {name: OMP_NUM_THREADS, value: "1"}
+            - {name: MKL_NUM_THREADS, value: "1"}
+          resources:
+            requests: {cpu: "500m", memory: "512Mi"}
+            limits:   {cpu: "1000m", memory: "1Gi"}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+```
+
+Four things worth defending, all of which Module 2 and Module 3 develop:
+
+1. **`runAsNonRoot` with the UID from the image's `useradd --uid 10001`.** If the image's user does not exist or the UID mismatches, the pod fails with `CreateContainerConfigError` and a message about running as root — which is why Week 23 Module 3 set an explicit numeric UID.
+2. **`readOnlyRootFilesystem: true`.** Your service writes nothing; enforcing that removes a large class of container escape and persistence. If something needs `/tmp`, mount an `emptyDir` there explicitly.
+3. **Liveness is much less aggressive than readiness.** Readiness every 5 s with 2 failures (traffic stops in ~10 s); liveness every 20 s with 3 failures (restart after ~60 s). **A liveness probe that is too aggressive turns a slow moment into a restart storm** — Module 2 has the failure mode.
+4. **`requests` below `limits` makes this Burstable**, not Guaranteed. Module 3 covers when that is right and when it is not.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **`kind` vs a cloud cluster for learning** | Always, for this week. Free, fast (cluster up in 41 s), deletable, and `kind load` skips the registry. | You need a real LoadBalancer, real node failures, or a GPU. `kind` fakes the first and cannot do the third. |
+| **Bare manifests vs Helm vs Kustomize** | Learning, and for a handful of objects. You can read them. | Kustomize for environment overlays with no templating language — it is built into `kubectl`. Helm when you need to *distribute* a chart to others, or consume someone else's. Do not reach for Helm to manage six of your own YAML files. |
+| **One namespace vs many** | One team, one product. Fewer things to get wrong. | Multi-tenancy, per-team resource quotas, or a blast radius you want to bound. Namespaces are the unit for quotas, network policies and RBAC. |
+| **`kubectl apply` vs GitOps (Argo/Flux)** | Learning and small teams. Immediate feedback. | Anything with more than one environment or more than three people. GitOps makes the cluster's state a reviewable artifact and removes the "who ran what by hand" question — which is the same argument as Week 23's immutable artifacts. |
+
+### War story — the cluster nobody could turn off
+
+A four-person team ran one Python service and one Postgres. They adopted Kubernetes because their next hire had used it. Eighteen months later:
+
+- **Three EKS clusters** (dev, staging, prod) at $73/month each in control-plane fees alone, plus nodes.
+- **A Helm chart with 340 lines of templating** for a service with four environment variables. Nobody could remember what half the conditionals were for.
+- **Two full-day outages** caused by Kubernetes itself: a cluster upgrade that deprecated an API version their chart used, and a cert-manager renewal failure that expired the ingress certificate.
+- **Roughly one day a week** across the team on cluster maintenance — upgrades, CVE patching on node images, debugging things that were not the product.
+
+Their actual requirement, measured after the fact: **peak 40 requests/second, one service, no state, no multi-tenancy.** A single VM behind a load balancer would have served it with room to spare, and their previous deploy script had been fifteen lines.
+
+The honest post-mortem sentence, from their lead: *"We adopted the tool for the problems we expected to have, and we got the operational cost immediately and the problems never."*
+
+**This is the most common Kubernetes failure mode and it is not technical.** Kubernetes is excellent at what it does, and what it does is manage many services across many machines for multiple teams. Below that threshold you pay the full operational cost for a fraction of the benefit.
+
+The decision table in Layer 3 is the one I now use, and the row that matters is the one about how many *services* you have, not how many *requests*.
+
+### Design checkpoint
+
+<Accordion title="Your team of three runs one FastAPI model service at 40 rps peak. Leadership asks 'should we move to Kubernetes?' What do you say?">
+**Probably not, and here is how I would frame the answer so it is a decision rather than a preference.**
+
+**What Kubernetes gives you that you do not currently have:** self-healing restarts, rolling updates with health-gated rollout, horizontal autoscaling, declarative config in git, and a standard interface that new hires already know.
+
+**What it costs:** in my estimate for a team of three, **roughly 0.5 FTE ongoing** — cluster upgrades (three or four a year, each with deprecated-API archaeology), node image patching, the ecosystem components you inevitably add (ingress controller, cert-manager, metrics-server, monitoring stack) each with their own upgrade cycle, and an on-call surface that now includes the platform as well as the product. Plus a genuine learning cliff: the failure modes are unfamiliar and the debugging vocabulary is new.
+
+**At 40 rps and one service, most of the benefit is available more cheaply:**
+
+- Self-healing: `systemd` with `Restart=always`, or ECS/Fly/Render/Cloud Run.
+- Rolling updates: any of those platforms, or a load balancer with two instances and a script.
+- Autoscaling: an ASG, or the platform's built-in.
+- Declarative config: Terraform, which you probably want anyway.
+
+**The questions whose answers actually decide it:**
+
+1. **How many services will you have in 18 months?** Below about five, the answer is usually no. Above ten, usually yes.
+2. **Do you need to run *someone else's* software?** Half the value of Kubernetes is that Helm charts exist for everything — if you want Kafka, Airflow, Prometheus and a vector database, K8s is the cheapest way to get them.
+3. **Will you need GPUs, or heterogeneous nodes?** Kubernetes' scheduler handles this genuinely well and the alternatives are worse.
+4. **Who operates it, and is that on their roadmap?** If the answer is "we all will, a bit", it will be nobody.
+
+**What I would say:** "Not yet, and here is what would change my mind: a second and third service, or needing to run off-the-shelf infrastructure. Meanwhile I'd put the deploy on ECS or Cloud Run, which gets us rolling updates, health checks and autoscaling for about a day of work — and both make migrating to Kubernetes later straightforward, because the container is already the unit."
+
+**And the thing to say out loud:** we should learn Kubernetes anyway, because it is the industry's lingua franca — but learning it and running it in production for one service are different decisions.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a measured number. Cluster: `kind` v0.23.0,
+`kindest/node:v1.30.2`, 1 control-plane + 3 workers, in **local Docker on a laptop-class host** —
+you can stand this up yourself today and reproduce the behaviour. Absolute timings track how
+fast your Docker host is; the *sequence* of events is the claim. See
+[About the numbers](/start/about-the-numbers).
+</Warning>
+
+### What actually happens when you `kubectl apply`
+
+Six steps, none of which involve `kubectl` talking to a node.
+
+```
+(1) kubectl                -> API server   HTTP POST/PATCH with the manifest
+(2) API server             -> etcd         authn, authz, mutating admission, validation,
+                                           validating admission, then a write
+(3) deployment controller  <- watch        sees a new Deployment, creates a ReplicaSet
+(4) replicaset controller  <- watch        sees a ReplicaSet with 0/3, creates 3 Pod objects
+                                           (spec.nodeName is empty)
+(5) scheduler              <- watch        sees unscheduled Pods; filters + scores nodes;
+                                           writes spec.nodeName via a Binding
+(6) kubelet on that node   <- watch        sees a Pod bound to itself; calls the CRI
+                                           (containerd) to pull and start containers
+```
+
+**Measured on the `kind` cluster**, `kubectl apply` of a 3-replica Deployment with the image already present, timestamps from `kubectl get events` and the API server audit log:
+
+| Step | Cumulative |
+| --- | --- |
+| `apply` → API server accepted | 0.03 s |
+| → ReplicaSet created | 0.09 s |
+| → Pod objects created | 0.14 s |
+| → all 3 scheduled (`nodeName` set) | 0.31 s |
+| → containers created by kubelet | 0.94 s |
+| → all containers `Running` | 2.1 s |
+| → all pods `Ready` (probe passed, app warmed up) | **5.4 s** |
+
+**3.3 s of the 5.4 s is your application starting and warming up.** Kubernetes' own overhead is about 1 second. When someone says "Kubernetes is slow to deploy", check which part.
+
+Four properties of this design worth internalizing, because they explain most surprising behaviour:
+
+1. **Everything is a watch on etcd.** Controllers do not poll and are not called; they maintain a local cache updated by a watch stream and re-run their reconcile function when something changes. This is why a controller being down is *silent* — nothing errors, things just stop converging.
+2. **The API server is the only writer.** Every mutation passes admission control, which is where policy engines (OPA/Gatekeeper, Kyverno), sidecar injection and defaulting all hook in. A misbehaving admission webhook can block **every** write to the cluster, which is a spectacular and non-obvious outage mode.
+3. **Controllers are level-triggered, not edge-triggered.** They act on observed state, not on events. Miss an event and the next resync (default 10 hours, plus any change) still converges. This is why Kubernetes is robust to controller restarts and why "it eventually fixed itself" is normal rather than mysterious.
+4. **Scheduling is filter-then-score.** Filter: which nodes *can* run this (resources, taints, affinity, ports)? Score: which is *best* (spread across nodes, least-allocated, image locality)? `describe pod` on a `Pending` pod tells you exactly which predicate rejected which nodes — `0/4 nodes are available: 1 node(s) had untolerated taint, 3 Insufficient cpu`.
+
+### The five failure signatures, produced and diagnosed
+
+The hands-on. Each one has a distinct signature and a distinct place to look.
+
+| # | Break | Status | Where the answer is | Exit code |
+| --- | --- | --- | --- | --- |
+| 1 | `image: bloodcell:nope` | `ImagePullBackOff` | `describe` → Events: `Failed to pull image` | — |
+| 2 | `limits.memory: 64Mi` | `OOMKilled`, restarting | `describe` → Last State: `OOMKilled` | **137** |
+| 3 | Readiness path `/nope` | `Running`, `0/1 Ready` | `describe` → Events: `Readiness probe failed: HTTP 404` | — |
+| 4 | `envFrom` a missing ConfigMap | `CreateContainerConfigError` | `describe` → Events: `configmap "x" not found` | — |
+| 5 | `requests.cpu: "64"` | `Pending` | `describe` → Events: `0/4 nodes are available: 4 Insufficient cpu` | — |
+
+Measured timings that are worth knowing:
+
+- **`ImagePullBackOff` backs off exponentially**: 10 s, 20 s, 40 s, … capped at 5 minutes. So after a few minutes, fixing the image tag does not produce an immediate recovery — you can wait up to 5 minutes, or `kubectl delete pod` to force a fresh attempt.
+- **`CrashLoopBackOff` uses the same backoff.** A pod crashing on startup is restarted 10 s later, then 20 s, up to 5 minutes. The restart count in `kubectl get pods` and the age tell you how long it has been failing.
+- **`OOMKilled` is exit code 137 = 128 + 9 (SIGKILL).** There is no grace period and no chance for the process to log anything, which is why `logs` is unhelpful and `describe`'s Last State is the answer. Contrast exit **143** = 128 + 15 (SIGTERM), which is a normal shutdown.
+- **Signature 5 produces no logs at all**, because no container was ever created. People spend a long time on `kubectl logs` returning nothing before checking `describe`.
+
+### When Kubernetes is overkill: the decision table
+
+The version I actually use, with the operational cost included because it is what gets left out.
+
+| Situation | Best fit | Why | Ongoing ops cost |
+| --- | --- | --- | --- |
+| 1 service, steady load, one team | **A VM + systemd**, or a PaaS | Nothing to orchestrate. A deploy script is 15 lines | ~0.05 FTE |
+| Spiky, under ~100k req/day, no GPU | **Lambda / Cloud Run** | Scale-to-zero, no capacity to manage (Week 23 Module 5) | ~0.05 FTE |
+| 3–10 services, one team, no exotic infra | **ECS / Fly / Render / Cloud Run** | Rolling updates, health checks, autoscaling, no control plane to run | ~0.1 FTE |
+| 10+ services, multiple teams | **Kubernetes** | The scheduler, RBAC, namespaces and quotas start earning their cost | **~0.5 FTE** |
+| You need to run off-the-shelf infra (Kafka, Airflow, Prometheus, vector DBs) | **Kubernetes** | Helm charts exist for everything; the alternatives are much worse | ~0.5 FTE |
+| GPUs, heterogeneous nodes, bin-packing matters | **Kubernetes** | The scheduler is genuinely good at this and there is no real alternative | ~0.5–1 FTE |
+| Regulated, air-gapped, or on-prem | **Kubernetes** | It is the portable substrate; the alternative is bespoke | ~1 FTE |
+
+**The 0.5 FTE figure is the one to argue about.** It comprises: 3–4 cluster upgrades a year (each with deprecated-API work), node image patching, the ecosystem components you will add and must also upgrade (ingress controller, cert-manager, metrics-server, monitoring, possibly a service mesh), and an on-call surface that now includes the platform. Managed control planes (EKS, GKE, AKS) remove maybe a third of it; they do not remove upgrades, and they do not remove the ecosystem.
+
+**The row that decides it is "how many services", not "how much traffic".** A single service at 50,000 rps is easier to run on VMs behind a load balancer than fifteen services at 50 rps each.
+
+### `kind` versus a real cluster: what is faked
+
+`kind` runs each node as a Docker container and is genuinely a real Kubernetes cluster — same API server, same scheduler, same kubelet. What differs matters for what you can learn from it:
+
+| Aspect | `kind` | A real cluster |
+| --- | --- | --- |
+| Node failure | Delete the container — works, and is a good exercise | Also loses the disk, and triggers a cloud-provider node replacement |
+| `Service type=LoadBalancer` | Stays `Pending` unless you install `cloud-provider-kind` or MetalLB | An actual cloud load balancer, and a cost |
+| Storage | `hostPath` on the node container; disappears with the cluster | Real PVs, with real attach/detach latency and zone constraints |
+| Networking | `kindnet` CNI; NetworkPolicy is **not enforced** by default | Calico/Cilium; policies actually block traffic |
+| Image pull | `kind load` puts images straight into containerd | A real registry, real pull times (Week 23 Module 3's numbers) |
+| Resource limits | Bounded by the Docker host's cgroups; you can over-commit heavily | Bounded by real node capacity |
+
+The two that bite in this week's work: **`type=LoadBalancer` stays Pending** (use `port-forward` or a NodePort, or install `cloud-provider-kind`), and **NetworkPolicies silently do nothing** — you write one, it applies cleanly, and traffic still flows. Testing a NetworkPolicy on default `kind` and concluding it works is a real and common mistake.
+
+**Measured cluster lifecycle (local `kind` in Docker):** `kind create cluster` with 4 nodes takes **41 s**; `kind load docker-image` for the 466 MB image takes **8.2 s**; `kind delete cluster` takes 3 s. Fast enough to destroy and recreate whenever you have made a mess, which is the correct instinct.
+
+### Production failure modes
+
+<AccordionGroup>
+<Accordion title="A failing admission webhook blocking every write">
+**Signature:** all `kubectl apply` calls hang or fail with `failed calling webhook`; nothing can be created or updated, including the fix. **Cause:** a mutating/validating webhook with `failurePolicy: Fail` whose backing pod is down. **Detection:** `kubectl get validatingwebhookconfigurations,mutatingwebhookconfigurations`. **Fix:** delete the webhook configuration to break the deadlock, then fix the service. **Prevention:** `failurePolicy: Ignore` for non-security webhooks, and always a `namespaceSelector` excluding `kube-system`.
+</Accordion>
+<Accordion title="Deleted pods immediately reappearing">
+**Signature:** `kubectl delete pod` seems to do nothing. **Cause:** working as designed — the ReplicaSet reconciles. **Fix:** understand which object owns the pod (`metadata.ownerReferences`) and change *that*. This is not a bug and it is the number one confusion for people arriving from Docker.
+</Accordion>
+<Accordion title="Pod Pending with no useful message on a large cluster">
+**Signature:** `0/200 nodes are available` with a truncated list of reasons. **Cause:** the scheduler summarizes predicates. **Detection:** `kubectl get events --field-selector involvedObject.name=<pod>` gives the full message; `kubectl describe node` shows allocatable versus allocated. **Fix:** usually resource requests larger than any node's allocatable — note that **allocatable is less than capacity**, because the kubelet and system reserve a slice.
+</Accordion>
+<Accordion title="imagePullPolicy: Always with a locally-loaded kind image">
+**Signature:** `ErrImagePull` for an image you can see in `docker exec -it nexus-worker crictl images`. **Cause:** `Always` forces a registry pull, and there is no registry. **Fix:** `IfNotPresent`. Note that a tag of `:latest` implies `Always` by default, which is a second reason never to use `:latest`.
+</Accordion>
+<Accordion title="A controller that has silently stopped reconciling">
+**Signature:** objects sit in a stale state; no errors anywhere. **Cause:** a controller crash-looping, or its watch connection wedged. **Detection:** the object's `status` and `conditions` stop advancing; check the controller's own pod and logs. **Fix:** restart it. **The lesson:** because controllers are level-triggered and silent, "nothing is happening" is a legitimate and under-monitored failure mode. Alert on reconciliation lag, not just on errors.
+</Accordion>
+</AccordionGroup>
+
+### Papers and specs
+
+- **Burns, Grant, Oppenheimer, Brewer &amp; Wilkes (2016), "Borg, Omega, and Kubernetes," ACM Queue.** *Takeaway:* the lessons Google carried across three generations of cluster manager — that the container is the right unit of management, that the API should be declarative and level-triggered rather than imperative, and that pods (co-scheduled groups) exist because sidecars and helper processes are the common case, not the exception.
+- **Verma, Pedrosa, Korupolu, Oppenheimer, Tune &amp; Wilkes (2015), "Large-scale cluster management at Google with Borg," EuroSys.** *Takeaway:* a decade of production data showing that bin-packing heterogeneous workloads onto shared machines raises utilization dramatically, and that the hard problems are isolation and priority/preemption rather than scheduling itself.
+- **Kubernetes, [API Conventions](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md).** *Takeaway:* the `spec`/`status` split, the meaning of conditions, and the rule that controllers must be idempotent and level-triggered — read the "Spec and Status" section to understand why controllers never trust an event.
+- **Hightower, Burns &amp; Beda, *Kubernetes: Up and Running*, 3rd ed. (2022), Ch. 2 and 5.** *Takeaway:* the clearest short explanation of the reconciliation loop and of pods as the scheduling unit, with the shared-network-namespace consequences spelled out.
+- **Google SRE Book, Chapter 4, "Service Level Objectives."** *Takeaway:* used properly in Module 5; worth reading now because "should we adopt Kubernetes" is ultimately a reliability-versus-cost question and SLOs are the vocabulary for having it numerically.
+
+### Stretch challenge
+
+**Break a Pod five ways and diagnose each from `kubectl` output alone — then automate the diagnosis.**
+
+Part one: produce all five signatures from the Layer 3 table. For each, write down (a) the status string, (b) the exact command that revealed the cause, (c) the line in its output that was diagnostic, and (d) the exit code if there was one. **Do not read logs first** — force yourself to reach the answer through `describe` and events, because that is the skill that transfers to a cluster with 200 pods where you cannot read all the logs.
+
+Part two: write `kdebug <pod>` — a shell script that runs the checks in the right order and prints a one-line diagnosis. Something like: is it Pending (scheduling)? Are containers waiting with a reason? Is there a `lastState.terminated` with exit 137 (OOM) or a non-zero code? Are probes failing? Is it Ready but absent from the Service's endpoints? Test it against all five broken pods.
+
+Part three, the open one: **decide what your `kdebug` cannot do, and whether Kubernetes should.**
+
+You will find some failures are unambiguous from the API (`Insufficient cpu`, `configmap not found`) and others require domain knowledge (`CrashLoopBackOff` with a Python traceback). Sketch where that line falls. Then the harder question: **a lot of this diagnosis is mechanical — why is it not built in?**
+
+Look at what exists (`kubectl get events`, the `Conditions` array, `kubectl debug`, and third-party tools like `k8sgt`) and form a view on why the platform exposes primitives rather than diagnoses. There are real arguments on both sides — a diagnosis is an opinion and opinions age badly in a platform with a compatibility guarantee; but a platform whose most common failure modes need a wiki page has arguably failed at something. Write your view down. It is exactly the kind of question a staff-level interview asks about a system you claim to know.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Break a Pod five ways — bad image, OOM, failing probe, missing config, insufficient resources —
+and diagnose each from `kubectl` output alone.
+</Card>
+
+<Steps>
+<Step title="Create the cluster (10 min)">
+The `kind` config from the [week index](/curriculum/p3/week-24/index). `kubectl get nodes` should show four. Then `kind load docker-image bloodcell:v3` and confirm with `docker exec -it nexus-worker crictl images | grep bloodcell`.
+</Step>
+<Step title="Run one Pod and call it (15 min)">
+The bare Pod manifest, then `port-forward`, then a real prediction through `curl`. Time it from `apply` to a successful prediction; expect about 5.4 s.
+</Step>
+<Step title="Delete the Pod and watch nothing happen (5 min)">
+`kubectl delete pod bloodcell` — it is gone and stays gone, because a bare Pod has no owner. Now do the same against the Deployment's pods and watch the ReplicaSet make a replacement. That contrast is the reconciliation loop in one exercise.
+</Step>
+<Step title="Break it five ways (60 min)">
+Bad image tag, `limits.memory: 64Mi`, readiness path `/nope`, `envFrom` a missing ConfigMap, `requests.cpu: "64"`. For each: record the status, the diagnostic command, the exact line that gave it away, and the exit code. **Reach the answer through `describe` before you look at logs.**
+</Step>
+<Step title="Watch the backoff (15 min)">
+Leave the bad image tag applied for five minutes and watch the retry interval grow: 10 s, 20 s, 40 s, up to 5 minutes. Then fix the tag and notice it does **not** recover immediately. Now you know why.
+</Step>
+<Step title="Write kdebug (45 min)">
+A script that runs the checks in order and prints one line of diagnosis. Test it against all five broken pods. Keep it — it is genuinely useful and it is a good portfolio artifact.
+</Step>
+<Step title="Fill in the decision table for a service you know (20 min)">
+Take a real service (yours, or your employer's) and place it on the Layer 3 table. Write two sentences on whether Kubernetes is the right substrate for it, including an estimate of the ongoing operational cost.
+</Step>
+</Steps>
+
+## The whiteboard
+
+The T2 build-up is: frame 1 the reconciliation loop alone, frame 2 the six numbered steps from `apply` to a running container, frame 3 the decision table, frame 4 the five failure signatures. The loop goes first because everything else is a consequence of it.
+
+<Tip>
+**Draw it yourself.** The loop with its four stations, the six numbered steps with the arrow that
+does **not** exist (kubectl to node) crossed out, and the five failure signatures with their
+statuses. If you can write the five statuses and where to look for each from memory, you can
+debug a broken pod in front of someone without opening a browser.
+[Blank version](/assets/diagrams/p3-w24-m1-blank.svg) · [Editable source](/assets/diagrams/p3-w24-m1.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Deployed a containerized model service on a 4-node `kind` cluster, measured the full `apply`-to-ready path at 5.4 s (of which 1.0 s is Kubernetes and 3.3 s is application warm-up), and wrote a `kdebug` script that diagnoses the five standard pod failure modes from the API alone."
+
+**The interview question this earns you.** "What happens when you run `kubectl apply`?" is a standard Kubernetes screening question and most candidates say "it creates the pod". The full answer: "`kubectl` POSTs to the API server, which authenticates, authorizes, runs mutating admission, validates, runs validating admission, and writes to etcd. That is the only write. Then controllers watching etcd react: the Deployment controller creates a ReplicaSet, the ReplicaSet controller creates Pod objects with no `nodeName`, the scheduler filters and scores nodes and writes a Binding, and the kubelet on that node sees a pod bound to itself and calls the CRI. `kubectl` never talks to a node. And the controllers are level-triggered, not event-driven, which is why a controller restart is harmless and why a stopped controller is silent."
+
+That last clause is the one that marks you as someone who has debugged it rather than read about it.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Practise `kubectl debug` before you need it.** If any of your images are distroless or slim without a shell, the first time you try to get inside one will be during an incident. `kubectl debug -it pod --image=busybox:1.36 --target=app` takes five minutes to learn and saves an hour at the worst possible time.
+
+**2. Audit your admission webhooks for `failurePolicy: Fail` without a `namespaceSelector`.** A webhook that fails closed and has no exclusion for `kube-system` can deadlock the entire cluster, including the ability to deploy the fix. It is a five-minute check and the failure mode is total.
+
+**3. Write down your team's actual position on the decision table.** Not to argue for a migration in either direction, but so that the next "should we move to/off Kubernetes" conversation starts from how many services you have and what the operational cost is, rather than from what people used at their last job.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `kubectl delete pod` does nothing | A ReplicaSet owns it and reconciles | Change the owning object; check `metadata.ownerReferences` |
+| `kubectl logs` is empty and you are confused | The container never started | `describe` first — Events tell you whether it got that far |
+| `ErrImagePull` for an image you loaded with `kind load` | `imagePullPolicy: Always` (also implied by a `:latest` tag) | `IfNotPresent`, and never tag `:latest` |
+| Fixed the image tag but it stays broken for minutes | Exponential backoff up to 5 minutes | Wait, or `kubectl delete pod` to force a fresh attempt |
+| `Pending` forever with no logs | Never scheduled — resources, taints or affinity | `describe` → Events for the predicate that rejected each node |
+| Exit code 137 with no application logs | `OOMKilled` — SIGKILL, no grace period | Raise the memory limit; `describe` → Last State is the evidence |
+| Manual `kubectl scale` reverted on the next deploy | Imperative commands are temporary overrides of a manifest | Change the manifest; use GitOps if this keeps happening |
+| A NetworkPolicy applies cleanly and blocks nothing | Default `kind` CNI does not enforce NetworkPolicy | Install Calico or Cilium in `kind`, or test elsewhere |
+| `Service type=LoadBalancer` stays `Pending` on `kind` | No cloud provider to fulfil it | `port-forward`, a NodePort, or `cloud-provider-kind` |
+| Every `kubectl apply` in the cluster fails | An admission webhook with `failurePolicy: Fail` whose pod is down | Delete the webhook configuration to break the deadlock |
+| Pod fails with a message about running as root | `runAsNonRoot: true` and the image has no matching non-root UID | An explicit numeric `useradd --uid` in the image (Week 23 Module 3) |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [Kubernetes — Concepts: Controllers](https://kubernetes.io/docs/concepts/architecture/controller/) — read this page in full. It is short and it is the single most important conceptual page in the documentation.
+- [Kubernetes — Debug Running Pods](https://kubernetes.io/docs/tasks/debug/debug-application/debug-running-pod/) — read the ephemeral-container section for `kubectl debug --target`, which is how you get inside a distroless container.
+- [Kubernetes — Scheduler](https://kubernetes.io/docs/concepts/scheduling-eviction/kube-scheduler/) — read the filter-and-score description; it makes `0/N nodes are available` messages readable rather than mysterious.
+- [`kind` — Quick start](https://kind.sigs.k8s.io/docs/user/quick-start/) — read the `loading an image` and `extraPortMappings` sections; both are used in this week's cluster config.
+- [Kubernetes — Recommended labels](https://kubernetes.io/docs/concepts/overview/working-with-objects/common-labels/) — adopt this convention verbatim on day one; retrofitting labels across a cluster is genuinely painful.
+
+**Papers**
+
+- [Burns et al. (2016)](https://doi.org/10.1145/2898442.2898444) — *three generations of cluster management at Google; why the API is declarative and level-triggered, and why pods rather than containers are the unit.*
+- [Verma et al. (2015)](https://doi.org/10.1145/2741948.2741964) — *Borg's production data on bin-packing and utilization; the hard problems are isolation and preemption, not scheduling.*
+- [Kubernetes API Conventions](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md) — *the `spec`/`status` split and the rule that controllers must be idempotent and never trust an event.*
+- [Google SRE Book, Ch. 4](https://sre.google/sre-book/service-level-objectives/) — *SLOs as the vocabulary for reliability-versus-cost decisions, including the decision to adopt a platform at all.*
+
+**Go deeper**
+
+- [Marko Lukša, *Kubernetes in Action*, 2nd ed.](https://www.manning.com/books/kubernetes-in-action-second-edition) — read chapters 1–4 for the clearest available narrative introduction, and chapter 11 ("Understanding Kubernetes internals") for a walkthrough of the `apply` flow with more detail than the docs give.
+- Daniel Smith's talk and the [`client-go` informer documentation](https://pkg.go.dev/k8s.io/client-go/tools/cache) — read this if you ever write a controller. The informer/workqueue pattern is why controllers are cheap despite watching everything, and understanding it changes how you read every controller's behaviour.
+- Kelsey Hightower, ["Kubernetes The Hard Way"](https://github.com/kelseyhightower/kubernetes-the-hard-way) — do this once, over a weekend, if you will operate a cluster. Standing up each control-plane component by hand makes the six-step flow permanent knowledge rather than a diagram you have seen.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-24/p3-w24-m1">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

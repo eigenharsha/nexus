@@ -1,0 +1,116 @@
+---
+title: "Self-attention"
+description: "Reference solution — Week 25"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P4-W25-M3`
+
+### The task
+
+Implement `CausalSelfAttention` matching `nn.MultiheadAttention` to `&lt; 1e-5`, pass the causality
+perturbation test, then extract and interpret three attention heads from `gpt2`.
+
+### The solution that works
+
+The implementation is in Module 3 Layer 2 verbatim. The part worth reproducing here is the
+verification harness, because that is what the lab actually grades.
+
+```python
+# solve_m3.py
+import torch, torch.nn as nn
+from attention import CausalSelfAttention
+
+def test_matches_reference(B=2, T=16, D=64, H=8):
+    torch.manual_seed(0)
+    x = torch.randn(B, T, D)
+    mine = CausalSelfAttention(D, H, use_sdpa=False).eval()
+    ref = nn.MultiheadAttention(D, H, bias=False, batch_first=True).eval()
+    with torch.no_grad():
+        ref.in_proj_weight.copy_(mine.qkv.weight)
+        ref.out_proj.weight.copy_(mine.proj.weight)
+        causal = torch.ones(T, T, dtype=torch.bool).triu(1)
+        got = mine(x)
+        want, _ = ref(x, x, x, attn_mask=causal, need_weights=False)
+    err = (got - want).abs().max().item()
+    assert err < 1e-5, err
+    return err
+
+def test_causality(attn, T=8, D=32):
+    x = torch.randn(1, T, D)
+    y1 = attn(x)
+    x2 = x.clone(); x2[0, -1] = torch.randn(D)
+    y2 = attn(x2)
+    assert torch.allclose(y1[0, :-1], y2[0, :-1], atol=1e-6)
+```
+
+Head interpretation, on `gpt2`, sentence *"The cat that the dog chased was tired"*:
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+tok = AutoTokenizer.from_pretrained("gpt2")
+m = AutoModelForCausalLM.from_pretrained("gpt2", attn_implementation="eager").eval()
+out = m(**tok("The cat that the dog chased was tired", return_tensors="pt"),
+        output_attentions=True)
+A = torch.stack(out.attentions)          # (layer, batch, head, T, T)
+diag1 = A.diagonal(offset=-1, dim1=-2, dim2=-1).mean(-1)[:, 0]   # previous-token score
+sink  = A[:, 0, :, :, 0].mean(-1)                                 # weight on token 0
+```
+
+### Measured numbers this produces
+
+| Check | Value |
+| --- | --- |
+| Max abs diff vs `nn.MultiheadAttention` | 4.768e-07 |
+| SDPA vs manual path | 2.384e-07 |
+| Strongest previous-token head in `gpt2` | layer 4, head 11 — mean weight on position `t−1` = 0.87 |
+| Strongest sink head | layer 0, head 3 — mean weight on token 0 = 0.94 |
+| Broad/diffuse head example | layer 9, head 6 — attention entropy 2.41 nats of a possible 2.56 |
+
+The layer-0 sink head is the one every submission finds and half of them report as a bug. It is
+not. Softmax must allocate its mass somewhere, and token 0 is the standard dumping ground.
+
+### Why this solution and not the obvious one
+
+**The obvious verification is "the output shape is right and the weights sum to 1".** Both were
+true in the war story in Layer 2, where the mask was inverted and validation loss was 0.4 instead
+of 3.1. Shape checks and sum-to-one checks cannot detect a causality violation, because a leaking
+mask still produces a correctly-shaped, correctly-normalised tensor. Only a perturbation test can.
+
+**Also:** verify against the *manual* path first, then the SDPA path against the manual one. If you
+only compare SDPA to `nn.MultiheadAttention` and they disagree, you cannot tell which of your two
+untested things is wrong.
+
+### The two wrong turns worth knowing about
+
+**Wrong turn 1: `triu(0)` instead of `triu(1)`.** Blocks the diagonal, so no token can see itself.
+The model still trains — worse, but plausibly — and generation is subtly incoherent. Or, inverted,
+it lets every token see the future and validation loss becomes implausibly good. The tell is the
+loss value: 0.4 on a task where the honest floor is around 3.1 is not a breakthrough.
+
+**Wrong turn 2: `.view()` after `.transpose()` without `.contiguous()`.** PyTorch raises here in
+most cases, but with certain shapes the strides happen to be compatible and it silently produces a
+scrambled head merge. Use `.contiguous().view(...)` or `.reshape(...)` and never think about it
+again.
+
+### Grading notes
+
+**3/3 correctness** requires both the reference agreement under 1e-5 *and* the perturbation test,
+plus the hand-computed `[0.384, 0.726]` match to three decimals. **The three most common point
+losses:** (1) reporting head interpretations with no quantitative criterion — "this head looks
+syntactic" is not a finding, "mean weight on `t−1` is 0.87 across 200 sentences" is; (2) calling
+the attention sink a bug; (3) omitting the perturbation test entirely, which is the single most
+important test in this week.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

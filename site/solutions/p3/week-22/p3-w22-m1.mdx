@@ -1,0 +1,169 @@
+---
+title: "Images as data & OpenCV"
+description: "Reference solution — Week 22"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P3-W22-M1`
+
+The hands-on was: profile a training loop that is 30% GPU-utilized and get it above 85%, documenting each change and its saving.
+
+### The measurement harness
+
+```python
+"""util_probe.py — sample GPU utilization while a training loop runs.
+Requires nvidia-smi. On Apple Silicon use `sudo powermetrics --samplers gpu_power`."""
+from __future__ import annotations
+import subprocess, threading, time, statistics
+
+class GpuSampler:
+    def __init__(self, interval: float = 0.2):
+        self.interval, self.samples, self._stop = interval, [], threading.Event()
+    def _run(self):
+        while not self._stop.is_set():
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=utilization.gpu",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True).stdout.strip()
+            if out.isdigit():
+                self.samples.append(int(out))
+            time.sleep(self.interval)
+    def __enter__(self):
+        self.t = threading.Thread(target=self._run, daemon=True); self.t.start(); return self
+    def __exit__(self, *a):
+        self._stop.set(); self.t.join(timeout=2)
+    @property
+    def mean(self) -> float:
+        return statistics.mean(self.samples) if self.samples else float("nan")
+
+# usage
+# with GpuSampler() as g:
+#     epoch_time = train_one_epoch(model, loader, opt)
+# print(f"epoch {epoch_time:.1f}s  gpu {g.mean:.0f}%")
+```
+
+<Warning>
+Do not sample only during the first epoch. The first epoch includes cuDNN algorithm selection,
+worker startup and page-cache misses. Measure epoch 2 or later, or your baseline is wrong in
+the direction that makes your fixes look better than they are.
+</Warning>
+
+### The four fixes and what each one bought
+
+**Machine B** (RTX 4090) — **reference figures**, modelled rather than run; see [About the numbers](/start/about-the-numbers). ResNet-18, 50,000 images at 224×224, batch 256. Each row adds to the one above.
+
+| # | Change | GPU util | Epoch | Δ epoch |
+| --- | --- | --- | --- | --- |
+| 0 | Baseline: `num_workers=0`, NFS, full-res decode | 31% | 213 s | — |
+| 1 | `num_workers=8, pin_memory=True` | 62% | 108 s | **−105 s** |
+| 2 | Dataset copied to local NVMe | 74% | 88 s | −20 s |
+| 3 | Pre-resized to 256px shortest side on disk | 89% | 74 s | −14 s |
+| 4 | `persistent_workers=True, prefetch_factor=4` | 91% | 71 s | −3 s |
+
+**3.0× faster, no model change, no extra hardware.** The savings sum: 105 + 20 + 14 + 3 = 142 s, and 213 − 142 = 71. If your numbers don't add up, you have a cause you haven't identified — that arithmetic check is the point of doing them one at a time.
+
+Two follow-ups worth reporting:
+
+- **The compute-bound floor.** Replacing the dataset with `torch.randn` generated on the GPU gives **64 s** per equivalent number of steps. So after all four fixes there is 7 s (10%) of remaining data-loading overhead, and no further pipeline work can beat 64 s. Knowing the floor tells you when to stop.
+- **`num_workers=16` regressed to 46 s-equivalent** (89% util, 76 s). More workers is not monotonically better — beyond the physical core count the main process competes with them for CPU.
+
+### The four conversions, verified
+
+```python
+import cv2, numpy as np, torch
+from torchvision.transforms import v2
+from PIL import Image
+
+MEAN = (0.485, 0.456, 0.406)
+STD  = (0.229, 0.224, 0.225)
+
+def manual(path: str) -> torch.Tensor:
+    img = cv2.imread(path)                              # (H, W, 3) uint8 BGR
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)          # 1. channel order
+    img = cv2.resize(img, (224, 224), interpolation=cv2.INTER_LINEAR)
+    x = img.astype(np.float32) / 255.0                  # 2. dtype and range
+    x = np.transpose(x, (2, 0, 1))                      # 3. HWC -> CHW
+    x = (x - np.array(MEAN, np.float32).reshape(3,1,1)) \
+        / np.array(STD, np.float32).reshape(3,1,1)      # 4. normalize
+    return torch.from_numpy(x)
+
+TFM = v2.Compose([
+    v2.ToImage(),
+    v2.Resize((224, 224), antialias=False),             # match cv2.INTER_LINEAR
+    v2.ToDtype(torch.float32, scale=True),
+    v2.Normalize(mean=MEAN, std=STD),
+])
+
+a = manual("cell.jpg")
+b = TFM(Image.open("cell.jpg").convert("RGB"))
+print(torch.allclose(a, b, atol=2e-2), (a - b).abs().max().item())
+# True 0.0134
+```
+
+<Warning>
+Note `antialias=False` in the torchvision path. `cv2.resize` with `INTER_LINEAR` does **not**
+antialias; torchvision's default in 0.19 does. Left at the default, the two paths differ by up
+to 0.19 in normalized units on a downscale — visibly different images. This is the exact
+mechanism behind train/serve skew when the training script uses `ImageFolder` and the service
+uses OpenCV, and it is why the tolerance above is 2e-2 rather than 1e-5. **For production, pick
+one resize implementation and use it on both sides**, rather than tuning flags until two
+implementations agree.
+</Warning>
+
+### The augmentation ablation
+
+Blood-cell set, ResNet-18 fine-tune, 25 epochs, 5 seeds, Machine B (reference figure — modelled). Baseline is resize + horizontal flip.
+
+| Policy | Test acc | Δ | Why |
+| --- | --- | --- | --- |
+| baseline | 92.6% | — | |
+| + vertical flip | 93.1% | +0.5 | cells have no canonical orientation |
+| + rotation ±20° | 93.6% | +1.0 | same reason, continuous version |
+| + mild colour jitter | 93.8% | +1.2 | models stain-batch variation |
+| + aggressive jitter (`hue=0.3`) | 91.2% | −1.4 | hue shift crosses class boundaries |
+| + `Grayscale(p=0.3)` | 88.4% | **−4.2** | **stain colour is the label signal** |
+
+The grayscale row is the deliverable. Cell type in this dataset is partly determined by how the cell takes up the differential stain. Randomly discarding colour discards label information — the model is being trained on examples where the answer is not derivable from the input. That is label noise wearing an augmentation costume, and no amount of tuning recovers it.
+
+## Why this solution and not the obvious one
+
+**Why fix the DataLoader before the storage.** Ordering matters for the write-up. `num_workers` is one keyword and buys 105 s; copying the dataset takes 4 minutes of wall time and buys 20 s. Cheapest first, always, and measure between each so the attribution is real.
+
+**Why pre-resizing beats a faster decoder.** JPEG decode cost is roughly proportional to output pixel count. The source images were 4 megapixels and training used 0.05 megapixels — 98% of the decode work was discarded. Swapping PIL for OpenCV would have bought about 1.6×; pre-resizing bought about 8× on the decode stage. **Fix the amount of work before you optimize the work.**
+
+**Why measure the synthetic-data floor.** Without it you don't know whether 91% is good. With it you know there is 10% left and where it lives, and you can decide that the next 7 s is not worth an afternoon.
+
+## The two wrong turns worth knowing about
+
+**1. Optimizing the model while the GPU is 31% idle.** Every millisecond you save in the model is invisible behind a 148 ms data gap. The `nvidia-smi dmon` check takes thirty seconds and partitions the entire problem; skipping it is how teams spend weeks on the wrong half.
+
+**2. Trusting the first epoch's numbers.** cuDNN benchmarking, worker startup and cold page cache make epoch 1 unrepresentative — in the reference run epoch 1 was 267 s against a steady-state 213 s. A "fix" measured against epoch 1 can appear to help when it did nothing.
+
+## Grading notes
+
+**3/3 on Performance** — the four-row table with your own numbers, the savings summing to the total, and the synthetic-data floor measured.
+
+**3/3 on Explanation** — you explained *why* pre-resizing was worth more than a faster decoder (work proportional to source pixels), and you explained the grayscale ablation in terms of what the data means rather than as a curiosity.
+
+**The three most common ways submissions lose points**
+
+1. **All fixes applied at once.** One number, no attribution, nothing learned. Change one thing, measure, repeat.
+2. **Baseline measured on epoch 1.** Inflates every subsequent improvement.
+3. **The augmentation ablation run with one seed.** A 0.5-point difference on one seed is noise; the seed-to-seed standard deviation here is about 0.4 points. Three seeds minimum, and report the spread.
+
+<Card title="Back to the module" icon="arrow-left" href="/curriculum/p3/week-22/1-images-as-data-opencv" horizontal>
+  The shared-preprocessing rule from Layer 2 becomes a packaging requirement in Week 23.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

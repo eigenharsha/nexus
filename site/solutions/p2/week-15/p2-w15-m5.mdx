@@ -1,0 +1,158 @@
+---
+title: "Storage, warehousing & orchestration"
+description: "Reference solution — Week 15"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P2-W15-M5`
+
+Benchmark the same aggregation in pandas, Polars and DuckDB on 10 million rows, then pick a default.
+
+### The harness that makes the memory number honest
+
+```python
+# engine_task.py — ONE (engine, query) per process.
+import resource, sys, time
+engine, query = sys.argv[1], sys.argv[2]
+t0 = time.perf_counter()
+...                                        # do the work
+el = time.perf_counter() - t0
+rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+mb = rss / 1e6 if sys.platform == "darwin" else rss / 1e3
+print(f"{el:.3f},{mb:.1f},{rows}")
+```
+
+**Two decisions that are the difference between a benchmark and a guess:**
+
+1. **`ru_maxrss`, not `tracemalloc`.** `tracemalloc` counts only Python-level allocations, so it
+   reports near zero for DuckDB and Polars — both of which do their work in native code. The
+   whole-process number is the one that decides whether your job fits its container.
+2. **One process per (engine, query).** `ru_maxrss` is a high-water mark that never decreases.
+   Measure three engines in one process and the second and third both report the first one's peak.
+
+### The results
+
+Group-by `category, region → sum, mean, count` over 10,000,000 rows (186 MB Parquet):
+
+| Engine | Time | Peak RSS | vs pandas |
+| --- | --- | --- | --- |
+| **DuckDB 1.1.3** | **0.117 s** | **96 MB** | **12.9× faster, 9.1× less memory** |
+| Polars 1.17.1 lazy | 0.299 s | 1,023 MB | 5.1× |
+| Polars 1.17.1 eager | 0.637 s | 934 MB | 2.4× |
+| pandas 2.2.3 | 1.510 s | 878 MB | 1.0× |
+
+Join to a 2,000-row dimension, then aggregate:
+
+| Engine | Time | Peak RSS |
+| --- | --- | --- |
+| **DuckDB** | **0.106 s** | **108 MB** |
+| Polars lazy | 0.277 s | 1,042 MB |
+| Polars eager | 0.651 s | 1,074 MB |
+| pandas | **3.609 s** | 877 MB |
+
+**The join is 34×, far larger than the group-by's 12.9×.** pandas' `merge` materialises the full
+joined frame — 10 million rows × every column from both sides — before aggregating. DuckDB builds a
+hash table on the 2,000-row dimension and streams the fact table past it, aggregating as it goes.
+**It never materialises the join at all.**
+
+### The row that contradicts the headline
+
+Top-100 by amount:
+
+| Engine | Time | Peak RSS |
+| --- | --- | --- |
+| DuckDB | 0.072 s | 103 MB |
+| Polars **eager**, `top_k` | **0.107 s** | 480 MB |
+| pandas `nlargest` | 0.586 s | 876 MB |
+| Polars **lazy**, `top_k` | **0.681 s** | 1,146 MB |
+
+**Lazy Polars is 6.4× slower than eager Polars on this query, and uses more memory.** Lazy evaluation
+is not uniformly better; the optimiser sometimes picks a plan that does not suit the operation.
+
+**Report this row.** A benchmark that only shows the results supporting its conclusion is an
+advertisement. Reporting the one that does not is the single strongest signal that the measurement
+was honest, and an interviewer will notice it.
+
+### The threshold, which is the actual deliverable
+
+| Rows | Recommendation |
+| --- | --- |
+| Under 100,000 | **pandas.** Milliseconds either way; use the ecosystem you know |
+| 100,000 – 1,000,000 | pandas is fine; watch memory if the frame is wide |
+| 1,000,000 – 10,000,000 | **DuckDB or Polars.** pandas works, but memory binds before speed does |
+| Over 10,000,000 | **DuckDB**, or Polars lazy with streaming |
+| Larger than RAM | **DuckDB** (spills) or Polars streaming. pandas cannot |
+
+**The threshold is memory, not time.** 1.5 s against 0.117 s is annoying; 878 MB against 96 MB
+decides whether the job runs. A 10 GB Parquet file is roughly 30–50 GB as a pandas DataFrame and is
+queryable by DuckDB on a 4 GB laptop.
+
+## Why this solution and not the obvious one
+
+**Why give pandas a fair chance.** Read only the columns each query needs. Comparing
+`pd.read_parquet()` against a DuckDB query that prunes columns measures the reader, not the engine,
+and produces a number nobody should believe.
+
+**Why more than one query shape.** The gap ranges from 12.9× (group-by) to 34× (join) to 43×
+(full read). A single-query benchmark misses that the join — which is where pandas' materialisation
+strategy hurts most — is where the difference actually lives.
+
+**Why the answer is a threshold rather than a winner.** "DuckDB is fastest" does not tell anyone what
+to do on Monday. "DuckDB above a million rows; pandas below, for the ecosystem" does.
+
+**Why DuckDB wins, mechanically** — a full-marks explanation names all three:
+
+1. **Vectorized execution** — 2,048 values per operator call instead of one tuple, so interpretation
+   overhead is amortised 2,048-fold and the inner loop auto-vectorises to SIMD.
+2. **Late materialisation** — only the needed columns, only the row groups whose statistics permit a
+   match, and selection *vectors* rather than copied rows.
+3. **Morsel-driven parallelism** — work split into ~100,000-row units across a thread pool with work
+   stealing. pandas is single-threaded for almost everything.
+
+## Grading notes
+
+**3/3 on Performance** — one subprocess per (engine, query), `ru_maxrss` for memory, at least three
+query shapes, machine and versions stated.
+
+**3/3 on Explanation** — a stated threshold with a reason, the mechanism behind the gap, and the
+lazy-Polars anomaly reported rather than dropped.
+
+**3/3 on Correctness** (for the SCD2 half) — `IS DISTINCT FROM` rather than `!=`, and
+`DATE '9999-12-31'` rather than `NULL` for the open `valid_to`, with a test for each.
+
+**The three most common ways submissions lose points:**
+
+1. **`tracemalloc` for the memory figure.** Reports near zero for DuckDB and Polars, which makes
+   them look impossibly good and the benchmark worthless.
+2. **All engines measured in one process.** Identical, meaningless memory numbers.
+3. **Reporting a winner instead of a threshold.** The question was which to use, not which is
+   fastest.
+
+**On the SCD2 traps specifically**, both of which are silent:
+
+- **`!=` instead of `IS DISTINCT FROM`.** `NULL != 'x'` evaluates to `NULL`, which is not true, so a
+  change from null is **never detected** — and it is precisely the records with poor data quality
+  whose history you lose.
+- **`NULL` for the open `valid_to`.** `BETWEEN` with a null upper bound matches nothing, so every
+  point-in-time query silently returns zero rows.
+
+Test a `NULL → value` transition, and test that a point-in-time query returns the current row.
+
+**On partitioning.** A `hard` submission must justify its partition key with a file-count and
+average-file-size calculation. The war story's team partitioned by `session_id` at 400,000 sessions a
+day and reached 96 million objects averaging **7.7 KB** — against a 128 MB–1 GB target, four orders
+of magnitude out. **The alternative that gets the same pruning without the cost is sorting within a
+date partition**, so row-group statistics do the skipping.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

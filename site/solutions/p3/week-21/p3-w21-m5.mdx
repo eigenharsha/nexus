@@ -1,0 +1,205 @@
+---
+title: "PyTorch fundamentals"
+description: "Reference solution — Week 21"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P3-W21-M5`
+
+The hands-on was: write a training loop with checkpointing and resumption, kill it mid-epoch, and resume without a discontinuity in the metrics.
+
+The `Trainer` class is in the module's Layer 2. This page covers the part that isn't: **mid-epoch resumption**, which is where everyone gets stuck, and the proof that it worked.
+
+### The problem with mid-epoch resumption
+
+Checkpointing at an epoch boundary is easy — the DataLoader starts a fresh shuffled pass either way. Mid-epoch, you must also restore *where you were in the epoch*, or the resumed run sees some examples twice and others not at all in that epoch.
+
+Two workable designs:
+
+| Design | How it works | Cost |
+| --- | --- | --- |
+| **Resumable sampler** | Record the epoch's permutation seed and the index within it; on resume, regenerate the permutation and skip ahead | Skipping is `O(skipped)` in DataLoader iterations — 30 s to skip 4,000 batches of images |
+| **Step-based infinite loop** | No epochs at all. One infinite sampler, checkpoint the step count and the sampler's RNG state | Nothing to skip. The concept of "epoch" becomes a logging convenience |
+
+The reference solution uses the second, because it is what every large training run does (nanoGPT, Megatron, the HF `Trainer` with `max_steps`) and because "epoch" stops being a useful unit the moment your dataset is streamed.
+
+```python
+"""resumable.py — step-based training with exact mid-run resumption.
+PyTorch 2.4.0, Python 3.12."""
+from __future__ import annotations
+import random, math
+from pathlib import Path
+import numpy as np, torch, torch.nn as nn
+from torch.utils.data import DataLoader, Sampler
+
+class InfiniteSampler(Sampler[int]):
+    """Yields indices forever, reshuffling each pass. State is (epoch, pos)."""
+    def __init__(self, n: int, seed: int = 0):
+        self.n, self.seed = n, seed
+        self.epoch, self.pos = 0, 0
+
+    def __iter__(self):
+        while True:
+            g = torch.Generator().manual_seed(self.seed + self.epoch)
+            perm = torch.randperm(self.n, generator=g).tolist()
+            while self.pos < self.n:
+                yield perm[self.pos]
+                self.pos += 1
+            self.epoch += 1
+            self.pos = 0
+
+    def __len__(self) -> int:
+        return self.n                       # nominal; the iterator never stops
+
+    def state_dict(self) -> dict:
+        return {"epoch": self.epoch, "pos": self.pos, "seed": self.seed}
+
+    def load_state_dict(self, s: dict) -> None:
+        self.epoch, self.pos, self.seed = s["epoch"], s["pos"], s["seed"]
+
+def save(path, model, opt, sched, sampler, step):
+    torch.save({
+        "model": model.state_dict(),
+        "opt": opt.state_dict(),
+        "sched": sched.state_dict(),
+        "sampler": sampler.state_dict(),
+        "step": step,
+        "torch_rng": torch.get_rng_state(),
+        "numpy_rng": np.random.get_state(),
+        "python_rng": random.getstate(),
+    }, path)
+
+def load(path, model, opt, sched, sampler) -> int:
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    model.load_state_dict(ck["model"]);  opt.load_state_dict(ck["opt"])
+    sched.load_state_dict(ck["sched"]);  sampler.load_state_dict(ck["sampler"])
+    torch.set_rng_state(ck["torch_rng"])
+    np.random.set_state(ck["numpy_rng"]); random.setstate(ck["python_rng"])
+    return ck["step"]
+```
+
+<Warning>
+`num_workers > 0` breaks this. The sampler is pickled into each worker at iterator creation,
+so `sampler.pos` in the parent process does not advance with the workers' consumption, and the
+state you checkpoint is stale by up to `num_workers × prefetch_factor` batches. Either use
+`num_workers=0` for the resumption test, or checkpoint the **step count** and derive the
+sampler position from it (`pos = step × batch_size % n`), which is what the reference does in
+production. The second is correct and worth the extra five lines.
+</Warning>
+
+### The proof
+
+```python
+"""test_resume.py — the test the war story needed. Runs in ~40 s on CPU."""
+import torch, torch.nn as nn, tempfile, pathlib
+
+def build(seed=0):
+    torch.manual_seed(seed)
+    model = nn.Sequential(nn.Linear(20, 64), nn.ReLU(), nn.Linear(64, 2))
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=500)
+    return model, opt, sched
+
+def steps(model, opt, sched, data, n, start=0):
+    crit = nn.CrossEntropyLoss()
+    losses = []
+    for s in range(start, start + n):
+        xb, yb = data[s % len(data)]
+        opt.zero_grad(set_to_none=True)
+        loss = crit(model(xb), yb)
+        loss.backward(); opt.step(); sched.step()
+        losses.append(loss.item())
+    return losses
+
+torch.manual_seed(123)
+data = [(torch.randn(32, 20), torch.randint(0, 2, (32,))) for _ in range(50)]
+
+# uninterrupted
+a = build(); la = steps(*a, data, 500)
+
+# killed at 137, 289, 402 and resumed each time
+tmp = pathlib.Path(tempfile.mkdtemp())
+b = build(); lb, done = [], 0
+for cut in [137, 289, 402, 500]:
+    lb += steps(*b, data, cut - done, start=done)
+    done = cut
+    torch.save({"m": b[0].state_dict(), "o": b[1].state_dict(),
+                "s": b[2].state_dict()}, tmp / "ck.pt")
+    ck = torch.load(tmp / "ck.pt", weights_only=False)
+    b = build()
+    b[0].load_state_dict(ck["m"]); b[1].load_state_dict(ck["o"]); b[2].load_state_dict(ck["s"])
+
+for pa, pb in zip(a[0].parameters(), b[0].parameters()):
+    assert torch.allclose(pa, pb, atol=1e-6), "resume is not exact"
+print("max loss diff:", max(abs(x - y) for x, y in zip(la, lb)))   # 0.0
+```
+
+On CPU with a fixed data order this is **bit-exact: max loss difference 0.0.** That is the
+strongest form of the test and it is the one to put in CI, because it fails loudly the moment
+someone stops checkpointing the scheduler.
+
+### The measurements
+
+**Reference figure** — Machine B (RTX 4090, modelled; see [About the numbers](/start/about-the-numbers)), ResNet-18 on CIFAR-10, batch 256:
+
+| Configuration | Step time | Notes |
+| --- | --- | --- |
+| Eager | 41.2 ms | baseline |
+| `torch.compile()` | 27.8 ms | **1.48×**, 38 s first-call cost, break-even at ~2,840 steps |
+| `torch.compile()` + `if loss.item() > 10: pass` in the loop | 39.2 ms | **1.05×** — one graph break destroyed the win |
+| `torch.compile(mode="max-autotune")` | 25.1 ms | 1.64×, 214 s first-call cost |
+
+| DataLoader config | GPU util | Epoch |
+| --- | --- | --- |
+| `num_workers=0` | 41% | 94 s |
+| `num_workers=4` | 78% | 51 s |
+| `num_workers=8, pin_memory=True` | 91% | 43 s |
+| `+ persistent_workers, prefetch_factor=4` | 94% | 41 s |
+| `num_workers=16` | 89% | 46 s (CPU contention — more is not better) |
+
+## Why this solution and not the obvious one
+
+**Why step-based rather than epoch-based.** Epochs are an artifact of datasets that fit on one disk. Once you stream, or once your dataset is large enough that you make one pass, the epoch boundary is arbitrary and mid-epoch resumption becomes the *normal* case. Building it step-based from the start means the resumption logic is the same at 10k examples and at 10B tokens — which is exactly the code you will want in Week 26.
+
+**Why checkpoint the RNG states.** Without them the resumed run gets different dropout masks and a different data order, so its loss curve is *statistically* equivalent but not *identical*, and you cannot write the exact test. With a non-exact test you cannot distinguish "resume is slightly wrong" from "resume is fine and this is noise" — which is precisely the situation the module's war story describes.
+
+**Why `best.pt` and `last.pt` are separate files.** `best.pt` is the artifact you serve; `last.pt` is the artifact you resume from. Conflating them means that after the best epoch, every subsequent resume rolls the optimizer state back, and the run effectively restarts from the best point repeatedly. The symptom is a loss curve with a sawtooth you cannot explain.
+
+**Why `weights_only=False` appears in `load`.** Because the checkpoint contains non-tensor objects (Python RNG state, the config dict). PyTorch 2.4 defaults to `weights_only=True` for security, and you must opt out deliberately. Only do so for checkpoints you produced — Week 23 Module 1 shows what a hostile pickle does.
+
+## The two wrong turns worth knowing about
+
+**1. Testing resume only at epoch boundaries.** It passes, and it does not test the thing that breaks. Preemption happens mid-epoch.
+
+**2. Concluding the resume is broken when the real cause is GPU non-determinism.** Run the exactness test on CPU first. If it passes on CPU and fails on GPU with differences around 1e-6 growing over steps, your resume is correct and you are seeing atomic-accumulation ordering. Then decide deliberately: pay the 27% determinism tax, or relax the assertion to "no visible discontinuity" with a measured tolerance. Both are defensible; picking one without measuring is not.
+
+## Grading notes
+
+**3/3 on Correctness** — mid-epoch resumption works, the exactness test passes on CPU, and the checkpoint contains model, optimizer, scheduler, scaler, step and RNG states.
+
+**3/3 on Performance** — you measured `torch.compile` and the DataLoader sweep, found your machine's optimum, and reported the break-even step count for compile rather than just the speedup.
+
+**3/3 on Explanation** — the loss curve across the kill is plotted and the write-up says what a *bad* resume would look like on that plot (a step change at each restart).
+
+**The three most common ways submissions lose points**
+
+1. **Scheduler not in the checkpoint.** It is the single most-omitted item and the cause of the module's war story. If your checkpoint dict has three keys, this is missing.
+2. **Resume "tested" by eye.** "It looked fine" is not the deliverable. The assertion against an uninterrupted run is.
+3. **`torch.compile` speedup reported without the compile cost.** A 1.48× speedup with a 38-second first call is not a win for a 200-step experiment. Report both numbers and the break-even.
+
+<Card title="Back to the module" icon="arrow-left" href="/curriculum/p3/week-21/5-pytorch-fundamentals" horizontal>
+  This Trainer is the one you use for Weeks 22, 25 and 26. Make it good now.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

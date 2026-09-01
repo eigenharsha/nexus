@@ -1,0 +1,1060 @@
+---
+title: "Data engineering landscape"
+description: "Week 15 · Module 1 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 15 · Module 1 · `P2-W15-M1`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Explain **ETL versus ELT** and say which one you are building, and why.
+2. Choose between **batch and streaming** using a decision table rather than a vibe.
+3. Distinguish **OLTP, OLAP and lakehouse**, and say which your query belongs in.
+4. Choose a file format — CSV, JSON, Parquet, Arrow — with measured numbers behind the choice.
+5. Design a pipeline to be **idempotent and replayable**, which is the property that makes it
+   operable at 3 a.m.
+6. Explain columnar storage internals: row groups, encoding, and predicate pushdown — measured.
+
+<Info>
+**Where this returns.** The Parquet layout you learn here is the same layout your vector store
+writes in week 27, the same layout the evaluation logs land in for week 32's cost analysis, and the
+reason DuckDB can answer a question over 10 million rows in 117 milliseconds in module 5. Row
+groups are B-Tree pages (week 14) applied to columns.
+</Info>
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p2-w15-m1.svg" alt="Hand-drawn sketch: row storage versus columnar storage and what a query actually reads" className="block dark:hidden" />
+  <img src="/assets/diagrams/p2-w15-m1-dark.svg" alt="Hand-drawn sketch: row storage versus columnar storage and what a query actually reads" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p2-w15-m1
+tier: T2
+one-sentence-goal: A CSV makes you read every byte to answer any question; Parquet lets the query read only the columns and only the row groups it actually needs, which is why the same aggregate is 16x faster.
+elements:
+  - Frame 1 (top-left, row storage): a CSV drawn as horizontal stripes, each stripe one record with 8 little cells. Shade the ENTIRE block. Beside it write "SELECT sum(amount)" and an arrow with the note "reads all 663 MB. every column. every row." Red cross-out over 7 of the 8 cells in one stripe with "wasted" beside it.
+  - Frame 2 (top-right, columnar): the same data drawn as 8 VERTICAL strips, each labelled with a column name and its measured size - ts 69.5 MB, txn_id 42.8, account_id 32.3, amount 20.9, merchant 13.9, category 3.8, region 2.5, is_refund 0.5. Shade ONLY the "amount" strip. Hand-write "reads 20.9 MB of 186 MB". Circle "amount".
+  - Frame 3 (row groups): the columnar block subdivided horizontally into 10 bands, each labelled "row group, 1,048,576 rows". Beside three of the bands write little min/max boxes - "txn_id 0..1048575", "txn_id 1048576..2097151", etc. Show a query "WHERE txn_id < 1000" with stroke ① checking the min/max boxes and strokes ② crossing out 9 of the 10 bands in red, leaving one shaded. Amber margin note: "the footer told it which bands to skip. it never opened them."
+  - Frame 4 (bottom bar, the measured payoff): three horizontal bars hand-lettered - "count(*) csv: 0.43 s", "count(*) parquet: 0.0019 s", and beside them "226x". Below: "sum(amount) csv 0.78 s / parquet 0.047 s = 16x".
+  - amber margin note bottom-left: "remember week 14? a row group is a B-Tree page for columns."
+numbers-to-write-in: 663.3 MB csv, 186.2 MB parquet snappy, 141.6 MB parquet zstd, amount column = 20.9 MB (11.2% of file), 10 row groups x 1,048,576 rows, count 226x, sum 16x
+alt: A hand-drawn whiteboard sketch contrasting row-oriented CSV storage, where answering a query about one column requires reading all 663 megabytes, with columnar Parquet storage drawn as eight vertical strips labelled with their real compressed sizes where the same query reads only the 20.9 megabyte amount column; then the file subdivided into ten row groups each carrying min and max statistics, with nine of them crossed out in red because the footer statistics proved they could not contain matching rows; and a measured comparison showing a row count taking 0.43 seconds on CSV and 0.0019 seconds on Parquet.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+
+    ## The idea in one paragraph
+
+    Data engineering is the work of getting data from where it is produced to where someone can ask
+    questions of it — reliably, repeatedly, and without a human in the loop. Almost all of the
+    difficulty is in three words: *reliably* (the source will fail, and you must not lose or
+    duplicate data), *repeatedly* (you must be able to run it again tomorrow, and re-run today's
+    without breaking anything), and *without a human* (which means it must report its own failures,
+    because nobody is watching). The technology choices — which file format, which database, which
+    tool — matter far less than those three properties, and this module is mostly about how the
+    choices serve them.
+
+    ### The analogy
+
+    A restaurant kitchen receiving deliveries.
+
+    - **The source** is the supplier. They deliver when they deliver, sometimes late, sometimes with
+      substitutions, occasionally twice.
+    - **Extraction** is unloading the van. You do not control the schedule and you must cope with a
+      driver who leaves halfway through.
+    - **Transformation** is prep — washing, chopping, portioning into a consistent form.
+    - **Loading** is putting it in the walk-in, labelled, where the chefs can find it.
+    - **Idempotency** is the property that if the same delivery arrives twice, you do not end up
+      with two of everything. You check the label first.
+
+    **ETL versus ELT** is a question about *where the chopping happens*: in the van (transform
+    before loading) or in the kitchen (load raw, transform in the warehouse). Modern practice is
+    overwhelmingly ELT, because warehouses got fast enough to do the chopping and because keeping
+    the raw delivery means you can re-chop it differently tomorrow without asking the supplier again.
+
+    ### Every term, defined
+
+    - **Pipeline** — an automated sequence that moves data from a source to a destination.
+    - **Source** — where the data comes from: an API, a database, a file drop, a scraped page.
+    - **Destination / sink** — where it lands: a warehouse, a lake, a database.
+    - **ETL** — Extract, Transform, Load. Transform *before* loading. Historically necessary
+      because the destination was expensive and slow.
+    - **ELT** — Extract, Load, Transform. Load the raw data, then transform inside the destination.
+      The modern default, because the destination is now cheap and fast, and because raw data you
+      already have is much easier to re-process than data you have to re-fetch.
+    - **Batch** — process a chunk of data on a schedule. Hourly, nightly.
+    - **Streaming** — process each record as it arrives, continuously.
+    - **OLTP** — Online Transaction Processing. The database behind your app. Optimised for reading
+      and writing *individual rows* fast. Postgres, MySQL.
+    - **OLAP** — Online Analytical Processing. Optimised for scanning *many rows, few columns*.
+      DuckDB, Snowflake, BigQuery, ClickHouse.
+    - **Lakehouse** — a lake (cheap object storage full of files) with warehouse features bolted on:
+      transactions, schema enforcement, time travel. Iceberg, Delta Lake.
+    - **Idempotent** — running it twice gives the same result as running it once.
+    - **Replayable** — you can re-run any past window and get the same answer.
+    - **Watermark** — a saved marker of how far you got, so the next run starts from there.
+    - **Row-oriented** — records stored one after another. All of row 1, then all of row 2. CSV, and
+      most OLTP databases.
+    - **Columnar** — all of column 1, then all of column 2. Parquet, Arrow, and every OLAP engine.
+
+    ### Do it by hand once
+
+    The fastest way to understand why you would automate something is to do it manually and feel
+    where it hurts.
+
+    ```python
+    # manual_pull.py — CPython 3.12, requests 2.32.3
+    import json
+    import sqlite3
+    import requests
+
+    # A free, no-auth public API.
+    resp = requests.get("https://api.github.com/repos/duckdb/duckdb/issues",
+                        params={"state": "all", "per_page": 100},
+                        timeout=30)
+    resp.raise_for_status()
+    issues = resp.json()
+    print(f"fetched {len(issues)} issues")
+
+    con = sqlite3.connect("issues.db")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS issues (
+            id INTEGER PRIMARY KEY,
+            number INTEGER,
+            title TEXT,
+            state TEXT,
+            created_at TEXT,
+            user_login TEXT
+        )
+    """)
+    for it in issues:
+        con.execute(
+            "INSERT OR REPLACE INTO issues VALUES (?, ?, ?, ?, ?, ?)",
+            (it["id"], it["number"], it["title"], it["state"],
+             it["created_at"], it["user"]["login"]),
+        )
+    con.commit()
+    print(con.execute("SELECT count(*) FROM issues").fetchone()[0], "rows in table")
+    ```
+
+    ### Line-by-line walkthrough
+
+    - `params={"state": "all", "per_page": 100}` — 100 is GitHub's maximum page size. **You just
+      got one page.** There are thousands of issues. Handling that is module 2.
+    - `resp.raise_for_status()` — raises on a 4xx or 5xx. Without it, an error page becomes your
+      data and the failure is silent. This is the single most important line in the script.
+    - `timeout=30` — **`requests` has no default timeout.** Without this the call can hang forever
+      on a half-open connection, and your scheduled job never finishes and never fails.
+    - `INSERT OR REPLACE` — this is what makes the script **idempotent**. Run it twice and you get
+      the same rows, not duplicates, because `id` is the primary key. A plain `INSERT` would
+      duplicate everything on the second run. **This one keyword is the difference between a script
+      you can re-run and one you cannot.**
+    - `it["user"]["login"]` — the API returns nested JSON and the table is flat, so you flatten by
+      hand. With 40 fields and three levels of nesting this becomes the bulk of the code, and it is
+      exactly what `dlt` does for you in module 4.
+
+    ### Now feel what is missing
+
+    Run that script and then ask what happens when:
+
+    | Question | What the script does | What it should do |
+    | --- | --- | --- |
+    | There are 5,000 issues, not 100 | silently gets the first 100 | paginate |
+    | GitHub returns 429 (rate limited) | `raise_for_status` throws; the job dies | back off and retry, respecting `Retry-After` |
+    | The connection drops at issue 3,000 | loses everything, starts over tomorrow | resume from a watermark |
+    | You run it again tomorrow | re-fetches all 5,000 | fetch only what changed |
+    | GitHub adds a field | silently ignored | evolve the schema, or fail loudly — your choice, made deliberately |
+    | It runs at 3 a.m. and fails | nobody knows until someone notices missing data | alert, with the run report |
+    | Someone asks "what did this look like last Tuesday?" | no idea | keep the raw extract |
+
+    **Every one of those rows is a module in this week.** The script is not wrong — it is the
+    correct first version. What makes it a pipeline is the seven rows of that table.
+
+    ### CSV versus Parquet, felt
+
+    ```python
+    # formats.py — pandas 2.2.3, pyarrow 18.1.0
+    import pandas as pd
+    import os, time
+
+    df = pd.DataFrame({
+        "id": range(1_000_000),
+        "category": ["alpha", "beta", "gamma", "delta"] * 250_000,
+        "amount": [i * 1.5 for i in range(1_000_000)],
+        "flag": [i % 2 == 0 for i in range(1_000_000)],
+    })
+
+    df.to_csv("data.csv", index=False)
+    df.to_parquet("data.parquet", compression="snappy")
+
+    for f in ("data.csv", "data.parquet"):
+        print(f"{f:15s} {os.path.getsize(f)/1e6:8.1f} MB")
+
+    t = time.perf_counter(); pd.read_csv("data.csv"); print(f"read csv     {time.perf_counter()-t:.3f}s")
+    t = time.perf_counter(); pd.read_parquet("data.parquet"); print(f"read parquet {time.perf_counter()-t:.3f}s")
+    t = time.perf_counter()
+    pd.read_parquet("data.parquet", columns=["amount"])
+    print(f"read parquet, one column  {time.perf_counter()-t:.3f}s")
+    ```
+
+    The third measurement is the one that matters. **Reading one column out of a Parquet file does
+    not read the others** — the format stores columns separately, so the reader skips them entirely.
+    A CSV has no such option: the `amount` values are interleaved with everything else, so finding
+    them means parsing every byte.
+
+    ### Checkpoint — 5 questions before you continue
+
+    <AccordionGroup>
+      <Accordion title="1. What is the difference between ETL and ELT, and why did the default change?">
+        ETL transforms before loading; ELT loads raw and transforms in the destination. The default
+        changed because warehouse compute got cheap and fast, and because **raw data you already
+        have is far easier to re-process than data you must re-fetch**. If your transform had a bug,
+        ELT lets you fix it and re-run over data you already hold; ETL means going back to the
+        source, which may have changed or may rate-limit you.
+      </Accordion>
+      <Accordion title="2. What makes a pipeline idempotent, and why does it matter at 3 a.m.?">
+        Running it twice produces the same result as running it once. Achieved with primary keys plus
+        upsert (`INSERT OR REPLACE`, `MERGE`), or by making each run write to a fresh partition that
+        replaces the old one. It matters because **the correct response to a failed pipeline should
+        always be "run it again"**. If re-running risks duplicating data, every incident needs a
+        human to reason about state first, at 3 a.m., under pressure.
+      </Accordion>
+      <Accordion title="3. When do you actually need streaming rather than batch?">
+        When the *decision* the data feeds needs to happen within seconds: fraud blocking, real-time
+        bidding, alerting, live personalisation. Streaming costs materially more in complexity —
+        exactly-once semantics, out-of-order events, late arrivals, state management. **Most
+        "real-time" requirements are satisfied by a 5-minute batch**, and asking "what decision
+        changes if this is 5 minutes stale?" resolves the question more often than not.
+      </Accordion>
+      <Accordion title="4. Why is Parquet so much smaller than CSV?">
+        Three reasons compounding. **Columnar layout** puts similar values together, so compression
+        works far better on a column of four repeated category strings than on rows mixing strings,
+        floats and booleans. **Type-aware encoding** stores an integer as 4 bytes rather than up to
+        10 ASCII characters. **Dictionary encoding** replaces repeated strings with small integers
+        plus a lookup table. Measured on the week's dataset: 663.3 MB CSV becomes 186.2 MB with
+        snappy and 141.6 MB with zstd.
+      </Accordion>
+      <Accordion title="5. What is a watermark and what does it break if you get it wrong?">
+        A saved marker of how far the last run got — usually a timestamp or an ID — so the next run
+        starts from there instead of re-fetching everything. Get it wrong in one direction (advance
+        too far) and you **silently skip records**. In the other (advance too little) you re-fetch,
+        which is wasteful but safe. **Always err toward re-fetching**, and make the load idempotent
+        so re-fetching is harmless. That combination — overlapping windows plus idempotent load — is
+        the standard correct design.
+      </Accordion>
+    </AccordionGroup>
+
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+
+    ## Batch versus streaming: a decision table
+
+    | Question | Batch | Streaming |
+    | --- | --- | --- |
+    | Latency requirement | minutes to hours | sub-second to seconds |
+    | Reprocessing history | trivial — re-run the job | hard — replay the log, if you kept it |
+    | Handling late data | just re-run the affected window | windowing, watermarks, allowed lateness |
+    | Exactly-once | easy — idempotent writes on a bounded set | genuinely hard; needs transactional sinks |
+    | Debugging | inspect the input file | attach to a live stream and hope it recurs |
+    | Cost | pay for the window you process | pay for a cluster that is always on |
+    | Team cost | one engineer | a team, plus on-call |
+    | Typical tools | `dlt`, dbt, Airflow, Spark batch | Kafka + Flink, Kinesis, Materialize |
+
+    **The honest heuristic: use batch until you can name the decision that a 5-minute delay makes
+    wrong.** "The dashboard should be live" is not such a decision. "We must decline the fraudulent
+    transaction before it settles" is. Micro-batching every 1–5 minutes covers most of the space
+    between, at a fraction of the operational cost.
+
+    ## OLTP, OLAP, lakehouse
+
+    | | OLTP | OLAP | Lakehouse |
+    | --- | --- | --- | --- |
+    | Optimised for | few rows, all columns | many rows, few columns | same as OLAP, over object storage |
+    | Layout | row-oriented | columnar | columnar files (Parquet) + a metadata layer |
+    | Typical query | `WHERE id = 4711` | `GROUP BY category` over 10⁸ rows | either, plus time travel |
+    | Index | B-Tree (week 14) | zone maps / min-max statistics | the same, plus a manifest |
+    | Write pattern | many small transactions | bulk append | bulk append with atomic commits |
+    | Examples | Postgres 16, MySQL 8 | DuckDB 1.1.3, ClickHouse, BigQuery | Iceberg, Delta Lake, Hudi |
+
+    **The mistake this table prevents** is running analytics against your production OLTP database.
+    A `GROUP BY` over 50 million rows in Postgres reads every row of every column, competes with
+    your application for buffer cache, and holds a snapshot that blocks vacuum. It works right up
+    until the day it takes the site down. The fix — replicate to an OLAP store — is a day of work
+    and it is the single most common piece of advice a data engineer gives.
+
+    ## File formats, measured
+
+    The week's dataset: 10,000,000 transactions, 8 columns.
+
+    | Format | Size | Ratio vs CSV |
+    | --- | --- | --- |
+    | CSV | 663.3 MB | 1.00× |
+    | CSV + gzip | 190.3 MB | 3.48× |
+    | Parquet, uncompressed | 240.4 MB | 2.76× |
+    | Parquet + snappy | 186.2 MB | 3.56× |
+    | Parquet + zstd | **141.6 MB** | **4.68×** |
+
+    <Info>
+    Method: pyarrow 18.1.0, default row group size, dictionary encoding on by default. Reproduce
+    with `w15_bench.py formats`.
+    </Info>
+
+    **Read the uncompressed-Parquet row.** It is 2.76× smaller than CSV with *no compression at
+    all* — that is pure encoding: integers stored as 4 or 8 bytes instead of ASCII digits, and
+    dictionary encoding turning 2,000 distinct merchant strings into small integer codes. Compression
+    then adds another 1.3–1.7× on top.
+
+    **gzipped CSV is nearly as small as snappy Parquet and is the wrong choice**, because gzip is not
+    splittable — you cannot start reading in the middle, so you cannot skip columns, skip row
+    groups, or read it in parallel. **Size is the least interesting property of a file format.**
+
+    ### What each format is for
+
+    | Format | Use it when | Avoid it when |
+    | --- | --- | --- |
+    | **CSV** | a human must read or edit it; interchange with a system that demands it | anything performance-sensitive; anything with embedded commas, newlines or unicode subtleties |
+    | **JSON / JSONL** | nested structure matters; the raw landing zone for an API response | analytics; it is 3–10× larger and must be fully parsed |
+    | **Parquet** | **the default for anything analytical on disk** | tiny files (under ~1 MB the footer overhead dominates); frequent single-row updates |
+    | **Arrow / Feather** | passing data between processes or libraries in memory, zero-copy | long-term storage — the format prioritises speed over compactness |
+    | **Avro** | row-oriented streaming with a strong schema registry; Kafka topics | column-selective analytics |
+
+    <Tip>
+    **Keep the raw JSON.** Land the API response exactly as received in a `raw/` prefix, *then*
+    convert to Parquet. Storage is roughly $0.023 per GB-month on S3 standard; 100 GB of raw JSON is
+    $2.30 a month. The first time a transform bug means you need to reprocess from source, that
+    $2.30 saves you a week and an awkward conversation with the API's rate limiter.
+    </Tip>
+
+    ## Designing for idempotency and replay
+
+    Four patterns, in increasing order of robustness:
+
+    **1. Truncate and reload.** Delete everything, write it all again. Trivially idempotent. Fine
+    below a few million rows; the whole table is unavailable during the rewrite unless you swap
+    atomically.
+
+    **2. Upsert by primary key.** `MERGE` / `INSERT ... ON CONFLICT DO UPDATE` / `INSERT OR REPLACE`.
+    Idempotent provided the key is genuinely unique. **This is the default and it is what `dlt`'s
+    `merge` write disposition does.**
+
+    **3. Partition replacement.** Each run writes one partition (usually a date) and atomically
+    replaces it. Re-running a day rewrites exactly that day. **This is the right pattern for
+    file-based storage**, because a partition is a directory and replacing it is a rename.
+
+    ```
+    warehouse/transactions/dt=2026-08-30/part-0000.parquet
+    warehouse/transactions/dt=2026-08-31/part-0000.parquet
+    ```
+
+    **4. Append-only with deduplication at read time.** Never mutate; append every observation with
+    an ingestion timestamp, and deduplicate in a view using `ROW_NUMBER() OVER (PARTITION BY id
+    ORDER BY ingested_at DESC)`. The most robust — you never lose history and you can reconstruct
+    any past state — at the cost of storage and query complexity.
+
+    ### The overlapping-window rule
+
+    Incremental extraction with a watermark has a subtle failure. If the last run saw records up to
+    `12:00:00` and the next run asks for `> 12:00:00`, any record *written* at 11:59:59 but
+    *committed* at 12:00:01 is lost forever. Source systems commit out of order; clocks differ.
+
+    ```python
+    # Wrong: a knife-edge boundary.
+    since = last_watermark
+
+    # Right: overlap, and rely on an idempotent load to absorb the duplicates.
+    since = last_watermark - timedelta(minutes=5)
+    ```
+
+    **You now fetch some records twice, and because the load is an upsert, that costs nothing.**
+    Overlapping windows plus idempotent writes is the standard correct design, and it is what
+    separates a pipeline that quietly loses 0.01% of records from one that does not.
+
+    ## Reference implementation: a CSV-to-Parquet converter with a report
+
+    ```python
+    # convert.py — CPython 3.12, pyarrow 18.1.0
+    from __future__ import annotations
+    import os
+    import time
+    from dataclasses import dataclass, asdict
+    from pathlib import Path
+
+    import pyarrow as pa
+    import pyarrow.csv as pacsv
+    import pyarrow.parquet as pq
+
+
+    @dataclass(frozen=True, slots=True)
+    class ConversionReport:
+        source: str
+        destination: str
+        rows: int
+        source_bytes: int
+        dest_bytes: int
+        compression: str
+        row_group_size: int
+        seconds: float
+
+        @property
+        def ratio(self) -> float:
+            return self.source_bytes / self.dest_bytes
+
+
+    def csv_to_parquet(
+        src: Path,
+        dst: Path,
+        compression: str = "zstd",
+        row_group_size: int = 1_000_000,
+        block_size: int = 64 << 20,
+    ) -> ConversionReport:
+        """Stream a CSV of any size into Parquet with bounded memory.
+
+        block_size caps how much CSV is parsed at once, so a 50 GB input works
+        on a laptop. Writing incrementally per batch is what keeps peak RSS
+        proportional to block_size rather than to the file size.
+        """
+        t0 = time.perf_counter()
+        reader = pacsv.open_csv(
+            src,
+            read_options=pacsv.ReadOptions(block_size=block_size),
+            convert_options=pacsv.ConvertOptions(strings_can_be_null=True),
+        )
+        writer: pq.ParquetWriter | None = None
+        rows = 0
+        try:
+            for batch in reader:
+                if writer is None:
+                    writer = pq.ParquetWriter(
+                        dst, batch.schema,
+                        compression=compression,
+                        use_dictionary=True,
+                        write_statistics=True,       # min/max per row group: enables skipping
+                    )
+                writer.write_batch(batch, row_group_size=row_group_size)
+                rows += batch.num_rows
+        finally:
+            if writer is not None:
+                writer.close()
+
+        return ConversionReport(
+            source=str(src), destination=str(dst), rows=rows,
+            source_bytes=os.path.getsize(src), dest_bytes=os.path.getsize(dst),
+            compression=compression, row_group_size=row_group_size,
+            seconds=time.perf_counter() - t0,
+        )
+
+
+    if __name__ == "__main__":
+        import json, sys
+        r = csv_to_parquet(Path(sys.argv[1]), Path(sys.argv[2]))
+        print(json.dumps(asdict(r) | {"ratio": round(r.ratio, 2)}, indent=2))
+    ```
+
+    ```python
+    # test_convert.py — pytest 8.x
+    import pyarrow.parquet as pq
+    import pytest
+    from convert import csv_to_parquet
+
+
+    @pytest.fixture
+    def csv_file(tmp_path):
+        p = tmp_path / "in.csv"
+        rows = "\n".join(f"{i},cat{i%4},{i*1.5},{i%2==0}" for i in range(50_000))
+        p.write_text("id,category,amount,flag\n" + rows + "\n")
+        return p
+
+
+    def test_row_count_preserved(csv_file, tmp_path):
+        out = tmp_path / "out.parquet"
+        r = csv_to_parquet(csv_file, out)
+        assert r.rows == 50_000
+        assert pq.ParquetFile(out).metadata.num_rows == 50_000
+
+
+    def test_smaller_than_source(csv_file, tmp_path):
+        r = csv_to_parquet(csv_file, tmp_path / "out.parquet")
+        assert r.ratio > 1.5
+
+
+    def test_statistics_are_written(csv_file, tmp_path):
+        """Without statistics there is no row-group skipping, which is most of the point."""
+        out = tmp_path / "out.parquet"
+        csv_to_parquet(csv_file, out, row_group_size=10_000)
+        md = pq.ParquetFile(out).metadata
+        assert md.num_row_groups == 5
+        stats = md.row_group(0).column(0).statistics
+        assert stats is not None and stats.has_min_max
+        assert stats.min == 0 and stats.max == 9_999
+
+
+    def test_types_are_inferred_not_strings(csv_file, tmp_path):
+        out = tmp_path / "out.parquet"
+        csv_to_parquet(csv_file, out)
+        schema = pq.ParquetFile(out).schema_arrow
+        assert schema.field("id").type == "int64"
+        assert schema.field("amount").type == "double"
+        assert schema.field("flag").type == "bool"
+
+
+    def test_empty_csv_does_not_crash(tmp_path):
+        src = tmp_path / "empty.csv"
+        src.write_text("id,category\n")
+        r = csv_to_parquet(src, tmp_path / "empty.parquet")
+        assert r.rows == 0
+    ```
+
+    <Check>
+    `test_statistics_are_written` is the test that protects the property everything else depends on.
+    `write_statistics=False` produces a valid, correctly-sized Parquet file in which **every query
+    reads every row group**, because there is no min/max to skip on. The file looks fine, the row
+    counts are right, and selective queries are 10–50× slower than they should be. Nothing else in
+    your test suite would notice.
+    </Check>
+
+    ## Trade-offs table
+
+    | Situation | Choose | Instead of | Because |
+    | --- | --- | --- | --- |
+    | Analytical data on disk | Parquet + zstd | CSV | 4.68× smaller, and 16× faster on a single-column aggregate |
+    | Raw landing zone for an API | JSONL, exactly as received | parsed Parquet | you cannot un-parse; storage is $0.023/GB-month |
+    | Human must edit it | CSV | Parquet | Parquet is binary; the operational cost of "I can't open this" is real |
+    | Passing data between processes | Arrow IPC / Feather | Parquet | zero-copy, no decode step; Parquet optimises size, Arrow optimises speed |
+    | Under ~1 MB per file | one bigger file, or CSV | many small Parquet files | footer and metadata overhead dominates; thousands of small files also destroy object-store listing performance |
+    | Latency requirement above ~1 minute | batch | streaming | streaming costs a cluster, a team, and exactly-once semantics you will get wrong |
+    | Sub-second decisions | streaming | batch | there is no batch size small enough |
+    | Analytics over production data | replicate to DuckDB / an OLAP store | querying the OLTP replica | a `GROUP BY` over 50M rows in Postgres competes with your application for buffer cache |
+    | Re-running must be safe | upsert by key, or partition replacement | plain append | append plus a retry equals duplicates, and duplicates are found by finance, not by you |
+
+    ## What breaks in the real world
+
+    A marketing analytics pipeline pulled campaign performance from an ad platform's API each night
+    at 02:00, keyed on `campaign_id`, and appended to a Postgres table. The dashboard summed spend
+    by campaign.
+
+    It ran for seven months. Reported spend was consistently about 3% above what the ad platform's
+    own dashboard showed, and everyone assumed a definitional difference — attribution windows,
+    currency conversion, something. Nobody chased it.
+
+    Two things were happening, and they compounded.
+
+    **First, the load was an append, not an upsert.** The API returned the last 7 days of data on
+    each call, so every campaign's numbers were inserted 7 times. The dashboard's `SUM(spend)`
+    therefore counted each day roughly 7 times — except that a `GROUP BY campaign_id` with a `MAX`
+    on the report date happened to mask most of it, leaving a residue that varied with how often
+    campaigns changed.
+
+    **Second, the job had a retry.** On failure it retried up to 3 times, and a partial failure
+    (some rows written, then a timeout) meant the successful rows were written *again* on the retry.
+    Failures were rare — about once a fortnight — so the extra duplication was small and irregular,
+    which is exactly why the 3% discrepancy never looked like a systematic bug.
+
+    The diagnosis came from one query:
+
+    ```sql
+    SELECT campaign_id, report_date, count(*)
+    FROM campaign_performance
+    GROUP BY 1, 2
+    HAVING count(*) > 1
+    ORDER BY 3 DESC
+    LIMIT 10;
+    ```
+
+    **Every row had a count above 1.** Some had 47.
+
+    The fix was a unique constraint plus an upsert:
+
+    ```sql
+    ALTER TABLE campaign_performance
+        ADD CONSTRAINT uq_campaign_date UNIQUE (campaign_id, report_date);
+    ```
+    ```python
+    INSERT INTO campaign_performance (...) VALUES (...)
+    ON CONFLICT (campaign_id, report_date)
+    DO UPDATE SET spend = EXCLUDED.spend, impressions = EXCLUDED.impressions,
+                  updated_at = now();
+    ```
+
+    What generalises:
+
+    - **A retry on a non-idempotent write is a duplication machine.** The retry was added to improve
+      reliability and made correctness worse. Any retry policy must be paired with an idempotent
+      write, or it is a bug with good intentions.
+    - **The natural key is almost always a composite.** `campaign_id` alone is not unique per row;
+      `(campaign_id, report_date)` is. Getting this wrong is the most common data-modelling error in
+      pipelines, and the database will enforce it for you the moment you declare it.
+    - **Run the duplicate-check query against every table you load.** It is four lines, and it
+      should be a data-quality assertion in the pipeline, not a thing you run during an incident.
+    - **A small, stable discrepancy is a bug, not a definitional difference.** "It's always about 3%
+      off" was treated as a known quirk for seven months. Discrepancies that are *consistent* are
+      the most suspicious kind, because randomness would produce a varying error.
+
+    ### Design checkpoint
+
+    <Accordion title="Your company has 40 spreadsheets that people update by hand and a nightly job that reads them. You are asked to 'modernise the data platform'. What do you build first, and what do you refuse to build?">
+    **Model answer.**
+
+    **What I refuse to build first: the platform.** The instinct is Airflow, a warehouse, dbt, a
+    catalogue, and a six-month project. That project will be judged against the 40 spreadsheets,
+    which — critically — *work*. People get their numbers. Replacing them wholesale is a large
+    change with a long time-to-value and a high chance of being cancelled at month four.
+
+    **What I build first: ingestion for the three spreadsheets that matter most, landed as raw
+    files, with a run report.** Concretely:
+
+    1. **Find the three.** Not by asking who shouts loudest — by asking which spreadsheets feed a
+       decision someone makes weekly, and which ones have broken in the last quarter. Usually two or
+       three dominate.
+    2. **Land them raw, versioned, on a schedule.** A scheduled job copies each file to
+       `raw/<name>/dt=YYYY-MM-DD/<name>.xlsx`, unchanged. **This alone is valuable** — you now have
+       history, which nobody has, and "what did this look like in March?" becomes answerable.
+    3. **Parse to Parquet in a second step, with data-quality assertions.** Row count within a band,
+       required columns present, no nulls in key fields, and a freshness check. Assertions fail the
+       run and post to a channel. **The assertions are the product**, because the current failure
+       mode is silent wrongness, not absence.
+    4. **DuckDB over the Parquet as the query layer.** No server, no cluster, one file, and it will
+       comfortably handle everything 40 spreadsheets contain. Adding Snowflake here would be
+       spending money to solve a problem nobody has.
+
+    **What I explicitly do not do yet:** ask people to stop using spreadsheets. The spreadsheet stays
+    the interface; I am putting a pipeline *behind* it. Once three months of history exists and
+    somebody asks a question the spreadsheet cannot answer, the pull toward the warehouse comes from
+    them rather than from me.
+
+    **The failure mode to guard against:** the hand-maintained spreadsheet changes shape — a column
+    renamed, a row inserted above the header — and the parser silently produces nulls. **This is the
+    single most likely incident**, so the schema assertion must be strict and must fail the run
+    rather than coerce. A pipeline that fails loudly beats one that produces plausible nulls, and
+    that is the whole argument for spending the first week on assertions rather than on architecture.
+
+    **The number to bring to the review:** "the finance close spreadsheet broke twice last quarter
+    and each time took two days to notice and half a day to fix. This costs one week of my time and
+    removes that." That is a far better case than "we should modernise our data platform".
+    </Accordion>
+
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+
+    ## What a Parquet file actually contains
+
+    ```
+    ┌──────────────────────────────────────┐
+    │ PAR1                                 │  4-byte magic
+    ├──────────────────────────────────────┤
+    │ Row Group 0                          │
+    │   Column chunk: txn_id               │
+    │     Page header + data page(s)       │
+    │     (dictionary page, if encoded)    │
+    │   Column chunk: account_id           │
+    │   ... 8 column chunks                │
+    ├──────────────────────────────────────┤
+    │ Row Group 1 .. Row Group 9           │
+    ├──────────────────────────────────────┤
+    │ File metadata (Thrift)               │  schema, and PER ROW GROUP PER COLUMN:
+    │                                      │  byte offset, size, min, max, null count,
+    │                                      │  distinct count, encoding
+    ├──────────────────────────────────────┤
+    │ 4-byte metadata length | PAR1        │  the reader seeks here FIRST
+    └──────────────────────────────────────┘
+    ```
+
+    **The footer is read first, and it is why Parquet is fast.** A reader seeks to the end, reads 4
+    bytes for the metadata length, reads the metadata, and now knows the byte offset and the min/max
+    of every column chunk in every row group — without having touched any data.
+
+    The week's dataset, inspected:
+
+    | | |
+    | --- | --- |
+    | Rows | 10,000,000 |
+    | Row groups | **10** |
+    | Rows per row group | **1,048,576** |
+    | Total compressed | 186.2 MB |
+
+    And the per-column breakdown, which is the number that makes column pruning concrete:
+
+    | Column | Compressed | % of file |
+    | --- | --- | --- |
+    | `ts` (timestamp) | 69.5 MB | **37.3%** |
+    | `txn_id` (int64, sequential) | 42.8 MB | 23.0% |
+    | `account_id` (int32) | 32.3 MB | 17.3% |
+    | `amount` (double) | 20.9 MB | 11.2% |
+    | `merchant` (2,000 distinct strings) | 13.9 MB | 7.4% |
+    | `category` (8 distinct strings) | 3.8 MB | 2.0% |
+    | `region` (4 distinct strings) | 2.5 MB | 1.4% |
+    | `is_refund` (bool, 3% true) | **0.5 MB** | **0.3%** |
+
+    <Info>
+    Method: `pyarrow.parquet.ParquetFile(...).metadata`, summing `total_compressed_size` per column
+    across all row groups. Reproduce with `w15_bench.py formats`.
+    </Info>
+
+    Read that table as a set of lessons about encoding:
+
+    - **`is_refund` is 10 million booleans in 0.5 MB — 0.4 bits per value.** RLE (run-length
+      encoding) plus bit-packing on a 3%-true column compresses to almost nothing.
+    - **`region` has 4 distinct values across 10 million rows and costs 2.5 MB.** Dictionary
+      encoding stores 4 strings once plus 10 million 2-bit codes.
+    - **`merchant` has 2,000 distinct values and costs 13.9 MB** — 5.6× more than `region` for 500×
+      more distinct values, because the dictionary is bigger and the codes are wider. **Cardinality
+      is what drives columnar size**, far more than the raw string length.
+    - **`ts` is the most expensive column at 37.3%**, because the timestamps are random within a
+      year, so delta encoding finds no pattern. **Sorting the file by timestamp before writing would
+      make this column compress dramatically better** — and would additionally make time-range
+      queries skip row groups. This is the single highest-value physical-layout decision available.
+    - **`txn_id` is sequential and still costs 23%.** Parquet v2's `DELTA_BINARY_PACKED` would store
+      the deltas (all 1) in almost nothing; pyarrow defaults to `use_dictionary=True` with plain
+      encoding for int64, which does not exploit the sequence. **Setting
+      `column_encoding={"txn_id": "DELTA_BINARY_PACKED"}` is a measurable free win** on any
+      monotonic column.
+
+    ## Predicate pushdown and row-group skipping, measured
+
+    ```
+    operation                     source     seconds   what happened
+    count(*)                      csv        0.4300    parsed all 663 MB
+    count(*)                      parquet    0.0019    read the footer, summed num_rows
+    sum(amount)                   parquet    0.0470    read 1 column of 8 (20.9 MB of 186 MB)
+    sum(amount)                   csv        0.7800    parsed all 8 columns
+    WHERE txn_id < 1000           parquet    0.0164    min/max skipped 9 of 10 row groups
+    WHERE amount > 150            parquet    0.0340    no skipping possible
+    ```
+
+    <Info>
+    Method: DuckDB 1.1.3 against the same data as CSV and as snappy Parquet, best-of-3 for Parquet
+    and best-of-1 for the CSV scans. Reproduce with `w15_bench.py formats`.
+    </Info>
+
+    Three separate mechanisms are visible in that table, and it is worth separating them because
+    people collapse them into "Parquet is fast".
+
+    **1. Metadata-only answers: 226×.** `count(*)` on Parquet reads no data at all — the footer
+    records `num_rows` per row group. 0.0019 s versus 0.43 s. Any query answerable from statistics
+    alone (`count(*)`, `min`, `max` on a column) is essentially free.
+
+    **2. Column pruning: 16×.** `sum(amount)` reads only the `amount` column chunks — 20.9 MB of
+    186 MB, 11.2% of the file. The measured speedup is 16×, larger than the 9× byte ratio would
+    suggest, because the CSV path also pays for text-to-float parsing on every column it must skip
+    past. **Column pruning is why `SELECT *` is a performance bug in a columnar store** in a way it
+    simply is not in a row store.
+
+    **3. Row-group skipping: 2.1×, and it depends entirely on physical order.** The predicate
+    `txn_id &lt; 1000` takes 0.0164 s while `amount > 150` — which matches a third of the rows —
+    takes 0.034 s. `txn_id` is written in sorted order, so nine of the ten row groups have a `min` above
+    1000 and are skipped without being opened. `amount` is randomly distributed, so **every row
+    group's min/max range contains 150** and none can be skipped.
+
+    **This is the whole argument for sort order as a physical design decision.** The same predicate
+    against the same data is 2× faster or 50× faster depending on whether the file is sorted on the
+    filtered column. It is the columnar equivalent of a clustered index, and it is free at write
+    time.
+
+    ## Row group size: the tuning knob
+
+    | Row group size | Effect |
+    | --- | --- |
+    | Too small (under ~100k rows) | footer metadata grows; more per-group overhead; compression has less data to work with |
+    | **1M rows (the default here)** | ~18 MB per group at this schema; a good default |
+    | Too large (over ~10M rows) | skipping becomes coarse — one non-matching row forces reading the whole group; peak memory per read rises |
+
+    The guidance from the Parquet community is **128–512 MB per row group** for HDFS-era systems and
+    **50–150 MB** for object storage, where you also want the group to be fetchable in a small number
+    of range requests. The real constraint on object storage is request count: a `GET` with a byte
+    range costs about 0.4 ms of latency plus ~$0.0004 per 1,000 requests, so a file split into
+    thousands of tiny groups spends its life in request overhead.
+
+    **The pathological case is the small-file problem.** 10,000 Parquet files of 1 MB each cost more
+    to list and open than one 10 GB file costs to scan. On S3, `LIST` is paginated at 1,000 keys per
+    request, and every file needs its own footer read. Compaction jobs exist entirely to fix this,
+    and the rule of thumb is **target 128 MB–1 GB per file**.
+
+    ## The lakehouse table formats, in one page
+
+    Parquet files in a directory are not a table. There is no atomic commit, no schema enforcement,
+    and no way to know which files constitute the current state — a reader can see a half-written
+    partition. **Iceberg, Delta Lake and Hudi** all solve this by adding a metadata layer that names
+    the files belonging to each snapshot.
+
+    | | Apache Iceberg | Delta Lake |
+    | --- | --- | --- |
+    | Metadata | a metadata file per snapshot, pointing at manifest lists, pointing at manifests, pointing at data files | a transaction log of JSON commits, periodically checkpointed to Parquet |
+    | Atomic commit | swap the pointer to the current metadata file | append a numbered commit file; the highest number wins |
+    | Schema evolution | full — add, drop, rename, reorder, widen types — because columns are tracked by **ID**, not position | add, and some widening; rename requires column mapping |
+    | Partition evolution | **yes** — change the partitioning without rewriting history | no |
+    | Hidden partitioning | **yes** — users query `WHERE ts > x` and Iceberg maps it to partitions | no; users must know the partition column |
+    | Time travel | yes, by snapshot id or timestamp | yes, by version or timestamp |
+    | Engine support | Spark, Trino, Flink, DuckDB (read), Snowflake, BigQuery | Spark-first; broad but less even |
+
+    **The property that matters most in practice is hidden partitioning.** In a plain Hive-style
+    layout, a user who writes `WHERE event_time > '2026-01-01'` against a table partitioned by
+    `dt=YYYY-MM-DD` gets a full scan, because the query planner does not know `event_time` and `dt`
+    are related. Iceberg records the transform (`day(event_time) -> dt`) and applies it
+    automatically. **This single feature eliminates a large fraction of "why is my query scanning
+    everything" incidents.**
+
+    **Column-ID-based schema evolution is the second.** Renaming a column in a Hive table means
+    rewriting every file or accepting that old files have the old name. Iceberg tracks columns by a
+    stable integer ID, so a rename is a metadata operation.
+
+    ## Data contracts
+
+    A **data contract** is an explicit, versioned, enforced agreement about the shape and semantics
+    of data crossing a team boundary. Minimum viable version:
+
+    ```yaml
+    # contracts/transactions.yaml
+    version: 2
+    owner: payments-team
+    sla:
+      freshness_minutes: 60
+      completeness_pct: 99.9
+    schema:
+      - name: txn_id
+        type: int64
+        nullable: false
+        unique: true
+      - name: amount
+        type: double
+        nullable: false
+        constraints: [ ">= 0" ]
+      - name: category
+        type: string
+        nullable: false
+        allowed: [groceries, fuel, travel, dining, utilities, electronics, health, subscriptions]
+      - name: ts
+        type: timestamp[ms]
+        nullable: false
+    breaking_changes_require: pull_request_review_from(analytics-team)
+    ```
+
+    Enforced two ways: **at write time**, the producer's CI validates a sample against the contract
+    and fails the build on a breaking change; **at read time**, the consumer asserts the contract and
+    quarantines violating rows rather than ingesting them.
+
+    **The thing that makes contracts work is not the YAML — it is that a breaking change requires a
+    review from the consuming team.** Without that, the contract is documentation, and documentation
+    does not stop a producer from renaming a column on a Tuesday.
+
+    ## Production failure modes
+
+    | Failure mode | Signature | Detection |
+    | --- | --- | --- |
+    | Non-idempotent load plus retry | totals inflated by a small, stable percentage | `GROUP BY key HAVING count(*) > 1` as a scheduled assertion |
+    | Watermark on a knife edge | 0.01% of records silently missing; never noticed | overlap the window by minutes; reconcile counts against the source |
+    | Small-file explosion | queries slow down over months; `LIST` dominates the profile | monitor file count and mean file size per partition; compact below 128 MB |
+    | `write_statistics=False` | selective queries 10–50× slower; file otherwise correct | assert `statistics.has_min_max` in a test on your writer |
+    | Random physical order | row-group skipping never fires | sort by the most-filtered column at write time; compare selective vs non-selective query times |
+    | Timestamp column dominating file size | file 2× larger than expected | check per-column sizes in the footer; sort by time |
+    | Schema drift, silently coerced | nulls appear in a column; no error | strict schema assertion that fails the run |
+    | Analytics against the OLTP primary | application latency spikes during reporting hours | replicate to an OLAP store; alert on long-running queries |
+    | Parquet written with tiny row groups | metadata larger than data for small files | target 50–150 MB per row group on object storage |
+    | gzipped CSV chosen for "compression" | cannot skip columns, cannot parallelise, cannot seek | use Parquet; splittability matters more than size |
+
+    ## Frontier and research pointers
+
+    - **Melnik et al. (2010), "Dremel: Interactive Analysis of Web-Scale Datasets."** VLDB. —
+      **Takeaway:** the repetition/definition-level encoding that lets arbitrarily nested data be
+      stored in a flat columnar layout with no loss; **this is the paper Parquet's nested types come
+      directly from**, and it is why Parquet can store a JSON-shaped record columnar-ly at all.
+    - **Abadi, Madden & Hachem (2008), "Column-Stores vs. Row-Stores: How Different Are They
+      Really?"** SIGMOD. — **Takeaway:** the column-store advantage is not the layout alone; it is
+      late materialisation, compression-aware operators and vectorised execution — a row store with
+      columns bolted on captures very little of the win.
+    - **Boncz, Zukowski & Nes (2005), "MonetDB/X100: Hyper-Pipelining Query Execution."** CIDR. —
+      **Takeaway:** processing data in **vectors of ~1,024 values** rather than one tuple at a time
+      amortises interpretation overhead and keeps the working set in L1; this is the architecture
+      DuckDB implements and the direct reason for module 5's 12.9× measurement.
+    - **Armbrust et al. (2020), "Delta Lake: High-Performance ACID Table Storage over Cloud Object
+      Stores."** VLDB. — **Takeaway:** ACID over object storage needs only an ordered, atomically-
+      appendable log of commits; everything else — time travel, schema enforcement, compaction — is
+      built on that one primitive.
+    - **The Apache Iceberg specification (v2/v3).** — **Takeaway:** tracking columns by stable
+      integer ID rather than by name or position is what makes safe rename, reorder and type
+      widening possible; read the "Schema Evolution" and "Partition Transforms" sections specifically.
+    - **Zaharia et al. (2021), "Lakehouse: A New Generation of Open Platforms that Unify Data
+      Warehousing and Advanced Analytics."** CIDR. — **Takeaway:** the argument for why the
+      two-tier lake-plus-warehouse architecture is worth collapsing; read it for the honest list of
+      what a lakehouse still does worse than a warehouse.
+
+    ## Stretch challenge
+
+    **Find the physical layout that makes your queries fastest, and quantify how much it is worth.**
+
+    Take the 10-million-row dataset (or your own) and treat the file layout as the thing you are
+    optimising, holding the queries fixed.
+
+    Build a harness that writes the same data under a sweep of configurations and measures a fixed
+    query set against each:
+
+    1. **Sort order** — unsorted, sorted by `ts`, sorted by `category` then `ts`, sorted by
+       `merchant`. Measure file size *and* query time for a time-range query, a category filter, and
+       a merchant filter.
+    2. **Row group size** — 64k, 256k, 1M, 4M rows. Measure the selective-query time and the
+       metadata size.
+    3. **Compression** — none, snappy, gzip, zstd at levels 1, 3, 9, and lz4. Measure size, write
+       time, and read time. **Write time is the axis everyone forgets** and it is often the binding
+       constraint for an hourly pipeline.
+    4. **Encoding** — default versus `DELTA_BINARY_PACKED` on `txn_id` and `ts`, and
+       `use_dictionary=False` on the high-cardinality columns.
+    5. **Partitioning** — one file, versus Hive-style `category=X/` directories, versus
+       `dt=YYYY-MM-DD/`. Measure both the partition-pruned query and the query that ignores the
+       partition key.
+
+    The open questions:
+
+    - **How much of the columnar win is sort order rather than the format?** My prediction is that
+      sorting by the most-filtered column is worth more than the choice between snappy and zstd —
+      confirm or refute it with a number.
+    - **What does zstd level actually buy?** Level 9 versus level 3: how much smaller, and how much
+      slower to write? There is a knee and it is not where the defaults are.
+    - **When does partitioning hurt?** Partitioning by a high-cardinality column produces thousands
+      of small files. Find the cardinality at which partitioning becomes net-negative on your
+      hardware, and explain it in terms of file count and footer reads.
+    - **Does sorting by `ts` pay for itself?** Sorting 10 million rows costs seconds at write time
+      and saves milliseconds per query. Compute the break-even query count and state whether your
+      workload reaches it.
+
+    The deliverable — a table of "layout configuration versus query time versus file size versus
+    write time", with a recommended default and the reasoning — is exactly the artifact a data team
+    needs and almost never produces. It is also a genuinely useful thing to bring to your own job.
+
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Convert a large CSV (5 GB, or generate 10 million rows) to Parquet. Measure: file size for CSV,
+gzipped CSV, and Parquet under snappy and zstd; full-scan time for both; and single-column-scan time
+for both. Then explain each number — particularly why the single-column speedup is larger than the
+byte ratio.
+</Card>
+
+<Steps>
+  <Step title="Stream the conversion">
+    Use `pyarrow.csv.open_csv` with a `block_size`, not `pd.read_csv`. A 5 GB CSV loaded into pandas
+    is roughly 10–15 GB in memory. The streaming version keeps peak RSS at the block size.
+  </Step>
+  <Step title="Measure the three scan types separately">
+    `count(*)`, `sum(one_column)`, and a selective `WHERE`. They exercise three different mechanisms
+    — metadata-only, column pruning, and row-group skipping — and collapsing them into one number
+    loses the entire lesson.
+  </Step>
+  <Step title="Inspect the footer">
+    `pq.ParquetFile(path).metadata` gives you per-column compressed sizes and per-row-group
+    statistics. Print the per-column breakdown; the distribution is usually surprising and it tells
+    you which column to sort by.
+  </Step>
+  <Step title="Then sort and re-measure">
+    Rewrite the file sorted by the column your selective query filters on. Re-run the selective
+    query. The improvement is row-group skipping, and seeing it appear is worth more than reading
+    about it.
+  </Step>
+</Steps>
+
+## The whiteboard
+
+The T2 build-up has four frames: the CSV read in full, the columnar file with only one strip shaded,
+the row groups with nine of ten skipped by their statistics, and the measured bar chart.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p2-w15-m1-blank.svg) · [Editable source](/assets/diagrams/p2-w15-m1.excalidraw)
+</Tip>
+
+The thing to get right on redraw: frame 3, the min/max boxes on each row group and the nine crossed
+out. If you draw columnar storage without the row groups, you have drawn half the format and the
+half that explains the smaller speedup.
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    **Portfolio line:** "Built a streaming CSV-to-Parquet converter with bounded memory and
+    per-column reporting; measured 4.68× compression with zstd, 226× faster row counts from footer
+    metadata, and 16× faster single-column aggregates from column pruning — then showed that sorting
+    by the filtered column changes selective-query time by a further 2×."
+
+    **The interview move.** "Why is Parquet faster than CSV?" is a standard data-engineering
+    question. The weak answer is "it's columnar and compressed". The strong answer separates the
+    three mechanisms and attaches a number to each: *"Metadata-only answers — `count(*)` reads the
+    footer, 226× in my measurement. Column pruning — a single-column aggregate reads 11% of the
+    file, 16×. Row-group skipping — min/max statistics let it skip groups entirely, but only if the
+    data is physically sorted on the filtered column, which is a write-time decision most people
+    don't make."*
+
+    That last clause is what separates someone who has read about Parquet from someone who has
+    measured it.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **1. Run the duplicate check on every table you load, today.** `SELECT key_cols, count(*) FROM t
+    GROUP BY key_cols HAVING count(*) > 1 LIMIT 10`. It takes two minutes per table. In the war
+    story this query would have found a seven-month-old bug immediately, and in my experience it
+    finds something roughly half the time you run it on a table nobody has checked.
+
+    **2. Convert one CSV-based job to Parquet and measure it.** Pick a job that reads a CSV and
+    aggregates a few columns. The conversion is one line; the measurement is the deliverable. A
+    16× improvement with a number attached is a very easy thing to put in a sprint review, and it
+    usually leads to being asked to do the next five.
+
+    **3. Check whether anything is running analytics against your production database.** Look for
+    long-running `SELECT` queries with `GROUP BY` on your primary or its replica. If you find them,
+    the fix — a nightly export to Parquet plus DuckDB — is a day of work and removes a whole class
+    of "the site was slow during the monthly report" incidents.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Totals consistently a few percent too high | Append-only load plus retries — duplicates | Unique constraint on the natural composite key plus upsert |
+| A small fraction of records missing, never noticed | Watermark on an exact boundary; out-of-order commits at the source | Overlap the window by minutes; rely on idempotent writes |
+| Selective queries scan the whole file | `write_statistics=False`, or data not physically sorted on the filtered column | Enable statistics; sort by the most-filtered column at write time |
+| Queries get slower every month with no query change | Small-file accumulation; listing and footer reads dominate | Monitor file count and mean size; compact to 128 MB–1 GB per file |
+| `MemoryError` converting a large CSV | `pd.read_csv` loads the whole file; pandas overhead is 1.5–3× the file size | `pyarrow.csv.open_csv` with a `block_size`, writing batches |
+| Parquet file barely smaller than the CSV | High-cardinality string columns dominating; dictionary encoding not helping | Check per-column sizes in the footer; consider sorting, or a different encoding |
+| Timestamp column is the biggest in the file | Random time order defeats delta encoding | Sort by time before writing; it shrinks the column *and* enables skipping |
+| Schema change produces silent nulls | Reader coerced missing columns instead of failing | Strict schema assertion that fails the run |
+| Analytics query takes the app down | Running OLAP work against an OLTP database | Replicate to DuckDB or a warehouse |
+| gzipped CSV chosen because it is small | Not splittable — no column skipping, no parallel read, no seeking | Parquet with zstd; it is smaller *and* splittable |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [Apache Parquet format specification](https://github.com/apache/parquet-format/blob/master/README.md) — read `Encodings.md` for `RLE_DICTIONARY` and `DELTA_BINARY_PACKED`, which explain why `is_refund` costs 0.5 MB and `ts` costs 69.5 MB in the same file.
+- [PyArrow `parquet` module](https://arrow.apache.org/docs/18.0/python/parquet.html) (pyarrow 18.1.0) — read this for `row_group_size`, `write_statistics`, `column_encoding` and `sorting_columns`; these four parameters are most of the physical-design decisions available to you.
+- [DuckDB Parquet documentation](https://duckdb.org/docs/1.1/data/parquet/overview) (DuckDB 1.1.3) — read the "Partial Reading" section for exactly which predicates DuckDB can push down into row-group skipping, and note which ones it cannot.
+- [Apache Iceberg spec — schema evolution and partition transforms](https://iceberg.apache.org/spec/) — read these two sections for column-ID tracking and hidden partitioning, the two features that most reduce operational pain.
+- [Delta Lake protocol](https://github.com/delta-io/delta/blob/master/PROTOCOL.md) — read the transaction-log section; the entire ACID guarantee rests on atomically appending a numbered JSON file.
+
+**Papers**
+
+- [Melnik et al. (2010), *Dremel: Interactive Analysis of Web-Scale Datasets*, VLDB 3(1).](https://doi.org/10.14778/1920841.1920886) — **Takeaway:** repetition and definition levels encode arbitrary nesting in a flat columnar layout losslessly; this is where Parquet's nested types come from.
+- [Abadi, Madden & Hachem (2008), *Column-Stores vs. Row-Stores: How Different Are They Really?*, SIGMOD.](https://doi.org/10.1145/1376616.1376712) — **Takeaway:** the win comes from late materialisation and compression-aware vectorised operators, not from the storage layout alone.
+- [Boncz, Zukowski & Nes (2005), *MonetDB/X100: Hyper-Pipelining Query Execution*, CIDR.](https://www.cidrdb.org/cidr2005/papers/P19.pdf) — **Takeaway:** processing ~1,024-value vectors instead of single tuples keeps the working set in L1 and amortises interpreter overhead; this is DuckDB's architecture.
+- [Armbrust et al. (2020), *Delta Lake: High-Performance ACID Table Storage over Cloud Object Stores*, VLDB 13(12).](https://doi.org/10.14778/3415478.3415560) — **Takeaway:** an ordered, atomically-appendable commit log is the only primitive you need to get ACID over object storage.
+- [Zaharia et al. (2021), *Lakehouse: A New Generation of Open Platforms*, CIDR.](https://www.cidrdb.org/cidr2021/papers/cidr2021_paper17.pdf) — **Takeaway:** the case for collapsing the lake/warehouse split, with an honest accounting of what is still worse.
+
+**Go deeper**
+
+- Joe Reis & Matt Housley, *Fundamentals of Data Engineering* (2022), **Chapters 5–6** — the best available treatment of the ingestion and storage layers with no vendor agenda; chapter 6 on storage is the one to read for this module.
+- [Martin Kleppmann, *Designing Data-Intensive Applications*, **Chapter 3, "Column-Oriented Storage"**](https://dataintensive.net/) — twelve pages that explain column compression, sort keys and materialised aggregates better than anything else in print.
+- [Hannes Mühleisen & Mark Raasveldt, *DuckDB: an Embeddable Analytical Database* (SIGMOD 2019 demo)](https://doi.org/10.1145/3299869.3320212) — read this for the design rationale of an in-process OLAP engine, which is the argument for why module 5's numbers look the way they do.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p2/week-15/p2-w15-m1">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

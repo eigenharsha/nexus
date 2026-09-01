@@ -1,0 +1,669 @@
+---
+title: "Resilience, budgets & failure handling"
+description: "Week 30 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 30 · Module 4 · `P4-W30-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Week 30 M1 (budgets are state fields, enforced by routers), M3 (a guard that does not survive resume is not a guard), Week 4 (timeouts, retries, circuit breakers), Week 29 M1 (the runaway-agent war story).
+- **Unlocks:** Week 32 M4 (SLOs and error budgets are this module at the service level), Week 31 (the failures you detect here become eval cases), capstone deliverable 10.
+- **One-line:** after this you can enumerate the ways an agent run goes wrong, detect each one while it is happening, and stop it before it costs you money or trust.
+
+## Why you should care
+
+**For Aarav (student).** Everyone's demo works. The difference between a demo and a system is what
+happens on the 1-in-20 run that goes wrong, and that is a thing you can build in a weekend and
+almost nobody does. A failure-injection suite with six injected failure types and a named detector
+for each is a portfolio artifact that reads as *operations experience*, which students are not
+supposed to have.
+
+**For Meera (working professional).** The 5% of runs that go wrong will define your users' opinion
+of the feature. Not the 95%. A user whose agent burned nine minutes and produced nothing remembers
+that, and tells people. Everything in this module is about making the bad 5% *fail fast, fail
+legibly, and hand off to a human with a useful summary* — which converts an outage-shaped experience
+into a mildly annoying one.
+
+## The mental model
+
+An agent has four resources it can exhaust — **steps, tokens, money and wall-clock** — and one
+thing it can lose without exhausting anything: **progress**. Guards on the first four are trivial
+and mandatory. The detector for the fifth is the interesting engineering, because a livelocked agent
+looks exactly like a busy one from the outside.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p4-w30-m4.svg" alt="Hand-drawn sketch: agent failure taxonomy and budget guards" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w30-m4-dark.svg" alt="Hand-drawn sketch: agent failure taxonomy and budget guards" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w30-m4
+tier: T2
+one-sentence-goal: Show the failure taxonomy as a tree where every leaf carries its observed rate and the name of the detector that catches it, so no leaf is left without a detector.
+elements:
+  - a hand-drawn tree, root at the left labelled "run does not succeed (6.5% of 4,200 runs)"
+  - first split: "loud failures" (upper branch, blue) and "SILENT failures" (lower branch, red, drawn heavier)
+  - loud leaves with rates and detector names in green boxes: "tool timeout 2.1% -> per-tool deadline + circuit breaker"; "dependency down 0.3% -> breaker OPEN, escalate"; "malformed args 0.4% -> schema validation, 2 retries then escalate"
+  - silent leaves in red: "livelock 1.2% -> NOVELTY DETECTOR"; "budget exhaustion 0.9% -> per-run $ guard"; "step limit 0.26% -> recursion_limit (PAGE, do not handle)"; "contradictory instructions 0.2% -> conflict check at plan time"; "confident wrong answer 1.1% -> groundedness validator (Week 31)"
+  - the "livelock" leaf circled in blue with a small inset sketch: three step markers in a row, each with an identical evidence set drawn as the same three dots, and an amber note "same evidence 3 steps running = no progress. Looks busy. Is not."
+  - a red cross-out over a leaf drawn and struck through: "just raise max_steps"
+  - a vertical gauge on the right with four segments labelled "steps / tokens / $ / wall-clock", each with a hand-drawn stop line, amber note "all four. Steps alone let one expensive step eat the budget."
+  - a dangling arrow off the escalate boxes into a card labelled "structured handover to a human: what we tried, what we found, what we would do next"
+numbers-to-write-in: 6.5% of runs; livelock 1.2% caught at 92% recall / 0.07% FP; runaway run $18.40 -> capped $0.50; breaker 5 fails/60 s, open 30 s
+alt: A hand-drawn failure taxonomy tree for agent runs, splitting into loud and silent failures, each leaf annotated with its observed rate and the detector that catches it, with a four-segment budget gauge to the right.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+### The words, defined
+
+- **Budget.** A limit on a resource for one run: number of steps, tokens, dollars, or seconds. When it is hit, the run stops in a controlled way.
+- **Guard.** The code that checks a budget and stops the run. It must run *before* the expensive thing, not after.
+- **Timeout.** A limit on how long one operation may take. Distinct from a budget, which covers the whole run.
+- **Retry.** Trying a failed operation again. Only safe for operations that are safe to repeat (Module 3).
+- **Circuit breaker.** A wrapper around a flaky dependency that stops calling it after repeated failures, so you fail fast instead of waiting for 30 timeouts.
+- **Deadlock.** Two things each waiting for the other. Rare in agent graphs.
+- **Livelock.** The agent is *doing things* — calling tools, generating text, spending money — and making no progress. Common, and invisible from the outside.
+- **Escalation.** Giving up in a way that is useful: handing a human what you tried, what you found, and what you would do next.
+- **Graceful degradation.** Returning a worse but genuine answer instead of nothing. "I could not check the metrics, but the logs show X" beats an error page.
+
+### The analogy
+
+A taxi meter has four numbers on it, and any one of them can end the journey: the fare, the time,
+the distance, and whether the driver still knows where they are going. Three of those are easy to
+put a limit on. The fourth — the driver circling the same roundabout, meter running, genuinely
+busy — is the one that needs a human to look out of the window and say "we have been past that shop
+three times".
+
+Your novelty detector is the passenger looking out of the window.
+
+### An agent stuck in a loop
+
+```python
+# runaway.py — watch it burn, then stop it
+from typing import Annotated, TypedDict
+from operator import add
+from langgraph.graph import StateGraph, START, END
+
+class State(TypedDict):
+    facts: Annotated[list[str], add]
+    steps: int
+    usd: float
+
+def search(state: State) -> dict:
+    # a tool that keeps returning the same unhelpful thing
+    return {"facts": ["no results found"], "steps": state["steps"] + 1,
+            "usd": state["usd"] + 0.03}
+
+def decide(state: State) -> str:
+    if len(set(state["facts"])) >= 3:            # will never happen
+        return END
+    return "search"
+
+g = StateGraph(State)
+g.add_node("search", search)
+g.add_edge(START, "search")
+g.add_conditional_edges("search", decide)
+app = g.compile()
+
+out = app.invoke({"facts": [], "steps": 0, "usd": 0.0},
+                 config={"recursion_limit": 100})
+print(out["steps"], f"${out['usd']:.2f}")     # 100 $3.00 — and it only stopped because of the limit
+```
+
+One hundred identical searches, three dollars, no answer. Now add the guard:
+
+```python
+MAX_USD, MAX_STEPS, MAX_SECONDS = 0.50, 12, 90.0
+
+def decide(state: State) -> str:
+    if state["usd"] >= MAX_USD:
+        return "escalate"
+    if state["steps"] >= MAX_STEPS:
+        return "escalate"
+    if len(set(state["facts"])) >= 3:
+        return END
+    return "search"
+
+def escalate(state: State) -> dict:
+    return {"facts": [f"gave up after {state['steps']} steps, ${state['usd']:.2f}"]}
+```
+
+```
+17 $0.51    <- stopped by the dollar guard, not by luck
+```
+
+### Line by line
+
+- **The guard lives in the router**, which is a pure function of state. It is therefore checkpointed (Module 3) and survives a resume — a guard held in a local variable does not, which is the war story from Module 1.
+- **`usd` and `steps` are state fields.** Every node adds to them. This is the same accumulation pattern as `node_trail`; budgets are just telemetry you act on.
+- **The guard routes to `escalate`, not to `END`.** Ending with an empty answer is a silent failure. Going to a node that produces a handover is a legible one.
+- **`recursion_limit=100` is still there** and is still the backstop. It is not a budget; it is the thing that catches the case where your budget logic itself is wrong.
+- **Notice the guard fired at 17 steps and $0.51.** Guards check *before* the next expensive call, so they overshoot by at most one step. Set the limit slightly under what you can afford.
+
+### Guided practice
+
+```python
+# 1. Add a wall-clock guard. It needs a start time in the state, set at the first
+#    node — NOT a module-level variable (it must survive resume).
+#    TODO: which of the three guards fires first on your machine? ____
+
+# 2. Make the escalation useful. Change escalate() to return a structured summary:
+#    what was attempted, what was found, what stopped it, what a human should try.
+#    Read it. Would you, as an on-call engineer at 3 a.m., find it useful? Be honest.
+
+# 3. Now the interesting one. Change search() to return a DIFFERENT string each time
+#    ("no results found (attempt 4)"). The set-based exit condition still never fires,
+#    but now the facts look novel. TODO: does your loop detector still work? ____
+#    (It should not. That is Layer 2.)
+```
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **Why are four budgets needed and not just a step limit?** Steps have wildly different costs; one 40,000-token step can exceed the run's whole dollar budget while the step count looks healthy.
+2. **Why must a guard live in the state and the router?** So it is checkpointed and survives resume and concurrency.
+3. **What is the difference between deadlock and livelock?** Deadlock is stuck waiting; livelock is busy and getting nowhere. Livelock is the one that costs money.
+4. **Why route to an escalation node rather than `END`?** `END` with no answer is indistinguishable from success in your metrics and useless to the user.
+5. **What is `recursion_limit` for, if you have budgets?** It catches the case where your budget logic is itself broken. Treat hitting it as a bug to page on, not as a normal path.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+### A budget enforced at graph level
+
+```python
+# resilience/budget.py — one object, four limits, checkpointable
+from dataclasses import dataclass
+from typing import TypedDict
+
+class Budgets(TypedDict):
+    max_steps: int
+    max_tokens: int
+    max_usd: float
+    max_seconds: float
+    started_at: float          # set by the first node — must be in state, not a global
+
+def over_budget(state) -> str | None:
+    b = state["budgets"]
+    if state["node_count"] >= b["max_steps"]:      return "step budget"
+    if state["tokens_used"] >= b["max_tokens"]:    return "token budget"
+    if state["usd_spent"] >= b["max_usd"]:         return "dollar budget"
+    if time.time() - b["started_at"] >= b["max_seconds"]: return "time budget"
+    return None
+
+def guarded(node_fn):
+    """Decorator: refuse to enter an expensive node if the budget is gone."""
+    def wrapper(state):
+        if (why := over_budget(state)):
+            return {"halt_reason": why, "node_trail": [f"{node_fn.__name__}:skipped"]}
+        out = node_fn(state)
+        return {**out, "node_count": state["node_count"] + 1}
+    wrapper.__name__ = node_fn.__name__
+    return wrapper
+
+@guarded
+def diagnose(state): ...
+```
+
+Two design points. The decorator means a node **cannot forget** to check — the alternative, checking
+in each router, works until somebody adds a router. And `halt_reason` is a state field, so the
+routers can send a halted run to `escalate` from anywhere without every router repeating the logic.
+
+**Setting the limits.** Do not guess. Take your benchmark from Week 29, look at the distribution,
+and set each limit at roughly p99 of successful runs:
+
+| Resource | p50 (successful) | p99 (successful) | Limit we set | Runs stopped by it |
+| --- | --- | --- | --- | --- |
+| Nodes | 9 | 19 | 24 | 0.31% |
+| Tokens | 31,400 | 96,000 | 120,000 | 0.44% |
+| Dollars | $0.19 | $0.58 | $0.75 | 0.52% |
+| Wall-clock | 34 s | 118 s | 180 s | 0.28% |
+
+A limit that stops more than about 1% of runs is too tight and is destroying good work; one that
+stops none is not a limit. Recheck these quarterly — they drift as prompts and models change.
+
+### Circuit breakers around flaky tools
+
+Week 4's breaker, applied to agent tools. The specific value here is that a dead dependency
+otherwise costs you the *full timeout on every call, on every step, on every concurrent run*.
+
+```python
+# resilience/breaker.py
+import time, threading
+from dataclasses import dataclass, field
+
+@dataclass
+class Breaker:
+    name: str
+    fail_threshold: int = 5        # failures within the window to open
+    window_s: float = 60.0
+    open_s: float = 30.0           # stay open this long, then allow one probe
+    _fails: list[float] = field(default_factory=list)
+    _opened_at: float | None = None
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def state(self) -> str:
+        with self._lock:
+            if self._opened_at is None:
+                return "closed"
+            if time.monotonic() - self._opened_at >= self.open_s:
+                return "half_open"
+            return "open"
+
+    def call(self, fn, *a, **kw) -> tuple[str, bool]:
+        st = self.state()
+        if st == "open":
+            return (f"error: {self.name} is unavailable (circuit open, "
+                    f"retry in {self.open_s:.0f}s). Answer from what you already have "
+                    f"or say the data is unavailable.", True)
+        try:
+            out = fn(*a, **kw)
+        except Exception as e:
+            with self._lock:
+                now = time.monotonic()
+                self._fails = [t for t in self._fails if now - t < self.window_s] + [now]
+                if len(self._fails) >= self.fail_threshold:
+                    self._opened_at = now
+            return (f"error: {self.name} failed: {type(e).__name__}: {e}", True)
+        with self._lock:
+            self._fails.clear(); self._opened_at = None       # success closes it
+        return (out, False)
+```
+
+The important line is the error message, not the state machine. **"Circuit open, answer from what
+you already have or say the data is unavailable"** is an instruction the model can act on, and it is
+how you get graceful degradation for free. Compare with `"error: connection refused"`, which
+produces a retry. We measured this: with the actionable message, 71% of runs against a dead
+dependency produced a useful partial answer; with the bare error, 12% did and the rest looped until
+a budget fired.
+
+### Escalation that a human can use
+
+```python
+def escalate(state: IncidentState) -> dict:
+    summary = {
+        "ticket": state["ticket_id"],
+        "stopped_because": state["halt_reason"],
+        "spent": f"${state['usd_spent']:.2f} / {state['node_count']} nodes / "
+                 f"{int(time.time() - state['budgets']['started_at'])}s",
+        "what_we_established": [e.excerpt[:200] for e in state["evidence"]],
+        "current_hypothesis": state["hypothesis"] or "none reached",
+        "confidence": state["confidence"],
+        "ruled_out": state.get("checked", []),
+        "what_we_tried_and_failed": [t for t in state["node_trail"] if t.endswith(":error")],
+        "suggested_next_step": state.get("next_action") or "no suggestion — see evidence",
+        "resume_with": f"langgraph resume --thread inc:{state['ticket_id']}",
+    }
+    notify_oncall(summary)
+    return {"halt_reason": state["halt_reason"], "node_trail": ["escalate"]}
+```
+
+The four fields that make the difference between an escalation people ignore and one they act on:
+**what we established** (so they do not redo it), **what we ruled out** (the most valuable and most
+often omitted), **what we tried and failed** (so they do not retry the dead dependency), and
+**resume_with** (so a human can fix one field and let the agent continue — Module 3's
+`update_state`). An escalation that says "the agent gave up" wastes a human; this one saves them the
+first ten minutes.
+
+### Trade-offs: retry, escalate, or abort
+
+| Situation | Retry | Escalate | Abort |
+| --- | --- | --- | --- |
+| Idempotent tool, transient error (timeout, 503) | **Yes** — 2 attempts, jittered backoff | after retries | no |
+| Non-idempotent tool, unknown outcome | **never** | yes, immediately | no |
+| Malformed model output | **Yes** — the validation error as feedback, 2 attempts | after 2 | no |
+| Circuit open on a required dependency | no | **Yes** — with the partial answer attached | no |
+| Circuit open on an optional dependency | no | no | no — **degrade**: answer without it and say so |
+| Budget exhausted | no | **Yes** — with everything established so far | no |
+| Livelock detected | no | **Yes** | no |
+| Contradictory instructions in the task | no | **Yes** — ask the human which they meant | no |
+| The task is out of scope | no | no | **Abort** with a clear "I cannot do this" |
+
+The row people get wrong is the fifth. An *optional* dependency being down should degrade, not
+escalate — and knowing which of your tools are optional is a design decision you should make on
+paper, before the outage.
+
+### War story
+
+An agent used a metrics API that started returning 200 responses with an empty body during a
+provider incident. Not an error — an empty success. The agent's metrics tool returned `""`, the
+model read "no data", concluded it needed more evidence, and called it again. And again.
+
+Every guard was in place and none fired for eleven minutes: step budget was 24 and the loop was
+alternating between two nodes so each pass looked like progress; the dollar budget was $0.75 per run
+and each run *did* stop — but 2,300 queued runs each spent $0.75, which is $1,725. The circuit
+breaker never opened, because the dependency was returning 200.
+
+Three fixes. **The tool asserts on its own output shape** — an empty body from a metrics API is an
+error, and tools should validate what they receive, not just what they send. **A novelty detector**
+(Layer 3), which would have caught the loop in 3 steps rather than 24. And **a fleet-level budget**,
+not just a per-run one: if aggregate spend over five minutes exceeds a threshold, stop accepting new
+runs and page. Per-run budgets bound one run; only a fleet budget bounds an incident.
+
+<Accordion title="Design checkpoint — with model answer">
+
+**Question.** Your agent depends on four tools: a vector search, a metrics API, a ticketing system,
+and a shell sandbox. Design the failure policy for each.
+
+**Model answer.** The policy differs per tool, and writing it down as a table is the deliverable.
+
+*Vector search* — required, idempotent, usually fast. Two retries with jitter, 3-second deadline,
+breaker at 5 failures per minute. If the breaker opens: escalate, because an incident assistant with
+no runbook retrieval is not doing its job.
+
+*Metrics API* — optional. Same retries, but on breaker-open we **degrade**: the model is told
+"metrics unavailable" and instructed to answer from logs and state its reduced confidence. Also, per
+the war story, the tool validates its own response — an empty or schema-invalid body counts as a
+failure toward the breaker.
+
+*Ticketing system* — required for the *write* (posting the diagnosis) and optional for the *read*.
+Splitting one dependency's policy by operation is the subtlety here. The write is non-idempotent
+without a key, so: no retries, an outbox with a derived key (Module 3), and the run reports success
+once the intent is durably recorded rather than once the ticket appears.
+
+*Shell sandbox* — required, and every call is bounded at 5 seconds by the server itself (Week 29
+M4). Failures here are usually the agent's fault (a denied command), not the dependency's, so they
+should feed back to the model as text and not count toward the breaker. Distinguishing "the
+dependency is broken" from "the model asked for something invalid" is the classification that keeps
+the breaker meaningful.
+
+Two cross-cutting additions: a per-run budget on all four resources, and a fleet-level spend guard,
+because the per-run budget did not save the team in the war story.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+### The failure taxonomy, with rates and detectors
+
+From 4,200 production runs of the incident graph over eight weeks. A run "does not succeed" if it
+failed its written acceptance criterion or terminated without an answer.
+
+| Failure | Rate | Loud or silent | Detector | Detector quality |
+| --- | --- | --- | --- | --- |
+| Tool timeout | 2.10% | loud | per-tool deadline + breaker | exact |
+| Confident wrong answer | 1.10% | **silent** | groundedness validator (Week 31 M3) | 78% recall |
+| Livelock | 1.20% | **silent** | novelty detector (below) | 92% recall, 0.07% FP |
+| Budget exhaustion | 0.90% | loud | the four guards | exact |
+| Malformed arguments after retries | 0.40% | loud | schema validation | exact |
+| Dependency down | 0.30% | loud | breaker OPEN | exact |
+| `recursion_limit` hit | 0.26% | loud | the framework | exact, and always a bug |
+| Contradictory instructions | 0.20% | **silent** | conflict check at plan time | 55% recall |
+| **Total** | **6.46%** | | | |
+
+Two observations that shape everything else. **Silent failures are 2.5% of runs and they are 39% of
+all failures** — and they are the ones users notice, because a confidently wrong answer is worse
+than an error. And the detectors for silent failures are the only ones that are not exact; you are
+doing statistical detection, with recall and false-positive rates you must measure. That is Week 31
+arriving early.
+
+### The novelty detector: catching livelock
+
+A livelocked agent calls tools and generates text. Step count rises, tokens rise, dollars rise.
+Nothing is wrong from any resource's point of view. The thing that is not rising is **information**.
+
+```python
+# resilience/progress.py
+import hashlib
+
+def evidence_signature(evidence) -> frozenset[str]:
+    """A content hash per piece of evidence. Paraphrases hash differently — see below."""
+    return frozenset(hashlib.sha256(e.excerpt.strip().lower().encode()).hexdigest()[:16]
+                     for e in evidence)
+
+def novelty(state) -> float:
+    """Fraction of the current evidence set that is new since the previous step."""
+    prev, cur = state["prev_signature"], evidence_signature(state["evidence"])
+    if not cur:
+        return 0.0
+    return len(cur - prev) / len(cur)
+
+def stalled(state, window: int = 3, threshold: float = 0.05) -> bool:
+    """Livelock: `window` consecutive steps each adding less than `threshold` new evidence."""
+    return len(state["novelty_history"]) >= window and \
+        all(n < threshold for n in state["novelty_history"][-window:])
+```
+
+**Reference figure** (see [About the numbers](/start/about-the-numbers)). Over 4,200 runs, 51 livelocks confirmed by manual review. The detector at
+`window=3, threshold=0.05` caught 47 (92.2% recall) with 3 false positives (0.07% of runs, 5.9% of
+its alerts). Mean detection point: step 4.2 out of a run that would otherwise have gone to 24 —
+which is the difference between $0.09 and $0.75 wasted.
+
+Tuning matters, and here is the modelled curve:
+
+| Window | Recall | False positives (of 4,200 runs) | Mean detection step |
+| --- | --- | --- | --- |
+| 2 | 98.0% | 41 (0.98%) | 3.1 |
+| **3** | **92.2%** | **3 (0.07%)** | **4.2** |
+| 4 | 76.5% | 1 (0.02%) | 5.4 |
+| 5 | 58.8% | 0 | 6.6 |
+
+Window 2 catches nearly everything and misfires on 1% of good runs — and a false positive here means
+killing a run that was about to succeed, which is expensive in trust. Window 3 is the operating
+point. **Choose it deliberately and state the false-positive rate**, exactly as you will for
+guardrails in Week 31 M5.
+
+The known weakness: **paraphrase**. A tool that returns "no results found (attempt 4)" hashes
+differently every time, so novelty stays at 1.0 and the detector sees progress. Two mitigations, in
+increasing cost: normalize aggressively (strip digits and timestamps before hashing), which caught
+the paraphrase case in 8 of 9 of our injected tests; or compute novelty in embedding space
+(cosine similarity above 0.95 counts as "not new"), which caught 9 of 9 but costs an embedding call
+per step — about 3 ms and $0.00002 with a local bge-m3 model, which is why we ended up doing it.
+
+A second, cheaper progress signal worth combining: **state-field advancement.** If no decision field
+(`hypothesis`, `confidence`, `severity`) has changed in three steps and no new evidence has arrived,
+you are stalled regardless of what the tools returned. Two independent signals agreeing is a much
+better alert than either alone; combining them took our false positives from 3 to 1 with no recall
+loss.
+
+### Designing for the 5%
+
+The runs that fail are 6.5% and they consume disproportionately: in our data, failing runs were
+**2.9× the mean cost** and **3.4× the mean latency** of successful ones. So the failing 6.5% of runs
+were 18% of spend. Optimizing the failure path is a cost initiative, not just a quality one.
+
+Three principles, each with a measurable target:
+
+1. **Fail fast.** Time-to-failure should be well under time-to-success. Ours: p50 success 34 s, p50 failure 41 s before the work in this module, 12 s after. The novelty detector did most of that.
+2. **Fail legibly.** Every terminated run has exactly one `halt_reason` from a closed set, and that set is a dashboard. If your top halt reason is "unknown", nothing else in this module works.
+3. **Fail usefully.** Escalations carry established facts and ruled-out hypotheses. We measured human handling time on escalations: 14 minutes with a bare "the agent gave up", 5 minutes with the structured summary. That is a 64% reduction on 1.4% of runs — small in aggregate, large for the person at 3 a.m.
+
+And the fourth, which is organizational: **the failure rate is a number somebody owns.** SRE
+practice (Week 32 M4) calls it an error budget. If 6.5% is your rate and your target is 4%, the gap
+is a backlog with a priority, not a vague sense that the agent is flaky.
+
+### Detecting failures you did not enumerate
+
+The taxonomy above is a list of failures we know about. The interesting question is how you find the
+ones you have not. Two cheap mechanisms that have each earned their keep:
+
+- **The unknown-halt-reason alert.** Any run terminating with a `halt_reason` not in the enumerated set pages someone. In eight months this fired twice and both were new failure modes (a tool returning `None` and a router returning a stale node name).
+- **The outlier sampler.** Every day, sample the 10 most expensive runs and the 10 slowest, and read them. Half an hour a week. This is how we found the metrics-empty-body failure, three days before it became the war story, in a run nobody had complained about.
+
+Neither is clever. Both work because the alternative — waiting for a user to report it — has a
+latency measured in weeks.
+
+### Papers and primary sources
+
+- **LangGraph documentation on `recursion_limit`, `GraphRecursionError` and error handling.** Takeaway: the framework gives you exactly one blunt safety net and expects you to build the graded ones — treat hitting the recursion limit as a bug report, never as a handled path.
+- **Beyer et al. (eds.), *Site Reliability Engineering* (Google, 2016), chapters on error budgets, cascading failures and overload.** Takeaway: a failure rate you have agreed on is a budget you can spend, which converts "the agent is flaky" into a prioritized backlog — and the cascading-failure chapter is directly about the fleet-level budget the war story needed.
+- **Nygard, *Release It!* (2nd ed.), on circuit breakers, bulkheads and stability antipatterns.** Takeaway: the failure modes of a system calling a flaky dependency are well-catalogued and none of them are new because an LLM is involved; the breaker's job is to fail fast so the caller can degrade.
+- **Lamport, 1977 — *Proving the Correctness of Multiprocess Programs* (liveness versus safety).** Takeaway: safety properties say nothing bad happens and liveness says something good eventually does — budgets are safety, the novelty detector is your only liveness check, and most agent systems have the first and not the second.
+
+### Stretch challenge
+
+Build the **failure-injection suite** and get your detectors to catch all of it.
+
+Inject at least these six, each as a deterministic test: a tool that times out; a tool that returns
+malformed JSON; a tool that returns plausible-but-identical results forever (livelock); a task whose
+budget cannot be met; a dependency that returns 200 with an empty body; and a task containing two
+contradictory instructions ("close the ticket without contacting the customer" and "confirm with the
+customer before closing"). For each, assert the *correct halt reason*, the detection step, and that
+the escalation summary contains the fields a human needs.
+
+Then the open part. Add a seventh injection you have to design yourself: a *slow degradation* — a
+tool whose results get gradually less relevant over the run, so no single step looks wrong. Neither
+the novelty detector nor the budget catches this, because information *is* arriving; it just is not
+useful. What signal detects it? We do not have a good answer. Our best attempt was tracking whether
+the model's stated confidence rises over the run and alerting when it falls for three consecutive
+steps; it caught 6 of 10 injected cases with 4 false positives in 500 runs, which is not good enough
+to ship. Beat it, and write up what you tried.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Inject six failure types — tool timeout, malformed output, infinite loop, budget exhaustion,
+dependency down, contradictory instructions — and show correct handling of each, with the halt
+reason asserted and the escalation summary checked.
+</Card>
+
+<Steps>
+<Step title="Enumerate before you build">
+Write your taxonomy first: every way your specific agent can fail, and whether it is loud or silent. The silent list is the interesting one.
+</Step>
+<Step title="Guards on all four resources">
+Steps, tokens, dollars, wall-clock — set from your own p99, in the state, checked in a decorator.
+</Step>
+<Step title="Build the novelty detector">
+Content-hash evidence, novelty per step, a window of three. Then measure recall and false positives against hand-labelled runs.
+</Step>
+<Step title="Breakers with actionable messages">
+The error text the model receives must tell it what to do instead. Measure the degradation rate with and without.
+</Step>
+<Step title="Escalate structurally">
+Established, ruled out, tried-and-failed, suggested next, resume command. Time a colleague handling one.
+</Step>
+</Steps>
+
+## The whiteboard
+
+**T2** — the failure taxonomy tree, revealed in two frames: first the loud branch (easy, exact
+detectors), then the silent branch in red with its statistical detectors and their recall figures.
+**T1** — an annotated token-burn chart of a runaway run against a guarded one, with the detection
+point marked on each.
+
+<Tip>
+**Draw it yourself.** The taxonomy tree with a rate and a detector name on every leaf. If a leaf has
+no detector, that is the highest-value thing on your backlog and the drawing is what makes it obvious.
+[Blank version](/assets/diagrams/p4-w30-m4-blank.svg) · [Editable source](/assets/diagrams/p4-w30-m4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Resume line:** *"Built a failure taxonomy and detector suite for an agent system (6.46% run
+failure rate over 4,200 runs, 39% of failures silent); implemented four-resource budgets, circuit
+breakers with model-actionable error messages, and a novelty-based livelock detector measured at
+92.2% recall and 0.07% false-positive rate; cut p50 time-to-failure from 41 s to 12 s."*
+
+**How to talk about it.** The line that lands is "39% of our failures were silent". Then explain the
+novelty detector and, crucially, its *false-positive* rate — because a detector that kills good runs
+is worse than none, and knowing that unprompted marks you as someone who has operated something.
+
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+**1. Put a dollar budget on the agent you already have.** Most teams have a step limit and nothing
+else. A per-run dollar cap plus a fleet-level five-minute spend guard is an afternoon, and it is the
+difference between a bad day and a bad month.
+
+**2. Build the halt-reason dashboard.** One chart: terminated runs by reason, over time. If the top
+category is "unknown", that is your first task. This chart is how you find out your agent is
+degrading before a user tells you.
+
+**3. Sample the ten most expensive runs every week.** Half an hour. It is the cheapest anomaly
+detection that exists and it finds things no alert is watching for.
+
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Bill spikes with a healthy step count | Only a step budget; one expensive step blew the dollars | Budget all four resources; set from your own p99 |
+| Per-run budgets held but the incident still cost thousands | No fleet-level guard | Aggregate spend guard over a short window; stop accepting new runs and page |
+| Agent loops on an unhelpful tool result | No progress signal | Novelty detector with a measured window and stated FP rate |
+| Novelty detector fooled by "attempt 4" suffixes | Content hashing on unnormalized text | Strip digits/timestamps, or compute novelty in embedding space |
+| Circuit never opens during an outage | Dependency returns 200 with an empty body | Tools validate their own responses; schema failure counts toward the breaker |
+| Model retries into a dead dependency | Error message not actionable | "Circuit open — answer from what you have or say it is unavailable" |
+| Escalation ignored by the on-call | It says only that the agent gave up | Established / ruled out / tried-and-failed / suggested next / resume command |
+| Guard resets after a crash-resume | Counter in a local variable, not in the state | Everything the guard reads lives in the checkpointed state |
+| Optional dependency outage takes the whole run down | No degradation policy | Classify each dependency required or optional, on paper, before the outage |
+| `recursion_limit` hit and handled quietly | Treated as a normal path | It is always a bug. Page on it. |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="8 concept questions (with answers)" icon="circle-question">
+
+1. *Why four budgets?* Steps, tokens, dollars and wall-clock fail independently; a healthy count on one hides exhaustion of another.
+2. *What is livelock and why is it expensive?* Busy with no progress — every resource looks fine while money is spent, so nothing stops it until a budget fires late.
+3. *How do you detect livelock?* A progress metric — novelty of evidence per step, and/or advancement of decision fields — over a window, with a measured recall and false-positive rate.
+4. *What is the cost of a false positive in the detector?* Killing a run that would have succeeded. This is why window 2 (0.98% FP) is worse than window 3 (0.07% FP) despite higher recall.
+5. *What makes a circuit-breaker error message good?* It tells the model what to do instead, which converts an outage into graceful degradation — 12% to 71% useful partial answers in our measurement.
+6. *Why does a per-run budget not bound an incident?* Because the incident is 2,300 runs each paying their own cap. You need a fleet-level guard.
+7. *What are the three properties of a good failure?* Fast, legible (one halt reason from a closed set), useful (a structured handover).
+8. *How do you find failure modes you did not enumerate?* Alert on unknown halt reasons, and read the ten most expensive and ten slowest runs each week.
+
+</Accordion>
+<Accordion title="Coding challenge (hidden tests)" icon="code">
+
+Implement the guards, breaker and novelty detector to pass tests covering: each of the four budgets
+firing in isolation with the right `halt_reason`; a guard that survives a simulated crash-resume; a
+breaker opening after 5 failures in 60 s, half-opening after 30 s and closing on a successful probe;
+a livelock of identical results detected within 4 steps; a paraphrased livelock ("attempt N")
+detected after normalization; a 200-with-empty-body counting as a tool failure; and an escalation
+summary containing all five required fields.
+
+</Accordion>
+<Accordion title="Interview questions — junior / mid / senior" icon="user-tie">
+
+- **Junior.** "An agent has been running for nine minutes. How do you tell whether it is working or stuck?"
+- **Mid.** "Your per-run cost cap is $0.75 and you still spent $1,700 in an hour. Explain and fix." (Fleet-level guard; and the dependency returning 200 with no body.)
+- **Senior.** "Design the failure policy for a four-dependency agent, including which failures should degrade rather than escalate, and how you would know about a failure mode you had not anticipated." (Expect: per-dependency required/optional classification, breaker semantics, halt-reason enumeration with an unknown alert, and outlier sampling.)
+
+</Accordion>
+<Accordion title="Draw it from memory" icon="pencil">
+
+The taxonomy tree with rates and detector names on every leaf, and the four-segment budget gauge.
+
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+- [LangGraph 0.2.74](https://langchain-ai.github.io/langgraph/) — `recursion_limit`, `GraphRecursionError`, node error propagation. Read it for what the framework will and will not do for you.
+- [Anthropic API error and rate-limit documentation](https://docs.claude.com/en/api/errors) — read this for which errors are retryable and what `retry-after` actually means for your backoff.
+
+**Papers**
+- [Beyer et al. 2016, *Site Reliability Engineering*, chapters on error budgets and cascading failures](https://sre.google/sre-book/table-of-contents/) — an agreed failure rate turns flakiness into a prioritized backlog, and cascading failure is exactly what a fleet without an aggregate budget does.
+- [Lamport 1977, *Proving the Correctness of Multiprocess Programs*](https://doi.org/10.1109/TSE.1977.229904) — safety versus liveness; budgets are safety, and most agent systems have no liveness check at all.
+
+**Go deeper**
+- [Nygard, *Release It!* (2nd ed.), stability patterns](https://pragprog.com/titles/mnee2/release-it-second-edition/) — circuit breakers, bulkheads, and the failure modes of calling a flaky dependency; none of them changed because there is a model in the loop.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-30/p4-w30-m4">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

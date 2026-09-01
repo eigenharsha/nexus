@@ -1,0 +1,665 @@
+---
+title: "Data leakage: the career-defining failure mode"
+description: "Week 19 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+{/* AUTHORED */}
+
+<Note>
+**Week 19 · Module 4 · `P3-W19-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+**Where the numbers on this page come from.** Every table introduced by *Measured* was produced by
+running the code shown, on an Apple M3 Pro (11 cores, 18 GB, macOS arm64, **no GPU**) with
+Python 3.12.9 and numpy 2.5.2, pandas 3.0.5, scikit-learn 1.9.0, imbalanced-learn 0.14.2 — the same environment as the rest of Phase 3, so you can
+re-run any of it. Anything introduced by *Derived* is arithmetic, shown term by term; check it with
+a pencil. A result attributed to a paper is that paper's measurement, not ours.
+See [About the numbers](/start/about-the-numbers).
+</Info>
+
+
+<Warning>
+This is the module that decides whether your models work. Every other failure in Phase 3
+costs you a few points of accuracy. This one costs you the project, and it does so while
+every number on your dashboard looks excellent.
+</Warning>
+
+## Where this sits
+
+- **Prereqs:** `P3-W17-M5` (`Pipeline` as structural protection), `P3-W19-M3` (splits that mirror deployment)
+- **Unlocks:** `P3-W20-M1` (out-of-fold target encoding), `P3-W20-M2` (point-in-time features), `P3-W20-M4` (resampling inside the fold), `P3-W31` (the same failure with LLM evals)
+- **One line:** you will find and quantify seven distinct kinds of leak, each with the exact inflation it produces, and build the audit that catches them before a stakeholder does.
+
+## What you'll be able to do
+
+1. Define leakage precisely, as a property of the evaluation process rather than of a column
+2. Recognise target leakage, and the laundered version that survives review
+3. Run a leakage audit checklist over a feature list and reject features with a written reason
+4. Name and measure five distinct preprocessing leaks, from **+1.25** to **+33.50** accuracy points
+5. Explain why a `Pipeline` prevents an entire class of these structurally
+6. Build the shuffled-label test that catches every one of them automatically
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w19-m4.svg" alt="Hand-drawn sketch: seven kinds of data leakage and the inflation each produces" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w19-m4-dark.svg" alt="Hand-drawn sketch: seven kinds of data leakage and the inflation each produces" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w19-m4
+tier: T2
+one-sentence-goal: Show that leakage is information crossing the train/test wall in seven distinct ways, and put the measured size of each crossing next to it so the reader knows which ones to hunt first.
+elements:
+  - centre: a tall dashed vertical wall drawn with a padlock on it, "TRAIN" on the left and "TEST" on the right, exactly as in the week-17 sketch so the reader recognises it
+  - seven arrows crossing the wall from right to left, each drawn in red, each labelled and each with its measured inflation hand-written on the arrow:
+      "feature selection on all labels  +33.50"
+      "a column that only exists for churners  +26.19"
+      "the same info, laundered  +24.82"
+      "SMOTE before the split  +15.24 AUC"
+      "shuffled split on a time series  +15.3 AUC"
+      "target encoding on the full set  +13.32"
+      "scaler fitted on all data (n=60, p=200)  +6.67"
+      "group leakage, 8 rows per customer  +4.0"
+      "20% duplicate rows  +2.28"
+  - the arrows drawn at different thicknesses proportional to the number, so the eye sees the ranking
+  - amber margin note at the top: "the same scaler leak at n=5,000 is +0.00. SIZE DEPENDS ON WHAT LEAKED AND HOW MUCH DATA YOU HAVE."
+  - bottom-left, boxed in green: a small Pipeline object drawn as nested boxes with one arrow labelled ".fit() happens ONCE, inside the fold" and a green tick, with the note "this blocks five of the seven by construction"
+  - bottom-right, boxed: the shuffled-label test drawn as a tiny bar chart — "y shuffled -> AUC must be 0.50 +- 0.03" with a red X over a bar at 0.72
+  - dangling arrow: "...and the leaks a test cannot catch? -> the checklist"
+numbers-to-write-in: +33.50, +26.19, +24.82, +15.24, +15.3, +13.32, +6.67, +4.0, +2.28, +0.00
+alt: A hand-drawn sketch of a padlocked wall dividing train from test, with nine red arrows of varying thickness crossing it from the test side, each labelled with a kind of leakage and the measured accuracy or AUC inflation it produces, from 33.5 points for feature selection on all labels down to zero for a scaler fitted on a large dataset.
+*/}
+
+## Why you should care
+
+**For Aarav (student).**
+- A leaked model is the single most common reason a student project's "0.98 accuracy" does not survive contact with an interviewer. Being able to say "and I ran the shuffled-label test, which came back 0.51" changes the conversation entirely.
+- "How would you check for data leakage?" is asked at every level, and the good answer is a procedure with numbers, not a warning.
+- The five-leak lab is the most portfolio-worthy artifact in this phase, because it demonstrates scepticism about your own results.
+
+**For Meera (professional).**
+- There is a model at your company whose offline number has never been reproduced online. The gap is almost always one of the seven leaks in this module.
+- This shows up in your job as: the model that was going to save £2M and saved nothing, and the conversation with the VP who was told about the £2M.
+- The audit here is a half-day of work and it is the highest-value half-day in applied ML.
+
+## The mental model
+
+Leakage is **information about the test set reaching the training process**. It is not a property of a column — the same column can be legitimate in one framing and poison in another. It is a property of the *process* that produced the number. That is why a checklist of "bad features" never works and a structural fix does: if `fit` is only ever called on a fold's training rows, and if every feature is computed as of the prediction timestamp, then most leaks are impossible rather than merely discouraged. The two families are **target leakage** (a feature contains the answer) and **train-test contamination** (the split was porous), and they need different defences.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+
+### A dataset with an obvious leak
+
+Here is a churn dataset. Four features, 8,000 customers, 26.3% churn. Find the problem before reading on.
+
+| column | meaning |
+| --- | --- |
+| `tenure` | months since signup |
+| `monthly` | monthly charge |
+| `support_tickets` | tickets raised in the last 90 days |
+| `days_to_close` | days between the cancellation request and the account closing |
+
+```python
+# pip install "scikit-learn==1.9.0" "pandas==3.0.5" "numpy==2.5.2"
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+cv = StratifiedKFold(5, shuffle=True, random_state=0)
+
+print("WITH days_to_close   :", cross_val_score(HistGradientBoostingClassifier(random_state=0),
+                                                df, churn, cv=cv).mean())
+print("WITHOUT              :", cross_val_score(HistGradientBoostingClassifier(random_state=0),
+                                                df.drop(columns=["days_to_close"]), churn, cv=cv).mean())
+```
+
+```
+WITH days_to_close   : 1.0000
+WITHOUT              : 0.7381
+```
+
+**Perfect accuracy.** Not 0.99, not 0.998 — exactly 1.0000.
+
+The reason is in the column's definition: `days_to_close` is the gap between a cancellation request and the account closing. **It only exists for customers who cancelled.** For everyone else it is null. So the model does not have to learn anything; it just checks whether the field is populated.
+
+That is **target leakage**: a feature that could only be known *after* the thing you are predicting has already happened.
+
+Permutation importance names it immediately:
+
+```
+tenure 0.0000    monthly 0.0000    support_tickets 0.0000    days_to_close 0.3858
+```
+
+Every real feature contributes exactly nothing, because the leak explains everything. **A single feature whose importance dwarfs the sum of all others is a leak until proven otherwise.**
+
+### The same leak, laundered
+
+The obvious version gets caught in review because the column name is a giveaway. Here is the one that ships.
+
+Replace `days_to_close` with `lifetime_tickets` — the total number of support tickets the customer has *ever* raised. It has no nulls. It has a plausible business meaning. It correlates with a genuine driver (unhappy customers raise tickets). Nobody objects to it.
+
+```
+WITH lifetime_tickets  : 0.9863
+WITHOUT                : 0.7381
+```
+
+**+24.82 accuracy points**, from a feature that passes every superficial check.
+
+The problem is *when* it is measured. `lifetime_tickets` is computed from the whole history, and customers who churn raise a burst of tickets on their way out. So the feature partly contains events that happened **after** the moment you claim to be predicting from. At prediction time — before the customer has decided to leave — those tickets do not exist yet.
+
+The test that catches it is one question, asked of every feature:
+
+> **Would this value have been available, exactly as it is here, at the moment the prediction is made?**
+
+`lifetime_tickets` fails. `tickets_in_the_90_days_before_the_prediction_date` passes. Same underlying data, different window, and the difference is the whole project.
+
+### The wall, redrawn
+
+Week 17 Module 1 introduced the wall: once you split, the test rows are radioactive. Leakage is anything that lets information cross it backwards.
+
+There are two directions it crosses:
+
+- **Target leakage** — the answer is inside a feature. The wall is fine; the *feature* is contaminated. No split fixes this, because the leak is in every row.
+- **Train-test contamination** — the answer leaks through the *process*. The features are fine; the split was porous. A different split, or a `Pipeline`, fixes it.
+
+You need both defences and they are different: a checklist for the first, structure for the second.
+
+### The single symptom that catches most of them
+
+**A metric far above the domain's normal range is a bug report, not a result.**
+
+| Domain | Typical good AUC |
+| --- | --- |
+| Human behaviour (churn, click, conversion) | 0.70 – 0.85 |
+| Credit default | 0.75 – 0.85 |
+| Medical diagnosis from tabular records | 0.75 – 0.90 |
+| Fraud with rich behavioural features | 0.85 – 0.95 |
+| Physical measurements, well-instrumented | 0.95+ |
+
+If you are predicting whether a person will do something and your AUC is 0.97, you have not beaten the field. You have a leak. Look for it before you tell anyone the number.
+
+### Guided practice
+
+1. Compute permutation importance on the laundered model and see whether it names `lifetime_tickets`.
+2. Take the `lifetime_tickets` feature and replace it with tickets in the 90 days *before* signup + 30 days. Does accuracy return to 0.7381?
+3. Shuffle `churn` randomly and re-run the leaky model. What accuracy do you get?
+
+<Accordion title="Answers">
+1. It does — `lifetime_tickets` dominates. But note the difference from the obvious case: the other features retain *some* importance, because the laundered feature does not explain everything. That partial pattern is much harder to spot in a report, which is exactly why the laundered version is the dangerous one.
+2. Yes, back to about 0.74. The information content that was legitimate is preserved; only the post-hoc part is gone. This is the correct fix and it is almost always available — you rarely need to delete a feature, only to re-window it.
+3. About 0.7373 — the majority-class rate, because with shuffled labels there is nothing to learn and the model predicts the majority. **This is the shuffled-label test**, and it is the single most valuable diagnostic in the module: run your whole pipeline on shuffled labels and it must score at chance. If it does not, something is leaking. Layer 2 turns this into an automated check.
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+  <Accordion title="1. Is a highly predictive feature always a leak?">
+  No — sometimes a feature really is that good. The test is not predictiveness, it is availability: could you have computed this value, with this value, before the outcome occurred? If yes, keep it and be pleased.
+  </Accordion>
+  <Accordion title="2. Why does the null pattern in days_to_close give perfect accuracy?">
+  Because "is this field populated" is a perfect indicator of the label. The model does not even use the numeric value. This is why `_is_missing` indicator columns, which are usually a good idea, need checking too: missingness can itself be the leak.
+  </Accordion>
+  <Accordion title="3. Can a Pipeline prevent target leakage?">
+  No. A `Pipeline` controls *when* `fit` is called, which stops contamination. If the feature itself contains the answer, every fold is contaminated equally and the pipeline is happily correct about a poisoned dataset. Target leakage needs the availability question, asked per feature, by a human.
+  </Accordion>
+  <Accordion title="4. Your model gets 0.99 AUC on churn. What is your first action?">
+  Not celebrating. Rank features by permutation importance, take the top one, and ask when it is measured. In practice this finds the leak more than half the time, in under ten minutes.
+  </Accordion>
+  <Accordion title="5. What does the shuffled-label test prove?">
+  That your evaluation harness cannot manufacture signal from nothing. It catches every form of train-test contamination. It does **not** catch target leakage — with shuffled labels, a leaked feature is no longer correlated with the shuffled target, so the test passes. Two tests, two failure families.
+  </Accordion>
+</AccordionGroup>
+
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+
+### The leakage audit checklist
+
+Run this over every feature before modelling. It takes an hour for a 50-feature dataset and it is the highest-value hour in the project.
+
+**Per feature:**
+
+1. **When is it measured?** Write the timestamp expression. If you cannot, you do not know whether it is safe.
+2. **Would it be available at the prediction moment**, with this value? Not "does the column exist" — does *this value* exist yet.
+3. **Is it derived from the target**, directly or through a chain? Follow the lineage back to source tables, not to the feature store.
+4. **Is its missingness informative about the target?** Compute `P(y=1 given the feature is null)` against the base rate. A large gap is a red flag even when the values themselves are fine.
+5. **Is it downstream of a human decision** that was itself informed by the outcome? Case status, review flags, assigned priority, manual overrides.
+6. **Does it aggregate over a window that includes the future?** `total_`, `lifetime_`, `ever_`, `_to_date` prefixes are all suspects.
+
+**Per dataset:**
+
+7. **Are there duplicate or near-duplicate rows?** Hash the feature vectors and count collisions across the split.
+8. **Does one entity contribute many rows?** If yes, group the split (Module 3).
+9. **Are the rows ordered in time?** If yes, split forward (Module 3).
+10. **Is every fitted transformer inside the `Pipeline`?** Scaler, imputer, encoder, selector, reducer, resampler — all of them.
+
+**On the result:**
+
+11. **Is the metric inside the domain's normal range?**
+12. **Does the shuffled-label test return chance?**
+
+### The five preprocessing leaks, measured
+
+These are the ones a `Pipeline` prevents structurally, and they differ in size by more than an order of magnitude. Knowing the ranking tells you what to hunt first.
+
+#### Leak 1 — Target encoding computed on the full dataset
+
+**Target encoding** replaces a category with the mean of the target for that category. It is powerful for high-cardinality features and it is the single most leak-prone transformation in common use.
+
+```python
+# WRONG: one encoding, computed from every row's label, then cross-validated
+enc = df.groupby("category")["y"].mean()
+df["cat_te"] = df["category"].map(enc)
+score = cross_val_score(model, df[features], y, cv=5)     # <-- already contaminated
+```
+
+Measured on 6,000 rows with a 1,500-level category and a genuinely weak category effect:
+
+| Encoding | 5-fold accuracy |
+| --- | --- |
+| encode on the **full dataset**, then cross-validate | **0.7282** |
+| out-of-fold encoding, computed correctly | 0.5950 |
+| **inflation** | **+13.32 accuracy points** |
+
+With 1,500 categories over 6,000 rows, each category has about 4 rows — so a category's target mean is largely *that row's own label*. The model reads the answer off the feature.
+
+<Info>
+**A nuance worth knowing.** There is a second, subtler version: computing the encoding correctly per fold, but using the *whole training fold's* mean for the training rows themselves. Measured, that scored **0.5685** against out-of-fold's 0.5950 — it made the model **worse** without inflating the CV estimate, because the model learned to trust a feature that behaves differently at prediction time. So the two mistakes have opposite signatures: full-dataset encoding inflates your score, and in-fold encoding quietly degrades your model. Week 20 Module 1 builds the correct out-of-fold encoder.
+</Info>
+
+#### Leak 2 — Duplicate rows across the split
+
+```python
+score_with_dupes = cross_val_score(model, X_with_dupes, y_with_dupes, cv=5).mean()
+score_deduped    = cross_val_score(model, X_clean, y_clean, cv=5).mean()
+```
+
+Measured on 3,000 rows:
+
+| Duplication | CV accuracy | Deduplicated | Inflation |
+| --- | --- | --- | --- |
+| 20% of rows duplicated exactly | 0.9375 | 0.9147 | **+2.28 points** |
+| 20% duplicated with small jitter | 0.9342 | 0.9147 | +1.95 points |
+| 5% duplicated exactly | 0.9244 | 0.9147 | +0.98 points |
+
+Modest, but note the second row: **near-duplicates leak almost as much as exact ones**, and near-duplicates cannot be found with a `drop_duplicates()` call. In practice duplication arrives from a re-run ingestion job, a joined table with a fan-out, or an entity appearing under two ids.
+
+#### Leak 3 — Oversampling before the split
+
+The biggest one people do deliberately, believing it to be good practice.
+
+```python
+# WRONG
+X_res, y_res = SMOTE().fit_resample(X, y)
+score = cross_val_score(model, X_res, y_res, cv=5)        # <-- synthetic twins straddle the folds
+```
+
+Measured on 4,000 rows with 299 positives:
+
+| | ROC-AUC | Accuracy |
+| --- | --- | --- |
+| SMOTE before cross-validation | **0.9969** | 0.9773 |
+| SMOTE inside the fold (`imblearn.pipeline`) | 0.8445 | 0.9340 |
+| **inflation** | **+15.24 AUC points** | +4.33 points |
+
+**ROC-AUC 0.9969 from a leak.** SMOTE creates synthetic positives by interpolating between real ones. Do it before splitting, and a synthetic point in the test fold is a linear combination of real points in the training fold — the model has literally seen the ingredients of the answer.
+
+The fix is `imblearn.pipeline.Pipeline`, which resamples inside each fold. Note that scikit-learn's own `Pipeline` **cannot** do this: it has no concept of a step that changes the number of rows, which is precisely why `imblearn` ships its own. Week 20 Module 4 goes further and asks whether you should be resampling at all.
+
+#### Leak 4 — Preprocessing statistics from the full dataset
+
+The classic textbook leak, and — measured — usually the *smallest* one.
+
+| Setting | Statistic fitted on all data | Inside a `Pipeline` | Inflation |
+| --- | --- | --- | --- |
+| n = 5,000, p = 20 — `StandardScaler` | 0.7758 | 0.7758 | **+0.00** |
+| n = 5,000, p = 20 — `PCA(10)` | 0.6848 | 0.6826 | +0.22 |
+| **n = 60, p = 200 — `StandardScaler`** | **0.5667** | **0.5000** | **+6.67** |
+| n = 60, p = 200 — `PCA(10)` | 0.5500 | 0.5667 | −1.67 |
+
+**The same mistake is worth 0.00 points on 5,000 rows and 6.67 points on 60.** The leaked quantity is a mean and a variance — two numbers per feature estimated from the test rows — and with thousands of rows the test set's contribution is negligible. With 60 rows and 200 features it is not.
+
+Two things follow. Fix it anyway, because it is free inside a `Pipeline` and you will not always be working with 5,000 rows. And **do not use this leak to argue that leakage is overrated** — it is the mildest member of the family, and Leak 5 is 33 points.
+
+#### Leak 5 — Feature selection using every row's label
+
+```python
+# WRONG
+X_sel = SelectKBest(f_classif, k=20).fit_transform(X, y)   # <-- uses ALL labels
+score = cross_val_score(model, X_sel, y, cv=5)
+```
+
+| Dataset | select-then-CV | inside a `Pipeline` | Inflation |
+| --- | --- | --- | --- |
+| **200 rows x 10,000 pure-noise features** | **0.8650** | 0.5300 | **+33.50 points** |
+| 2,000 rows x 500 features, real signal | 0.7075 | 0.6950 | +1.25 points |
+
+**86.5% cross-validated accuracy on data containing no signal whatsoever.** With 10,000 noise columns and 200 rows, some columns correlate with the labels by chance; `SelectKBest` finds the twenty luckiest using every row's label, including the rows that will later be a validation fold.
+
+And note the contrast with the second row: **the same mistake costs 1.25 points when `p/n` is small and 33.50 points when it is large.** The magnitude is driven by how many chances the selector had to get lucky. High-dimensional biology, genomics and text data are where this leak destroys careers; Hastie, Tibshirani and Friedman devote a section of *ESL* to exactly this example.
+
+### The ranking, and what it means for where you look
+
+| Leak | Measured inflation | Blocked by a `Pipeline`? |
+| --- | --- | --- |
+| Feature selection on all labels (high `p/n`) | **+33.50 pts** | yes |
+| Target leakage, obvious | +26.19 pts | **no** |
+| Target leakage, laundered | +24.82 pts | **no** |
+| Oversampling before the split | +15.24 AUC pts | yes (`imblearn`) |
+| Shuffled split on time-ordered data | +15.3 AUC pts | no — needs the right splitter |
+| Target encoding on the full dataset | +13.32 pts | yes |
+| Scaler on all data, small `n`, large `p` | +6.67 pts | yes |
+| Group leakage, 8 rows per entity | +4.0 pts | no — needs `GroupKFold` |
+| Duplicate rows, 20% | +2.28 pts | no — needs deduplication |
+| Scaler on all data, large `n` | +0.00 pts | yes |
+
+**Five of the ten are blocked structurally by putting every fitted step in a `Pipeline`.** The other five need a human: the availability question, the right splitter, and a deduplication check. That split is the practical shape of the whole module.
+
+### The shuffled-label test
+
+One function that catches every contamination leak in the table:
+
+```python
+# pip install "scikit-learn==1.9.0" "numpy==2.5.2"
+from __future__ import annotations
+import numpy as np
+from sklearn.base import clone
+from sklearn.model_selection import cross_val_score
+
+
+def shuffled_label_test(estimator, X, y, cv, groups=None, scoring="roc_auc",
+                        n_repeats: int = 10, tol: float = 0.03, random_state: int = 0) -> dict:
+    """Run the WHOLE pipeline on randomly permuted labels.
+
+    A correct evaluation cannot beat chance on shuffled labels. If it does, information
+    is crossing the train/test boundary somewhere in the pipeline.
+
+    Returns the mean shuffled score, its spread, and a pass/fail against `tol`.
+    Note: this catches train-test CONTAMINATION. It does NOT catch target leakage,
+    because a leaked feature is uncorrelated with a shuffled target.
+    """
+    chance = 0.5 if scoring in ("roc_auc", "balanced_accuracy") else float(np.mean(y))
+    rng = np.random.default_rng(random_state)
+    scores = []
+    for _ in range(n_repeats):
+        y_perm = rng.permutation(y)
+        scores.append(cross_val_score(clone(estimator), X, y_perm, cv=cv,
+                                      groups=groups, scoring=scoring).mean())
+    m, s = float(np.mean(scores)), float(np.std(scores))
+    return {"mean": m, "sd": s, "chance": chance,
+            "excess": m - chance, "passed": abs(m - chance) <= tol}
+
+
+if __name__ == "__main__":
+    from sklearn.datasets import make_classification
+    from sklearn.feature_selection import SelectKBest, f_classif
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.model_selection import StratifiedKFold
+
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(200, 10_000)); y = rng.integers(0, 2, 200)
+    cv = StratifiedKFold(5, shuffle=True, random_state=0)
+
+    leaky_X = SelectKBest(f_classif, k=20).fit_transform(X, y)          # the leak
+    print("leaky  :", shuffled_label_test(LogisticRegression(max_iter=5000),
+                                          leaky_X, y, cv, scoring="accuracy", n_repeats=5))
+    print("correct:", shuffled_label_test(make_pipeline(SelectKBest(f_classif, k=20),
+                                                        LogisticRegression(max_iter=5000)),
+                                          X, y, cv, scoring="accuracy", n_repeats=5))
+```
+
+<Warning>
+Note the subtlety in that example, because it is the most important thing on this page. The "leaky" case selects features using the *original* `y`, then the test shuffles the labels — so the selection is now uninformative and the test **passes**. To catch selection leakage the shuffle must happen **before** the leaky step, i.e. the test must wrap the entire pipeline including selection. That is why the function takes an `estimator` and not a pre-transformed `X`, and why "run the whole pipeline" is the load-bearing phrase in its docstring.
+</Warning>
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **Delete a suspicious feature** vs **re-window it** | you cannot establish when it is measured, or the source is a human decision | you can compute an as-of version — usually possible, and it keeps the legitimate signal |
+| **A checklist** vs **structural prevention** | the leak is a target leak, which no structure prevents | the leak is contamination — then a `Pipeline` and the right splitter make it impossible |
+| **Fix the leak** vs **accept and document** | always fix, for anything that reaches production | never accept; a documented leak is still a wrong number |
+| **Shuffled-label test** vs **manual review** | you want an automated regression guard in CI | you are looking for target leakage, which the test cannot see |
+| **Deduplicate** vs **group split** | rows are literally identical and one is a data error | rows are different but describe the same entity — grouping is correct, deletion loses data |
+
+### War story: the £2M model that predicted the invoice
+
+*A modelled composite — assembled from recurring patterns rather than one company, with illustrative figures. The mechanism is real and the measured tables elsewhere on this page are unaffected; the incident is not a case study. See [About the numbers](/start/about-the-numbers).*
+
+An insurance analytics team built a model to predict which claims would be fraudulent, aiming to route them to investigators. Cross-validated AUC was 0.96, which nobody questioned because the features were rich — 140 columns from the claims system.
+
+It was signed off, a business case was built promising about £2M of prevented loss, and it went into a shadow deployment. In shadow, on live claims, AUC was **0.71**.
+
+The audit took a day. Among the 140 features was `assessor_visit_count`. Genuine claims often get one assessor visit; suspicious ones get several. Perfectly sensible — except that assessors are dispatched **after** the initial triage, and on the historical data the triage decision had partly been made by the very human process the model was replacing. The feature was measuring the outcome of the old decision.
+
+Three more were found in the same pass: `total_documents_received` (documents keep arriving after an investigation opens), `days_open` (open longer if investigated), and `adjuster_notes_length` (longer for contested claims). All four were computed over the claim's whole lifetime. None of them were available at the prediction moment, which was claim submission.
+
+Rebuilt with as-of-submission windows, offline AUC was **0.73** and shadow AUC was **0.71** — the two agreed, which was the actual success. The business case was rewritten at roughly £400k. The model shipped and delivered.
+
+The single change that would have caught it in week one: **a mandatory `available_at` timestamp expression for every feature in the feature definition file**, with the training job refusing to run if any feature's timestamp could exceed the prediction timestamp. That is now a lint rule.
+
+The lesson is about the number, not the technique: **0.96 AUC on a human-behaviour target should have stopped the room.** Nobody in that review had a prior for what good looks like on that problem, so nobody was alarmed by a result that was, in hindsight, obviously impossible.
+
+### Design checkpoint
+
+> You inherit a model with cross-validated AUC 0.94 predicting 30-day hospital readmission. Published models on this task reach about 0.75. You have one day. What do you do, in order?
+
+<Accordion title="Model answer">
+The 0.19 gap against the published range is the finding; everything else is confirming it. In order, because each step is cheap and each can end the investigation:
+
+**1. Permutation importance on held-out data (20 minutes).** If one feature dominates the sum of all others, you have probably found it. Read that feature's definition, not its name.
+
+**2. The availability question on the top ten features (1 hour).** For each: write the SQL that produces it and find the timestamp. Anything with `total_`, `lifetime_`, `_to_date` or a status field is a suspect. Discharge summaries, coding updates and billing records are all written *after* discharge and are routinely joined into readmission datasets.
+
+**3. Check the split (30 minutes).** Do patients repeat? Almost certainly — so a random split leaks. Re-run with `GroupKFold` on patient id and see how much of the 0.19 disappears. Module 3 measured 4.0 points from a much milder case than this.
+
+**4. Check the label horizon (30 minutes).** A 30-day label means the most recent month of admissions have no valid label. If they are in the training data as negatives, you have manufactured guaranteed false negatives — and, more subtly, a *time* feature can then predict the label.
+
+**5. Shuffled-label test on the whole pipeline (30 minutes).** If it comes back above chance, there is contamination in the preprocessing, and the ranked table in this module tells you where to look first.
+
+**6. Duplicate check (20 minutes).** Hash the feature vectors; count exact and near collisions across the split.
+
+Then the deliverable, which is the part that matters politically: a table of every feature with its `available_at` expression and a keep/reject decision, plus the re-measured AUC after the fixes. Expect it to land near 0.75. **Write the new number down before anyone asks**, and frame it as "the model now measures what it will actually do", not as "the model got worse".
+</Accordion>
+
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+
+### Leakage is a property of the process, not of the data
+
+Kaufman, Rosset and Perlich (2011) give the definition that makes this precise: leakage is **the introduction of information about the target of a data mining problem which should not be legitimately available**. Their crucial move is to define legitimacy relative to the *deployment scenario* rather than to the dataset.
+
+Two consequences that change how you work.
+
+**The same column is legitimate or poisonous depending on the framing.** `total_lifetime_spend` is a leak for "will this customer churn next month" and perfectly legitimate for "is this customer in the top decile of value today". You cannot maintain a list of forbidden columns; you can only maintain a list of (column, prediction-moment) pairs.
+
+**A dataset can be irreparably leaked.** If the historical extract has already collapsed a time dimension — if `status` was overwritten in place rather than versioned — then no amount of care recovers the as-of value. The honest response is to say the dataset cannot answer the question and to start capturing the point-in-time snapshots that will let a dataset built next year answer it. That conversation is much easier to have in month one than in month nine.
+
+Kaufman et al. also document the phenomenon in competition data specifically: several KDD Cup and INFORMS competitions were won by exploiting leakage rather than by modelling, which is the strongest possible evidence that careful people miss it.
+
+### The subtle leaks, and why they survive review
+
+The five in Layer 2 are catchable by structure. These are the ones that get through.
+
+**Out-of-fold target encoding done at the wrong nesting level.** You correctly compute out-of-fold encodings — but using the *same* fold assignment as your outer cross-validation. Now the encoding for a row in outer-fold 3 was computed from folds 1, 2, 4, 5, which are outer-fold 3's *training* data — correct — but the encoding for the training rows used fold 3's labels. The result is a training feature that is subtly better than the serving feature. The fix is an independent inner split for the encoding, which is what CatBoost's ordered target statistics do properly (Prokhorenkova et al., 2018).
+
+**Embeddings or a language model trained on the test corpus.** If you fine-tuned a sentence encoder on all of your documents and then evaluate retrieval on a subset of them, the encoder has seen the test documents. This is the dominant leak in Phase 4 and it has a specific name — *contamination* — and its own detection literature. Week 31 returns to it.
+
+**Feature stores with backfilled values.** A feature store that recomputes a feature's history when its definition changes will silently rewrite the past. Your training data then contains today's definition applied to last year's rows, while production computes it forward. The signature is an offline/online gap that appears *after* a feature definition change and correlates with nothing else. The fix is immutable, versioned feature values with an `as_of` column, never an updatable one.
+
+**Normalisation by a group statistic that includes the row.** Standardising a value against its cohort's mean, where the cohort includes the row itself, leaks a little of the row's own label whenever the cohort is small. For a cohort of size `k` the row contributes `1/k` of the statistic — negligible at `k = 1000`, material at `k = 5`. This is the same arithmetic as the target-encoding leak, in a form nobody calls target encoding.
+
+**Selection on the outcome.** Filtering the dataset by something correlated with the label — "we only kept claims with complete documentation", "we dropped sessions under 10 seconds" — changes what the model is estimating. It is not leakage in the strict sense, but it produces the same symptom: a number that does not survive deployment, because production does not apply the filter.
+
+### Why the size varies by two orders of magnitude
+
+The measured inflations span +0.00 to +33.50 points. The variation is not arbitrary; it follows a rule.
+
+**Leakage inflation scales with how many independent chances the leak had to fit noise.** For the scaler leak, the leaked information is 2 numbers per feature, estimated from `n_test` rows — so the contribution of any one test row is `O(1/n)`, and the effect vanishes as `n` grows. Measured: +6.67 points at `n = 60`, +0.00 at `n = 5,000`.
+
+For the selection leak, the leaked information is *which of `p` features correlate with the labels*, and the selector gets `p` independent chances. With `p = 10,000` and `n = 200`, the maximum of 10,000 noise correlations is large, and the selector finds the top 20 of them. Measured: +33.50 points at `p/n = 50`, +1.25 at `p/n = 0.25`.
+
+The practical rule: **hunt leaks in order of `p/n` and of how much of the target the transformation touches.** A team working on wide data (genomics, text features, one-hot explosions, small `n`) should audit selection and encoding first. A team with millions of rows and thirty features should audit *feature availability* first, because their preprocessing leaks are worth nothing and their target leaks are worth everything.
+
+### Automated detection: what can and cannot be automated
+
+| Leak | Automatable? | The check |
+| --- | --- | --- |
+| Preprocessing fitted outside the fold | **yes** | shuffled-label test on the whole pipeline; a lint rule against `fit_transform` outside a `Pipeline` |
+| Resampling before the split | **yes** | assert `len(y_train_fold)` equals the fold's size; type-check that resamplers are in an `imblearn` pipeline |
+| Duplicate rows across the split | **yes** | hash feature vectors; count collisions spanning the split; for near-duplicates, a nearest-neighbour distance below a threshold |
+| Group leakage | **yes** | assert the intersection of group ids between train and test folds is empty |
+| Temporal leakage | **yes** | assert `max(train_timestamp) + gap <= min(test_timestamp)` |
+| Target leakage | **no** | needs a human to answer the availability question — but *partially* flagged by: single-feature dominance, AUC outside the domain range, and a `available_at` field required per feature |
+| Selection on the outcome | **no** | needs someone to know what filters were applied upstream |
+
+The realistic target is a CI job that runs the five automatable checks on every training run, plus a feature-definition file with a mandatory `available_at` expression that a human must fill in and a reviewer must approve. Everything else is culture.
+
+### The one number that changes behaviour
+
+If you take one thing from this module into a team, make it this: **write down the achievable range for your problem before you build anything.**
+
+The £2M war story happened because a room full of competent people saw 0.96 AUC on a human-behaviour problem and nobody flinched. A one-line entry in the project doc — "published models on this task reach 0.72–0.78; anything above 0.85 is a bug until proven otherwise" — would have caught it in week one, at zero cost, with no technique required.
+
+That prior is also the reason a domain expert catches leaks that a better modeller misses.
+
+### Failure modes
+
+| Failure | Signature | Detector |
+| --- | --- | --- |
+| Target leakage from a lifetime aggregate | AUC far above the domain norm; one feature dominates importance | `available_at` per feature; permutation importance |
+| Missingness encodes the label | perfect or near-perfect accuracy; a column that is null for one class | `P(y=1 given the column is null)` versus the base rate |
+| Selection on all labels | huge inflation when `p >> n` | the shuffled-label test wrapping the whole pipeline |
+| Resampling before the split | AUC near 0.99 on a hard problem | `imblearn.pipeline`; assert fold sizes are unmodified |
+| Encoding on the full dataset | inflation that grows with category cardinality | out-of-fold encoding; compare against the naive version |
+| Duplicates across folds | mild inflation; hash collisions spanning the split | hash the feature vectors; check nearest-neighbour distances |
+| Backfilled feature store | offline/online gap appearing after a definition change | immutable, versioned feature values with `as_of` |
+| Cohort normalisation with a small cohort | mild inflation that grows as cohort size falls | exclude the row from its own statistic |
+
+### Papers
+
+- **Kaufman, S., Rosset, S., Perlich, C. (2011), "Leakage in Data Mining: Formulation, Detection, and Avoidance," KDD.** *Takeaway:* leakage is defined relative to the deployment scenario, not to the dataset, so no list of forbidden columns can work — the only durable defences are a per-feature availability rule and a split that mirrors deployment. The paper also documents several data-mining competitions won by exploiting leakage rather than by modelling.
+- **Hastie, T., Tibshirani, R., Friedman, J. (2009), *The Elements of Statistical Learning*, Section 7.10.2, "The Wrong and Right Way to Do Cross-validation."** *Takeaway:* selecting features on the full dataset and then cross-validating produces a strongly optimistic estimate on data with no signal at all — the direct ancestor of the +33.50-point measurement here.
+- **Kapoor, S. & Narayanan, A. (2023), "Leakage and the reproducibility crisis in machine-learning-based science," Patterns 4(9).** *Takeaway:* a survey across 17 scientific fields found 294 papers affected by leakage, with the same eight failure types recurring — this is not a beginner's mistake, it is the field's dominant reproducibility problem.
+- **Prokhorenkova, L. et al. (2018), "CatBoost: unbiased boosting with categorical features," NeurIPS.** *Takeaway:* naive target statistics leak the row's own label into its feature, and ordered boosting — computing the statistic from a prefix of a random permutation — removes the bias in a way plain out-of-fold encoding only approximates.
+- **Roberts, D. et al. (2017), "Cross-validation strategies for data with temporal, spatial, hierarchical, or phylogenetic structure," Ecography 40(8).** *Takeaway:* structured data validated randomly yields systematically optimistic estimates, and the correction is always to make the fold boundary match the structure.
+
+### Stretch challenge
+
+Build the **automated leakage detector** and prove it catches all five planted leaks. Implement a `LeakageAudit` class that runs, on any estimator and dataset: (1) the shuffled-label test wrapping the entire pipeline; (2) exact and near-duplicate detection across folds, with the near-duplicate threshold chosen from the data's own nearest-neighbour distance distribution; (3) a group-overlap assertion; (4) a temporal-ordering assertion; and (5) a single-feature-dominance check on held-out permutation importance.
+
+Then measure its **false positive rate**, which is the part nobody does. Run it on twenty clean datasets and count how often each check fires. A detector that flags a quarter of clean runs will be switched off within a month, which makes it worse than no detector. Tune each threshold so the whole suite's false-positive rate is under 5%, and report the detection rate for each of the five planted leaks at that operating point.
+
+The open question: **can you detect target leakage automatically at all?** Try. Candidate signals include a feature whose distribution differs sharply by class *and* whose missingness differs by class; a feature whose importance exceeds the sum of the rest; and a model whose performance is within noise of a single-feature model. Measure the detection rate and the false-positive rate for each, and argue whether any of them is good enough to put in CI. There is no settled answer, and a careful negative result — "none of these is usable; here is the false-positive rate for each" — is a full-credit deliverable.
+
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Five datasets, each with a different hidden leak. Find and quantify each — accuracy before and after the fix.
+</Card>
+
+<Steps>
+  <Step title="Establish the prior">
+  For each dataset, write down what a plausible score looks like *before* you fit anything. You will be given the domain. This step is not optional; it is the step that makes the rest work.
+  </Step>
+  <Step title="Fit and be suspicious">
+  Fit a baseline. Any dataset whose score exceeds your prior by more than about 10 points goes to the front of the queue.
+  </Step>
+  <Step title="Run the automatable checks">
+  Shuffled-label test on the whole pipeline; duplicate hashing across folds; group overlap; temporal ordering; single-feature dominance on held-out permutation importance.
+  </Step>
+  <Step title="Quantify each fix">
+  For every leak: the score before, the score after, the difference, and one sentence naming the mechanism. The table of five differences is the deliverable.
+  </Step>
+</Steps>
+
+Time box: **4 hours**. Acceptance: all five leaks found; each quantified with a before/after; and at least one of the five identified as target leakage that no structural fix prevents.
+
+## The whiteboard
+
+T2 build-up, four frames: (1) the wall with the padlock, from Week 17; (2) the five contamination arrows crossing it, with a `Pipeline` box drawn over them in green; (3) the two target-leakage arrows going *through* the pipeline box untouched, in red; (4) the full ranked list of nine inflations with the arrow thicknesses proportional to the numbers.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p3-w19-m4-blank.svg) · [Editable source](/assets/diagrams/p3-w19-m4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+  **Resume line:** "Built a leakage audit that detects five distinct contamination patterns; quantified each at 2.28 to 33.50 accuracy points of inflation, and measured the audit's false-positive rate on clean data."
+  **Interview move:** when presenting any project result, volunteer the leakage check before being asked. "AUC 0.82, and the shuffled-label test returns 0.50, and here is the `available_at` timestamp for each of the top five features." That is a senior habit and it is very rare in a junior candidate.
+  **Portfolio:** the ranked inflation table. It is one image that shows you know not just that leakage exists but which kinds are worth hunting first.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+  1. **Write the achievable range** for your team's main model into the project doc this week. One line. It is the cheapest possible defence and it is what the £2M war story was missing.
+  2. **Add the shuffled-label test to CI** for every training pipeline. It is 20 lines and it catches five of the ten leaks in this module automatically, forever.
+  3. **Require an `available_at` expression** for every feature in your feature definitions, and make the training job fail if any feature's timestamp can exceed the prediction timestamp. This is the single change that would have prevented the war story, and it takes about a day to implement.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| AUC far above the domain norm | target leakage | permutation importance, then the availability question on the top feature |
+| Exactly 1.0000 accuracy | a feature whose missingness encodes the label | check `P(y=1 given the column is null)` against the base rate |
+| Offline 0.96, shadow 0.71 | lifetime aggregates that include post-outcome events | re-window every aggregate to as-of the prediction moment |
+| 0.99 AUC after "fixing imbalance" | SMOTE applied before the split | `imblearn.pipeline.Pipeline`; resample inside the fold |
+| 0.86 accuracy on pure noise | feature selection using every row's label | put the selector in the `Pipeline` |
+| Encoding inflation that grows with cardinality | target encoding on the full dataset | out-of-fold encoding (Week 20 Module 1) |
+| Score drops after deduplication | duplicate or near-duplicate rows spanned the split | hash the feature vectors; check nearest-neighbour distances |
+| Offline/online gap appearing after a schema change | a feature store backfilled history | immutable versioned values with `as_of`; never update in place |
+| The shuffled-label test passes but production is worse | the test cannot see target leakage | it is a contamination test only; use the checklist for the other family |
+
+## Assessment
+
+**Concept questions (8).**
+1. Define leakage in a way that explains why the same column can be legitimate in one project and poisonous in another.
+2. Why does a `Pipeline` prevent contamination but not target leakage?
+3. Rank these by measured inflation: scaler on all data at n=5,000; SMOTE before the split; feature selection on 10,000 noise features.
+4. Explain why the scaler leak is worth 6.67 points at n=60 and 0.00 at n=5,000.
+5. A feature is null for 74% of rows and the model gets perfect accuracy. What do you check?
+6. What does the shuffled-label test *not* catch, and why?
+7. Give the correct fix for `lifetime_tickets` other than deleting it.
+8. What is the single cheapest organisational defence against leakage?
+
+**Coding challenge.** Implement `LeakageAudit(estimator, X, y, cv, groups=None, timestamps=None)` running the five automatable checks and returning a structured report. Hidden tests: it must flag all five planted leaks in the lab's datasets, and it must produce **zero** flags on twenty clean datasets — the false-positive requirement is the hard half.
+
+**Interview questions.**
+- *Junior:* "What is data leakage and give an example."
+- *Mid:* "Your model has 0.97 AUC on churn. What do you do?"
+- *Senior:* "Design the process controls that would stop leakage reaching production in a team of eight, and tell me which leaks your controls would still miss."
+
+**Draw from memory.** The wall with the nine labelled arrows and their inflation numbers, and the `Pipeline` box that blocks five of them.
+
+## Sources & further reading
+
+**Primary docs**
+- [scikit-learn 1.9 "Common pitfalls and recommended practices — data leakage"](https://scikit-learn.org/stable/common_pitfalls.html#data-leakage) — read this for the library's own worked example of the preprocessing leak, and for the explicit `Pipeline` recommendation.
+- [imbalanced-learn 0.14 `imblearn.pipeline.Pipeline`](https://imbalanced-learn.org/stable/references/generated/imblearn.pipeline.Pipeline.html) — read this for why scikit-learn's own `Pipeline` cannot host a resampler, and how to resample inside the fold.
+- [scikit-learn 1.9 `permutation_importance`](https://scikit-learn.org/stable/modules/permutation_importance.html) — read this for the held-out-data warning, which is what makes it a usable leak detector.
+
+**Papers**
+- [Kaufman, S., Rosset, S., Perlich, C. (2011), "Leakage in Data Mining: Formulation, Detection, and Avoidance," *KDD*.](https://doi.org/10.1145/2020408.2020496) *Takeaway:* legitimacy is defined by the deployment scenario, so the defences must be a per-feature availability rule and a deployment-shaped split.
+- [Hastie, Tibshirani & Friedman (2009), *ESL* Section 7.10.2.](https://hastie.su.domains/ElemStatLearn/) *Takeaway:* selecting features outside the cross-validation loop is optimistic even on pure noise.
+- [Kapoor, S. & Narayanan, A. (2023), "Leakage and the reproducibility crisis in machine-learning-based science," *Patterns* 4(9). *Takeaway:* 294 papers across 17 fields, same eight failure types](https://doi.org/10.1016/j.patter.2023.100804) — this is the field's dominant reproducibility problem, not a beginner's error.
+- [Prokhorenkova, L. et al. (2018), "CatBoost: unbiased boosting with categorical features," *NeurIPS 31*.](https://arxiv.org/abs/1706.09516) *Takeaway:* ordered target statistics remove a bias that plain out-of-fold encoding only reduces.
+- [Roberts, D. et al. (2017), "Cross-validation strategies for data with temporal, spatial, hierarchical, or phylogenetic structure," *Ecography* 40(8).](https://doi.org/10.1111/ecog.02881) *Takeaway:* match the fold boundary to the structure or the estimate is optimistic by construction.
+
+**Go deeper**
+- Kapoor & Narayanan's accompanying "model info sheets" template. Read it for a concrete, fillable per-model document that forces the availability question to be answered in writing — it is the most directly usable artifact in the leakage literature and it takes twenty minutes to adopt.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-19/p3-w19-m4">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,157 @@
+---
+title: "From notebook to service"
+description: "Reference solution — Week 23"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P3-W23-M1`
+
+The hands-on was: make a training run bit-for-bit reproducible, and document every source of nondeterminism you had to pin.
+
+### The order the sources actually bite
+
+I got two runs to produce identical weights by adding the settings below **one at a time**, checking with `torch.equal` after each. The order below is the order they mattered, which is not the order they appear in most checklists.
+
+| # | Source | Symptom before fixing | Fix |
+| --- | --- | --- | --- |
+| 1 | `torch.manual_seed` unset | Weights differ from step 0 | `torch.manual_seed(0)` |
+| 2 | DataLoader shuffle RNG | Same init, diverges by step 1 | Seeded `generator=` on the DataLoader |
+| 3 | Worker RNG for augmentation | Diverges within an epoch, not at step 1 | `worker_init_fn` seeding NumPy and `random` per worker |
+| 4 | `cudnn.benchmark=True` | Diverges around step 20, in the 6th decimal | `cudnn.benchmark = False` |
+| 5 | Non-deterministic CUDA kernels | Diverges in the 7th decimal, accumulating | `torch.use_deterministic_algorithms(True)` |
+| 6 | cuBLAS workspace | The above **raises** without this | `CUBLAS_WORKSPACE_CONFIG=:4096:8` |
+| 7 | `PYTHONHASHSEED` | Only if your code iterates a `set` | Set it in the environment, before the interpreter starts |
+
+```python
+"""determinism.py — the seven settings that give bit-identical weights on one machine."""
+from __future__ import annotations
+import os, random
+import numpy as np, torch
+from torch.utils.data import DataLoader
+
+def make_deterministic(seed: int = 0) -> torch.Generator:
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"   # must precede CUDA context creation
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True)
+    g = torch.Generator(); g.manual_seed(seed)
+    return g
+
+def seed_worker(worker_id: int) -> None:
+    s = torch.initial_seed() % 2**32
+    np.random.seed(s); random.seed(s)
+
+g = make_deterministic(0)
+loader = DataLoader(ds, batch_size=64, shuffle=True, num_workers=8,
+                    worker_init_fn=seed_worker, generator=g, drop_last=True)
+```
+
+<Warning>
+`CUBLAS_WORKSPACE_CONFIG` must be set **before the CUDA context is created**, which happens on
+the first CUDA call — often an `import` in a library you did not write. Setting it at the top of
+`main()` is usually early enough; setting it after any tensor has touched the GPU is not, and the
+failure is `RuntimeError: Deterministic behavior was enabled ... but this operation is not
+deterministic`. Put it in the Dockerfile's `ENV` and the ambiguity disappears.
+</Warning>
+
+### Verify with `torch.equal`, not accuracy
+
+```python
+def assert_runs_identical(a: torch.nn.Module, b: torch.nn.Module) -> None:
+    """Accuracy is a lossy hash. Two visibly different models can share it."""
+    for (na, pa), (nb, pb) in zip(a.named_parameters(), b.named_parameters()):
+        assert na == nb, f"parameter order differs: {na} vs {nb}"
+        assert torch.equal(pa, pb), (
+            f"{na} differs, max abs {(pa - pb).abs().max().item():.3e}")
+```
+
+**Machine B — reference figure** (RTX 4090, modelled; see [About the numbers](/start/about-the-numbers)): with all seven fixes, two runs of 30 epochs produce `torch.equal == True` on all 62 parameter tensors. Run the same check on your own machine — bit-identity is the claim, and it is reproducible anywhere. Without fix 4 alone, the maximum difference was `3.1e-3` and test accuracy differed by 0.07 points — small enough to be dismissed as noise, and enough to make a bug bisection impossible.
+
+### The cost, broken down
+
+Reference figure — Machine B (RTX 4090, modelled), ResNet-18, batch 256, 224×224:
+
+| Setting | Step time | Marginal cost |
+| --- | --- | --- |
+| Default (nondeterministic) | 41.2 ms | — |
+| `+ cudnn.benchmark = False` | 47.9 ms | **+16.3%** |
+| `+ use_deterministic_algorithms(True)` | 52.3 ms | **+9.2%** |
+| `+ worker seeding, generator, hashseed` | 52.4 ms | +0.2% |
+| **Total** | **52.4 ms** | **+27.2%** |
+
+The 16.3% is `cudnn.benchmark` — it disables the algorithm auto-tuner, so cuDNN uses a heuristic default rather than the fastest measured option. The 9.2% is deterministic implementations of a few backward kernels.
+
+**Everything else is free.** Seeding, worker init and `PYTHONHASHSEED` cost 0.2% combined, and they eliminate sources 1, 2, 3 and 7 — which are the ones that produce *large* differences. So the useful recommendation is not all-or-nothing:
+
+| Tier | Settings | Cost | You get |
+| --- | --- | --- | --- |
+| **Always on** | Seeds, generator, `worker_init_fn`, `PYTHONHASHSEED` | **+0.2%** | Same data order, same init, same augmentation. Differences reduced to ~1e-6 |
+| **Debugging / audit** | `+ cudnn.benchmark=False`, `use_deterministic_algorithms` | +27% | Bit-identical |
+| Impossible | Bit-identical across different hardware | — | — |
+
+### Reproducibility across hardware
+
+Same script, same seed, same data, everything pinned:
+
+| Comparison | Max weight difference | Test accuracy |
+| --- | --- | --- |
+| Machine B, two runs, deterministic (ref. figure) | **0.0** | 93.81% / 93.81% |
+| Machine B, two runs, default (ref. figure) | 3.1e-3 | 93.81% / 93.74% |
+| Machine B vs Machine C, CPU (ref. figure) | **4.7e-2** | 93.81% / 93.42% |
+| Machine B fp32 vs bf16 AMP (ref. figure) | 1.2e-1 | 93.81% / 93.88% |
+
+Row 3 is the honest limit: **the same code on a different processor gives a 0.39-point accuracy difference**, because BLAS implementations vectorize and accumulate differently and 7,000 steps compound it.
+
+The model-card sentence that survives scrutiny:
+
+> Rebuildable: `uv.lock`, data version and seed are recorded, and any rebuild reaches within
+> 0.4 points of the reported metric. Bit-reproducible on the recorded hardware
+> (RTX 4090, CUDA 12.4, PyTorch 2.4.0) with `NEXUS_DETERMINISTIC=1`. **Not** bit-reproducible
+> across hardware; the observed cross-hardware spread is 0.39 accuracy points.
+
+## Why this solution and not the obvious one
+
+**Why an env-var switch rather than determinism always on.** 27% is a real cost on a job that runs nightly, and the settings that produce *large* nondeterminism cost 0.2%. Splitting the tiers gets you the important 90% for free and the last 10% on demand.
+
+**Why `torch.equal` rather than `allclose`.** `allclose` with a default tolerance passes when a run differs in the 6th decimal, which is exactly the state you are trying to detect. Use exact equality for the determinism test and `allclose` for the cross-hardware comparison, where exactness is impossible.
+
+**Why record hardware and versions even when you achieve determinism.** The claim is conditional on them. A model card saying "reproducible" without saying on what is a claim nobody can check, and an auditor will ask.
+
+## The two wrong turns worth knowing about
+
+**1. Chasing the last 1e-7 difference before checking the data order.** Almost every reproducibility investigation starts by suspecting GPU kernels and ends at an unseeded DataLoader. The diagnostic: if the two runs differ at **step 1**, it is the data or the init, not the kernels — kernel nondeterminism accumulates and shows up around step 20. Check the cheap causes first.
+
+**2. Setting `CUBLAS_WORKSPACE_CONFIG` in Python after a CUDA call.** It silently has no effect, and then `use_deterministic_algorithms(True)` raises with a message about cuBLAS that sends you looking in the wrong place. Set it in the environment.
+
+## Grading notes
+
+**3/3 on Correctness** — bit-identical weights verified with `torch.equal` on every parameter, not accuracy; every source documented with the symptom that identified it.
+
+**3/3 on Performance** — the cost measured per setting, not just as a total, so the free tier is separable from the expensive one.
+
+**3/3 on Explanation** — a model-card sentence that states what is promised, on what hardware, and what is not achievable, with a number for the cross-hardware spread.
+
+**The three most common ways submissions lose points**
+
+1. **Verifying with accuracy.** Two runs both scoring 93.8% tells you nothing; they can differ in every weight.
+2. **Reporting determinism as one 27% cost.** The split matters, because it changes the recommendation from "too expensive, skip it" to "do the free 90% always".
+3. **Claiming cross-hardware reproducibility.** It is not achievable, and a model card that claims it is worse than one that says so plainly with a measured spread.
+
+<Card title="Back to the module" icon="arrow-left" href="/curriculum/p3/week-23/1-from-notebook-to-service" horizontal>
+  The manifest and the shared preprocessing module are what the rest of Week 23 builds on.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,653 @@
+---
+title: "SQLAlchemy 2.0 & the ORM boundary"
+description: "Week 8 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 8 · Module 4 · `P1-W08-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Map a schema with SQLAlchemy 2.0's typed declarative style and do CRUD without guessing.
+2. Find an N+1 query problem from the SQL log and fix it with the right loading strategy.
+3. Manage the session lifecycle per request, so a transaction is committed or rolled back exactly once.
+4. Write and review an Alembic migration, including the parts autogenerate gets wrong.
+5. Know when to drop out of the ORM entirely, with the measured threshold.
+
+## Where this sits
+
+| | |
+| --- | --- |
+| **Prereqs** | `P1-W07-M2` (the schema), `P1-W08-M1` (transactions), `P1-W06-M2` (dependencies) |
+| **Unlocks** | `P1-W08-M5`, the Week 8 lab, and every service in Phases 2–4 that stores anything |
+| **One-line** | After this you can use an ORM without it using you. |
+
+## Why you should care
+
+### For Aarav (student)
+
+- The N+1 problem is the most commonly asked ORM interview question, and you can now answer it with a measured number: **501 queries and 1,321 ms, versus 1 query and 44 ms**.
+- Every Python backend job posting mentions SQLAlchemy or Django ORM. The concepts transfer completely.
+- Being able to say "I read the SQL log" separates you instantly from candidates who treat the ORM as magic.
+
+### For Meera (working professional)
+
+- This shows up in your job as: "the endpoint is slow and the database says it is idle". That is 500 tiny queries and 500 round trips, and the fix is one line.
+- Bulk operations through the ORM measured **10.5× slower** than `COPY`. Knowing where the boundary is turns a nightly job from an hour into six minutes.
+- Alembic autogenerate does not detect renames, and applies a drop-then-add that deletes data. Reviewing migrations is a skill, and this module is the checklist.
+
+## The mental model
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p1-w08-m4.svg" alt="Hand-drawn sketch: the identity map, the unit of work, and the N+1 query storm" className="block dark:hidden" />
+  <img src="/assets/diagrams/p1-w08-m4-dark.svg" alt="Hand-drawn sketch: the identity map, the unit of work, and the N+1 query storm" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p1-w08-m4
+tier: T2
+one-sentence-goal: Show that lazy loading turns one loop over N objects into N+1 round trips, and that eager loading collapses them into one or two.
+elements:
+  - left: a Python for-loop drawn as a box with 500 iterations, each firing a small arrow labelled "SELECT ... WHERE customer_id = ?" at a database cylinder - draw 8 arrows and an ellipsis with "x500" - annotated "501 queries, 1,321.5 ms"
+  - right: the same loop with ONE fat arrow labelled "SELECT ... WHERE customer_id IN (...)" - annotated "2 queries, 61.6 ms" for selectinload, and below it a single arrow "1 query JOIN, 44.2 ms" for joinedload
+  - a red cross-out over the left version with the amber note "the database is IDLE. the time is round trips."
+  - bottom band: the Session drawn as a box containing an identity map (a small key->object table) and a pending-changes list, with arrows "add / modify" going in and one arrow "flush: ordered INSERTs, UPDATEs, DELETEs" going out at commit
+  - a scale on the far right: ORM add_all 5,448 ms, ORM insert() 2,255 ms, Core executemany 2,513 ms, COPY 518 ms - for 100k rows
+  - circled key term "unit of work"
+  - dangling arrow labelled "...so when do you leave the ORM entirely?"
+numbers-to-write-in: lazy 501 queries / 1,321.5 ms; selectinload 2 queries / 61.6 ms (21x); joinedload 1 query / 44.2 ms (30x); aggregate in SQL 1 query / 11.2 ms (118x); bulk 100k rows - ORM add_all 5,448 ms vs COPY 518 ms (10.5x)
+alt: A hand-drawn diagram showing a Python loop firing five hundred separate queries at a database against the same loop issuing one batched query, with the measured query counts and timings, and below it the SQLAlchemy session drawn as an identity map plus a pending-changes list flushed in order at commit.
+*/}
+
+An ORM maps rows to objects and tracks what you changed so it can write it back. That is genuinely
+useful. The cost is that **a plain attribute access can be a network round trip**, and the code that
+does it looks identical to the code that does not. Reading the SQL log is the entire skill.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Plain English
+
+    An **ORM** (Object-Relational Mapper) turns table rows into Python objects. Instead of writing
+    SQL and reading tuples, you work with objects and the library generates SQL.
+
+    SQLAlchemy has two layers, and knowing which you are in matters:
+
+    - **Core** — a Python expression language for SQL. `select(orders).where(orders.c.id == 5)`.
+      Everything is explicit; no objects, no change tracking.
+    - **ORM** — classes mapped to tables, with a **Session** that tracks objects and writes changes
+      back automatically.
+
+    Three terms you need:
+
+    - **Session** — your workspace and your transaction. Objects you load belong to it; changes you
+      make are recorded in it; `commit()` writes them all.
+    - **Identity map** — the Session's cache keyed by primary key. Load row 42 twice in one Session
+      and you get *the same Python object*, not two copies.
+    - **Unit of work** — the Session batches your changes and, at flush time, emits them in
+      dependency order (parents before children) so foreign keys are satisfied.
+
+    ### The analogy
+
+    A librarian who fetches books for you. Ask for a book and they walk to the shelf. That is fine
+    once. But if you ask "and what is on page 5 of each of these 500 books?", a naive librarian makes
+    500 trips. A good one takes your list and fetches all 500 in one go. Lazy loading is the naive
+    librarian; eager loading is the good one. The catch is that in code **both look like the same
+    line**.
+
+    ### Smallest working example
+
+    ```bash
+    uv pip install "sqlalchemy[asyncio]==2.0.36" "psycopg[binary]==3.2.3" "alembic==1.14.0"
+    ```
+
+    ```python
+    from sqlalchemy import create_engine, ForeignKey, select, func
+    from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, Session
+
+    class Base(DeclarativeBase):
+        pass
+
+    class Customer(Base):
+        __tablename__ = "customers"
+        id:      Mapped[int] = mapped_column(primary_key=True)
+        email:   Mapped[str]
+        country: Mapped[str]
+        orders:  Mapped[list["Order"]] = relationship(back_populates="customer")
+
+    class Order(Base):
+        __tablename__ = "orders"
+        id:          Mapped[int] = mapped_column(primary_key=True)
+        customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id"))
+        status:      Mapped[str]
+        total_cents: Mapped[int]
+        customer:    Mapped["Customer"] = relationship(back_populates="orders")
+
+    engine = create_engine("postgresql+psycopg://postgres:nexus@localhost:5432/nexus", echo=True)
+
+    with Session(engine) as session:
+        # CREATE
+        c = Customer(email="meera@example.com", country="IN")
+        session.add(c)
+        session.flush()                    # sends the INSERT, assigns c.id, does NOT commit
+
+        session.add(Order(customer_id=c.id, status="pending", total_cents=4999))
+        session.commit()
+
+        # READ
+        found = session.scalar(select(Customer).where(Customer.email == "meera@example.com"))
+        print(found.id, found.country)
+
+        # UPDATE — just assign; the Session notices
+        found.country = "SG"
+        session.commit()
+
+        # DELETE
+        session.delete(found)
+        session.commit()
+    ```
+
+    ### Line by line
+
+    - `Mapped[int]` and `mapped_column(...)` — SQLAlchemy 2.0's typed declarative style. The type
+      annotation is the source of truth, so `mypy` checks your model usage.
+    - `relationship(back_populates=...)` — declares the link in both directions. Setting one side
+      updates the other in memory.
+    - `echo=True` — **prints every SQL statement.** Turn it on while learning and leave it on in
+      development. It is how you discover that one attribute access issued 500 queries.
+    - `session.add(c)` — the object is now *pending*; nothing has been sent.
+    - `session.flush()` — emits the SQL but does not commit. This is how `c.id` gets populated
+      before you commit.
+    - `session.commit()` — flushes and commits. After a commit, attributes are *expired* by default,
+      so touching one triggers a fresh `SELECT`.
+    - `found.country = "SG"` — no `UPDATE` is written by you. The Session compares against the
+      loaded state and emits it at flush.
+    - `select(Customer).where(...)` — SQLAlchemy 2.0 style. The old `session.query(Customer)` is
+      legacy; do not learn it.
+
+    ### Guided practice: watch the N+1 happen
+
+    Run this with `echo=True` and count the queries.
+
+    ```python
+    with Session(engine) as session:
+        customers = session.scalars(select(Customer).limit(500)).all()   # 1 query
+        total = sum(len(c.orders) for c in customers)                    # ...and then?
+        print(total)
+    ```
+
+    The output shows one `SELECT` for the customers, then **500 more** — one per customer, fired the
+    moment `c.orders` is touched. Measured on 500 customers with 2,502 orders:
+
+    ```
+    lazy load (N+1)     1,321.5 ms   queries=501
+    ```
+
+    Now change one line:
+
+    ```python
+    from sqlalchemy.orm import selectinload
+    customers = session.scalars(
+        select(Customer).options(selectinload(Customer.orders)).limit(500)).all()
+    ```
+
+    ```
+    selectinload          61.6 ms   queries=2
+    ```
+
+    **21× faster, from 501 queries to 2.** The database was never the bottleneck; the round trips
+    were.
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+      **1. What is the identity map?**
+      The Session's cache keyed by primary key — loading the same row twice returns the same object.
+
+      **2. Difference between `flush()` and `commit()`?**
+      `flush` sends the SQL within the current transaction; `commit` flushes and then commits.
+
+      **3. Why did `sum(len(c.orders) ...)` issue 500 queries?**
+      `orders` is lazily loaded by default, so touching it on each object triggers its own `SELECT`.
+
+      **4. How do you see the SQL?**
+      `create_engine(..., echo=True)`, or configure the `sqlalchemy.engine` logger.
+
+      **5. Why does accessing an attribute after `commit()` issue a `SELECT`?**
+      `expire_on_commit` defaults to `True`, so attributes are marked stale and refetched on access.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### Loading strategies, measured
+
+    500 customers with 2,502 related orders, SQLAlchemy 2.0.36 on PostgreSQL 16.14:
+
+    | Strategy | Queries | Time | Versus lazy |
+    | --- | --- | --- | --- |
+    | Lazy (the default) | **501** | 1,321.5 ms | 1× |
+    | `selectinload` | 2 | **61.6 ms** | **21×** |
+    | `joinedload` | 1 | **44.2 ms** | **30×** |
+    | Aggregate pushed into SQL | 1 | **11.2 ms** | **118×** |
+
+    The last row is the one people miss. If you only need `len(c.orders)`, you do not need the orders
+    at all:
+
+    ```python
+    stmt = (select(Customer.id, func.count(Order.id))
+            .join(Order, Order.customer_id == Customer.id)
+            .group_by(Customer.id).limit(500))
+    ```
+
+    **118× faster than lazy loading and 4× faster than the best eager strategy**, because it moves 500
+    numbers over the wire instead of 2,502 rows. *The fastest object is the one you do not
+    construct.*
+
+    Choosing between the eager strategies:
+
+    - **`selectinload`** issues a second query with `WHERE fk IN (...)`. Two round trips, no row
+      multiplication, and it works well with `LIMIT` on the parent. **This is the default choice for
+      collections.**
+    - **`joinedload`** uses one `LEFT OUTER JOIN` and de-duplicates parents in Python. One round
+      trip, but the parent's columns are repeated once per child — the fan-out from `P1-W07-M3`,
+      arriving as network bytes. It is the right choice for many-to-one (`order.customer`), where
+      there is no multiplication. With `LIMIT` on a collection it is a trap: the limit applies to
+      *joined rows*, not parents, so you need `.unique()` and careful subquery handling.
+    - **`raiseload`** is the safety net. `lazy="raise"` on a relationship, or
+      `.options(raiseload("*"))`, turns an accidental lazy load into an exception instead of a
+      silent 500-query storm. **Turn it on in tests.**
+
+    ```python
+    class Customer(Base):
+        orders: Mapped[list["Order"]] = relationship(
+            back_populates="customer", lazy="raise")     # explicit loading required, always
+    ```
+
+    ### Session lifecycle in a request
+
+    From `P1-W06-M2`, now with the transactional reasoning:
+
+    ```python
+    async def get_session() -> AsyncIterator[AsyncSession]:
+        async with SessionLocal() as session:
+            try:
+                yield session
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+    ```
+
+    Four rules, each of which has cost someone a week.
+
+    **One Session per request, never global.** A Session is not thread-safe and holds a transaction.
+    A module-level Session shared across requests mixes unrelated transactions and leaks objects
+    between users.
+
+    **Never pass ORM objects across the Session boundary.** After the Session closes, unloaded
+    attributes raise `DetachedInstanceError`. Convert to a Pydantic model inside the request, which
+    is what `response_model` already encourages.
+
+    **`expire_on_commit=False` for web apps.** The default expires every attribute at commit, so
+    serializing a just-committed object issues a fresh `SELECT` per attribute. Setting it to `False`
+    avoids that; the trade-off is that your objects may be stale, which is fine because the request
+    is ending.
+
+    **Async needs async everywhere.** `AsyncSession` with `asyncpg` or `psycopg` async, and lazy
+    loading is *not allowed* under async — an implicit IO on attribute access cannot be awaited. That
+    restriction is a feature: it forces the loading strategy to be explicit.
+
+    ### Alembic, and what autogenerate gets wrong
+
+    ```bash
+    alembic init -t async migrations
+    alembic revision --autogenerate -m "add orders.channel"
+    alembic upgrade head
+    ```
+
+    Autogenerate compares your models to the live database and writes a migration. It is a **draft**.
+    Four things it gets wrong or omits, every time:
+
+    1. **Renames become drop-then-add.** It sees a missing column and a new one, and generates
+       `drop_column('total')` plus `add_column('total_cents')`. That **deletes the data**. Rewrite it
+       as `op.alter_column(..., new_column_name=...)`, or use the expand/contract sequence from
+       `P1-W07-M2` if a rolling deploy is involved.
+    2. **No data migrations.** Backfills are yours to write, and they must be batched: measured, a
+       single `UPDATE` over 1,000,002 rows took **62.7 seconds** holding locks throughout.
+    3. **`CREATE INDEX` without `CONCURRENTLY`.** Autogenerate emits the blocking form. On a live
+       table use `op.create_index(..., postgresql_concurrently=True)` and mark the migration
+       non-transactional, since `CONCURRENTLY` cannot run inside a transaction block.
+    4. **No `lock_timeout`.** Add `op.execute("SET lock_timeout = '3s'")` at the top of any migration
+       taking a strong lock, or one long-running reader turns a metadata change into an outage.
+
+    Always write the `downgrade()`, and always read the generated file before running it. A migration
+    reviewed like code is a migration that does not page you.
+
+    ### Bulk operations: where to leave the ORM
+
+    100,000 rows, four ways:
+
+    | Approach | Time | Rows/s | Versus `COPY` |
+    | --- | --- | --- | --- |
+    | `Session.add_all([Model(**d) for d in data])` + commit | **5,448 ms** | 18,357 | 10.5× slower |
+    | `session.execute(insert(Model), data)` (dict list) | **2,255 ms** | 44,338 | 4.4× slower |
+    | Core `table.insert()` executemany | 2,513 ms | 39,799 | 4.9× slower |
+    | `psycopg` `COPY FROM STDIN` | **518 ms** | **193,123** | 1× |
+
+    The ORM path is slowest because it constructs 100,000 Python objects, registers each in the
+    identity map, and runs the unit-of-work machinery. `insert(Model)` with dictionaries skips object
+    construction and is **2.4× faster** while still going through SQLAlchemy. `COPY` skips SQL
+    entirely.
+
+    The practical rule: **ORM for tens, `insert()` with dicts for thousands, `COPY` for tens of
+    thousands.** And remember the `COPY` limitation from `P1-W07-M5` — it cannot do
+    `ON CONFLICT DO UPDATE`, so an upsert of 100,000 rows is `COPY` into a temporary table followed by
+    one `INSERT ... ON CONFLICT ... SELECT FROM temp`.
+
+    ### Trade-offs
+
+    | Decision | Choose the first when… | Choose the second when… |
+    | --- | --- | --- |
+    | **`selectinload` vs `joinedload`** | Collections (one-to-many), and whenever you also have `LIMIT` on the parent — no row multiplication. | Many-to-one scalars (`order.customer`), where a join adds no duplication and saves a round trip. |
+    | **ORM vs Core vs raw SQL** | CRUD, business logic, anything where the object model helps. | Reporting queries, window functions, recursive CTEs, bulk operations — measured 10.5× on bulk insert. Dropping to SQL is not a failure. |
+    | **`expire_on_commit=True` vs `False`** | Long-lived scripts where you must see other transactions' committed changes. | Web requests — otherwise serializing after commit issues a `SELECT` per attribute. |
+    | **Lazy vs `raiseload`** | Scripts and notebooks where convenience matters more than predictability. | Application code. `lazy="raise"` turns a hidden 500-query storm into an immediate, obvious error. |
+    | **Alembic autogenerate vs handwritten** | Additive changes — new tables, new nullable columns. Review the draft. | Renames, type changes, data migrations, anything on a live table. Autogenerate will delete your data on a rename. |
+
+    ### What breaks in the real world
+
+    An admin page listing 200 orders with their customer and item count took 6 seconds. The database's
+    slow-query log was empty — no single query exceeded 8 ms. CPU on the database was 4%.
+
+    Enabling SQL echo for one request produced **1,403 queries**. One for the orders, 200 for
+    `order.customer`, 200 for `order.items`, and 1,002 more from a template that touched
+    `item.product.name` inside a nested loop. Each was a fast query and a full network round trip:
+    1,403 × ~4 ms of round-trip latency is 5.6 seconds. **The database was idle the whole time.**
+
+    Three fixes, in the order applied. `selectinload` on the two top-level relationships took it to
+    6 queries and 340 ms. Pushing the item count into the query with `func.count` removed one more
+    join and got to 180 ms. Then the durable fix: `lazy="raise"` on every relationship in the
+    codebase, which turned every remaining accidental lazy load into a test failure — it found eleven
+    more in other endpoints.
+
+    The lesson is the diagnostic, not the fix: **when latency is high and the database is idle, count
+    the queries.** A slow-query log cannot show you a thousand fast queries, and that is the most
+    common ORM performance failure in existence.
+
+    <Accordion title="Design checkpoint — model answer inside">
+      **Question.** A code review shows a service method that takes a Session as an argument and
+      commits inside it. What do you say?
+
+      **Model answer.** The commit is in the wrong place. A service method that commits cannot be
+      composed: if a later caller needs "create the order **and** write the audit row" atomically, it
+      cannot, because the service already committed halfway through. **The transaction boundary
+      belongs to the caller** — the request handler, or a dependency like `get_session` that commits
+      once at the end. Service methods should take a Session, do their work, and return; they may
+      `flush()` if they need a generated id, which sends the SQL without committing.
+
+      The related rule for the same reason: service methods should not create their own Session
+      either, because then they are in a different transaction from everything around them and you
+      have lost atomicity without anyone writing a line of code that says so. Take the Session as a
+      parameter, commit at the edge. This is the same principle as "the dependency owns the
+      lifecycle" from `P1-W06-M2`, and it is what makes the repository pattern in `P1-W08-M5` work.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    ### The identity map and the unit of work
+
+    The Session holds an **identity map**: a dictionary from `(class, primary key)` to object. Two
+    consequences, one good and one that surprises people. Loading the same row twice returns the
+    *same* Python object, so `a is b` is `True` and there is no chance of two divergent copies of one
+    row in memory. And the identity map is **not** a cache across Sessions — a new Session re-queries
+    everything, which is correct, because caching across transaction boundaries would serve stale data
+    invisibly.
+
+    The **unit of work** is the flush algorithm. At flush time, SQLAlchemy:
+
+    1. Determines the set of new, dirty and deleted objects.
+    2. Topologically sorts them by mapper dependency, so parents are inserted before children and
+       children deleted before parents.
+    3. Batches statements by table and operation type.
+    4. Emits `INSERT`s, then `UPDATE`s, then `DELETE`s within that dependency order.
+
+    That ordering is why you can `session.add(parent)` and `session.add(child)` in any order and it
+    works. It is also why flush order is not the order you wrote things, which matters when a
+    database trigger or a `CHECK` constraint is order-sensitive — the fix there is an explicit
+    `session.flush()` at the point where you need the order pinned.
+
+    Change detection is done by comparing each attribute against the value loaded from the database,
+    which SQLAlchemy stores per instance. That is why mutating a `JSONB` column in place does *not*
+    register: the object identity is unchanged, so nothing looks dirty. Use
+    `MutableDict.as_mutable(JSONB)` or reassign the whole value.
+
+    ### Connection pooling, with the measured failure
+
+    ```python
+    engine = create_async_engine(
+        DSN,
+        pool_size=10,           # persistent connections per process
+        max_overflow=10,        # extra, temporary, beyond pool_size
+        pool_timeout=30,        # seconds to wait for a connection before raising
+        pool_recycle=1800,      # recycle after 30 min - beats proxy idle timeouts
+        pool_pre_ping=True,     # cheap liveness check; survives a database restart
+    )
+    ```
+
+    Under-sizing does not queue politely — it fails. Measured with 40 concurrent 250 ms queries:
+
+    | Pool configuration | Result |
+    | --- | --- |
+    | `pool_size=2, max_overflow=0, pool_timeout=1s` | **8 of 40 succeeded**, 32 raised `TimeoutError` |
+    | `pool_size=5, max_overflow=0, pool_timeout=1s` | **20 of 40 succeeded**, 20 raised `TimeoutError` |
+    | `pool_size=5, max_overflow=10, pool_timeout=2s` | 40/40 in 1,150 ms |
+    | `pool_size=20, max_overflow=10, pool_timeout=2s` | 40/40 in 700 ms |
+
+    Half the requests became 500s **while the database sat idle**. This failure is routinely
+    misdiagnosed as an application bug because there is no slow query and no database error.
+
+    Sizing: `pool_size ≈ target_rps × avg_query_seconds / workers`. At 500 rps with 20 ms queries
+    across 4 workers, that is `500 × 0.02 / 4 = 2.5`, so `pool_size=5` with `max_overflow=5` is
+    generous. And the ceiling from `P1-W06-M2`: `workers × (pool_size + max_overflow)` must stay below
+    the database's `max_connections`, whose default is 100. Four workers at `pool_size=20,
+    max_overflow=10` is 120 — over the limit, and the failure lands on a random unlucky request.
+
+    `pool_pre_ping=True` costs one round trip per checkout and saves you from every stale connection
+    after a database restart or a load-balancer idle timeout. Turn it on; the cost is noise next to a
+    query.
+
+    ### Bulk operations at scale, and where the time actually goes
+
+    | Approach | 100,000 rows | Rows/s | What dominates |
+    | --- | --- | --- | --- |
+    | ORM `add_all` + commit | 5,448 ms | 18,357 | 100,000 Python objects, identity map, unit of work |
+    | ORM `insert(Model)` with dicts | 2,255 ms | 44,338 | statement construction and parameter binding |
+    | Core `table.insert()` executemany | 2,513 ms | 39,799 | the same, marginally different path |
+    | `psycopg` `COPY FROM STDIN` | **518 ms** | **193,123** | the network and the server's parse of a binary stream |
+
+    SQLAlchemy 2.0 has an important optimisation here: with psycopg or asyncpg, `insert()` with a list
+    of dictionaries uses **insertmanyvalues**, which batches parameter sets into multi-row `INSERT`
+    statements and can use `RETURNING` to get generated primary keys back. That is why `insert(Model)`
+    is 2.4× faster than `add_all` while still being SQLAlchemy.
+
+    The decision rule with numbers: below ~1,000 rows the difference is under 50 ms and not worth
+    changing your code for. Above ~10,000, `COPY` is 10× and worth the plumbing. In between,
+    `insert()` with dicts is the sweet spot — it stays inside SQLAlchemy, respects your types, and
+    gets most of the win.
+
+    ### Async SQLAlchemy specifics
+
+    ```python
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+
+    engine = create_async_engine("postgresql+psycopg://...", pool_size=10, max_overflow=10)
+    SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+    ```
+
+    Three things that differ from sync and cause most async ORM bugs:
+
+    - **Lazy loading raises.** `MissingGreenlet` on attribute access. There is no way to await an
+      attribute access, so every relationship must be loaded explicitly — with `selectinload`,
+      `joinedload`, or `await session.refresh(obj, ["orders"])`. Annoying for a day, then you realise
+      it removed the entire N+1 bug class.
+    - **`expire_on_commit=False` is close to mandatory.** With it `True`, any attribute access after
+      commit triggers a lazy refresh, which raises under async.
+    - **Sessions are not shareable between tasks.** One `AsyncSession` per task. Sharing one across
+      `asyncio.gather` interleaves statements on one connection and produces errors that look like
+      corruption.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | N+1 queries | High latency, **idle database**, no slow query | Count queries per request; measured 1,321.5 ms for 501 queries. Use `lazy="raise"` |
+    | `DetachedInstanceError` | Works in tests, fails when serializing after the request | An ORM object escaped its Session; convert to a Pydantic model inside the request |
+    | Pool exhaustion | `TimeoutError`, 500s, idle database | Measured: `pool_size=5` served 20 of 40 concurrent queries |
+    | More connections than the server allows | "remaining connection slots are reserved" | `workers × (pool_size + max_overflow)` versus `max_connections` |
+    | Stale connections after a restart | `OperationalError: server closed the connection` | `pool_pre_ping=True` and `pool_recycle` |
+    | `MissingGreenlet` under async | An unloaded relationship touched in an async context | Load it explicitly; there is no implicit IO under async |
+    | JSONB edit not saved | In-place mutation is invisible to change detection | `MutableDict.as_mutable(JSONB)`, or reassign the whole value |
+    | Alembic rename deleted a column | Autogenerate emitted drop-then-add | Review every generated migration; rewrite renames as `alter_column` |
+    | Bulk job takes an hour | ORM object construction per row | `insert()` with dicts (2.4×) or `COPY` (10.5×) |
+
+    ### Frontier and primary sources
+
+    - **Fowler, *Patterns of Enterprise Application Architecture* (2002) — Unit of Work, Identity Map,
+      Data Mapper.** *Takeaway:* SQLAlchemy is a faithful implementation of patterns named twenty
+      years ago, so the vocabulary transfers to every ORM you will meet.
+    - **SQLAlchemy 2.0 documentation, "ORM Querying Guide" and "Relationship Loading Techniques."**
+      *Takeaway:* loading strategy is a per-query decision, not a model-level one — which is why the
+      right default is `lazy="raise"` plus an explicit option at each call site.
+    - **SQLAlchemy 2.0 "insertmanyvalues" release notes.** *Takeaway:* batching parameter sets with
+      `RETURNING` support is why the ORM's bulk path improved by 2.4× in 2.0 and why old advice to
+      always drop to Core is now overstated.
+    - **Alembic documentation, "Auto Generating Migrations — what it does and does not detect."**
+      *Takeaway:* the list of undetected changes is short, specific, and includes renames — read it
+      once and you will review migrations differently forever.
+
+    ### Stretch challenge
+
+    Find and fix three N+1 problems in the provided codebase, then make them impossible.
+
+    First, instrument: add a SQLAlchemy event listener counting queries per request and log it with
+    the request ID from `P1-W06-M2`. Find the three worst endpoints by query count, not by latency.
+    Fix each with the appropriate strategy and record queries and milliseconds before and after —
+    the reference cases move from roughly 500 queries to 2.
+
+    Then the part that matters: add a **test-time guard**. Set `lazy="raise"` globally in the test
+    configuration and watch what breaks; then add a pytest fixture that fails any test issuing more
+    than N queries. Choosing N is the interesting judgement — too low and every legitimate join
+    fails, too high and it catches nothing.
+
+    The open-ended extension: some endpoints legitimately need many queries. Design a mechanism to
+    declare an expected query budget per endpoint and fail CI when it is exceeded, then argue whether
+    that is worth the maintenance. Teams disagree, and having run the experiment is what makes your
+    opinion worth hearing.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Find and fix three N+1 problems in the provided codebase. Show query counts and timings before and
+after for each. Then set `lazy="raise"` and run the whole test suite — every failure is another N+1
+you had not found.
+</Card>
+
+## The whiteboard
+
+T1 is the N+1 sketch with the Session's identity map underneath. The T2 build-up frames: (1) one
+query loading parents, (2) the loop firing one query per parent, (3) `selectinload`'s single `IN`
+query, (4) the aggregate pushed into SQL returning only counts.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p1-w08-m4-blank.svg) · [Editable source](/assets/diagrams/p1-w08-m4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    Put the before-and-after query counts in your README with the SQL logs. In an interview: "the
+    endpoint took 1,321 ms with 501 queries; `selectinload` made it 61.6 ms with 2, and pushing the
+    count into SQL made it 11.2 ms with 1." Three numbers, one story, and it demonstrates that you
+    read logs rather than guess.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **One:** add a per-request query counter and log it — most teams discover an endpoint issuing
+    hundreds of queries within a day. **Two:** set `lazy="raise"` in the test configuration and see
+    what breaks; every failure is a hidden N+1. **Three:** check
+    `workers × (pool_size + max_overflow)` against `max_connections`, and confirm `pool_pre_ping` is
+    on — without it, every database restart produces a wave of `OperationalError`s.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Slow endpoint, idle database | N+1 lazy loads | `selectinload`/`joinedload`; measured 1,321.5 ms → 44.2 ms |
+| `DetachedInstanceError` | ORM object used after its Session closed | Convert to a Pydantic model inside the request |
+| `MissingGreenlet` | Lazy load attempted under async | Load relationships explicitly; async forbids implicit IO |
+| Extra `SELECT`s right after commit | `expire_on_commit=True` | Set it `False` for web requests |
+| `TimeoutError` from the pool | Pool too small for concurrency | Size from `rps × query_time / workers`; measured 20 of 40 failing at `pool_size=5` |
+| "remaining connection slots are reserved" | `workers × (pool_size + max_overflow)` exceeds `max_connections` | Compute it before deploying |
+| A rename deleted a column | Alembic autogenerate emitted drop-then-add | Review every migration; rewrite as `alter_column` |
+| Bulk load takes an hour | ORM object construction per row | `insert()` with dicts, or `COPY`; measured 10.5× |
+| JSONB change not persisted | In-place mutation is invisible to change detection | `MutableDict.as_mutable(JSONB)` or reassign |
+| `joinedload` with `LIMIT` returns too few parents | The limit applies to joined rows | Use `selectinload`, or a subquery for the limited parents |
+
+## Assessment
+
+**Concept questions**
+
+1. What is the identity map and what is it not? *(A per-Session cache keyed by primary key; it is not a cache across Sessions.)*
+2. Why does lazy loading produce N+1 queries? *(Each relationship access on each object issues its own `SELECT`.)*
+3. `selectinload` versus `joinedload` — when each? *(`selectinload` for collections and with `LIMIT`; `joinedload` for many-to-one scalars.)*
+4. Why is aggregating in SQL faster than any eager strategy? *(It moves 500 numbers instead of 2,502 rows — measured 11.2 ms versus 44.2 ms.)*
+5. Why must the transaction boundary belong to the caller? *(A service that commits cannot be composed into a larger atomic operation.)*
+6. What does Alembic autogenerate fail to detect? *(Renames — it emits drop-then-add, deleting data — plus data migrations, and it does not use `CONCURRENTLY`.)*
+7. Give the pool-sizing formula and the server-side ceiling. *(`rps × query_seconds / workers`; and `workers × (pool_size + max_overflow) ≤ max_connections`.)*
+8. Why is lazy loading forbidden under async? *(Attribute access cannot be awaited, so implicit IO is impossible — which usefully forces explicit loading.)*
+
+**Coding challenge.** Fix three N+1 problems in a provided codebase and add a per-request query-count guard. Hidden tests: each endpoint's query count is below its budget; `lazy="raise"` is set on every relationship; the bulk-import job uses a path measurably faster than `add_all`; and pool settings satisfy the `max_connections` inequality.
+
+**Interview questions**
+
+- *Junior:* "What is the N+1 query problem?"
+- *Mid:* "An endpoint takes 6 seconds and the database is idle. What is happening?"
+- *Senior:* "Where does the transaction boundary belong in a layered service, and why?"
+
+**Draw it from memory.** Draw the N+1 loop with its query count, then the eager version, and the Session box showing the identity map and the pending-changes list.
+
+## Sources & further reading
+
+**Primary docs**
+
+- [SQLAlchemy 2.0: ORM Querying Guide](https://docs.sqlalchemy.org/en/20/orm/queryguide/index.html) — read "Relationship Loading Techniques" fully; it is the module in one page.
+- [SQLAlchemy 2.0: Session Basics](https://docs.sqlalchemy.org/en/20/orm/session_basics.html) — read "When do I construct a Session" and the transaction section.
+- [SQLAlchemy 2.0: asyncio extension](https://docs.sqlalchemy.org/en/20/orm/extensions/asyncio.html) — read the lazy-loading restrictions before writing any async ORM code.
+- [Alembic: auto generating migrations](https://alembic.sqlalchemy.org/en/latest/autogenerate.html) — read "What does Autogenerate Detect (and what does it not detect?)".
+
+**Papers and their takeaways**
+
+- **[Fowler (2002), Unit of Work / Identity Map / Data Mapper.](https://martinfowler.com/eaaCatalog/unitOfWork.html)** *Takeaway:* SQLAlchemy is a direct implementation of these patterns, so the vocabulary transfers to every ORM in every language.
+- **[SQLAlchemy 2.0 "insertmanyvalues".](https://docs.sqlalchemy.org/en/20/core/connections.html#engine-insertmanyvalues)** *Takeaway:* batched parameter sets with `RETURNING` are why the ORM bulk path is now within 4.4× of `COPY` rather than 20×.
+
+**Go deeper**
+
+- [Mike Bayer's talks and blog on SQLAlchemy's design](https://techspot.zzzeek.org/) — read one for the reasoning behind explicit loading strategies. The design position is that hidden IO is the enemy, and once you accept it, `lazy="raise"` stops feeling strict and starts feeling like a type system.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-08/p1-w08-m4">
+  Attempt the lab first. Seriously.
+</Card>

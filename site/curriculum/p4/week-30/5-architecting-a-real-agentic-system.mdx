@@ -1,0 +1,568 @@
+---
+title: "Architecting a real agentic system"
+description: "Week 30 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 30 · Module 5 · `P4-W30-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** all of Weeks 29 and 30 so far, Week 28 (hybrid RAG and re-ranking), Week 24 (Kubernetes, deployment shape).
+- **Unlocks:** Week 31 (you cannot defend a system you have not specified), Week 32 (you cannot operate one either), and the capstone design document, which is this module's output.
+- **One-line:** after this you can write the design document and blast-radius analysis for an autonomous system, and defend the autonomy level of every step in it.
+
+## Why you should care
+
+**For Aarav (student).** The capstone is graded 20 points on architecture and design rigor, and the
+defence asks "what breaks first?" — a question you can only answer from a written blast-radius
+analysis. Beyond the course: a design document for an autonomous system is a portfolio piece that
+almost nobody has, because most people build first and describe never.
+
+**For Meera (working professional).** The reason autonomous systems do not ship inside real companies
+is rarely technical. It is that nobody can answer "what is the worst thing this can do, and what
+stops it" in a form a risk owner will sign. Being the person who writes that document — and who
+proposes suggest-then-approve-then-auto instead of asking for autonomy on day one — is how these
+projects actually get through.
+
+## The mental model
+
+Autonomy is not a property of a system. It is a property of **each step**, and it is rationed by two
+questions asked per step: *how bad is the worst outcome*, and *can we undo it*. The architecture is
+then almost mechanical — reversible low-impact steps run automatically, irreversible or high-impact
+steps go behind a human, and everything is recorded so the answer to "what happened" is a query
+rather than an investigation.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p4-w30-m5.svg" alt="Hand-drawn sketch: the incident auto-remediation architecture" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w30-m5-dark.svg" alt="Hand-drawn sketch: the incident auto-remediation architecture" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w30-m5
+tier: T1
+one-sentence-goal: Show the whole incident system as one picture in which every step carries an autonomy level, and the human-approval boundary is a single visible line that only irreversible actions cross.
+elements:
+  - left to right flow, hand-drawn: "alert / ticket" -> "TRIAGE" -> "GATHER (RAG over runbooks + MCP read tools)" -> "DIAGNOSE (bounded cycle back to GATHER, counter shown)" -> "PROPOSE" -> a heavy vertical RED DASHED LINE labelled "APPROVAL BOUNDARY" -> "EXECUTE" -> "VERIFY" -> "REPORT"
+  - each node carries a small badge with its autonomy level: A (auto), S (suggest), H (human-approved) - triage A, gather A, diagnose A, propose S, execute H, verify A, report A
+  - below EXECUTE, three action cards with blast radius written in: "restart pod - reversible, ~30 s of 5xx"; "scale deployment - reversible, cost"; "rotate credential - IRREVERSIBLE, breaks 4 services" with the last one struck through in red and moved OUTSIDE the system with the note "not in scope. Ever."
+  - a green box under EXECUTE labelled "rollback: recorded before the action, tested weekly"
+  - a store icon under GATHER labelled "runbook corpus - hybrid BM25 + dense + rerank (Week 28)"
+  - a lock icon under GATHER and EXECUTE labelled "MCP server, allow-listed, audited (Week 29 M4)"
+  - a cylinder under the whole flow labelled "Postgres: checkpoints + audit log" with dashed lines up to every node
+  - amber margin note beside the approval boundary: "the line moves LEFT over time, one action type at a time, with data. Never right on day one."
+  - the words "blast radius" circled
+numbers-to-write-in: suggest phase 1,240 suggestions / 71% agreement; approve phase 890 / 94% approved; auto for 3 of 11 action types; MTTR 41 min -> 26 min
+alt: A hand-drawn end-to-end architecture of an incident auto-remediation system, with each node badged by autonomy level, a red approval boundary before the execute step, blast-radius cards for three candidate actions, and a shared Postgres checkpoint and audit store beneath everything.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+### The words, defined
+
+- **Runbook.** A written procedure a human follows when something breaks: "if checkout latency is above 2 s, check the database connection pool, then check the cache hit rate, then…". Most companies have dozens and they are mostly out of date.
+- **Autonomy level.** How much a step is allowed to do by itself. Three useful levels: **suggest** (it writes what it would do, a human does it), **approve** (it does it after a human clicks yes), **auto** (it does it, and tells you).
+- **Blast radius.** What is affected if this action is wrong. "Restarts one pod" is small. "Rotates a shared credential" is large.
+- **Reversible.** Can be undone. Restarting a service is reversible; deleting a database is not; sending an email is technically reversible and practically is not.
+- **Approval boundary.** The line in your architecture that actions must cross with a human's consent.
+- **Rollback.** The specific, pre-recorded action that undoes what you just did. Not "we would restore from backup" — an actual command, tested.
+- **Audit log.** An append-only record of what happened, who or what caused it, and what the system knew at the time.
+
+### The analogy
+
+A new junior engineer joins your on-call rota. On day one you do not give them production access.
+You have them shadow — they say what they would do, and you compare. When they are consistently
+right, you let them do things with you watching. Eventually, for the three or four routine actions
+they have never got wrong, you let them act alone, and you keep the ability to undo it.
+
+Nobody finds this controversial for a human. **Do exactly this for the agent, for exactly the same
+reasons, and say so in those words** — it is the argument that wins the meeting, because it maps
+onto a process every engineering manager already trusts.
+
+### Map the runbook to a graph, on paper
+
+Take a real runbook. Here is one, abbreviated:
+
+> **Checkout latency alert.** 1. Check the p99 latency panel and confirm it is real, not a scrape
+> gap. 2. Check whether a deploy went out in the last 30 minutes; if so, consider rolling back.
+> 3. Check database connection pool saturation. 4. Check cache hit rate. 5. If the pool is
+> saturated and no deploy went out, scale the connection pool and observe for 5 minutes.
+> 6. If it does not recover, page the database on-call.
+
+Now the graph, drawn before any code:
+
+```
+START -> confirm_alert
+confirm_alert --(scrape gap)--> close_as_noise -> END
+confirm_alert --(real)--> gather_context        [deploy history, pool, cache — in parallel]
+gather_context -> diagnose
+diagnose --(confident, known remedy)--> propose_action
+diagnose --(not confident, attempts < 3)--> gather_context      [bounded cycle]
+diagnose --(attempts >= 3)--> escalate_to_human -> END
+propose_action -> [APPROVAL BOUNDARY] -> execute_action
+execute_action -> verify -> END
+verify --(not recovered)--> escalate_to_human
+```
+
+Count what the runbook told you and the graph made explicit: two exits that are not "fix it", one
+parallel gather, one bounded loop, one approval boundary, and a verify step the runbook mentions
+only as "observe for 5 minutes". **Writing the runbook as a graph finds the missing steps.** Every
+runbook we have converted had at least one — usually the verify.
+
+### Autonomy, decided per step
+
+Draw the graph, then write a level next to each node. For the graph above:
+
+| Step | Level | Why |
+| --- | --- | --- |
+| confirm_alert | auto | Read-only. Wrong answer costs one wasted gather. |
+| gather_context | auto | Read-only against three systems. Nothing can be changed. |
+| diagnose | auto | Produces text and a confidence number. No effect. |
+| propose_action | **suggest** at first | It writes what it would do. A human reads it. This is the shadow phase. |
+| execute_action | **approve** | An effect on production. A human clicks yes, seeing the resolved arguments. |
+| verify | auto | Read-only. |
+| escalate | auto | Sends a message. Worst case: an unnecessary page. |
+
+Five of seven nodes are automatic on day one, because they are read-only. **Most of an agentic
+system is read-only, and read-only is where the value is** — the 20 minutes an engineer spends
+gathering context is the 20 minutes you are actually saving.
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **What is the difference between suggest, approve and auto?** Who performs the action: the human, the human after the agent asks, or the agent.
+2. **Why is most of an agentic system safely automatic?** Because most of it is reading, and reads have almost no blast radius.
+3. **What does converting a runbook to a graph reliably reveal?** Missing steps — usually the verification, and usually the "this was not a real alert" exit.
+4. **What must an approval prompt show?** The resolved arguments and the blast radius, not the verb.
+5. **What is a rollback?** A specific pre-recorded command that undoes the action, which you have tested — not a plan to restore from a backup.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+### The full architecture
+
+Three agent roles, two data planes, one approval boundary.
+
+```python
+# architecture.py — the shape. Details are in the lab.
+#
+#   ALERT/TICKET
+#        |
+#   [triage]          one model call, tool_choice forced -> Severity, is_real
+#        |
+#   [gather] <-------------+     parallel: RAG over runbooks (Week 28)
+#        |                 |               MCP read tools (Week 29 M4)
+#   [diagnose] -- cycle ---+               metrics, deploys, logs
+#        |  (bounded: attempts < 3, novelty detector on, budgets enforced)
+#   [propose]         -> Action(kind, arguments, blast_radius, rollback, evidence_ids)
+#        |
+#   === interrupt(): human sees kind, arguments, blast radius, evidence ===
+#        |
+#   [execute]         -> MCP write tool, derived idempotency key, outbox
+#        |
+#   [verify]          -> re-read the signal that fired; did it recover?
+#        |
+#   [report]          -> post to the ticket, close or escalate
+```
+
+Component by component, with the decision behind each:
+
+**Retrieval over runbooks (Week 28).** Hybrid: BM25 for the exact service and error strings, dense
+for the paraphrased symptom, reciprocal-rank fusion, then a cross-encoder re-rank of the top 30 to
+the top 5. Measured on 120 labelled alert-to-runbook pairs: BM25 alone recall@5 = 0.71, dense alone
+0.68, hybrid 0.84, hybrid plus re-rank **0.91**. The re-rank costs 180 ms and is worth it because a
+wrong runbook is not a slightly worse answer — it is a confident, well-evidenced proposal to do the
+wrong thing.
+
+**MCP for system access (Week 29 M4).** Read tools and write tools in *separate servers* with
+separate credentials. The read server has a read-only Kubernetes role and a read-only database role;
+the write server has exactly three verbs and is only reachable from the `execute` node. This is not
+paranoia, it is the least-privilege argument from Week 29 M4 made structural: a prompt injection in a
+log line reaches the read server's context, and the read server cannot do anything.
+
+**Durability and approval (Module 3).** Postgres checkpointer. `interrupt()` at the approval
+boundary means the process can exit while a human sleeps; approval hours later resumes the run in a
+new process. `approved_by` is a state field.
+
+**Budgets and detectors (Module 4).** Four budgets, novelty detector, breakers on the three
+dependencies, structured escalation. Failing runs route to `escalate`, never to `END`.
+
+### The Action contract
+
+The most important type in the system, because it is what a human approves.
+
+```python
+from typing import Literal
+from pydantic import BaseModel, Field
+
+class Action(BaseModel):
+    kind: Literal["restart_pod", "scale_deployment", "clear_cache",
+                  "rollback_deploy", "increase_pool_size"]
+    arguments: dict[str, str]                 # resolved. "payments-api", not "the service"
+    blast_radius: str = Field(description="Plain English. Who is affected, for how long.")
+    reversible: bool
+    rollback: str | None = Field(description="The exact command that undoes this, or None")
+    evidence_ids: list[str] = Field(min_length=1,
+        description="Ids of the evidence that justifies this. Empty is not allowed.")
+    runbook_id: str | None = Field(description="The runbook this follows, if any")
+    confidence: float = Field(ge=0, le=1)
+
+    def approval_prompt(self) -> str:
+        return (f"{self.kind}({', '.join(f'{k}={v}' for k, v in self.arguments.items())})\n"
+                f"Blast radius: {self.blast_radius}\n"
+                f"Reversible: {'yes — ' + self.rollback if self.reversible else 'NO'}\n"
+                f"Confidence: {self.confidence:.0%} · runbook {self.runbook_id or 'none'}\n"
+                f"Because: {summarize(self.evidence_ids)}")
+```
+
+Four constraints that are doing real work:
+
+1. **`kind` is a closed enum.** The agent cannot propose an action the system does not implement. Adding a new capability is a code change with a review, not a prompt change.
+2. **`evidence_ids` cannot be empty.** An action with no evidence is refused by the validator before a human ever sees it. This turns "the agent hallucinated a reason" into a caught error.
+3. **`rollback` is required when `reversible` is true**, and the executor *records the rollback command before performing the action*. Recording it afterwards is too late — you may not be able to compute it once the state has changed.
+4. **The approval prompt is generated from the object**, so the human sees exactly what will run. There is no path where the displayed text and the executed action differ.
+
+### The design document
+
+This is the deliverable. Nine sections, and the hands-on says to write it before the code.
+
+<AccordionGroup>
+<Accordion title="1 · Problem and users" icon="target">
+Who is on the other end, what they do today, and how long it takes. Ours: 6 on-call engineers, 41-minute median time to resolution, of which a median 19 minutes is context gathering. That 19 minutes is the target and it is why the read-only part of the system is the valuable part.
+</Accordion>
+<Accordion title="2 · The decisions the system makes" icon="git-branch">
+A list. For each: what decides it, what it can be wrong about, and what happens then. If a decision is not in this list it should not be in the system.
+</Accordion>
+<Accordion title="3 · Autonomy boundary" icon="shield">
+The table from Layer 1, per node, with the level and the justification. Plus the explicit list of actions that will **never** be automated, and why. Ours has four, headed by credential rotation.
+</Accordion>
+<Accordion title="4 · Blast-radius analysis" icon="triangle-alert">
+Per action kind: worst case, likelihood, what stops it, what detects it, how it is undone, and how long the undo takes. Layer 3 has the format.
+</Accordion>
+<Accordion title="5 · Architecture" icon="network">
+The hand-drawn diagram and the final one. Both, in the document. The rough version shows the thinking; the clean one is the reference.
+</Accordion>
+<Accordion title="6 · Data and trust boundaries" icon="lock">
+Every input, its source, whether it is trusted, and what it can reach. Log lines and ticket text are untrusted (Week 29 M4, Week 31 M4). Name them as such here.
+</Accordion>
+<Accordion title="7 · Failure modes" icon="bug">
+The Module 4 taxonomy for this system, with rates once you have them and detectors from day one.
+</Accordion>
+<Accordion title="8 · Rollout plan" icon="rocket">
+Suggest, then approve, then auto — with the numeric gate for each transition, stated in advance. Layer 3.
+</Accordion>
+<Accordion title="9 · Operations" icon="wrench">
+Who owns the prompts, who is paged when the agent misbehaves, what the runbook for the runbook-agent is, and what it costs per month.
+</Accordion>
+</AccordionGroup>
+
+### War story
+
+A team built an incident agent and it worked. Diagnosis quality was good, the approval flow was
+clean, engineers liked it. It was switched off after five weeks.
+
+The reason was section 9. Nobody owned the prompts. When a diagnosis was wrong, the on-call engineer
+had no way to fix it — they were not the team that built the agent, and that team had moved on to
+the next project. Two months of small inaccuracies accumulated with no mechanism to correct them,
+trust decayed, and engineers went back to doing it by hand. The system was never *wrong* enough to
+kill; it just had no owner and so it slowly stopped being believed.
+
+What the second attempt did differently, and it is entirely organizational: the runbook corpus
+became owned by the on-call rota, with a pull-request flow, so fixing the agent meant editing a
+runbook — something on-call engineers already do. Prompt changes required an eval-suite pass
+(Week 31) so a fix could not silently regress something else. And every escalation carried a
+one-click "this diagnosis was wrong" that created a labelled eval case. **The technical architecture
+was identical. The second one is still running.**
+
+<Accordion title="Design checkpoint — with model answer">
+
+**Question.** Your incident agent can restart a pod. A director asks why it cannot also roll back a
+deploy, since that is "just as reversible". Answer them.
+
+**Model answer.** They are right that both are reversible and wrong that reversibility is the only
+axis. Three differences.
+
+*Blast radius.* Restarting one pod affects that pod's in-flight requests — for us, about 30 seconds
+of elevated 5xx on one replica of a service that has six. Rolling back a deploy affects every user
+of that service and, because our deploys are not always independent, potentially services that
+depend on a contract introduced in that deploy. The worst case is an order of magnitude larger.
+
+*Reversibility in practice.* Rolling back a deploy is reversible in the sense that you can roll
+forward. But if the deploy included a database migration, rolling back the code without the
+migration is not a return to a previous state — it is a *new* state nobody has tested. Reversibility
+must be evaluated as "returns to a known-good state", not "there is an inverse command".
+
+*Detection.* We can tell within 90 seconds whether a pod restart helped, from the same signal that
+fired. Whether a deploy rollback helped is confounded by everything else the deploy contained, so
+the verify step is much weaker.
+
+What I would offer instead: put deploy rollback at **suggest** level immediately — the agent
+identifies the suspect deploy and writes the exact rollback command with its evidence, and a human
+runs it. That captures most of the time saving (finding the deploy is the slow part) with none of
+the risk. Then measure agreement for eight weeks. If the agent's suggested rollback matches what the
+human did in more than 90% of cases, we have the data to move it to approve. That is a promise with
+a date and a number attached, which is a better answer than "no".
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+### Blast-radius analysis, done properly
+
+One row per action kind. This is the table a risk owner signs.
+
+| Action | Worst realistic outcome | What stops it | What detects it | Undo | Undo time |
+| --- | --- | --- | --- | --- | --- |
+| `restart_pod` | Restarts the wrong pod: ~30 s of 5xx on 1 of 6 replicas, ~0.4% of requests in that window | Namespace allow-list; `kind` enum; approval showing the resolved pod name | Error-rate alert on the affected service within 60 s | None needed (it comes back) | 45 s |
+| `scale_deployment` | Scales to an absurd replica count: cost, and possible database connection exhaustion | Hard `max_replicas` in the tool, not in the prompt; approval | Replica-count alert; database connection saturation alert | Scale back to the recorded prior value | 30 s |
+| `clear_cache` | Clears a hot cache: latency spike for ~4 min while it refills, no data loss | Cache-name allow-list; rate limit of once per 15 min per cache | p99 latency alert | None (it refills) | 4 min |
+| `increase_pool_size` | Exhausts database connections for other services | Hard ceiling; the tool checks the database's `max_connections` before acting | Connection-saturation alert | Set back to the recorded prior value | 20 s |
+| `rollback_deploy` | Rolls back past a database migration into an untested state | **Not automated.** Suggest only. | — | — | — |
+| `rotate_credential` | Breaks 4 dependent services simultaneously | **Not in the system at all.** | — | — | — |
+
+Three things this table forces that prose does not:
+
+1. **"What stops it" must name a mechanism in code, not an instruction in a prompt.** If the only thing preventing a 500-replica scale-up is the system prompt saying to be careful, the cell reads "nothing".
+2. **"What detects it" must be an existing alert.** If nothing detects the failure, you are relying on a human noticing, and the row should be at approve level at best.
+3. **The last two rows exist.** A blast-radius analysis that only covers what you built is a description. One that names what you deliberately excluded, and why, is an argument.
+
+### Staged autonomy rollout, with the gates stated in advance
+
+The mistake is to launch at approve level and then debate autonomy forever. State the gate first.
+
+| Phase | Duration | What the agent does | Gate to advance |
+| --- | --- | --- | --- |
+| **Shadow** | 4 weeks | Runs on every alert, writes its proposal to a channel nobody has to read. Does nothing. | Proposal agrees with what the human did in **more than 70%** of cases, and zero proposals that would have been harmful |
+| **Suggest** | 6 weeks | Posts its proposal into the incident thread with a copyable command | Human uses the suggestion in more than 60% of incidents; measured MTTR improvement |
+| **Approve** | 8 weeks | Executes after a human clicks approve | Approval rate above 90% for a given action kind, across at least 50 instances of that kind |
+| **Auto (per action kind)** | ongoing | Executes automatically, posts what it did, rollback armed | Per kind, not globally. Any incident caused by the agent returns that kind to approve. |
+
+**Our numbers.** Shadow: 1,240 proposals, 71% agreement with the human action, 3 proposals judged
+harmful (all three were `scale_deployment` with an absurd target — which is what produced the hard
+ceiling in the tool). Suggest: 6 weeks, engineers used the suggestion in 68% of incidents; median
+time-to-resolution moved from 41 to 33 minutes, entirely from the gathering phase. Approve: 890
+proposals, 94% approved, 6% declined with a reason (52 of those 53 declines became eval cases).
+Auto: enabled for **3 of 11 action kinds** — `restart_pod`, `clear_cache`, `increase_pool_size` —
+and MTTR is now 26 minutes.
+
+Two honest observations. **The biggest single win came at suggest level**, not at auto: 41 to 33
+minutes, from the agent doing the reading. Autonomy over actions bought a further 7 minutes and
+carried nearly all of the risk. And **the 6% decline rate is the most valuable output of the approve
+phase** — those are labelled failures, arriving free, and they became the seed of the Week 31 eval
+set.
+
+### Auditability: what must be recorded
+
+For every run, permanently:
+
+| Field | Why |
+| --- | --- |
+| Thread id, start and end, final `halt_reason` | The spine of every later query |
+| Every node entered, with state delta and duration | "Which step went wrong" |
+| Every model call: model id, prompt version, token counts, cost | Attribution when quality changes (Week 32 M2) |
+| Every tool call: name, resolved arguments, result digest, latency | The security question from Week 29 M4 |
+| Every retrieval: query, document ids returned, scores | "Why did it think that" — usually the answer |
+| The `Action` object, verbatim, as approved | What was *actually* sanctioned |
+| `approved_by`, timestamp, and the exact text shown to the approver | The compliance question. The last clause matters: showing a different string than you executed is the failure. |
+| Rollback command recorded **before** execution | It may be uncomputable afterwards |
+| Any `update_state` intervention: actor, field, old, new | The human write path bypasses everything else |
+
+Retention: the audit log outlives the checkpoints. Ours keeps checkpoints for 7 days (Module 3) and
+the audit log for 13 months, because the question "what did this system do in March" arrives in
+April of the following year, from someone in a different department.
+
+### The organizational reality
+
+The technical architecture is the easy half. Four questions decide whether the system survives, and
+all four belong in the design document:
+
+1. **Who owns the prompts and the runbook corpus?** If it is the team that built it, the system dies when that team moves on (the war story). It must be the team that *feels the failures* — the on-call rota — with a normal pull-request flow.
+2. **Who is paged when the agent misbehaves?** There must be a name. An agent with no on-call owner is a service with no on-call owner.
+3. **What is the mechanism for a human to say "that was wrong"?** One click, from the place they already are, producing a labelled case. If correcting the agent is more work than doing the task by hand, nobody will do it, and the system cannot improve.
+4. **What does it cost, monthly, and who sees that number?** Ours: $310 in model spend, roughly 1.5 engineer-days per month of maintenance (prompt fixes, runbook updates, eval triage). The maintenance number is the one that surprises people and the one that must be budgeted, or it comes out of somebody's slack time and then stops happening.
+
+### Papers and primary sources
+
+- **Beyer et al., *Site Reliability Engineering*, chapters on incident response and postmortem culture.** Takeaway: incident response is a *role* structure (incident commander, ops lead, communications) before it is a procedure — an agent slots in as a very fast ops lead and never as the commander, and that framing settles most autonomy arguments.
+- **Anthropic, *Building Effective Agents*.** Takeaway: it is explicit that autonomy should be added only where the branching is genuinely unknown and that human checkpoints belong at the boundaries of irreversible actions — the same conclusion this module reaches from the blast-radius side.
+- **LangGraph reference architectures and the human-in-the-loop guide (0.2.74).** Takeaway: `interrupt` plus a durable checkpointer is what makes an hours-long approval wait cheap, which is what makes approve-level autonomy operationally viable rather than a nice idea.
+- **Woods & Hollnagel, *Joint Cognitive Systems* (2006).** Takeaway: automation does not remove human work, it changes it — usually into the harder work of supervising an opaque process — which is exactly why the "this was wrong" button and the structured escalation are architecture, not polish.
+
+### Stretch challenge
+
+Write the design document and blast-radius analysis for a system you would actually be allowed to
+run at your own workplace, and then get it reviewed by someone who would have to sign it.
+
+The document is the artifact. The review is the exercise. Take it to the person who owns the systems
+your agent would touch — an SRE lead, a security engineer, a database owner — and ask them to find
+the row in your blast-radius table that is wrong. They will. Ours had two: we had classified
+`clear_cache` as harmless, and the person who owned that cache pointed out that clearing it during a
+traffic peak causes a thundering herd against a database that is already the bottleneck, which turns
+a 4-minute latency blip into an outage. That single conversation moved the action from auto to
+approve and added the rate limit.
+
+The genuinely open question you will hit: how do you decide when to move the approval boundary left
+for an action kind you have only seen 12 times? Fifty instances is a comfortable gate; some action
+kinds will never reach fifty in a year. There is a real statistical answer here (Week 12's
+confidence intervals on a proportion — 12 successes out of 12 gives a 95% lower bound of about 74%,
+which is nowhere near 90%) and a real organizational one, and they disagree. Write down which one
+you would use, and what you would tell the person who has to sign it.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Write the design document and the blast-radius analysis **before** you write the code. Then build
+the system and diff what you built against what you designed — the differences are the things you
+did not understand when you started, and they are the most interesting part of your write-up.
+</Card>
+
+<Steps>
+<Step title="Convert a real runbook to a graph, on paper">
+Yours, or a public one. Find the missing verify step. Photograph the drawing.
+</Step>
+<Step title="Assign autonomy per node">
+Three levels, with a written justification each, plus the explicit never-automate list.
+</Step>
+<Step title="Blast-radius table">
+Six columns. "What stops it" must name code, not a prompt. "What detects it" must name an alert that exists.
+</Step>
+<Step title="Rollout plan with numeric gates">
+Shadow, suggest, approve, auto — per action kind, with the gate for each transition stated before you start.
+</Step>
+<Step title="Build it, then diff">
+Implement, then compare with the document. Update the document. The diff is the deliverable.
+</Step>
+</Steps>
+
+## The whiteboard
+
+**T1 pair** — the whole system twice: the hand-drawn whiteboard version with the crossings-out
+visible, and the polished version. Publish both side by side so the progression from sketch to spec
+is visible; this pair is also the template for the capstone poster in Week 32 M5.
+
+<Tip>
+**Draw it yourself.** The flow with an autonomy badge on every node, the red approval boundary, and
+three blast-radius cards under the execute node. Then move the boundary one node to the left and
+write down what evidence would justify it.
+[Blank version](/assets/diagrams/p4-w30-m5-blank.svg) · [Editable source](/assets/diagrams/p4-w30-m5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Resume line:** *"Designed and built an incident auto-remediation system (LangGraph, Postgres
+checkpointing, hybrid RAG over runbooks at 0.91 recall@5, MCP servers split read/write by
+credential); wrote the blast-radius analysis and a staged autonomy rollout with numeric gates;
+3 of 11 action kinds reached automatic execution with armed rollbacks."*
+
+**How to talk about it.** Do not lead with the agents. Lead with the blast-radius table and the two
+rows that say "not automated, and here is why". Deciding what *not* to build, in writing, with
+reasons, is the single strongest signal of engineering maturity available to someone with no job
+history.
+
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+**1. Convert one runbook to a graph this week.** No code. One hour, on paper. You will find the
+missing verify step and at least one branch nobody documented, and that alone is worth the hour to
+your on-call rota.
+
+**2. Write the blast-radius table for an automation you already have.** Not an agent — any
+automation. Most teams have scripts with more blast radius than the agent they are nervous about,
+and the table is how you find out.
+
+**3. Propose shadow mode, not autonomy.** When the agentic proposal arrives, the intervention that
+gets it shipped is "run it in shadow for four weeks and measure agreement". It is unarguable, it
+costs nothing, and it produces the data that every later conversation needs.
+
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| The project dies quietly after two months | No owner for prompts and runbooks | Ownership by the on-call rota, with a pull-request flow they already use |
+| Approval fatigue; humans click yes without reading | The prompt shows the verb, not the resolved arguments and blast radius | Generate the prompt from the `Action` object; include evidence |
+| The agent proposes an action the system cannot do | Action space is prose, not a type | Closed `Literal` enum for `kind`; new capabilities are code reviews |
+| An action cannot be undone because the prior state is gone | Rollback computed after the action | Record the rollback command before executing |
+| "What stops it" is the system prompt | Controls in text rather than code | Hard ceilings and allow-lists in the tool; the prompt is not a control |
+| Autonomy debated forever | No numeric gate stated in advance | Shadow/suggest/approve/auto with per-kind gates written before launch |
+| Wrong runbook retrieved, confident wrong proposal | Dense-only retrieval | Hybrid plus re-rank; 0.68 to 0.91 recall@5 in our measurement |
+| Injected instruction from a log line reaches a write tool | One MCP server for reads and writes | Separate servers, separate credentials, writes reachable only from `execute` |
+| Nobody can answer "what did it do in March" | Audit log retained as long as checkpoints | Audit log outlives checkpoints — ours 13 months against 7 days |
+| Maintenance cost surprises everyone at quarter end | Only model spend was budgeted | Budget engineer-days too. Ours is 1.5 per month, and it is the number that decides survival. |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="8 concept questions (with answers)" icon="circle-question">
+
+1. *Is autonomy a property of a system?* No — of each step, rationed by blast radius and reversibility.
+2. *Why is most of an agentic system safely automatic?* Most of it reads, and reads have near-zero blast radius. The value is also mostly there.
+3. *What must an approval prompt contain?* Resolved arguments, blast radius, reversibility with the rollback, confidence, and the evidence.
+4. *What makes "reversible" a trickier property than it looks?* An inverse command is not the same as returning to a known-good state — a code rollback past a migration is a new, untested state.
+5. *Where does the biggest time saving come from?* Suggest level: the agent doing the context gathering. Ours was 41 to 33 minutes before any action was automated.
+6. *What is the most valuable output of the approve phase?* The declines — labelled failures, free, which become eval cases.
+7. *Why must the audit log outlive the checkpoints?* Questions about what the system did arrive months later; checkpoints are pruned in days.
+8. *What kills these projects?* Not accuracy. No owner for the prompts, and no cheap way for a human to say "that was wrong".
+
+</Accordion>
+<Accordion title="Coding challenge (hidden tests)" icon="code">
+
+Implement the `Action` contract and the execute path to pass tests covering: an action with empty
+`evidence_ids` is rejected before approval; a `reversible` action with no `rollback` is rejected; the
+rollback command is recorded before the tool call and is present even if the tool then fails; the
+approval prompt string contains the resolved arguments verbatim; the executed action is byte-identical
+to what the prompt displayed; `scale_deployment` above the hard ceiling is refused by the tool
+regardless of prompt; and an action kind not in the enum cannot be constructed.
+
+</Accordion>
+<Accordion title="Interview questions — junior / mid / senior" icon="user-tie">
+
+- **Junior.** "What is the difference between suggest, approve and auto, and which would you start with?"
+- **Mid.** "Write the blast-radius row for an action that restarts a service." (Expect all six columns, with "what stops it" naming code.)
+- **Senior.** "You have four weeks of shadow data showing 71% agreement. A director wants full autonomy next month. What do you do?" (Expect: per-action-kind gates, the distinction between reading and acting, the 3-of-11 shape, the numeric gate, and a concrete counter-offer rather than a refusal.)
+
+</Accordion>
+<Accordion title="Draw it from memory" icon="pencil">
+
+The full architecture with autonomy badges on every node, the approval boundary in red, and three
+blast-radius cards under the execute node.
+
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+- [LangGraph 0.2.74 human-in-the-loop guide](https://langchain-ai.github.io/langgraph/) — `interrupt`, `Command(resume=...)`, and why a durable checkpointer is what makes an hours-long approval affordable.
+- [Kubernetes RBAC documentation](https://kubernetes.io/docs/reference/access-authn-authz/rbac/) — read it for how to actually construct the read-only role the read MCP server uses; "read-only" is a set of verbs, not an adjective.
+
+**Papers**
+- [Beyer et al. 2016, *Site Reliability Engineering* (incident response, postmortems)](https://sre.google/sre-book/postmortem-culture/) — the role structure of an incident tells you exactly where an agent fits and where it does not.
+- Woods & Hollnagel 2006, *Joint Cognitive Systems* — automation transforms human work into supervision, which is why the correction path and the escalation summary are architecture rather than polish.
+
+**Go deeper**
+- [Anthropic, *Building Effective Agents*](https://www.anthropic.com/engineering/building-effective-agents) — read the closing guidance on human checkpoints at irreversible boundaries; it is the same conclusion as the blast-radius table, reached from the other direction.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-30/p4-w30-m5">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

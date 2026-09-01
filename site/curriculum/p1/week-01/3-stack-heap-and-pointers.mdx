@@ -1,0 +1,593 @@
+---
+title: "Stack, heap, and pointers"
+description: "Week 1 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 1 · Module 3 · `P1-W01-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Draw the stack for a three-function call chain and say which variable dies when.
+2. State, for every pointer in your program, who owns it and who frees it — and write that in the header.
+3. Predict `sizeof` a struct from its field order, and reorder fields to shrink it.
+4. Write a bump allocator that beats `malloc` by a measured 37× on your own machine, and explain the exact trade you made.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/P1-W01-M3.svg" alt="Hand-drawn sketch: Stack, heap, and pointers" className="block dark:hidden" />
+  <img src="/assets/diagrams/P1-W01-M3-dark.svg" alt="Hand-drawn sketch: Stack, heap, and pointers" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: P1-W01-M3
+tier: T3
+one-sentence-goal: A stack frame dies when its function returns, so a pointer into it becomes a lie — while a heap block outlives the frame and becomes your responsibility.
+elements:
+  - tall rounded box labelled "one process, one address space", split into bands
+  - bottom band "TEXT (your code)" then "DATA / BSS" then "HEAP" with an up-arrow "grows up via malloc/brk/mmap"
+  - top band "STACK" with a down-arrow "grows DOWN", three hand-drawn frames stacked: main at 0x16dd920a8, a at 0x16dd9207c, b at 0x16dd9205c, c at 0x16dd9203c, each with the measured address written in
+  - amber margin note by the stack: "86,000-ish frames and you are out. 8 MB / ~96 B."
+  - a green arrow from a heap block labelled "malloc(24) -> 32 usable" up to a pointer variable living in frame a, labelled "OK: block outlives the frame"
+  - a red arrow from frame c's local `int z` DOWN to a pointer stored in main, struck through with a red X, labelled "returning &z: the frame is gone"
+  - amber note next to it: "careful — this compiles, runs, and prints the right answer on Tuesday"
+  - small inset bottom-right: two struct diagrams, "bad" 24 bytes with hatched padding gaps drawn in, "good" 16 bytes, arrow labelled "same fields, 33% smaller"
+  - dangling arrow off the heap labelled "who frees this? -> ownership, Layer 2"
+numbers-to-write-in: stack 8176 KB · ~96 B/frame · SIGSEGV at depth ~87,000 · malloc(1) -> 16 B usable · struct 24 -> 16 B · bump 0.85 ns vs malloc 31.85 ns
+alt: A hand-drawn diagram of a process address space with text, data, heap growing upward and stack growing downward, showing three stack frames with their measured addresses, a green arrow from a valid heap allocation to a pointer, and a red crossed-out arrow showing a returned pointer to a dead stack frame, plus an inset comparing a 24-byte and a 16-byte struct layout.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term is defined where it first appears.
+
+### The one idea
+
+Every variable lives at an **address** — a number identifying one byte of memory. A **pointer** is a variable whose value is an address. That is all a pointer is: a number that says "the thing is over there".
+
+Memory comes from two places with two different lifetimes. The **stack** is automatic: space appears when a function is entered and vanishes when it returns, and you get no say in it. The **heap** is manual: you ask for space, you get it, and it stays yours until you give it back. Every memory bug in C is a confusion about *which* of those two you are pointing at, and *when*.
+
+### The analogy
+
+A pointer is a **house address written on a slip of paper**, not the house.
+
+You can copy the slip of paper a hundred times — that costs nothing and does not build a hundred houses. You can hand the slip to a friend and they can go put furniture in *your* house. If the house is demolished and you still have the slip, the address is still a perfectly valid-looking number; walk to it and you will find rubble, or someone else's new house. Nothing about the paper tells you the house is gone.
+
+The stack is a **hotel room**: assigned when you check in, cleaned out the second you check out, and the next guest gets it. Writing your friend's address as "room 402, Hotel Ubiquity" is fine while you are staying there and worthless the moment you leave. The heap is a **storage unit**: yours until you cancel it, and if you forget to cancel it you keep paying rent forever. That is a memory leak.
+
+### The vocabulary, defined
+
+- **Address** — a number naming one byte of memory. On a 64-bit machine, addresses are 64-bit numbers, which is why `sizeof(void *)` is 8.
+- **Pointer** — a variable holding an address. Written `int *p;` — "p holds the address of an int".
+- **`&x`** — the **address-of** operator. Gives you the address of the variable `x`.
+- **`*p`** — the **dereference** operator. Gives you the *value* stored at the address in `p`. Read it as "the thing at".
+- **`NULL`** — the address `0`, reserved to mean "this pointer points at nothing". Dereferencing it crashes on purpose.
+- **Stack** — memory for local variables, managed automatically. Each function call pushes a **stack frame**; each return pops it.
+- **Stack frame** — the block of stack memory belonging to one active function call: its locals, its saved registers, the return address.
+- **Heap** — memory you request explicitly with `malloc` and release with `free`. Lives until you free it.
+- **`malloc(n)`** — ask for `n` bytes of heap. Returns a pointer, or `NULL` if it failed.
+- **`free(p)`** — give back a block previously returned by `malloc`. After this, `p` is a **dangling pointer**: the number is still there, the memory is not yours.
+- **Memory leak** — heap memory you allocated and never freed and can no longer reach. It stays reserved until the process exits.
+- **Struct** — a group of variables laid out together in memory under one name.
+
+### Smallest working example
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int x = 42;
+    int *p = &x;             /* p holds the address of x */
+
+    printf("x    = %d\n", x);
+    printf("&x   = %p\n", (void *)&x);
+    printf("p    = %p\n", (void *)p);
+    printf("*p   = %d\n", *p);
+
+    *p = 99;                 /* write through the pointer */
+    printf("x    = %d  <- changed via p\n", x);
+    return 0;
+}
+```
+
+```bash
+cc -std=c17 -Wall -Wextra ptr.c -o ptr && ./ptr
+```
+
+```
+x    = 42
+&x   = 0x16b32f0a8
+p    = 0x16b32f0a8
+*p   = 42
+x    = 99  <- changed via p
+```
+
+`&x` and `p` print the same number. `*p = 99` changed `x` without ever mentioning `x`. That is the entire mechanism behind every "pass by reference" you will ever meet, in any language.
+
+### Line-by-line walkthrough
+
+- `int x = 42;` — reserves 4 bytes on the stack in `main`'s frame, and writes 42 into them.
+- `int *p = &x;` — reserves 8 bytes on the stack (a pointer is 8 bytes on a 64-bit machine) and writes the address of `x` into them. The `*` in the *declaration* means "p is a pointer to int". It is not a dereference here — the same symbol means two things depending on position, which is the single most confusing thing about C syntax, and the only cure is to read declarations as "the type of `*p` is `int`".
+- `(void *)&x` in `printf` — `%p` is specified to take a `void *`, and passing anything else is undefined behaviour. Casting is not decoration; without it, this is a real (if usually harmless) bug that `-Wall` will flag.
+- `*p` in an expression — now the `*` *is* the dereference operator. "Go to the address in `p`, read an int."
+- `*p = 99;` — go to the address in `p` and write 99 there. Since that address is `x`, `x` becomes 99.
+
+### The stack, drawn
+
+Run this and watch the addresses:
+
+```c
+#include <stdio.h>
+static void c(void) { int z; printf("c    frame at %p\n", (void *)&z); }
+static void b(void) { int y; printf("b    frame at %p\n", (void *)&y); c(); }
+static void a(void) { int x; printf("a    frame at %p\n", (void *)&x); b(); }
+int main(void) { int m; printf("main frame at %p\n", (void *)&m); a(); return 0; }
+```
+
+Measured output:
+
+```
+main frame at 0x16dd920a8
+a    frame at 0x16dd9207c
+b    frame at 0x16dd9205c
+c    frame at 0x16dd9203c
+```
+
+Each address is **lower** than the one before. The stack grows **downwards** on ARM64 and x86-64. `main` is at the top, `c` is 108 bytes below it. When `c` returns, that memory is not erased — it is simply no longer reserved, and the next function call will write over it.
+
+### Guided practice
+
+<Steps>
+<Step title="Write the classic bug on purpose">
+
+```c
+#include <stdio.h>
+int *broken(void) {
+    int local = 7;
+    return &local;        /* returning the address of a dead frame */
+}
+int main(void) {
+    int *p = broken();
+    printf("%d\n", *p);   /* might print 7. might print garbage. */
+    return 0;
+}
+```
+
+Compile with `cc -Wall -Wextra`. The compiler warns: `address of stack memory associated with local variable 'local' returned`. Run it. On this machine it printed `7` — which is the worst possible outcome, because it teaches you the code works.
+</Step>
+<Step title="Prove it is a lie">
+Add one function call between `broken()` and the `printf`:
+
+```c
+int *p = broken();
+printf("%d\n", 0);        /* this call reuses the frame */
+printf("%d\n", *p);       /* now prints garbage */
+```
+
+The second `printf` overwrote the frame `local` used to live in. Nothing crashed; the value simply changed under you. This is why "it worked when I tested it" means nothing for memory bugs.
+</Step>
+<Step title="Do it correctly with the heap">
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+int *correct(void) {
+    int *p = malloc(sizeof *p);   /* sizeof *p, not sizeof(int) — see Layer 2 */
+    if (!p) return NULL;          /* malloc can fail. always check. */
+    *p = 7;
+    return p;                     /* the block outlives the frame */
+}
+int main(void) {
+    int *p = correct();
+    if (!p) return 1;
+    printf("%d\n", *p);
+    free(p);                      /* the caller owns it now */
+    return 0;
+}
+```
+</Step>
+<Step title="Find the leak yourself">
+Remove the `free(p)` and run under the sanitizer:
+
+```bash
+cc -std=c17 -g -fsanitize=address ok.c -o ok && ASAN_OPTIONS=detect_leaks=1 ./ok
+```
+
+On Linux this prints a leak report naming the allocation site. On macOS, LeakSanitizer is not supported, so use `leaks -atExit -- ./ok` instead, which comes with Xcode. Module 5 covers this properly.
+</Step>
+</Steps>
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **What is `sizeof(char *)` on a 64-bit machine?** — 8. Every pointer is an address, and addresses are 64-bit, regardless of what they point to.
+2. **Why does returning `&local` compile?** — because it is type-correct: `&local` really is an `int *`. C's type system does not track lifetimes. That is exactly the hole Rust's borrow checker fills.
+3. **After `free(p)`, what is wrong with `p`?** — nothing is wrong with the *number*; it is still a valid-looking address. It is wrong to *use* it. Set `p = NULL` immediately after freeing so misuse crashes loudly instead of corrupting silently.
+4. **You call `malloc` in a loop 1000 times and `free` once. What have you got?** — 999 leaked blocks. The process holds that memory until it exits.
+5. **Which grows towards which — stack or heap?** — heap grows up from low addresses, stack grows down from high addresses, and the gap between them is your remaining memory. On this machine the stack is capped at 8,176 KB.
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions. Measured on Apple M3 Pro, macOS 15, Apple clang 15.0.0.
+
+### Ownership is a design decision, and it belongs in the header
+
+C has no destructor, no borrow checker and no garbage collector. The only thing standing between you and a leak is a convention you wrote down. Pick one per API and state it in the header comment. There are exactly three that work:
+
+```c
+/* 1. CALLER OWNS: returns a new block; caller must free() it. */
+char *nx_strdup(const char *s);
+
+/* 2. CALLEE BORROWS: pointer must remain valid for the duration of the call only. */
+int nx_parse(const char *input, size_t len, struct record *out);
+
+/* 3. CONTEXT OWNS: allocated from an arena; freed all at once by nx_arena_reset. */
+struct record *nx_record_new(struct nx_arena *a);
+```
+
+Convention 3 is the one people underuse and it is the one that eliminates whole classes of bug — we build it in the hands-on. If you find yourself unable to say which of the three a function uses, that function is the bug.
+
+### The five memory bugs, with their signatures
+
+| Bug | What you wrote | What happens | Sanitizer output |
+|---|---|---|---|
+| Use after free | `free(p); use(p);` | reads stale or reallocated data | `heap-use-after-free` |
+| Double free | `free(p); free(p);` | allocator metadata corruption, often a crash much later | `attempting double-free` |
+| Buffer overflow | `malloc(strlen(s)); strcpy(buf, s);` | writes one byte past the block | `heap-buffer-overflow` |
+| Leak | no `free` on a path | RSS grows without bound | `LeakSanitizer` / `leaks` |
+| Uninitialised read | `int *p; *p = 1;` | reads whatever was there | `-fsanitize=memory` (MSan, Linux/clang only) |
+
+The `malloc(strlen(s))` one deserves a moment because it is the most common C bug in the world. `strlen("nexus")` is 5. `strcpy` writes 6 bytes — five characters plus the terminating `'\0'`. You need `malloc(strlen(s) + 1)`. Here is the actual sanitizer output from that exact bug, which you should learn to read:
+
+```
+==18051==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x00010c2006f5
+WRITE of size 6 at 0x00010c2006f5 thread T0
+    #1 0x104fdbcf8 in main buggy.c:10
+0x00010c2006f5 is located 0 bytes after 5-byte region [0x00010c2006f0,0x00010c2006f5)
+allocated by thread T0 here:
+    #1 0x104fdbce4 in main buggy.c:10
+```
+
+Three facts in five lines: it was a **write**, of **6 bytes**, **0 bytes after** a **5-byte** region allocated at the same line. The bug is fully diagnosed before you have opened the file.
+
+### `strcpy` vs `strncpy` vs neither
+
+`strncpy` is not the safe version of `strcpy`. It was designed in 1979 for fixed-width filesystem records and it has two behaviours nobody wants: if the source is longer than `n`, the destination is **not null-terminated**; if it is shorter, `strncpy` pads the entire remaining buffer with zeros, which is O(n) work you did not ask for.
+
+| Function | Null-terminates? | Truncation is detectable? | Use when |
+|---|---|---|---|
+| `strcpy` | yes | no — it overflows | never, unless the length is a compile-time constant you control |
+| `strncpy` | **no**, if truncated | no | only for fixed-width record formats |
+| `snprintf(dst, n, "%s", src)` | yes, always | yes — return value is the length it *wanted* | this is the portable right answer |
+| `strlcpy` (BSD, macOS, glibc 2.38+) | yes, always | yes — returns source length | when available; `snprintf` when not |
+
+Use `snprintf` and check the return value against `n`. It is three characters longer to type and it is correct.
+
+### Struct layout, alignment and padding — with numbers
+
+The compiler inserts padding so every field sits at an address that is a multiple of its **alignment** (usually its size, up to the platform maximum). Field order therefore changes `sizeof`.
+
+```c
+struct bad  { char a; int b; char c; double d; };   /* sizeof = 24 */
+struct good { double d; int b; char a; char c; };   /* sizeof = 16 */
+```
+
+Measured with `offsetof` on this machine:
+
+```
+sizeof(bad)  = 24    offsets: a=0  b=4  c=8  d=16
+sizeof(good) = 16    offsets: d=0  b=8  a=12 c=13
+```
+
+`bad` wastes 8 bytes — 33% — on padding: 3 bytes after `a`, then 7 bytes after `c` so that `d` lands on an 8-byte boundary. The rule that gets it right almost every time: **declare fields in descending order of alignment**. Largest first.
+
+At a million records this is 8 MB of nothing. At the scale where it matters — a hash table entry, a packet header, a tensor descriptor — it also changes how many records fit in a 64-byte cache line, which is a throughput effect and not just a size one. `clang -Wpadded` will tell you every place it inserted padding; it is far too noisy to leave on, but running it once over your core data structures is a 10-minute exercise with real payoff.
+
+### Trade-offs table
+
+| Decision | Choose X when… | Choose Y when… |
+|---|---|---|
+| Stack vs heap for a buffer | **Stack** for anything under a few KB with a known compile-time bound — allocation is one instruction, deallocation is free, and it is cache-hot. This is the default | **Heap** when the size is only known at run time, when it must outlive the frame, or when it is large. The 8 MB stack limit means a 4 MB local array is one nested call from a `SIGSEGV` |
+| `malloc` per object vs an arena | **`malloc`** when objects have independent, unpredictable lifetimes | **Arena** when a whole batch dies at once — per-request, per-frame, per-parse. Measured below: 0.85 ns vs 31.85 ns per allocation, and `free` becomes a single pointer reset |
+| Fixed array vs `realloc` growth | **Fixed** when you can bound the size and the bound is small; no failure path to test | **`realloc` doubling** for unbounded input. Double, never add a constant: doubling gives amortised O(1) per element; growing by 1 gives O(n²) copies |
+| `strncpy` vs `snprintf` | never `strncpy` for strings | **`snprintf`** always: it terminates, and its return value tells you whether it truncated |
+
+### Reference implementation — a bump allocator
+
+Complete, tested, and the basis for the hands-on.
+
+```c
+/* arena.h */
+#ifndef NEXUS_ARENA_H
+#define NEXUS_ARENA_H
+#include <stddef.h>
+
+typedef struct nx_arena {
+    unsigned char *base;
+    size_t cap;
+    size_t used;
+    size_t high_water;     /* peak usage, for reporting */
+} nx_arena;
+
+/* CONTEXT OWNS: everything allocated from `a` is freed by nx_arena_free(a). */
+int    nx_arena_init(nx_arena *a, size_t cap);
+void  *nx_arena_alloc(nx_arena *a, size_t n, size_t align);
+void   nx_arena_reset(nx_arena *a);   /* O(1): all objects die here */
+void   nx_arena_free(nx_arena *a);
+#endif
+```
+
+```c
+/* arena.c */
+#include "arena.h"
+#include <stdlib.h>
+#include <string.h>
+
+int nx_arena_init(nx_arena *a, size_t cap) {
+    a->base = malloc(cap);
+    if (!a->base) return -1;
+    a->cap = cap; a->used = 0; a->high_water = 0;
+    return 0;
+}
+
+void *nx_arena_alloc(nx_arena *a, size_t n, size_t align) {
+    /* align must be a power of two */
+    size_t off = (a->used + (align - 1)) & ~(align - 1);
+    if (off > a->cap || n > a->cap - off) return NULL;   /* overflow-safe */
+    void *p = a->base + off;
+    a->used = off + n;
+    if (a->used > a->high_water) a->high_water = a->used;
+    return p;
+}
+
+void nx_arena_reset(nx_arena *a) { a->used = 0; }
+
+void nx_arena_free(nx_arena *a) {
+    free(a->base); a->base = NULL; a->cap = a->used = 0;
+}
+```
+
+Two details that are the whole point of the implementation. The bounds check is written `n > a->cap - off` rather than `off + n > a->cap`, because the second form can overflow `size_t` and pass when it should fail — the exact bug class from Module 1, appearing in real code. And `align` is passed explicitly rather than assumed, because a `double` or a SIMD vector needs 8 or 16-byte alignment and a misaligned load is undefined behaviour (and a hardware fault on some architectures).
+
+Measured, 1,000,000 allocations of 24 bytes, minimum of 5 runs, CPU time:
+
+| Allocator | Per allocation | Deallocating everything |
+|---|---|---|
+| `malloc` + `free` | **31.85 ns** | 1,000,000 `free` calls |
+| bump arena | **0.85 ns** | one `a->used = 0` |
+
+**37.3× faster per allocation**, and the teardown goes from a million calls to one store. That is the trade in one line: you gave up the ability to free individual objects, and you bought a pointer increment.
+
+### What breaks in the real world
+
+An image-processing service processed each upload through a chain of filters, allocating a working buffer per filter with `malloc` and freeing it at the end of the request. Memory looked fine in staging. In production, RSS climbed steadily from 400 MB to 3.2 GB over about six hours and the container was OOM-killed, then restarted, then climbed again. There was no leak: every `malloc` had a matching `free`, and the leak checker was clean.
+
+The cause was **fragmentation**. Requests interleaved: a large buffer for a 20-megapixel image would be allocated, then a small metadata object, then the large buffer freed. The small object sat in the middle of the freed region, so the allocator could not coalesce it back into a block large enough for the next big image, and had to extend the heap instead. Over hours the heap became a sieve — plenty of free bytes, none of them contiguous and large. `malloc_zone_statistics` (macOS) and `malloc_info` (glibc) both showed the signature: total free bytes high, largest free block small.
+
+The fix was an arena per request, reset at the end of the request. RSS went flat at 480 MB. The general lesson is that "no leaks" and "bounded memory" are different properties, and only the second one keeps the container alive.
+
+<Accordion title="Design checkpoint — one question, with a model answer">
+
+**Question.** A colleague's parser allocates a `struct node` with `malloc` for every token in the input and frees the whole tree with a recursive `free_node()` walk at the end. Profiling says 34% of parse time is in `malloc`/`free`. They propose caching freed nodes in a free list. What do you recommend instead, and what do you need to check first?
+
+**Model answer.** Recommend an arena, but check one thing first: does any node outlive the parse?
+
+The lifetime pattern here is the arena's exact use case — thousands of small, same-shaped objects that all die at one well-defined moment. A free list would help (it avoids the general-purpose allocator's size-class lookup and coalescing) but it still pays a per-object cost on both ends and still fragments the underlying heap. The arena replaces the per-object cost with a pointer bump — measured above at 0.85 ns versus 31.85 ns, a 37× difference — and replaces the entire recursive teardown walk with `a->used = 0`. On a 34%-in-allocator profile, that is most of the 34% gone plus the removal of the free walk entirely.
+
+What to check first: whether the caller retains pointers into the tree after `parse()` returns. If it does, the arena must be owned by the caller and passed in — `nx_parse(arena, input)` — not created and destroyed inside the parser. That is a signature change and it is the real cost of the design. Also check whether input size is bounded: an arena that grows to the largest input ever seen and never shrinks is fine for a request-scoped arena and a slow leak for a long-lived one, so either size it per request or add a chained-block arena that frees all but the first block on reset.
+
+The measurement that settles it: run the parser on your p99 input, record `high_water`, and compare it to the sum of all `malloc` sizes. If they are close, the arena wins outright; if the arena's high water is much larger, you have long-lived objects mixed in with short-lived ones and you need two arenas, not one.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a measured number. All figures were produced on an
+Apple M3 Pro (11 cores, 18 GB), macOS 15, Apple clang 15.0.0. macOS uses the `libmalloc`
+(magazine/nano) allocator, Linux glibc uses ptmalloc2 — the numbers differ and the
+mechanisms rhyme. If you cannot reproduce the number on your machine, treat the claim
+as unproven and tell us.
+</Warning>
+
+### What `malloc` actually gives you
+
+`malloc` never returns exactly what you asked for. It returns a block from a **size class**, and the rest is rounded away. Measured with `malloc_size()` on macOS:
+
+| Requested | Usable (macOS `libmalloc`) |
+|---|---|
+| 1 | 16 |
+| 8 | 16 |
+| 16 | 16 |
+| 32 | 32 |
+| 64 | 64 |
+| 4096 | 4096 |
+
+Two consecutive `malloc(1)` calls returned addresses **16 bytes apart**. So `malloc(1)` costs 16 bytes on macOS, not 1. On glibc the number is different and larger: the minimum chunk is 32 bytes on 64-bit (a 8-byte size header plus a 24-byte minimum payload after alignment), so `malloc(1)` there consumes 32 bytes — the figure most textbooks quote. Both allocators round to 16-byte granularity because that is `max_align_t` on the platform.
+
+The consequence at scale: a linked list of one million nodes each holding one 8-byte `long` plus one 8-byte `next` pointer is 16 bytes of payload, which fits the 16-byte class exactly on macOS — but add one `char` flag and each node jumps to the 32-byte class. **One byte of struct growth doubles your memory.** This is not hypothetical; it is why `__slots__` matters in Week 3 and why tensor metadata is packed obsessively in Week 26.
+
+### Bins, arenas and fragmentation
+
+Both major allocators use the same three ideas.
+
+**Size classes / bins.** Small allocations are served from per-size free lists so allocation is a pop, not a search. glibc has 62 "small bin" size classes at 16-byte spacing up to 1008 bytes, then "large bins" with sorted ranges. macOS `libmalloc` has a "nano" zone for allocations up to 256 bytes with 16-byte classes, and a magazine-based "scalable" zone above that.
+
+**Per-thread caching.** glibc's `tcache` (since 2.26) gives each thread 64 entries per bin with no locking at all — this is why a single-threaded `malloc` microbenchmark measures ~30 ns while a naive locked allocator measures hundreds. macOS gives each CPU a "magazine" for the same reason. When you see allocation performance collapse under threading in Week 4, this is the layer that ran out of cache.
+
+**Coalescing.** When you `free` a block, the allocator checks whether the physically adjacent blocks are also free and merges them. This is what keeps the heap from turning to dust — and it is exactly what the image-service story defeated, because a live 32-byte object between two freed 8 MB regions prevents any merge.
+
+The metric that predicts an OOM is not "bytes free"; it is **largest free block / total free bytes**. When that ratio collapses, the next large allocation extends the heap even though there is plenty free. Instrument it: `mallinfo2()` on glibc gives `fordblks` (total free) and you can walk bins for the max; `malloc_zone_statistics()` on macOS gives `size_allocated` versus `size_in_use`.
+
+### The bump allocator, and exactly what it costs
+
+Measured above: **0.85 ns vs 31.85 ns per allocation, 37.3×.** The mechanism is that `nx_arena_alloc` compiles to roughly four instructions — an add, an and, a compare and a store — with no lock, no size-class lookup, no header write, and perfect spatial locality because consecutive allocations are contiguous. `malloc` must do a size-class computation, a `tcache`/magazine lookup, a header write, and (on miss) a lock and a bin walk.
+
+What you gave up, precisely:
+
+1. **No individual `free`.** Everything dies together. If one object needs to outlive the reset, the design is wrong, not the allocator.
+2. **Peak memory, not average.** The arena holds `high_water` bytes for its whole life. A workload with a rare huge input keeps that peak reserved.
+3. **No coalescing means no reuse within the arena.** Allocate, reset, allocate is fine; allocate, "free", allocate is not a thing you can do.
+
+The generalisation is worth naming: **region-based memory management**, formalised by Tofte and Talpin (1997), and it is what Rust's arena crates, Apache's `apr_pool_t`, PostgreSQL's `MemoryContext`, and every game engine's per-frame allocator are all instances of. PostgreSQL is the clearest one to read: every allocation happens in a named context, contexts nest, and `MemoryContextReset` at the end of a query frees everything at once. That is why Postgres does not leak across a million queries despite being written in C.
+
+### The stack, and where it ends
+
+Measured on this machine:
+
+```
+$ ulimit -s
+8176                      # KB, so 8,372,224 bytes
+```
+
+A recursive function with a 64-byte local array received `SIGSEGV` (exit status 139) between depth **87,000 and 88,000**. That works out to 8,372,224 / 87,500 ≈ **96 bytes per frame** — the 64-byte array, the saved frame pointer and link register, and alignment padding.
+
+This is the arithmetic behind three real failures:
+
+- **Recursion on user-controlled depth is a denial of service.** A JSON parser that recurses per nesting level dies at ~87,000 levels of `[`, and a 90 KB request can produce that. Every production parser either has an explicit depth limit or is iterative with an explicit stack. Check yours.
+- **Threads get much smaller stacks.** pthreads default to 512 KB on macOS and 8 MB on glibc Linux, but Go goroutines start at 8 KB and grow, and many embedded RTOS threads get 4 KB. Code that is fine on the main thread can overflow on a worker.
+- **A large local array is a landmine.** `char buf[4 * 1024 * 1024];` as a local uses half the stack in one statement. It compiles without a warning unless you pass `-Wstack-usage=8192` or `-Wframe-larger-than=8192`, which every kernel and embedded build turns on and almost no application build does.
+
+Stack **canaries** (`-fstack-protector-strong`, on by default in most distro toolchains and in Apple's clang) place a random value between the locals and the saved return address, and check it before returning. They convert a linear stack buffer overflow from "attacker controls the return address" into "process aborts with `stack smashing detected`". They do not stop a targeted write to a specific offset, and they cost roughly a load, a compare and a branch per protected function — measured overhead on typical code is low single-digit percent, which is why it is on by default and you should leave it on.
+
+### ASan internals: shadow memory and redzones
+
+AddressSanitizer maps every 8 bytes of application memory to 1 byte of **shadow memory** — a 1:8 compression at a fixed offset. The shadow byte says how many of those 8 bytes are addressable: `0` means all 8 are fine, `1`–`7` means only the first *k* are, and a negative value is a poison code (`fa` = heap left redzone, `fd` = freed memory). Every load and store is instrumented to check the shadow byte first.
+
+That is why the report earlier printed a shadow map with `[05]` at the fault address — five valid bytes in that 8-byte granule — surrounded by `fa` bytes, the **redzones** ASan places around every allocation to catch overflows. Freed memory is poisoned `fd` and held in a quarantine so the address is not immediately recycled, which is how use-after-free is detected rather than silently working.
+
+Costs, measured on the merge sort from Module 4 at n = 1,000,000:
+
+| Build | CPU time | Ratio |
+|---|---|---|
+| `-O2` | 65.2 ms | 1.0× |
+| `-O2 -fsanitize=address,undefined` | 179.0 ms | **2.75×** |
+| `-O0` | 180.1 ms | 2.76× |
+
+The documented typical ASan slowdown is about 2× with roughly 3× memory overhead, and 2.75× here for a memory-traffic-heavy workload is right in range. The number worth internalising is the last row: **a sanitized `-O2` build costs about the same as an unsanitized `-O0` build.** If your test suite already runs on a debug build, switching it to `-O2 -fsanitize=address,undefined` is roughly free and finds real bugs. There is no reason not to.
+
+Valgrind, for comparison, costs 10–50× — a **cited finding**, from the Valgrind 3.22 manual (§4, Memcheck), not something measured here, because Valgrind does not run on Apple Silicon at all. On this course: **ASan/UBSan everywhere, Valgrind only on Linux x86-64 and only when you need its uninitialised-value tracking (memcheck), which ASan does not provide.**
+
+### Production failure modes and how you detect them
+
+| Failure | Signature | Detection |
+|---|---|---|
+| Fragmentation, not a leak | RSS grows for hours, leak checker clean, largest-free-block shrinking | `malloc_info` / `malloc_zone_statistics`; switch to arenas per request |
+| Use-after-free that "works" | intermittent wrong values, crash far from the cause, disappears under a debugger | ASan in CI; set pointers to `NULL` after free; quarantine keeps the address poisoned |
+| Stack overflow from recursion depth | `SIGSEGV` with a backtrace thousands of frames deep, only on large input | explicit depth limits; `-Wframe-larger-than`; fuzz with deeply nested input |
+| Struct padding blowing the memory budget | RSS 30–50% above your arithmetic for N records | `clang -Wpadded` once over core structs; reorder fields largest-first |
+| Allocation stalls under threading | throughput plateaus then drops as threads increase; time in `malloc` lock | per-thread arenas; `MALLOC_ARENA_MAX` on glibc; jemalloc or mimalloc |
+| Every allocation succeeds until one does not | unchecked `malloc` returning `NULL`, then a null dereference | check every `malloc`; on Linux be aware of overcommit — the `NULL` may never come and the OOM killer arrives instead |
+
+### Frontier and research pointers
+
+- **Tofte, M. & Talpin, J.-P. (1997). "Region-Based Memory Management." *Information and Computation* 132(2).** One-sentence takeaway: if you can prove a set of objects dies together, allocation and deallocation both become O(1) and you need neither a GC nor per-object `free`.
+- **Berger, E., Zorn, B. & McKinley, K. (2002). "Reconsidering Custom Memory Allocation." *OOPSLA*.** One-sentence takeaway: most hand-rolled custom allocators do *not* beat a good general-purpose `malloc` — except region allocators, which do, by a lot.
+- **Serebryany, K. et al. (2012). "AddressSanitizer: A Fast Address Sanity Checker." *USENIX ATC*.** One-sentence takeaway: shadow memory at a 1:8 ratio plus redzones and a free quarantine detects the majority of memory-safety bugs at ~2× slowdown, which is cheap enough to leave on in testing forever.
+- **Evans, J. (2006). "A Scalable Concurrent malloc(3) Implementation for FreeBSD" (jemalloc).** One-sentence takeaway: allocator scalability under threads comes from per-thread caches and multiple arenas, not from a faster lock.
+- **Szekeres, L. et al. (2013). "SoK: Eternal War in Memory." *IEEE S&P*.** One-sentence takeaway: every memory-safety defence (canaries, ASLR, DEP, CFI) blocks one link in a chain, and attackers move to the next — which is the honest reason C code needs sanitizers rather than just mitigations.
+
+### Stretch challenge
+
+Extend the arena into a **chained-block arena**: instead of one fixed `cap`, allocate 64 KB blocks on demand and chain them, so the arena grows without a fixed ceiling. Then:
+
+1. Measure allocation cost again. How much of the 37× advantage survives the block-boundary check?
+2. Add `nx_arena_reset` semantics that keep the first block and free the rest, and measure RSS across 10,000 simulated requests with a lognormal size distribution (most small, a few huge). Compare to `malloc`/`free` on the same trace.
+3. Now add a **debug mode** that poisons freed blocks with `0xDD` and, under `-fsanitize=address`, calls `__asan_poison_memory_region` on reset — so use-after-reset is caught. Measure the overhead of debug mode.
+4. Open question with no single right answer: at what request-size variance does the chained arena's peak RSS become worse than `malloc`'s, and would you rather have that predictable peak or `malloc`'s unpredictable fragmentation? Argue it with your own numbers from step 2.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Implement a bump allocator and a free-list allocator in about 150 lines total, and benchmark both against `malloc` for 1,000,000 allocations of 24 bytes. Report ns/allocation for each, using `CLOCK_PROCESS_CPUTIME_ID` and the minimum of 5 runs.
+</Card>
+
+Acceptance: the arena's bounds check is written so it cannot overflow `size_t`; alignment is a parameter, not an assumption; `high_water` is reported; the whole thing runs clean under `-fsanitize=address,undefined`; and your README states the measured ns/alloc for all three allocators plus one sentence naming what the arena gave up.
+
+## The whiteboard
+
+The T1 sketch is the address space with three live stack frames and one heap block. The T3 animation (A01) shows frames pushing and popping through a call chain, a `malloc`'d block outliving the frame in green, and the returned stack pointer turning red as its frame is popped.
+
+<Tip>
+**Draw it yourself.** From memory: the address space bands, the direction each of stack and
+heap grows, three frames with `main` highest, the green arrow from heap to a live pointer,
+and the red crossed-out arrow from a dead frame. Then compare.
+[Blank version](/assets/diagrams/P1-W01-M3-blank.svg) · [Editable source](/assets/diagrams/P1-W01-M3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Portfolio line:** *"A 150-line arena allocator with alignment handling, overflow-safe bounds checks and a benchmark harness showing 37× faster allocation than `malloc` for a request-scoped workload — plus a written analysis of what that trade costs."* The analysis is what makes it a portfolio item rather than a snippet.
+
+**The interview angle.** "What is the difference between stack and heap?" is asked at every level, and the junior answer is "stack is automatic, heap is manual". The answer that separates you is the *lifetime* framing plus a number: *a stack frame's memory is reclaimed on return whether or not something still points at it, which is why returning `&local` is the classic bug; the stack here is 8 MB and I measured a `SIGSEGV` at about 87,000 frames, so recursion depth on untrusted input is a DoS.* Then be ready for "so how would you fix a recursive parser?" — explicit depth limit, or an explicit stack on the heap.
+
+The senior version is "your service's RSS grows all day but the leak checker is clean." The answer is fragmentation, and the follow-up is arenas.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+Three places this shows up in a normal engineering week:
+
+1. **The container that gets OOM-killed at 3 a.m.** Before assuming a leak, get the ratio of largest-free-block to total-free-bytes. If total free is high and largest is small, it is fragmentation, and the fix is allocation *lifetime* discipline (arena per request), not hunting a missing `free`. This same reasoning applies in Python and the JVM, where the equivalent is heap fragmentation across generations.
+
+2. **Reviewing any C/C++/Rust-FFI code.** Ask one question on every function that returns a pointer: *who frees this?* If the header does not say, that is the review comment. In Rust FFI specifically, an owned pointer crossing the boundary needs a documented matching `free` function exported from the same crate, because the allocator on either side may differ.
+
+3. **Sizing anything that has a million of it.** Before adding a field to a hot struct — a cache entry, a metrics label set, a row in an in-memory index — compute the new `sizeof` including padding. Adding a `bool` to a 16-byte struct can move it to the 32-byte allocator size class and double your memory for one bit of information. Pack flags into an existing word, or reorder fields largest-first.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Function returns the right value in testing, garbage in production | returning `&local` — a pointer into a popped stack frame | return by value, or `malloc` and document who frees; heed `-Wreturn-stack-address` |
+| One-byte heap overflow on every string copy | `malloc(strlen(s))` forgot the `'\0'` | `malloc(strlen(s) + 1)`, or use `strdup` |
+| Truncated string is not null-terminated | `strncpy` does not terminate when it truncates | use `snprintf(dst, n, "%s", src)` and check the return value |
+| Crash inside `free` on an unrelated pointer | earlier heap overflow corrupted allocator metadata | build with `-fsanitize=address`; the report names the *original* bug, not the crash site |
+| `sizeof` your struct is larger than the sum of fields | alignment padding | reorder fields largest-alignment-first; verify with `offsetof` |
+| RSS grows all day, no leaks reported | fragmentation, not a leak | measure largest free block; move to per-request arenas |
+| `SIGSEGV` with a 10,000-frame backtrace | unbounded recursion on input depth | explicit depth cap; `-Wframe-larger-than`; iterative algorithm with a heap stack |
+| Sanitizer says `heap-use-after-free` at a line that looks fine | the pointer was freed elsewhere; this is just the first *use* | read the "freed by thread T0 here" stack in the report — that is the real bug site |
+| `malloc` result used without checking | assumed allocation cannot fail | check every allocation; on Linux, note that overcommit may kill you instead of returning `NULL` |
+
+## Sources & further reading
+
+**Primary docs**
+
+- **ISO/IEC 9899:2018 (C17), §6.2.4 "Storage durations of objects" and §7.22.3 "Memory management functions".** Read this for the exact wording that makes using a pointer after `free` undefined, and for what `malloc(0)` is allowed to return.
+- **`man 3 malloc`, `man 3 malloc_size` (macOS 15); `man 3 mallopt`, `man 3 mallinfo2` (glibc 2.39).** Read these for the tuning knobs and introspection functions you will use to diagnose fragmentation.
+- **[Clang AddressSanitizer documentation (LLVM 17/18) and the `AddressSanitizerAlgorithm` wiki page.](https://clang.llvm.org/docs/AddressSanitizer.html)** Read this for the shadow-memory mapping and the poison byte values, which is what makes a shadow dump readable rather than decorative.
+- **[PostgreSQL source, `src/backend/utils/mmgr/README`.](https://github.com/postgres/postgres/blob/master/src/backend/utils/mmgr/README)** Read this for the clearest production example of region-based memory management in a large C codebase.
+
+**Papers**
+
+- **[Tofte, M. & Talpin, J.-P. (1997). "Region-Based Memory Management." *Information and Computation* 132(2), 109–176.](https://doi.org/10.1006/inco.1996.2613)** One-sentence takeaway: grouping objects by lifetime rather than by size turns both allocation and deallocation into O(1) pointer operations.
+- **[Berger, E. D., Zorn, B. G. & McKinley, K. S. (2002). "Reconsidering Custom Memory Allocation." *OOPSLA*.](https://doi.org/10.1145/582419.582421)** One-sentence takeaway: custom allocators usually lose to a good `malloc` — except region allocators, which win decisively, so build an arena or build nothing.
+- **[Serebryany, K., Bruening, D., Potapenko, A. & Vyukov, D. (2012). "AddressSanitizer: A Fast Address Sanity Checker." *USENIX ATC*.](https://www.usenix.org/conference/atc12/technical-sessions/presentation/serebryany)** One-sentence takeaway: a 1:8 shadow map plus redzones and a free quarantine catches most memory errors at about 2× slowdown, cheap enough to run on every test.
+- **[Szekeres, L., Payer, M., Wei, T. & Song, D. (2013). "SoK: Eternal War in Memory." *IEEE Symposium on Security and Privacy*.](https://doi.org/10.1109/SP.2013.13)** One-sentence takeaway: memory-safety mitigations each break one step of an exploit chain and attackers route around them, which is why detection tooling beats mitigation alone.
+
+**Go deeper**
+
+- **[Bryant & O'Hallaron, *Computer Systems: A Programmer's Perspective*, 3rd ed., Chapter 9 ("Virtual Memory"), §9.9 "Dynamic Memory Allocation".](https://csapp.cs.cmu.edu/)** Builds an implicit-free-list allocator and then an explicit one, with the coalescing logic written out; doing the malloc lab from this chapter is the single best week you can spend on memory.
+- **[Chris Wellons, "Arena allocator tips and tricks" (nullprogram.com, 2023).](https://nullprogram.com/blog/2023/09/27/)** Short, practical, and covers the parts the papers skip: alignment, sub-arenas, and how to make arena code composable rather than global.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-01/p1-w01-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

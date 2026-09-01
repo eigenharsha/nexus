@@ -1,0 +1,638 @@
+---
+title: "Testing, docs & deployment"
+description: "Week 6 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 6 · Module 5 · `P1-W06-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Write endpoint tests that run in well under a second and do not need a running server.
+2. Replace a real dependency with a fake using `dependency_overrides`, and isolate database tests with a transaction that always rolls back.
+3. Serve a `/healthz` and a `/readyz` that mean different things, because orchestrators use them differently.
+4. Emit structured logs with a correlation ID you can trace across services.
+5. Run a load test, read the throughput curve, find the knee, fix one thing, and re-measure.
+
+## Where this sits
+
+| | |
+| --- | --- |
+| **Prereqs** | `P1-W03-M5` (pytest), `P1-W06-M2` (dependencies), `P1-W06-M4` (the app you are testing) |
+| **Unlocks** | The Week 6 lab's load-test report; Week 24 (Kubernetes probes are these endpoints); Week 32 (tracing extends this logging) |
+| **One-line** | After this you can prove your API works and prove how fast it is. |
+
+## Why you should care
+
+### For Aarav (student)
+
+- A repo with a green CI badge and 25 tests reads as professional in a way that a bigger feature set does not.
+- The load-test report is the single most distinctive artifact you can attach to a first-job application: almost nobody submits one.
+- "Find the knee of the curve" is a real skill that transfers to every system you will ever operate.
+
+### For Meera (working professional)
+
+- This shows up in your job as: "the tests pass locally and fail in CI", which is almost always shared state between tests. Transactional isolation removes the whole class.
+- Liveness and readiness confusion causes rolling deploys to kill healthy pods. It is a five-line fix that people spend days on.
+- A correlation ID is what turns "a customer says it was slow at 3 p.m." into a two-minute investigation.
+
+## The mental model
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p1-w06-m5.svg" alt="Hand-drawn sketch: the API test pyramid and the throughput knee" className="block dark:hidden" />
+  <img src="/assets/diagrams/p1-w06-m5-dark.svg" alt="Hand-drawn sketch: the API test pyramid and the throughput knee" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p1-w06-m5
+tier: T2
+one-sentence-goal: Show that most tests should run without a network or a database, and that a load test is read by finding the point where throughput stops rising but latency keeps climbing.
+elements:
+  - left: a test pyramid drawn by hand - wide base "unit - services and validators, no I/O, ~1 ms each", middle "endpoint tests via TestClient, no server, ~50 ms each", narrow top "contract and smoke tests against a deployed instance"
+  - an amber margin note beside the middle band - "5 endpoint tests, 0.25 s total - measured"
+  - right: two axes - x is offered concurrency, y has two curves - throughput rising then flattening (green), and p99 latency flat then rising steeply (red)
+  - a circled point where the two cross behaviour, labelled "THE KNEE" with an arrow and the note "capacity is here, not at the peak"
+  - a red cross-out over a third curve labelled "average latency" with the note "the average hides the knee - always p95/p99"
+  - bottom strip: two boxes "/healthz - am I alive? (restart me)" and "/readyz - can I serve? (stop routing to me)" with an arrow from a wrong shared implementation crossed out in red
+  - circled key term "readiness"
+  - dangling arrow labelled "...and what saturated first? find out"
+numbers-to-write-in: 5 endpoint tests in 0.25 s; async 50 ms endpoint at c=200 = 2,565 rps p50 59 ms; sync def = 655 rps p50 279 ms; pool_size=5 pool_timeout=1s -> 20 of 40 requests fail with TimeoutError
+alt: A hand-drawn diagram with a test pyramid on the left showing unit, endpoint and contract layers with their measured runtimes, and on the right a throughput-versus-concurrency plot with the knee circled where throughput flattens while p99 latency climbs.
+*/}
+
+Two ideas. **Test at the cheapest layer that can catch the bug** — most API bugs are caught by a
+`TestClient` call with no server and no database. And **capacity is where the curve bends, not
+where it peaks** — throughput that stops rising while latency climbs means you are already past
+the point where users notice.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Plain English
+
+    A **test** is code that runs your code and asserts something about the result. `pytest` finds
+    every function named `test_*` in files named `test_*.py`, runs them, and reports pass or fail.
+
+    FastAPI gives you a **`TestClient`**: an object that looks like an HTTP client but calls your
+    app directly, in the same process, with no socket, no port and no server. That is why endpoint
+    tests are fast — measured below, five of them in 0.25 seconds.
+
+    A **fixture** is a pytest function that prepares something a test needs. Decorate it with
+    `@pytest.fixture`, and any test that takes a parameter with that name receives it.
+
+    A **dependency override** replaces one of your FastAPI dependencies for the duration of a test —
+    a fake database, a fixed clock, a stub payment provider — without changing the handler.
+
+    ### The analogy
+
+    Testing a car. You do not need a racetrack to check whether the indicator bulb works; a
+    multimeter on the bench is faster and tells you more precisely what is wrong. Most tests should
+    be bench tests. Keep the racetrack — a full deployed environment — for the few things that only
+    show up when everything is connected.
+
+    ### Smallest working example
+
+    ```bash
+    uv pip install "pytest==8.3.4" "httpx==0.28.1"
+    ```
+
+    ```python
+    # app.py
+    from fastapi import FastAPI, Depends, HTTPException
+    from pydantic import BaseModel
+
+    app = FastAPI()
+
+    class Item(BaseModel):
+        id: int
+        name: str
+
+    def get_db() -> dict[str, Item]:
+        return {"1": Item(id=1, name="real")}
+
+    @app.get("/items/{item_id}", response_model=Item)
+    def read(item_id: str, db=Depends(get_db)):
+        if item_id not in db:
+            raise HTTPException(404, "not found")
+        return db[item_id]
+
+    @app.get("/healthz")
+    def healthz():
+        return {"status": "ok"}
+    ```
+
+    ```python
+    # test_app.py
+    import pytest
+    from fastapi.testclient import TestClient
+    from app import app, get_db, Item
+
+    @pytest.fixture
+    def client():
+        app.dependency_overrides[get_db] = lambda: {"9": Item(id=9, name="fake")}
+        with TestClient(app) as c:
+            yield c
+        app.dependency_overrides.clear()
+
+    def test_health(client):
+        assert client.get("/healthz").json() == {"status": "ok"}
+
+    def test_override_applies(client):
+        r = client.get("/items/9")
+        assert r.status_code == 200 and r.json()["name"] == "fake"
+
+    def test_missing(client):
+        assert client.get("/items/1").status_code == 404
+
+    def test_response_model(client):
+        assert client.get("/items/9").json()["id"] == 9
+
+    def test_openapi_contains_route(client):
+        spec = client.get("/openapi.json").json()
+        assert "/items/&#123;item_id&#125;" in spec["paths"]
+    ```
+
+    Real output:
+
+    ```
+    $ pytest -q
+    .....                                                    [100%]
+    5 passed in 0.25s
+    ```
+
+    Five endpoint tests, a quarter of a second, no server started and no database.
+
+    ### Line by line
+
+    - `TestClient(app)` — wraps your ASGI app. Its `.get()` and `.post()` calls go straight into the
+      app; nothing listens on a port.
+    - `with TestClient(app) as c` — the context manager runs your **lifespan** (startup and
+      shutdown). Without it, anything you set up in `lifespan` does not exist and you get confusing
+      `AttributeError`s.
+    - `app.dependency_overrides[get_db] = lambda: {...}` — replaces the dependency by its function
+      object, not by name. Handlers are untouched.
+    - `yield c` — everything after the `yield` runs as teardown. Clearing overrides matters: they
+      live on the app object and leak into every later test otherwise.
+    - `test_missing` asserts `404` — testing the failure path is not optional. Most production
+      surprises live there.
+    - `/openapi.json` is generated by FastAPI from your code, so asserting against it is a cheap
+      contract test: if someone renames a route, this fails.
+
+    ### Guided practice
+
+    Add three tests. 60% is above.
+
+    1. `POST` an invalid body and assert `422` and that the error names the offending field.
+    2. Assert that a field the model does not declare never appears in the response.
+    3. Add a fixture that overrides a "current user" dependency with a fake user, and use it to test
+       that user B gets `404` for user A's item. This is the cross-tenant test from `P1-W06-M4`, and
+       it is the single highest-value test in your suite.
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+      **1. Why does `TestClient` not need a running server?**
+      It calls the ASGI application directly in-process; the "HTTP" never crosses a socket.
+
+      **2. What does `with TestClient(app)` do that `TestClient(app)` alone does not?**
+      Runs the lifespan startup and shutdown, so anything created there exists during the test.
+
+      **3. Why clear `dependency_overrides` in teardown?**
+      They are stored on the app object and would otherwise persist into every subsequent test.
+
+      **4. Why test the 404 path?**
+      Error paths are where production behaviour diverges from expectations, and they are the ones
+      no one exercises by hand.
+
+      **5. What does asserting against `/openapi.json` catch?**
+      Accidental contract changes — a renamed route, a removed field, a changed status code.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The real theory: the API test pyramid
+
+    | Layer | What it covers | Cost each | How many |
+    | --- | --- | --- | --- |
+    | **Unit** | services, validators, pure logic — no I/O | ~1 ms | hundreds |
+    | **Endpoint** | routing, validation, auth, serialization via `TestClient` | 5–50 ms | dozens |
+    | **Integration** | real database, real migrations, transactional isolation | 20–200 ms | tens |
+    | **Contract** | your OpenAPI versus a consumer's expectations | seconds | a handful |
+    | **Smoke** | a deployed instance answers `/readyz` and one real flow | seconds | 2–3 |
+
+    The rule that keeps a suite fast: **push each test down to the cheapest layer that can still
+    catch the bug.** "Discount cannot exceed total" is a unit test on the model, not an endpoint
+    test. "A missing token returns 401" is an endpoint test. "The migration adds the column" is an
+    integration test.
+
+    ### The production surface: transactional test isolation
+
+    The best database-test pattern: each test runs inside a transaction that is **always rolled
+    back**, so tests cannot see each other's data and no cleanup code exists to forget.
+
+    ```python
+    # conftest.py
+    import pytest
+    from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+    from app.main import app
+    from app.api.deps import get_session
+
+    @pytest.fixture(scope="session")
+    def anyio_backend():
+        return "asyncio"
+
+    @pytest.fixture(scope="session")
+    async def engine():
+        eng = create_async_engine(TEST_DATABASE_URL, pool_pre_ping=True)
+        async with eng.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)   # or run Alembic to head
+        yield eng
+        await eng.dispose()
+
+    @pytest.fixture
+    async def session(engine) -> AsyncSession:
+        connection = await engine.connect()
+        transaction = await connection.begin()              # outer transaction
+        maker = async_sessionmaker(bind=connection, expire_on_commit=False)
+        async with maker() as s:
+            yield s                                          # the test's commits become savepoints
+        await transaction.rollback()                         # everything vanishes
+        await connection.close()
+
+    @pytest.fixture
+    async def client(session):
+        app.dependency_overrides[get_session] = lambda: session
+        from httpx import AsyncClient, ASGITransport
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            yield c
+        app.dependency_overrides.clear()
+    ```
+
+    Two subtleties worth the paragraph. The session is bound to a **connection with an open
+    transaction**, so a `commit()` inside your application code commits to the outer transaction,
+    not to the database — and the outer rollback erases it. And `ASGITransport` is how httpx's async
+    client calls the app in-process, which you need because `TestClient` is synchronous and cannot
+    await your async fixtures.
+
+    Data via factories, not fixtures full of literals:
+
+    ```python
+    import factory
+    class UserFactory(factory.Factory):
+        class Meta: model = UserCreate
+        email = factory.Sequence(lambda n: f"user{n}@example.com")
+        name  = factory.Faker("name")
+        password = "correct horse battery staple"
+    ```
+
+    A test then says `UserFactory(email="specific@example.com")` and only names the field it cares
+    about. Every other field is valid and irrelevant, which is exactly what a reader needs.
+
+    ### Health checks that mean different things
+
+    ```python
+    @router.get("/healthz", include_in_schema=False)
+    async def liveness():
+        # "is this process alive?" - NO dependency checks.
+        return {"status": "ok"}
+
+    @router.get("/readyz", include_in_schema=False)
+    async def readiness(session: SessionDep, response: Response):
+        checks = {}
+        try:
+            await asyncio.wait_for(session.execute(text("SELECT 1")), timeout=2.0)
+            checks["database"] = "ok"
+        except Exception as exc:
+            checks["database"] = f"error: {type(exc).__name__}"
+        ok = all(v == "ok" for v in checks.values())
+        response.status_code = 200 if ok else 503
+        return {"status": "ready" if ok else "not ready", "checks": checks,
+                "version": settings.git_sha}
+    ```
+
+    **Liveness** answers "should you restart me?" and must not depend on anything external. If
+    liveness checks the database, a database blip restarts every pod at once, turning a recoverable
+    incident into an outage. **Readiness** answers "should you send me traffic?" — it checks
+    dependencies, and a failure removes the instance from the load balancer while leaving it
+    running. This distinction returns in Week 24 as `livenessProbe` and `readinessProbe`, and
+    getting it wrong there is how a database hiccup becomes a full outage.
+
+    ### Trade-offs
+
+    | Decision | Choose the first when… | Choose the second when… |
+    | --- | --- | --- |
+    | **Real database vs mocks in tests** | You are testing anything involving SQL, migrations, constraints or transactions — a mock cannot fail a unique constraint. Docker makes it cheap. | You are testing pure logic, or an external paid API you must not call. Then stub at the boundary you own. |
+    | **Transactional rollback vs truncate-between-tests** | Speed and isolation — no cleanup code, and tests can run in parallel on separate connections. | Your code under test needs real committed data across connections (rare, but true for some concurrency tests — see Week 8). |
+    | **`TestClient` vs a real server** | Almost always: no port, no startup, measured 0.25 s for five tests. | You are testing something the ASGI layer does not exercise: TLS, proxy headers, timeouts, graceful shutdown. |
+    | **Contract tests from OpenAPI vs hand-written** | You have several consumers and want a change to break the build rather than the client. | One consumer that you also own and deploy together. |
+    | **`locust` vs `k6`** | You want load logic in Python, sharing your app's models and auth code. | You want a single static binary in CI with a JS scripting model and lower client-side overhead at high rates. |
+
+    ### Reference implementation: structured logging with correlation IDs
+
+    ```python
+    import logging, structlog
+    from structlog.contextvars import bind_contextvars, clear_contextvars
+
+    def configure_logging(json_logs: bool, level: str = "INFO") -> None:
+        structlog.configure(
+            processors=[
+                structlog.contextvars.merge_contextvars,     # pulls in request_id
+                structlog.processors.add_log_level,
+                structlog.processors.TimeStamper(fmt="iso", utc=True),
+                structlog.processors.StackInfoRenderer(),
+                structlog.processors.format_exc_info,
+                structlog.processors.JSONRenderer() if json_logs
+                    else structlog.dev.ConsoleRenderer(),
+            ],
+            wrapper_class=structlog.make_filtering_bound_logger(getattr(logging, level)),
+            cache_logger_on_first_use=True,
+        )
+    ```
+
+    Combined with the request-ID middleware from `P1-W06-M2`, every log line inside a request
+    carries the same `request_id` with no threading of arguments:
+
+    ```json
+    {"event":"order_created","level":"info","timestamp":"2026-09-01T09:14:22Z",
+     "request_id":"01J9X2K7QP3M","path":"/v1/orders","user_id":42,"order_id":9001,"duration_ms":37.2}
+    ```
+
+    Three rules. **Log events, not sentences** — `order_created` with fields, not
+    `f"Created order {id} for user {uid}"`; the first is queryable, the second needs a regex.
+    **Never log secrets** — tokens, passwords, full card numbers, and be careful with request
+    bodies, which contain all three. **Return the request ID to the client** in a header and in the
+    error envelope, so a support ticket carries the key to your logs.
+
+    ### What breaks in the real world
+
+    A team's CI suite went from 40 seconds to 11 minutes over six months and started failing
+    randomly about once in five runs. Two causes, both structural.
+
+    The random failures were **shared state**: tests created users with a fixed email
+    `test@example.com`, so any pair running in the wrong order hit a unique constraint. It passed
+    locally because local runs happened to be ordered by file name. The fix was factories with
+    `factory.Sequence` for unique fields, plus running the suite with `pytest -p no:randomly`
+    *disabled* — that is, deliberately randomising order so ordering dependencies fail immediately
+    and visibly instead of intermittently.
+
+    The 11 minutes was **every test being an integration test**. 400 tests each spun up a database
+    transaction to check things like "discount cannot exceed total", which is a pure function of the
+    model. Moving 280 of them to unit tests took the suite to 95 seconds. The remaining 120 were
+    parallelised across four workers with `pytest-xdist` and separate connections, reaching 38
+    seconds.
+
+    The rule they adopted: **a test that touches the database must justify it in one sentence in the
+    docstring.** Not a policy about coverage — a policy about the cheapest layer that catches the
+    bug.
+
+    <Accordion title="Design checkpoint — model answer inside">
+      **Question.** Your load test shows p95 at 180 ms with 50 concurrent users and 1,400 ms with
+      200. Throughput rose from 380 rps to 410 rps between those points. What is happening, and what
+      do you measure next?
+
+      **Model answer.** Throughput rose 8% while concurrency rose 4×, so you are past the knee:
+      requests are queuing, not being served faster. Little's Law makes it concrete — with 410 rps
+      and 1,400 ms latency, about 574 requests are in the system at once, but only ~74 are being
+      *served* (410 × 0.18). The other 500 are waiting for a resource. Next measurements, in order
+      of likelihood: connection-pool waits (the fastest to confirm — SQLAlchemy's pool emits
+      checkout timing, and measured here, `pool_size=5` with a 1 second timeout failed **20 of 40**
+      concurrent 250 ms queries outright); threadpool saturation if any handler is `def`
+      (the ceiling is 40); then database-side waits via `pg_stat_activity`; then CPU. Do not add
+      workers before knowing which — if the constraint is the database, more workers make it worse
+      by opening more connections to something already saturated.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    ### Reading a throughput curve
+
+    Sweep offered concurrency and plot two curves. Throughput rises, then flattens. Latency is flat,
+    then climbs. The **knee** is where the first flattens and the second turns up, and it is your
+    capacity — not the peak throughput, which is achieved at a latency no user accepts.
+
+    From the measurements in `P1-W06-M2`, one uvicorn worker, a 50 ms I/O-bound endpoint:
+
+    | Concurrency | `async def` + await | `def` (threadpool) |
+    | --- | --- | --- |
+    | 50 | 470 rps · p50 58 ms | 538 rps · p50 68 ms |
+    | 100 | 1,224 rps · p50 54 ms | 587 rps · p50 136 ms |
+    | 200 | 2,565 rps · p50 59 ms | 655 rps · p50 279 ms |
+
+    The sync curve has a textbook knee between 50 and 100: throughput rises 9% while latency doubles.
+    Past it, latency grows linearly with concurrency while throughput is pinned near
+    `40 threads / 50 ms`. The async curve has not bent yet at 200 — p50 is still 59 ms — so its knee
+    is somewhere higher, and finding it is the exercise.
+
+    **Little's Law** turns the table into a prediction: `L = λ × W`, where `L` is requests in the
+    system, `λ` is throughput and `W` is latency. At c=200 sync: `655 × 0.279 = 183` requests
+    resident. But only 40 can be *executing* (the threadpool), so 143 are queued. That arithmetic —
+    not a profiler — tells you the constraint is the pool.
+
+    ### Connection pool sizing, with the measured failure
+
+    The formula: `workers × (pool_size + max_overflow) + admin_margin ≤ database max_connections`.
+    With `--workers 4`, `pool_size=20`, `max_overflow=10`, that is 120 against PostgreSQL's default
+    100 — you will exhaust the server, and the failure lands on whichever unlucky request is next.
+
+    What under-sizing looks like, measured (SQLAlchemy 2.0.36, 40 concurrent 250 ms queries):
+
+    | Pool config | Result |
+    | --- | --- |
+    | `pool_size=2, max_overflow=0, pool_timeout=1s` | **8 of 40 succeeded**, 32 raised `TimeoutError` |
+    | `pool_size=5, max_overflow=0, pool_timeout=1s` | **20 of 40 succeeded**, 20 raised `TimeoutError` |
+    | `pool_size=5, max_overflow=10, pool_timeout=2s` | 40/40 in 1,150 ms |
+    | `pool_size=20, max_overflow=10, pool_timeout=2s` | 40/40 in 700 ms |
+
+    The important detail: **the pool does not queue indefinitely; it gives up.** Half your requests
+    became 500s with no database error and no slow query — the database was idle. Pool exhaustion
+    looks like an application bug and is a capacity mistake.
+
+    Sizing rule of thumb: `pool_size ≈ concurrent_in_flight_queries_per_worker`, which for an async
+    app is roughly `target_rps × avg_query_seconds / workers`. At 500 rps, 20 ms queries, 4 workers:
+    `500 × 0.02 / 4 = 2.5`, so `pool_size=5` with `max_overflow=5` is generous. Teams routinely
+    configure 20 and then wonder why the database has 300 connections.
+
+    ### Graceful shutdown and in-flight draining
+
+    On `SIGTERM`, uvicorn stops accepting connections, lets in-flight requests finish, then runs
+    lifespan shutdown. Three things break it, and all three matter again in Week 24.
+
+    **A request longer than the platform's grace period** is killed mid-flight. Kubernetes defaults
+    to `terminationGracePeriodSeconds: 30`; a 45-second report generation is a truncated response
+    and possibly a half-written transaction. Either cap request duration below the grace period or
+    raise the grace period deliberately.
+
+    **`--timeout-graceful-shutdown` is unlimited by default.** One hung request blocks the deploy
+    indefinitely. Set it to a few seconds under the platform grace period.
+
+    **Readiness must fail before the process stops accepting.** Otherwise the load balancer is still
+    routing to a pod that has stopped listening, and users see connection resets. The sequence is:
+    mark not-ready, wait one or two load-balancer poll intervals, *then* stop accepting. A
+    `preStop` sleep of 5 seconds is the standard, ugly, correct answer.
+
+    ### CI: what actually catches regressions
+
+    | Gate | Catches | Cost |
+    | --- | --- | --- |
+    | `ruff check` + `ruff format --check` | style, unused imports, a surprising number of real bugs | ~1 s |
+    | `mypy --strict` on `app/` | wrong types crossing module boundaries | 5–20 s |
+    | `pytest -q` with randomised order | logic, and ordering dependencies between tests | seconds |
+    | OpenAPI diff against `main` | accidental contract breaks | ~2 s |
+    | `pip-audit` / `safety` | known CVEs in dependencies | ~5 s |
+    | `gitleaks` | committed secrets | ~3 s |
+    | A single smoke request after deploy | "the container starts and can reach its database" | ~10 s |
+
+    The OpenAPI diff is the underrated one. Generate `openapi.json` in CI, compare with the base
+    branch, and fail on removed paths, removed response fields, or newly required request fields.
+    That is a contract test that costs nothing and catches the exact class of change that breaks
+    partners silently.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Tests pass locally, fail in CI | Shared state and implicit ordering | Randomise order deliberately; unique data from factories |
+    | Suite grows to minutes | Everything is an integration test | Count DB-touching tests; require a one-line justification |
+    | Liveness probe checks the database | A database blip restarts every instance simultaneously | Liveness must have no external dependencies |
+    | Rolling deploy drops requests | Readiness does not fail before shutdown | `preStop` sleep, then drain; set graceful-shutdown timeout |
+    | Load test measures your laptop | Client saturates before the server does | Watch client CPU; measured here, a Python async client collapsed at c=50 while `ab` reached 2,565 rps |
+    | Pool exhaustion read as an app bug | 500s with an idle database | Instrument pool checkout wait time; compare to `max_connections` |
+    | Averages hide the problem | "Mean latency is fine" while users complain | Always p50/p95/p99; a knee is invisible in the mean |
+
+    ### Frontier and primary sources
+
+    - **Gil Tene, "How NOT to Measure Latency."** *Takeaway:* coordinated omission makes most load
+      tests understate latency badly, because a stalled client stops issuing requests exactly when
+      the system is slowest — use an open-model generator or correct for it.
+    - **Little's Law (Little, 1961).** *Takeaway:* `L = λW` lets you infer how many requests are
+      queued from throughput and latency alone, without a profiler.
+    - **The Twelve-Factor App.** *Takeaway:* config in the environment, logs to stdout as an event
+      stream, disposability with fast startup and graceful shutdown — factors III, XI and IX are the
+      three this module implements.
+    - **Universal Scalability Law (Gunther).** *Takeaway:* throughput does not just plateau, it can
+      *decline* past a point due to coherency costs, which is why "add more workers" sometimes makes
+      things measurably worse.
+
+    ### Stretch challenge
+
+    Produce a capacity model for your service and then falsify it. Predict, from first principles,
+    the maximum throughput at p95 under 200 ms given your measured per-request CPU time, query time,
+    worker count, pool size and threadpool size. Write the prediction down with its arithmetic.
+    Then load-test with an open-model generator (`k6` with constant arrival rate, not constant VUs —
+    this is the coordinated-omission fix) and find the real number.
+
+    You will be wrong. The interesting work is the second phase: instrument until you can account
+    for the gap. Add pool checkout time, event-loop lag (`loop.time()` drift), and database wait
+    events, and rerun. A model that predicts within 20% after two iterations is a genuinely
+    senior-level artifact, and the instrumentation you added to get there is worth more than the
+    model.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Produce a load-test report: RPS against p50/p95/p99 at concurrency 10, 25, 50, 100, 200. Identify
+the knee. Name the resource that saturated — pool, threadpool, CPU or database — and say how you
+know. Fix exactly one thing and re-measure. The report is a table, a chart and three paragraphs,
+and it is the most valuable artifact in the Week 6 lab.
+</Card>
+
+## The whiteboard
+
+T1 is the pyramid plus the throughput curve with the knee circled. The T2 build-up: (1) the curve
+rising, (2) throughput flattening, (3) p99 turning up, (4) the knee marked and the saturated
+resource labelled.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p1-w06-m5-blank.svg) · [Editable source](/assets/diagrams/p1-w06-m5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    Put `LOADTEST.md` in the repo: the table, the chart, the knee, the one thing you changed, and
+    the after numbers. Add a CI badge. In an interview, "I found the knee at 100 concurrent users;
+    the constraint was the connection pool, because Little's Law said 183 requests were resident
+    while only 40 could execute" is a paragraph that is very hard to fake and immediately places you
+    above the median candidate.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **One:** check whether your liveness probe touches the database — if it does, a database blip
+    restarts your whole fleet. **Two:** compute `workers × (pool_size + max_overflow)` against your
+    database's `max_connections`; most teams are over, and the failure mode looks like an
+    application bug. **Three:** randomise test order in CI for one week and fix everything that
+    breaks; those are real ordering dependencies that would otherwise fail at the worst time.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Tests fail intermittently in CI | Shared fixture data, implicit ordering | Factories with sequences; randomise order deliberately |
+| `AttributeError` on `app.state` in tests | `TestClient` used without the context manager, so lifespan never ran | `with TestClient(app) as c:` |
+| Overrides leak between tests | `dependency_overrides` never cleared | Clear in fixture teardown |
+| Suite takes minutes | Everything hits the database | Push logic tests down to unit level |
+| Rolling deploys drop requests | Readiness does not fail before shutdown | Fail readiness, wait one poll interval, then drain |
+| A database blip restarts every pod | Liveness checks dependencies | Liveness has no external dependencies; readiness has them |
+| Load test plateaus at a suspiciously round number | The client is the bottleneck | Watch client CPU; use `ab`, `k6` or `wrk` rather than a Python client |
+| 500s with an idle database | Connection pool exhaustion | Instrument checkout wait; size from `rps × query_time / workers` |
+| A partner breaks after a "safe" release | No contract test | Diff `openapi.json` against the base branch in CI |
+
+## Assessment
+
+**Concept questions**
+
+1. Why does `TestClient` not need a server? *(It calls the ASGI app in-process.)*
+2. What does the `with` form of `TestClient` add? *(Lifespan startup and shutdown.)*
+3. How does transactional isolation keep tests independent? *(Each test runs in an outer transaction that is rolled back, so commits inside never persist.)*
+4. Difference between liveness and readiness, with the consequence of conflating them. *(Restart me vs stop routing to me; a liveness probe touching the database restarts the fleet during a blip.)*
+5. Define the knee of a throughput curve. *(Where throughput stops rising while latency climbs — capacity, not the peak.)*
+6. Apply Little's Law to 655 rps at 279 ms. *(≈183 resident; with 40 executable, ≈143 queued.)*
+7. What is coordinated omission? *(A closed-model load generator stops issuing requests while stalled, so the worst latencies are never sampled.)*
+8. Compute the maximum connections for 4 workers, `pool_size=20`, `max_overflow=10`. *(120 — above the default `max_connections` of 100.)*
+
+**Coding challenge.** Build a test suite for the Week 6 lab API: 25+ tests covering auth, validation, cross-tenant isolation, pagination boundaries, idempotency replay and error shape; database tests with transactional rollback; and a CI workflow running lint, types, tests and an OpenAPI diff. Hidden tests: the suite passes in randomised order; no test leaves data behind; the whole suite finishes in under 30 seconds.
+
+**Interview questions**
+
+- *Junior:* "How would you test an endpoint that requires authentication?"
+- *Mid:* "Your test suite is slow and flaky. Where do you start?"
+- *Senior:* "Walk me through finding the capacity of a service you have never seen, with the measurements in order."
+
+**Draw it from memory.** Draw the test pyramid with a cost per layer, and the throughput/latency curves with the knee marked and the saturated resource labelled.
+
+## Sources & further reading
+
+**Primary docs**
+
+- [FastAPI: testing](https://fastapi.tiangolo.com/tutorial/testing/) and [Testing dependencies with overrides](https://fastapi.tiangolo.com/advanced/testing-dependencies/) — read both; the second is the one that makes tests fast.
+- [pytest documentation: fixtures](https://docs.pytest.org/en/stable/how-to/fixtures.html) — read the scope and teardown sections, which is where flakiness comes from.
+- [SQLAlchemy: joining a session to an external transaction](https://docs.sqlalchemy.org/en/20/orm/session_transaction.html) — read this exact recipe; it is the canonical transactional-test pattern.
+- [k6 documentation](https://k6.io/docs/) — read "Test types" and the constant-arrival-rate executor, which is the open-model generator that avoids coordinated omission.
+
+**Papers and their takeaways**
+
+- **[Little (1961), "A Proof for the Queuing Formula L = λW".](https://doi.org/10.1287/opre.9.3.383)** *Takeaway:* resident requests can be computed from throughput and latency alone, which turns a load-test table into a diagnosis.
+- **[Gil Tene, "How NOT to Measure Latency."](https://www.infoq.com/presentations/latency-response-time/)** *Takeaway:* closed-model load generators systematically hide the worst latencies, so most published p99s are optimistic by an order of magnitude.
+- **[Gunther, *Universal Scalability Law*.](https://www.perfdynamics.com/Manifesto/USLscalability.html)** *Takeaway:* contention and coherency costs mean throughput can decline with added concurrency, which is why capacity has a peak and not a plateau.
+
+**Go deeper**
+
+- [*Release It!* (2nd ed.), Michael Nygard](https://pragprog.com/titles/mnee2/release-it-second-edition/) — read the Stability Patterns chapters. Circuit breakers, bulkheads, timeouts and graceful degradation are the vocabulary for everything that goes wrong past the knee, and you will use it for the rest of the course.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-06/p1-w06-m5">
+  Attempt the lab first. Seriously.
+</Card>

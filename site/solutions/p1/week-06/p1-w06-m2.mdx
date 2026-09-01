@@ -1,0 +1,130 @@
+---
+title: "FastAPI fundamentals"
+description: "Reference solution — Week 6"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W06-M2`
+
+The exercise: build the four-endpoint benchmark app and explain the collapse.
+
+### The app
+
+```python
+# app_bench.py
+import asyncio, time
+from fastapi import FastAPI
+
+app = FastAPI()
+DELAY = 0.05
+
+@app.get("/ping")             # no I/O at all - measures the framework itself
+async def ping():
+    return {"pong": True}
+
+@app.get("/async-await")      # correct: yields to the loop
+async def a():
+    await asyncio.sleep(DELAY)
+    return {"ok": True}
+
+@app.get("/async-blocking")   # the bug: blocks the only event loop
+async def b():
+    time.sleep(DELAY)
+    return {"ok": True}
+
+@app.get("/sync-def")         # def -> Starlette runs it in the threadpool
+def c():
+    time.sleep(DELAY)
+    return {"ok": True}
+```
+
+```bash
+uvicorn app_bench:app --host 127.0.0.1 --port 8111 --workers 1 --log-level warning
+ab -n 600 -c 50 -k -q http://127.0.0.1:8111/async-await
+```
+
+### The measurements
+
+uvicorn 0.34.0, one worker, `ab -k`, Apple Silicon:
+
+| Endpoint | c=50 | p50 | p95 |
+| --- | --- | --- | --- |
+| `/ping` | 3,536 rps | 9 ms | 54 ms |
+| `/async-await` | 470 rps | 58 ms | 263 ms |
+| `/async-blocking` | **16.9 rps** | **2,873 ms** | 3,289 ms |
+| `/sync-def` | 538 rps | 68 ms | 112 ms |
+
+| Concurrency | `/async-await` | `/sync-def` |
+| --- | --- | --- |
+| 100 | 1,224 rps · p50 54 ms | 587 rps · p50 136 ms |
+| 200 | 2,565 rps · p50 59 ms | 655 rps · p50 279 ms |
+
+### The explanation a 3/3 gives
+
+**Why 16.9 rps.** `1 / 0.05 s = 20`. The process serves one request at a time because the event
+loop is frozen for the whole 50 ms, so the theoretical maximum is 20 rps and the measured 16.9
+is that minus overhead. Concurrency is irrelevant: 50 clients or 500, the number does not move.
+
+**Why the sync plateau is ~655 rps.** Starlette runs `def` handlers in an anyio threadpool whose
+default capacity is 40. `40 / 0.05 s = 800` is the ceiling; the measured 655 is that minus
+context-switching and GIL contention. Latency grows linearly past the ceiling because requests
+queue for a thread — p50 went 68 → 136 → 279 ms as concurrency went 50 → 100 → 200, which is
+almost exactly proportional.
+
+**Why async keeps p50 flat.** There is no fixed pool. Each request is a coroutine costing a few
+hundred bytes, and the loop multiplexes them, so p50 stayed at 54–59 ms across a 4× concurrency
+range and throughput scaled to 2,565 rps.
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: concluding "async is always faster".** At c=50 `/sync-def` was *faster* than
+`/async-await` (538 vs 470 rps). Below the threadpool ceiling, threads are perfectly adequate and
+have less per-request overhead. The async advantage is a scaling property, not a constant factor —
+it appears at c=100 and is 3.9× at c=200. A submission that reports the c=50 row alone and
+concludes async wins has drawn the right conclusion from the wrong evidence.
+
+**Wrong turn 2: fixing blocking code with `asyncio.to_thread` and calling it solved.** It works and
+it consumes the same 40-slot pool, so the ceiling is unchanged. It is a correct stopgap and a poor
+destination; say which you mean.
+
+**Wrong turn 3: measuring with a Python load generator.** My first attempt used an `httpx` async
+client and reported 29.6 rps for `/async-await` at c=50 — the *client* was the bottleneck on a
+loaded machine. `ab` on the same server and the same endpoint reported 470 rps. Always sanity-check
+by watching client CPU, and by confirming that the blocking endpoint's number matches `1/delay`;
+if it does not, you are measuring your generator.
+
+## Measured numbers this solution produces
+
+| Claim | Number |
+| --- | --- |
+| Cost of one blocking call in `async def` | 470 → 16.9 rps = **27.8× throughput loss**, p50 58 ms → 2,873 ms |
+| Blocking-async throughput equals 1/delay | 16.9 vs the theoretical 20 |
+| Threadpool ceiling | ~655 rps ≈ 40 threads / 50 ms |
+| Async advantage at c=200 | 2,565 vs 655 rps = **3.9×**, at one fifth the latency |
+| Framework overhead floor | 3,536 rps on `/ping` |
+
+## Grading notes
+
+**A 3/3 on correctness** produces all four numbers at three concurrency levels and explains both
+the 16.9 and the 655 with arithmetic, not adjectives.
+
+**A 3/3 on explanation** identifies that the sync path is *ceiling-limited* and the blocking-async
+path is *serialised* — different failures with different fixes — and states the machine, the load
+generator and the worker count.
+
+**The three most common ways submissions lose points**
+
+1. Only one concurrency level, so the threadpool plateau is invisible.
+2. "Async is faster" with no mention that sync won at c=50.
+3. Numbers that do not reconcile with `1/delay` and `40/delay`, indicating the load generator saturated instead of the server — and no note that this was checked.

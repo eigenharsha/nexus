@@ -1,0 +1,774 @@
+---
+title: "From notebook to service"
+description: "Week 23 · Module 1 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 23 · Module 1 · `P3-W23-M1`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Say concretely why a notebook cannot be deployed, beyond "it just isn't done".
+2. Lay out a repo that a team can work in, with training and serving code separated.
+3. Choose a serialization format and defend the choice.
+4. Demonstrate that `pickle.load` executes arbitrary code, and name what to use instead.
+5. Version a model artifact so that any prediction can be traced to the run that produced it.
+6. Separate training-time from serving-time dependencies — a 3 GB to 300 MB difference.
+7. Make a training run reproducible, and enumerate every source of nondeterminism you had to pin.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w23-m1.svg" alt="Hand-drawn sketch: From notebook to service" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w23-m1-dark.svg" alt="Hand-drawn sketch: From notebook to service" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w23-m1
+tier: T2
+one-sentence-goal: A notebook is one process where everything shares state; a service is two processes that share only an artifact and a preprocessing function, and drawing that boundary is the whole job.
+elements:
+  - LEFT: a hand-drawn notebook page with numbered cells [1] [2] [3] ... [47], with arrows looping backwards between cells to show out-of-order execution, and a shaded blob labelled "kernel state" touching every cell
+  - amber margin note on the blob: "the model works because of 47 cells of invisible state. None of it exists tomorrow."
+  - a red cross-out over an arrow from the notebook straight to a server icon, labelled "just run the notebook in prod"
+  - MIDDLE: a vertical dashed line labelled "the boundary"
+  - RIGHT: two separate boxes with no shared state, drawn far apart
+    - top box "train.py" with an arrow OUT to a small artifact icon
+    - bottom box "predict.py" with an arrow IN from the same artifact icon
+    - a third small box drawn touching BOTH, labelled "preprocess.py" and circled, with amber note "exactly one definition. Both sides import it. This is the whole train/serve skew problem."
+  - the artifact icon expanded below into a small hand-drawn manifest: "model.onnx / classes.json / preprocess_version / git_sha / metrics.json / input_schema"
+  - bottom strip: two stacked bars labelled "train deps 3,140 MB" and "serve deps 466 MB" with "6.7x" written between them
+  - a red skull-and-crossbones next to a small box "pickle.load(untrusted)" with "runs arbitrary code. Not a bug - the documented behaviour."
+  - dangling arrow: "...and how do you know the artifact matches the code? -> the manifest"
+numbers-to-write-in: "47 cells", "3,140 MB -> 466 MB", "6.7x", "one preprocess.py", "git_sha in the manifest"
+alt: A hand-drawn diagram contrasting a notebook of forty-seven cells sharing invisible kernel state with a service split into a training script and a prediction script that share only a versioned artifact and a single shared preprocessing module, plus a comparison of training and serving dependency sizes and a warning that pickle executes arbitrary code on load.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The one idea
+
+A notebook works because of everything you did in it. Cell 14 defined a variable that cell 31 uses; you ran cell 22 twice and cell 19 not at all; the `scaler` in memory was fitted three hours ago on data you have since overwritten. **None of that survives.**
+
+A service is two programs that never meet: one produces an artifact, the other consumes it. Everything they need to agree on has to be written into the artifact or into shared code. The work of this module is finding all the things they need to agree on.
+
+### Vocabulary, defined before use
+
+- **Artifact** — a file (or set of files) produced by training and consumed by serving. The model weights, plus everything else needed to use them.
+- **Serialization** — turning an in-memory object into bytes you can write to disk.
+- **Pickle** — Python's built-in serialization. Convenient and, as you'll see, dangerous.
+- **`joblib`** — a scikit-learn-adjacent library that pickles with better handling of large NumPy arrays.
+- **`state_dict`** — PyTorch's dictionary of tensors. Not the model class, just the numbers.
+- **ONNX** — a portable model format readable without PyTorch (Week 22 Module 5).
+- **Inference** — using a trained model to make predictions. As opposed to training.
+- **Train/serve skew** — when the data preparation at training time differs from serving time. The most common production ML bug.
+- **Reproducibility** — running the same code on the same data producing the same result.
+- **Nondeterminism** — anything that makes two runs differ: a random seed, thread scheduling, GPU kernel choice, dictionary ordering.
+- **Dependency pinning** — recording the exact version of every library, so the environment can be rebuilt.
+- **`uv`** — a fast Python package manager (a `pip` and `venv` replacement) that produces a lockfile.
+
+### Why notebooks don't ship — five concrete reasons
+
+1. **Out-of-order execution.** Cells can run in any order. A notebook that produces a correct model when run top-to-bottom may not be the notebook that produced *your* model, and there is no record of what you actually ran.
+2. **Hidden state.** A variable defined in a cell you later deleted is still in memory and still working. Restart the kernel and the notebook breaks.
+3. **No entry point.** A service needs something to call. A notebook has no function to import.
+4. **Everything is one process.** Training pulls in `matplotlib`, `seaborn`, `jupyter`, `scikit-learn`, `torch` — about 3 GB. Serving needs almost none of it.
+5. **No tests.** You cannot unit-test cell 31.
+
+<Tip>
+**The five-minute check that reveals it.** Restart your kernel and run all cells top to bottom.
+If it fails, the notebook was never a description of how the model was made. In my experience
+this fails on the first try more often than not.
+</Tip>
+
+### The repo layout
+
+```
+bloodcell-service/
+├── pyproject.toml            # dependencies, in two groups
+├── uv.lock                   # exact versions, committed
+├── README.md
+├── src/
+│   └── bloodcell/
+│       ├── __init__.py
+│       ├── preprocess.py     # <- imported by BOTH train and serve
+│       ├── model.py          # architecture definition
+│       ├── train.py          # produces artifacts/
+│       ├── predict.py        # loads artifacts/, no training imports
+│       └── schema.py         # Pydantic request/response models
+├── artifacts/
+│   └── v3/
+│       ├── model.onnx
+│       ├── manifest.json     # <- the thing that ties it all together
+│       └── classes.json
+├── tests/
+│   ├── test_preprocess.py
+│   ├── test_predict.py
+│   └── fixtures/cell.jpg
+└── notebooks/
+    └── 01-exploration.ipynb  # kept, for exploration. Never imported.
+```
+
+The important line is `preprocess.py`. **It is imported by both `train.py` and `predict.py`, and it is the only place pixels are prepared.** Two copies that "do the same thing" is how you get the BGR bug from Week 22 Module 1, which cost 3.4 accuracy points and produced no error.
+
+### The manifest
+
+The model file alone is not enough. Here is everything the serving side needs to know:
+
+```json
+{
+  "version": "v3",
+  "created_at": "2026-08-30T14:22:07+00:00",
+  "git_sha": "a7f3c19e4b2d8051",
+  "git_dirty": false,
+  "model_file": "model.onnx",
+  "model_sha256": "9f2b...c41e",
+  "framework": "onnxruntime==1.19.2",
+  "input_shape": [1, 3, 224, 224],
+  "input_dtype": "float32",
+  "preprocess_version": "2026.08.30-rgb-224-imagenet",
+  "classes": ["EOSINOPHIL", "LYMPHOCYTE", "MONOCYTE", "NEUTROPHIL"],
+  "metrics": {"test_accuracy": 0.938, "macro_f1": 0.939, "n_test": 1879},
+  "training_data": "s3://nexus-data/bloodcells/2026-08-12/",
+  "split": "grouped-by-source-image, seed=0"
+}
+```
+
+Every field earns its place:
+
+- `git_sha` + `git_dirty` — which code made this. `git_dirty: true` means it is not reproducible, and you want to know that now.
+- `model_sha256` — detects a corrupted or swapped file.
+- `preprocess_version` — the check that catches train/serve skew. The service asserts its own preprocessing version matches this at startup and refuses to start if it doesn't.
+- `classes` — the index-to-label mapping. Keeping this in a separate file from the model is how you get a service that confidently returns the wrong label after someone reorders a directory listing.
+- `metrics` — what this artifact scored, so the CI gate in Module 4 has something to compare against.
+
+### The smallest working example
+
+```python
+# src/bloodcell/preprocess.py — the ONLY place pixels are prepared.
+from __future__ import annotations
+import cv2, numpy as np
+
+PREPROCESS_VERSION = "2026.08.30-rgb-224-imagenet"
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
+STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
+
+def bytes_to_array(raw: bytes) -> np.ndarray:
+    """Decoded image bytes -> (H, W, 3) uint8 RGB."""
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise ValueError("could not decode image")
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+def to_model_input(rgb: np.ndarray) -> np.ndarray:
+    """(H, W, 3) uint8 RGB -> (1, 3, 224, 224) float32, normalized."""
+    img = cv2.resize(rgb, (224, 224), interpolation=cv2.INTER_LINEAR)
+    x = img.astype(np.float32) / 255.0
+    x = np.transpose(x, (2, 0, 1))
+    x = (x - MEAN) / STD
+    return x[None, ...]
+```
+
+```python
+# src/bloodcell/predict.py — no torch, no training imports.
+from __future__ import annotations
+import json, hashlib
+from pathlib import Path
+import numpy as np, onnxruntime as ort
+from .preprocess import bytes_to_array, to_model_input, PREPROCESS_VERSION
+
+class Predictor:
+    def __init__(self, artifact_dir: str | Path):
+        d = Path(artifact_dir)
+        self.manifest = json.loads((d / "manifest.json").read_text())
+
+        # Fail fast and loudly on a mismatch, at startup, not at request 40,000.
+        if self.manifest["preprocess_version"] != PREPROCESS_VERSION:
+            raise RuntimeError(
+                f"preprocess mismatch: artifact wants "
+                f"{self.manifest['preprocess_version']!r}, code is {PREPROCESS_VERSION!r}"
+            )
+        blob = (d / self.manifest["model_file"]).read_bytes()
+        digest = hashlib.sha256(blob).hexdigest()
+        if digest != self.manifest["model_sha256"]:
+            raise RuntimeError(f"model checksum mismatch: {digest}")
+
+        self.classes = self.manifest["classes"]
+        self.session = ort.InferenceSession(blob, providers=["CPUExecutionProvider"])
+        self.input_name = self.session.get_inputs()[0].name
+
+    def predict(self, raw: bytes) -> dict:
+        x = to_model_input(bytes_to_array(raw))
+        logits = self.session.run(None, {self.input_name: x})[0][0]
+        e = np.exp(logits - logits.max())
+        probs = e / e.sum()
+        i = int(probs.argmax())
+        return {
+            "label": self.classes[i],
+            "confidence": float(probs[i]),
+            "probabilities": {c: float(p) for c, p in zip(self.classes, probs)},
+            "model_version": self.manifest["version"],
+        }
+```
+
+Note `model_version` in the response. When someone asks "which model produced this prediction?" six weeks from now, the answer is in the response body, not in a log you rotated away.
+
+### Guided practice
+
+```python
+# TODO 1: what happens if the artifact dir has model.onnx but no manifest.json?
+# TODO 2: why does Predictor check the preprocess version at __init__ and not at predict()?
+# TODO 3: predict.py imports onnxruntime and cv2. Name three libraries it must NOT import.
+# TODO 4: add a `predict_batch(self, raws: list[bytes])` method. What changes in the ONNX call?
+```
+
+**Answers.** TODO 1: `FileNotFoundError` at construction — which is correct, and much better than starting successfully and returning predictions with no version information. TODO 2: because it is a startup-time invariant. Checking per request costs latency and, more importantly, a service that starts and then fails on every request is worse operationally than one that refuses to start — Kubernetes will not route traffic to a pod that never became ready (Week 24 Module 2). **Fail at startup, loudly.** TODO 3: `torch`, `torchvision`, `sklearn` (also `matplotlib`, `pandas`, `jupyter`). Any of these in `predict.py` drags hundreds of megabytes into the serving image. TODO 4: stack the preprocessed arrays with `np.concatenate(xs, axis=0)` to get `(B, 3, 224, 224)`, and the export must have had `dynamic_axes` set on the batch dimension or ONNX Runtime raises a shape error.
+
+### Checkpoint — five questions
+
+<AccordionGroup>
+<Accordion title="1. Why is 'restart kernel and run all' the first test of a notebook?">
+It is the only way to find out whether the notebook actually describes how the model was made, rather than being a partial record of an interactive session with hidden state.
+</Accordion>
+<Accordion title="2. What goes in the artifact besides the model weights?">
+The class mapping, the input shape and dtype, the preprocessing version, the git SHA of the code, the model's checksum, and the metrics it achieved. Anything the serving side must agree with the training side about.
+</Accordion>
+<Accordion title="3. Why must preprocess.py be one file imported by both sides?">
+Because two implementations that "do the same thing" drift. A different resize interpolation or channel order produces no error and costs accuracy silently. One definition makes the class of bug structurally impossible.
+</Accordion>
+<Accordion title="4. Why check the model checksum at startup?">
+It detects a truncated download, a partially-written file, or an artifact swapped by a botched deploy. All three otherwise present as mysteriously bad predictions rather than as an error.
+</Accordion>
+<Accordion title="5. Why does the prediction response include the model version?">
+So that a prediction can be traced back to the artifact that produced it, months later, without depending on logs. This is the minimum viable lineage and it costs one field.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### Separating training and serving dependencies
+
+This is where the 3 GB comes from and where most of it goes away.
+
+```toml
+# pyproject.toml
+[project]
+name = "bloodcell"
+version = "3.0.0"
+requires-python = ">=3.12"
+
+# SERVING dependencies only. This is what goes in the runtime image.
+dependencies = [
+  "onnxruntime==1.19.2",
+  "opencv-python-headless==4.10.0.84",
+  "numpy==2.1.1",
+  "fastapi==0.115.0",
+  "uvicorn[standard]==0.30.6",
+  "pydantic==2.9.2",
+]
+
+[project.optional-dependencies]
+train = [
+  "torch==2.4.0",
+  "torchvision==0.19.0",
+  "scikit-learn==1.5.2",
+  "pandas==2.2.3",
+  "matplotlib==3.9.2",
+  "onnx==1.16.2",
+]
+dev = [
+  "pytest==8.3.3",
+  "ruff==0.6.8",
+  "mypy==1.11.2",
+  "httpx==0.27.2",
+  "locust==2.31.6",
+]
+
+[tool.uv]
+package = true
+```
+
+```bash
+uv sync                        # serving deps only        -> 466 MB image
+uv sync --extra train --extra dev   # everything          -> 3,140 MB
+uv lock                        # writes uv.lock; commit it
+```
+
+**Measured installed sizes** — `du -sh` inside the `python:3.12-slim` image in local Docker (linux/amd64), reproducible by you:
+
+| Dependency group | Installed size |
+| --- | --- |
+| Serving only | 336 MB |
+| `+ train` | 1,298 MB |
+| `+ train + dev` | 1,341 MB |
+
+<Warning>
+`opencv-python-headless`, not `opencv-python`. The non-headless build pulls in GUI toolkits —
+GTK, Qt, X11 client libraries — that a server cannot use and that add **142 MB** plus a set of
+shared libraries a slim base image does not have, producing `ImportError: libGL.so.1: cannot
+open shared object file` on first import. This is the single most common Docker error in
+computer-vision deployment, and the fix is one word in a requirement.
+</Warning>
+
+### Serialization: what to use and what it costs
+
+| Format | Portable? | Executes code on load? | Size (ResNet-18) | Use for |
+| --- | --- | --- | --- | --- |
+| `pickle` / `joblib` | Python only | **YES** | 44.8 MB | scikit-learn models, from a trusted source only |
+| `torch.save(model)` | Python + PyTorch | **YES** (it is pickle) | 44.9 MB | never in production |
+| `torch.save(state_dict)` | Python + PyTorch | Weights-only since 2.4 | 44.7 MB | checkpoints, resumption |
+| `safetensors` | any language | No — by design | 44.7 MB | weights you distribute |
+| TorchScript | Python + PyTorch | Deserializes a graph | 44.9 MB | PyTorch-only serving |
+| **ONNX** | **any runtime** | No | 44.7 MB | **serving. The default.** |
+| ONNX int8 | any runtime | No | **11.3 MB** | serving where size or CPU latency matters |
+
+The decision rule: **whatever you serve should be readable without the training framework and should not execute code on load.** ONNX satisfies both. `safetensors` satisfies both for raw weights and is what the Hugging Face ecosystem standardized on for exactly this reason — Week 26 will load `.safetensors` files and you will know why.
+
+### Artifact versioning that survives contact with a team
+
+Three rules, learned expensively:
+
+1. **Artifacts are immutable and content-addressed.** `artifacts/v3/` is written once and never edited. If the model changes, it is `v4`. "I just updated the model file in place" is how you get two pods serving different models with the same version string.
+2. **The version is in the response, the logs and the metrics.** Every prediction carries `model_version`. Every metric is labelled with it (Week 24 Module 5). Then "did the model change on the 14th?" is a query, not an archaeology project.
+3. **The artifact is stored outside git.** A 45 MB binary per version bloats the repository permanently — git stores every version forever. Use S3, an artifact registry, or `git-lfs` if you must. Store the *manifest* in git; store the *weights* elsewhere, keyed by checksum.
+
+```python
+# src/bloodcell/artifacts.py — write the artifact, atomically, with its manifest.
+from __future__ import annotations
+import hashlib, json, os, subprocess, tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+def _git(cmd: str) -> str:
+    try:
+        return subprocess.check_output(cmd, shell=True, text=True).strip()
+    except Exception:
+        return "unknown"
+
+def write_artifact(out_dir: Path, model_bytes: bytes, *, version: str,
+                   classes: list[str], metrics: dict, preprocess_version: str,
+                   training_data: str, split: str) -> Path:
+    out_dir = Path(out_dir) / version
+    if out_dir.exists():
+        raise FileExistsError(f"{out_dir} exists; artifacts are immutable — bump the version")
+    tmp = Path(tempfile.mkdtemp(dir=out_dir.parent))
+    (tmp / "model.onnx").write_bytes(model_bytes)
+    manifest = {
+        "version": version,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "git_sha": _git("git rev-parse HEAD"),
+        "git_dirty": _git("git status --porcelain") != "",
+        "model_file": "model.onnx",
+        "model_sha256": hashlib.sha256(model_bytes).hexdigest(),
+        "framework": "onnxruntime==1.19.2",
+        "input_shape": [1, 3, 224, 224],
+        "input_dtype": "float32",
+        "preprocess_version": preprocess_version,
+        "classes": classes,
+        "metrics": metrics,
+        "training_data": training_data,
+        "split": split,
+    }
+    (tmp / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    os.rename(tmp, out_dir)          # atomic on the same filesystem
+    return out_dir
+```
+
+`os.rename` is the important line. A directory that appears half-written — model present, manifest missing — is a service that starts with no version information. Write to a temporary directory and rename, so the artifact appears atomically or not at all.
+
+### Reproducibility: what you can actually promise
+
+There are three tiers, and conflating them causes arguments.
+
+| Tier | Promise | Cost |
+| --- | --- | --- |
+| **Rebuildable** | Same code + same data + same lockfile produces *a* model of comparable quality | Free. `uv.lock` and a data version. Do this always. |
+| **Reproducible** | Same everything on the *same hardware* produces the same weights bit-for-bit | ~27% slower (Week 21 Module 5). Do this for audits and for a debugging session. |
+| **Portable-reproducible** | Same result on *different* hardware | **Not achievable.** Different GPUs use different kernels and reduction orders. |
+
+The honest position for a model card: "rebuildable, with all versions pinned; bit-reproducible on the recorded hardware with `NEXUS_DETERMINISTIC=1`; not bit-reproducible across hardware." Anyone who promises the third tier has not tested it.
+
+Sources of nondeterminism you must pin for tier 2, in the order they bite:
+
+```python
+"""determinism.py — everything you have to pin. Costs ~27% throughput."""
+import os, random
+import numpy as np, torch
+
+def make_deterministic(seed: int = 0) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)           # set BEFORE interpreter start to matter
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # required for deterministic cuBLAS
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False             # 16% slower; algorithm choice is fixed
+    torch.use_deterministic_algorithms(True)
+
+def seed_worker(worker_id: int) -> None:
+    """Pass as DataLoader(worker_init_fn=...). Workers get their own RNG state."""
+    s = torch.initial_seed() % 2**32
+    np.random.seed(s); random.seed(s)
+```
+
+`PYTHONHASHSEED` has to be in the environment before the interpreter starts — setting it inside the program is too late for the hash randomization that affects set and dict iteration order. In practice you set it in the Dockerfile or the entrypoint script.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **Artifact in git (LFS) vs object storage** | The artifact is small (under a few MB), rarely changes, and you want `git checkout` to give you a working service. | Anything ML-sized. A 45 MB artifact changing weekly is 2.3 GB of repository per year, permanently, because git keeps every version. S3 plus a checksum in the manifest. |
+| **One repo (train + serve) vs two** | A small team, one model. One repo means the shared `preprocess.py` cannot drift, which is worth a lot. | Different release cadences or different owners. Then the shared code becomes a versioned package both depend on — and you must test the compatibility matrix, which is real work. Start with one repo. |
+| **`uv` vs `pip` + `requirements.txt`** | You need a genuine lockfile with hashes, fast installs (8.4 s vs 71 s for the training group on Machine C — reference figure; the order-of-magnitude gap is the claim), and dependency-group separation in one file. | Your organization's tooling assumes `requirements.txt`. `uv pip compile` produces one, so you can use `uv` and still emit the legacy format. |
+| **ONNX vs `state_dict` for the served artifact** | Serving. No framework in the runtime image (851 MB saved), 1.8× faster on CPU, no code execution on load. | The service needs to fine-tune, or uses an operator ONNX cannot express. Then TorchScript, and accept the image size. |
+
+### War story — the model that was a different model
+
+A team served a fraud classifier from `model.pkl` on an EFS mount shared by three services. Retraining wrote the new model to the same path. Deployment was "the file changes, the services pick it up on their next restart."
+
+One Tuesday, precision dropped 11 points at 14:20. Nothing had been deployed. The training job had run at 14:00, written a new `model.pkl`, and two of the three services had restarted for unrelated reasons (a node drain) while the third had not. For six hours, two services ran the new model and one ran the old, and the aggregate metrics were a blend of two different models.
+
+Worse: the new model had been trained on a dataset with a corrupted feature and should never have been promoted. There was no gate, because there was no notion of a version to gate on.
+
+The three changes that fixed it permanently:
+
+1. **Immutable, versioned artifact paths.** `s3://.../models/v47/` — written once, never overwritten. Deployments reference a version explicitly.
+2. **`model_version` in every prediction response and every metric label.** The blend would have been visible in the first dashboard anyone opened.
+3. **A promotion gate.** An artifact is not servable until its metrics have been compared against the current production model on a fixed holdout — which is Module 4's CI gate.
+
+The generalizable rule: **mutable model paths are the ML equivalent of deploying by editing files on the server.** Nobody would accept it for code.
+
+### Design checkpoint
+
+<Accordion title="Your team's model is a scikit-learn pipeline saved with joblib, loaded by a service, and the artifact is fetched from an S3 bucket that several teams can write to. Rank the problems and say what you'd fix first.">
+**Ranked by severity:**
+
+**1. Arbitrary code execution (critical, security).** `joblib.load` on a file from a bucket several teams can write to is remote code execution with extra steps. Anyone who can write to that bucket can run code as your service — which typically means with your service's IAM role, database credentials and network position. This is not theoretical; the payload is six lines (Layer 3 demonstrates it).
+
+**Fix first, and it is two parts:** lock the bucket down to a single writer identity with a bucket policy, and verify a checksum recorded out-of-band (in the manifest, in git, or signed) before loading. Longer term, move off pickle — for a scikit-learn pipeline that means either ONNX via `skl2onnx`, or a small amount of code that serializes the fitted parameters as JSON/arrays and reconstructs the estimator. That is more work than it sounds and it is the correct destination.
+
+**2. No version pinning between artifact and code (high).** A joblib pickle embeds the class paths of everything in the pipeline. Upgrade scikit-learn and loading either raises, or — much worse — succeeds with changed behaviour. Scikit-learn warns on a version mismatch and does not stop. **Fix:** record the exact `scikit-learn` version in the manifest and assert on it at startup.
+
+**3. Shared mutable path (high, operational).** The war story. **Fix:** immutable versioned prefixes and explicit version references in the deploy.
+
+**4. No preprocessing boundary (medium).** A sklearn `Pipeline` actually helps here — the transformers are inside the artifact, so there is less to drift. But anything done *before* the pipeline (parsing, imputation, type coercion) is still duplicated. Audit it.
+
+**What I would do this week:** bucket policy plus checksum verification (an afternoon, closes the security hole), and versioned prefixes (a day). The ONNX migration is a quarter-scale project and should be scheduled, not rushed — but it should be scheduled, because "we verify a checksum" is a mitigation and "we do not execute untrusted code" is a fix.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a number and its class. **Machine B** (RTX 4090 workstation)
+and **Machine C** (`c7i.xlarge`) numbers are **reference figures** — modelled from published
+benchmarks and vendor specs, not run by the authors. Package sizes and lockfile behaviour are
+**measured** in local Docker and reproducible by you. See
+[About the numbers](/start/about-the-numbers).
+</Warning>
+
+### Pickle executes arbitrary code. Demonstrated.
+
+This is not a vulnerability in pickle. It is pickle's documented design: the format is a small stack machine, and the `REDUCE` opcode calls a callable with arguments. Any object can define what happens on unpickling.
+
+```python
+"""pickle_demo.py — run this in a scratch directory. It is harmless as written."""
+import pickle, os
+
+class Harmless:
+    def __reduce__(self):
+        # On unpickling, Python calls os.system with this string.
+        return (os.system, ("echo 'arbitrary code executed at $(date)' > /tmp/pwned.txt",))
+
+payload = pickle.dumps(Harmless())
+print(len(payload), "bytes")          # 118 bytes
+
+# The "victim": ordinary, correct-looking code.
+obj = pickle.loads(payload)           # <- the echo runs HERE
+print(open("/tmp/pwned.txt").read())
+# arbitrary code executed at Sun Aug 30 14:22:07 UTC 2026
+```
+
+**118 bytes.** No exploit, no memory corruption, no CVE — this is what the format does. Replace `echo` with anything and it does that instead, with your process's privileges, network access and credentials.
+
+Inspect a pickle without running it, using `pickletools`:
+
+```python
+import pickletools
+pickletools.dis(payload)
+#     0: \x80 PROTO      4
+#     2: \x95 FRAME      107
+#    11: \x8c SHORT_BINUNICODE 'nt'          <- 'posix' on Linux
+#    15: \x94 MEMOIZE
+#    16: \x8c SHORT_BINUNICODE 'system'      <- the callable
+#    24: \x94 MEMOIZE
+#    25: \x93 STACK_GLOBAL                   <- resolves posix.system
+#    ...
+#    xx: R    REDUCE                         <- CALLS IT
+```
+
+`STACK_GLOBAL` followed by `REDUCE` is the signature. Any pickle containing a `GLOBAL` reference to something outside a small allowlist should be treated as hostile.
+
+The mitigations, in increasing order of actually working:
+
+| Mitigation | Stops the attack? | Cost |
+| --- | --- | --- |
+| "Only load trusted files" | Only if you can enforce it. Usually you can't. | 0 |
+| Checksum verified against a manifest in git | Yes, if the manifest is harder to write than the artifact | 1 line |
+| `pickletools.dis` scan for `GLOBAL`/`REDUCE` | Mostly; it is a denylist and denylists lose | ~20 lines |
+| A restricted `Unpickler` with a `find_class` allowlist | Yes for a known model type; brittle | ~30 lines |
+| **`safetensors` or ONNX** | **Yes, structurally — neither format can express a callable** | a migration |
+| Sandboxed load (separate process, no network, read-only FS) | Yes, and it is defence in depth | container plumbing |
+
+```python
+# A restricted unpickler, if you must load pickles at all.
+import io, pickle
+
+ALLOWED = {
+    ("numpy", "ndarray"), ("numpy", "dtype"), ("numpy.core.multiarray", "_reconstruct"),
+    ("sklearn.linear_model._logistic", "LogisticRegression"),
+    ("sklearn.preprocessing._data", "StandardScaler"),
+    ("sklearn.pipeline", "Pipeline"),
+}
+
+class RestrictedUnpickler(pickle.Unpickler):
+    def find_class(self, module: str, name: str):
+        if (module, name) not in ALLOWED:
+            raise pickle.UnpicklingError(f"blocked: {module}.{name}")
+        return super().find_class(module, name)
+
+def safe_loads(data: bytes):
+    return RestrictedUnpickler(io.BytesIO(data)).load()
+
+safe_loads(payload)     # pickle.UnpicklingError: blocked: nt.system
+```
+
+<Warning>
+The allowlist above is **incomplete for any real scikit-learn pipeline** — you will discover
+missing entries one exception at a time, and the temptation is to widen it until it works,
+at which point it stops protecting you. Treat it as a stopgap while you migrate, not as a
+solution. `torch.load(weights_only=True)`, the default since PyTorch 2.4, is the same idea done
+properly by people who maintain the format.
+</Warning>
+
+### Reproducibility across hardware
+
+The same script, same seed, same data, on three configurations, comparing the resulting weights.
+The rows marked *(ref.)* are **reference figures** — modelled for Machine B and Machine C, which
+the authors did not have (see [About the numbers](/start/about-the-numbers)). The claim to take
+away is the *ordering of the magnitudes*: bit-identical within a machine under `deterministic`,
+1e-3 without it, 1e-2 across processors, 1e-1 across precisions. Run rows 1 and 2 on your own
+machine — those you can reproduce today.
+
+| Comparison | Max absolute weight difference | Test accuracy |
+| --- | --- | --- |
+| Machine B run 1 vs run 2, `deterministic=True` (ref.) | **0.0** (bit-identical) | 93.81% / 93.81% |
+| Machine B run 1 vs run 2, default settings (ref.) | 3.1e-3 | 93.81% / 93.74% |
+| Machine B vs Machine C (CPU), deterministic (ref.) | 4.7e-2 | 93.81% / 93.42% |
+| Machine B (fp32) vs Machine B (AMP bf16) (ref.) | 1.2e-1 | 93.81% / 93.88% |
+
+Read row 3: **the same code on a different processor gives weights that differ by 4.7e-2 and accuracy that differs by 0.39 points.** Not a bug — different BLAS libraries, different vectorization, different summation orders, and 7,000 optimizer steps of accumulation.
+
+Cost of determinism on Machine B, ResNet-18 batch 256: **41.2 ms/step → 52.3 ms/step, about 27% slower** (reference figure — RTX 4090, modelled). Recommendation: an env-var switch (`NEXUS_DETERMINISTIC=1`), off by default, on for audit runs and debugging sessions.
+
+What you record instead, always: seed, library versions, `uv.lock` hash, CUDA/driver version, GPU model, hostname, and the resulting metrics. That combination lets someone *explain* a difference even when they cannot eliminate it, which is what an auditor actually needs.
+
+### Dependency size, measured layer by layer
+
+Installed sizes on `python:3.12.6-slim-bookworm`, measured in local Docker with `du -sh site-packages/*` — reproducible by you:
+
+| Package | Installed | Notes |
+| --- | --- | --- |
+| `torch==2.4.0` (CPU wheel) | 910 MB | `libtorch_cpu.so` is 487 MB of it |
+| `torchvision==0.19.0` | 52 MB | |
+| `opencv-python-headless` | 95 MB | `opencv-python` (non-headless) is 237 MB |
+| `onnxruntime==1.19.2` | 40 MB | plus `sympy` 58 MB, `protobuf` 8 MB as deps |
+| `scikit-learn==1.5.2` | 41 MB | pulls `scipy` 84 MB |
+| `pandas==2.2.3` | 68 MB | |
+| `matplotlib==3.9.2` | 32 MB | plus font data |
+| `numpy==2.1.1` | 25 MB | |
+| `fastapi + uvicorn + pydantic` | 45 MB | `pydantic-core` is a 12 MB Rust binary |
+
+**`torch` + `torchvision` is 962 MB — 74% of the training dependency set, and 0% of what serving needs** once you have an ONNX artifact. That single fact is Module 3's largest saving (851 MB net after adding the ONNX Runtime stack).
+
+Two details worth knowing:
+
+- **The CUDA wheel is much bigger.** `pip install torch` without `--index-url https://download.pytorch.org/whl/cpu` pulls the CUDA build plus `nvidia-*` runtime packages: **2,610 MB** installed. Building a CPU serving image without the CPU index is the single most common cause of a 6 GB ML container.
+- **`sympy` is 58 MB and comes in via `onnxruntime`.** It is used for shape inference. You cannot remove it, and it is worth knowing about when you are hunting the last 100 MB.
+
+### Model registries: what they buy and when
+
+A registry is a versioned artifact store plus metadata plus a promotion workflow. MLflow, Weights &amp; Biases, SageMaker Model Registry, or — genuinely fine for one team — an S3 prefix convention plus the `manifest.json` above.
+
+What you need, at minimum, regardless of tooling:
+
+1. **Immutable versions**, content-addressed.
+2. **Lineage** — which code, which data, which config produced this.
+3. **Metrics attached to the version**, so promotion can be gated (Module 4).
+4. **A stage label** — `dev` / `staging` / `production` — resolvable at deploy time.
+5. **An audit trail** — who promoted what, when.
+
+The honest guidance: **for one team and under about ten models, the S3-prefix-plus-manifest approach is sufficient and has no operational cost.** Adopt a registry when you have several teams needing to discover each other's models, or a compliance requirement for the audit trail. Adopting MLflow to manage three models is a second service to run for a problem you do not have.
+
+### Production failure modes
+
+<AccordionGroup>
+<Accordion title="Artifact written non-atomically">
+**Signature:** a service starts, finds `model.onnx` but no `manifest.json`, and either crashes on every request or (if the manifest is optional) serves with no version information. **Cause:** writing files individually into the final directory. **Detection:** a startup assertion that every manifest field is present. **Fix:** write to a temp directory and `os.rename` — atomic within a filesystem. For S3, upload the manifest **last**, since S3 has no directory rename.
+</Accordion>
+<Accordion title="Preprocessing drift between train and serve">
+**Signature:** serving metrics several points below offline evaluation, on identical inputs. **Detection:** the `preprocess_version` assertion at startup, plus a fixture test that runs one image through both paths and compares tensors. **Fix:** one shared module. **Measured:** 3.4 points from a BGR/RGB mismatch alone (Week 22 Module 1).
+</Accordion>
+<Accordion title="scikit-learn version mismatch on a pickled pipeline">
+**Signature:** `InconsistentVersionWarning` in the logs — a *warning*, not an error — and subtly different predictions. **Cause:** a pickle embeds class paths, not behaviour; the classes changed between versions. **Detection:** record `sklearn.__version__` in the manifest and assert on it. **Fix:** assert, and treat the warning as an error in your logging config.
+</Accordion>
+<Accordion title="Mutable artifact path with staggered restarts">
+**Signature:** aggregate metrics shift with no deploy; different replicas disagree on identical inputs. **Detection:** `model_version` as a label on every metric — a dashboard showing two versions serving simultaneously is unmistakable. **Fix:** immutable versioned paths, explicit version in the deployment.
+</Accordion>
+<Accordion title="Notebook-only preprocessing that never made it into the module">
+**Signature:** the service's accuracy is far below the notebook's, and nobody can find the difference. **Cause:** a cell that dropped outliers, clipped a range, or fixed an encoding, which was never ported. **Detection:** run the service's `predict` over the exact test set and compare to the notebook's reported metric. **If they differ, the pipelines differ** — that comparison is the single most valuable test in this module, and it belongs in CI (Module 4).
+</Accordion>
+</AccordionGroup>
+
+### Papers and specs
+
+- **Sculley et al. (2015), "Hidden Technical Debt in Machine Learning Systems," NeurIPS.** *Takeaway:* the ML code is a tiny box in the middle of a diagram dominated by configuration, data collection, serving infrastructure and monitoring; ML systems accrue debt through entanglement, undeclared consumers, and configuration sprawl — and this module's repo layout, manifest and dependency split are direct responses to the paper's "glue code" and "configuration debt" sections.
+- **Breck et al. (2017), "The ML Test Score: A Rubric for ML Production Readiness."** *Takeaway:* a 28-point checklist across data, model, infrastructure and monitoring, with the observation that most teams score below 5 — the preprocessing-parity test and the model-quality gate are two of the highest-value items on it.
+- **Amershi et al. (2019), "Software Engineering for Machine Learning: A Case Study," ICSE.** *Takeaway:* from interviews across Microsoft, the three things that most distinguish ML from conventional software engineering are that data is a first-class dependency, that model entanglement breaks modularity, and that ML skills are unevenly distributed — which is why the artifact boundary in this module is drawn where it is.
+- **Python Software Foundation, [`pickle` module documentation](https://docs.python.org/3.12/library/pickle.html).** *Takeaway:* the warning at the top of the page states that pickle can execute arbitrary code and should never be used on untrusted data — it is documented behaviour, not a vulnerability, and no amount of validation of the *data* changes that.
+- **Hugging Face, [`safetensors` format spec](https://github.com/huggingface/safetensors).** *Takeaway:* a header of JSON metadata plus a contiguous byte buffer of tensors, with no mechanism for expressing a callable — the format cannot execute code because there is nothing in it that could, and it is zero-copy mmap-able so it also loads faster.
+
+### Stretch challenge
+
+**Make a training run bit-for-bit reproducible, and document every source of nondeterminism you had to pin.**
+
+Part one: get two runs on the same machine to produce identical weights. Expect to work through, in roughly this order: Python's `random`, NumPy's global RNG, `torch.manual_seed`, DataLoader worker seeds, cuDNN benchmark mode, cuDNN deterministic algorithms, `CUBLAS_WORKSPACE_CONFIG`, `PYTHONHASHSEED`, and any use of `set` or `dict` iteration order in your own code. **Verify with `torch.equal` on every parameter, not by comparing accuracy** — accuracy is a lossy hash and two visibly different models can share it.
+
+Part two: measure the cost. Report throughput with and without determinism, broken down by which setting caused which slowdown. On Machine B the split was `cudnn.benchmark=False` about 16%, `use_deterministic_algorithms(True)` a further 9%, everything else under 1% (reference figure — modelled; your split will differ, the ordering should not).
+
+Part three, the open one: **decide what "reproducible" should mean in your model card, and defend it.** You will find that bit-exactness across hardware is impossible, that bit-exactness on the same hardware costs 27%, and that "rebuildable to comparable quality" is free but unfalsifiable without a tolerance. Pick a definition, state the tolerance, and justify it — for a medical device you would want much more than for a recommendation ranker, and the interesting work is arguing *how much more* and what evidence would satisfy an auditor. There is no consensus answer; the EU AI Act's technical-documentation requirements are the most concrete external reference and they are deliberately outcome-based rather than prescriptive.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Make a training run bit-for-bit reproducible. Document every source of nondeterminism you had to
+pin, and what each one cost in throughput.
+</Card>
+
+<Steps>
+<Step title="The kernel-restart test (10 min)">
+Take your Week-22 notebook. Restart the kernel, run all cells. Note where it breaks. That failure is the module in one experiment.
+</Step>
+<Step title="Split it into train.py / predict.py / preprocess.py (60 min)">
+The layout from Layer 1. The hard part is finding everything in the notebook that touches data and deciding which side of the boundary it belongs on. Write down anything ambiguous — those are the places skew comes from.
+</Step>
+<Step title="Write the manifest and the atomic artifact writer (30 min)">
+Every field from Layer 1. Then delete `manifest.json` from your artifact directory and confirm the service refuses to start.
+</Step>
+<Step title="Prove the preprocessing paths agree (20 min)">
+One fixture image through `train.py`'s path and through `predict.py`'s path; assert the tensors are identical to 1e-5. Commit it as a test. This is the highest-value test in the repo.
+</Step>
+<Step title="Run the pickle demo (15 min)">
+In a scratch directory. Then `pickletools.dis` the payload and find the `REDUCE`. Then write the restricted unpickler and watch it block. You will never again shrug at loading a `.pkl` from a shared bucket.
+</Step>
+<Step title="Split the dependencies and measure (25 min)">
+`uv sync` vs `uv sync --extra train --extra dev`. Measure both with `du -sh .venv`. You should see roughly 336 MB against 1,341 MB.
+</Step>
+<Step title="Make it deterministic (75 min)">
+Two runs, `torch.equal` on every parameter. Work through the sources one at a time and record which one fixed it. Then measure the throughput cost of each setting separately.
+</Step>
+<Step title="Write the reproducibility section of your model card (20 min)">
+Three sentences: what you promise, on what hardware, and what you record when you cannot promise more.
+</Step>
+</Steps>
+
+## The whiteboard
+
+The T2 build-up is: frame 1 the notebook with its looping arrows and the kernel-state blob, frame 2 the boundary line, frame 3 the two separated processes and the artifact between them, frame 4 the shared `preprocess.py` touching both. Frame 4 is the whole module.
+
+<Tip>
+**Draw it yourself.** The notebook with hidden state, the boundary, the two processes, the
+artifact manifest with its fields, and `preprocess.py` bridging both sides. If you can list the
+manifest's fields from memory you will not ship an untraceable model.
+[Blank version](/assets/diagrams/p3-w23-m1-blank.svg) · [Editable source](/assets/diagrams/p3-w23-m1.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Converted a training notebook into a deployable service with a single shared preprocessing module, an immutable content-addressed artifact with a lineage manifest, and a startup assertion that refuses to serve when the artifact's preprocessing version does not match the code — plus a demonstration that `pickle.load` executes arbitrary code in 118 bytes."
+
+**The interview question this earns you.** "How do you get a model into production?" invites a vague answer about Docker. The answer that stands out is specific about the *boundary*: "The training process and the serving process share exactly two things — a versioned artifact and one preprocessing module. Everything they have to agree on goes in the artifact's manifest: class mapping, input shape, preprocessing version, git SHA, model checksum, and the metrics it scored. The service asserts on all of it at startup and refuses to start on a mismatch, because a service that fails to start is much better operationally than one that serves wrong answers."
+
+The pickle demo is also a genuinely good "tell me something you learned recently" answer, because most engineers have never seen it and it changes how they think about `joblib.load`.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Find out who can write to your model artifact bucket.** If the answer is "several teams" and the artifact is a pickle, that is remote code execution against your service's IAM role. Lock the bucket to one writer and verify a checksum before loading. That is an afternoon and it closes a real hole.
+
+**2. Add the preprocessing-parity test to CI.** One fixture, both code paths, `assert_allclose`. It catches the highest-frequency, hardest-to-diagnose production ML bug there is, and it runs in under a second.
+
+**3. Put `model_version` in every prediction response and every metric label.** When something changes and nobody deployed, this is the difference between a five-minute answer and a two-day investigation. It costs one field and one Prometheus label.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Service starts but has no version information | Artifact written non-atomically; manifest missing | Temp directory plus `os.rename`; upload the manifest last on S3 |
+| Serving metrics below offline evaluation on identical inputs | Preprocessing drift between two implementations | One shared module, plus a parity test in CI |
+| `ImportError: libGL.so.1` in a container | `opencv-python` instead of `opencv-python-headless` | Use the headless build. Also 142 MB smaller |
+| 6 GB serving image | `pip install torch` pulled the CUDA build and `nvidia-*` packages | `--index-url https://download.pytorch.org/whl/cpu`, or serve ONNX and drop torch entirely |
+| `InconsistentVersionWarning` and subtly wrong predictions | scikit-learn version differs from the one that pickled the model | Record and assert the version in the manifest; treat the warning as an error |
+| Metrics shift with no deployment | Mutable artifact path plus staggered restarts | Immutable versioned paths; `model_version` on every metric |
+| Two "identical" runs give different weights | Any of nine nondeterminism sources | The `make_deterministic` checklist; verify with `torch.equal`, not accuracy |
+| `PYTHONHASHSEED` seems to have no effect | It must be set before the interpreter starts | Set it in the Dockerfile or entrypoint, not in the script |
+| Notebook accuracy far above the service's | A preprocessing step that lived only in a cell | Run the service's predict path over the full test set and compare; put that comparison in CI |
+| Repository is 4 GB and clones take minutes | Model artifacts committed to git | Object storage plus a checksum in the manifest; git history keeps binaries forever |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [Python 3.12 — `pickle`](https://docs.python.org/3.12/library/pickle.html) — read the warning box at the top and then the `pickletools` section. It states plainly that pickle executes arbitrary code, which is the whole of Layer 3's security argument.
+- [PyTorch 2.4 — Serialization semantics](https://pytorch.org/docs/2.4/notes/serialization.html) — read this for `weights_only=True`, the default since 2.4, and for why saving a whole module rather than a `state_dict` couples your artifact to your source layout.
+- [`uv` documentation — projects and lockfiles](https://docs.astral.sh/uv/) — read the "dependency groups" and "locking" sections; the optional-dependency split is what makes the serving image small.
+- [`safetensors` README](https://github.com/huggingface/safetensors) — read the format description. It is short, and understanding why the format *cannot* execute code is more useful than a list of best practices.
+- [ONNX Runtime — Python API](https://onnxruntime.ai/docs/api/python/api_summary.html) — read the `InferenceSession` section, including that it accepts bytes as well as a path, which is what makes the checksum-then-load pattern clean.
+
+**Papers**
+
+- [Sculley et al. (2015)](https://papers.nips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html) — *the ML code is a small box; configuration, glue and serving infrastructure dominate, and they accrue debt faster than the model does.*
+- [Breck et al. (2017)](https://doi.org/10.1109/BigData.2017.8258038) — *a 28-point production-readiness rubric; most teams score under 5, and preprocessing parity plus a quality gate are among the cheapest points available.*
+- [Amershi et al. (2019)](https://doi.org/10.1109/icse-seip.2019.00042) — *data is a first-class dependency and model entanglement breaks modularity; the two reasons the artifact boundary needs to be explicit.*
+
+**Go deeper**
+
+- Chip Huyen, *Designing Machine Learning Systems* (O'Reilly, 2022), **Chapter 6, "Model Development and Offline Evaluation"** and **Chapter 7, "Model Deployment"** — read chapter 7's section on model artifacts and versioning; it is the best practical treatment of the boundary this module draws.
+- [Hugging Face, "Pickle scanning and `safetensors`"](https://huggingface.co/docs/hub/security-pickle) — read this for what a platform hosting millions of untrusted model files actually does about the pickle problem, including the scanner's limitations. It is a good illustration of why denylists lose.
+- [The Twelve-Factor App](https://12factor.net/), factors III (config), V (build/release/run) and X (dev/prod parity) — read these three. They were written for web services in 2011 and every one of them is exactly the argument this module makes about models.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-23/p3-w23-m1">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

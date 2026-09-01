@@ -1,0 +1,187 @@
+---
+title: "Model-serving frameworks"
+description: "Reference solution — Week 24"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P3-W24-M4`
+
+The hands-on was: benchmark FastAPI versus TF Serving at batch 1, 8 and 32; produce the table and a recommendation with a stated regime for each.
+
+## Parity first, then benchmarks
+
+The step that makes everything after it meaningful, and the one most submissions skip:
+
+```python
+"""test_parity.py — run BEFORE any benchmark. Otherwise you are comparing two models."""
+import numpy as np, onnxruntime as ort, requests, json
+
+sess = ort.InferenceSession("artifacts/v3/model.onnx", providers=["CPUExecutionProvider"])
+
+def parity(images: list[np.ndarray]) -> float:
+    worst = 0.0
+    for x in images:
+        onnx_out = sess.run(None, {"input": x})[0]
+        r = requests.post("http://localhost:8501/v1/models/bloodcell:predict",
+                          data=json.dumps({"instances": x.transpose(0, 2, 3, 1).tolist()}))
+        tf_out = np.array(r.json()["predictions"])
+        worst = max(worst, float(np.abs(onnx_out - tf_out).max()))
+    return worst
+
+print(f"max abs diff over 50 fixtures: {parity(fixtures):.2e}")   # 3.1e-05
+```
+
+`3.1e-05` — within the 1e-4 tolerance. Note the `transpose(0, 2, 3, 1)`: **ONNX is NCHW and the TensorFlow SavedModel is NHWC.** Getting that wrong produces a model that runs, returns plausible-looking probabilities, and is wrong — and it would have silently invalidated every number below.
+
+## The benchmark
+
+Fixed offered load at 90% of each configuration's capacity — not at saturation, so the comparison is at a realistic operating point.
+
+| Server | Client batch | `max_batch` | Window | rps | p50 | p95 | p99 | Mean batch |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FastAPI + ORT | 1 | — | — | 97 | 41 | 55 | 61 | 1.0 |
+| FastAPI + ORT | 1 | 8 | 5 ms | 156 | 58 | 79 | 94 | 5.4 |
+| FastAPI + ORT | 8 | — | — | 178 | 121 | 178 | 214 | 8.0 |
+| **TF Serving** | 1 | 8 | 5 ms | **118** | 34 | 43 | **49** | 3.1 |
+| **TF Serving** | 8 | 32 | 5 ms | **289** | 31 | 61 | 78 | 14.2 |
+| **TF Serving** | 32 | 32 | 5 ms | **412** | 84 | 118 | 143 | 32.0 |
+| TF Serving | 1 | 32 | 20 ms | 121 | 53 | 68 | 81 | 4.7 |
+| TF Serving | 1 | — | off | 94 | **29** | 38 | **44** | 1.0 |
+
+Four things the table says that a headline number does not:
+
+1. **The mean batch is 3.1 against a `max_batch` of 8**, because Poisson arrivals mean the window usually closes on the timer. Size memory for the max and throughput expectations for the mean.
+2. **Batching *off* is the lowest-latency configuration** (p50 29 ms, p99 44) and the lowest throughput. If you have latency headroom you are leaving throughput on the table; if you do not, turn it off and say so.
+3. **5 ms → 20 ms raises throughput 2.5% and p50 by 56%.** Sweep the window; never pick it.
+4. **TF Serving's batch-1 advantage is not batching.** With batching off it still does 94 rps at a much better p99 than FastAPI's 97/61 — a C++ request path with no interpreter and a shared thread pool.
+
+## The latency model
+
+Timing the model call in isolation, no server:
+
+| Batch | Measured | `20 + 1.8n` | Error |
+| --- | --- | --- | --- |
+| 1 | 23.0 ms | 21.8 | −5.2% |
+| 2 | 25.8 ms | 23.6 | −8.5% |
+| 4 | 28.1 ms | 27.2 | −3.2% |
+| 8 | 31.4 ms | 34.4 | +9.6% |
+| 16 | 44.7 ms | 48.8 | +9.2% |
+| 32 | 79.2 ms | 77.6 | −2.0% |
+| **64 (predicted)** | — | **135.2** | |
+| **64 (measured)** | **141.6 ms** | | **+4.5%** |
+
+Least-squares fit gives `a = 20.1 ms` (fixed cost per call) and `b = 1.79 ms` (marginal cost per image). **Prediction error under 10% across a 64× range**, including an out-of-sample prediction at batch 64.
+
+The fixed cost is where the batching win comes from: at batch 8, `a` is amortized over eight images, so per-image cost falls from 23.0 ms to 3.9 ms — **5.9×**. Past batch 16 the marginal term dominates and each doubling costs nearly double the latency for a shrinking throughput gain. **The knee is batch 8–16 for this model on this hardware**, and it was chosen analytically rather than by sweep.
+
+## Payloads
+
+One 224×224×3 float32 image = 150,528 floats:
+
+| Encoding | Size | Ratio | Encode | Decode | End-to-end p50 |
+| --- | --- | --- | --- | --- | --- |
+| REST, JSON float array | **1.42 MB** | 1.0× | 38.0 ms | 51.0 ms | **187 ms** |
+| gRPC, protobuf float32 | 602 KB | 2.4× | 2.1 ms | 1.4 ms | **41 ms** |
+| REST, base64 JPEG, in-graph decode | **27 KB** | **53×** | 0.3 ms | 4.9 ms | **38 ms** |
+
+**The JPEG-over-REST path is both the fastest and the easiest to debug from `curl`.** The transport was never the problem — sending decoded pixels was. And moving the decode into the graph fixes the preprocessing-duplication problem at the same time: decode, resize and normalize now ship inside the artifact, so there is exactly one implementation.
+
+## Warmup
+
+| | First request after ready | Steady state |
+| --- | --- | --- |
+| No warmup file | **1,840 ms** | 34 ms |
+| Warmup at batch 1 only | 41 ms | 34 ms — **but 1,210 ms on the first batch of 8** |
+| Warmup at batches 1, 8, 32 | **34 ms** | 34 ms |
+
+The middle row is the one that catches people. **TensorFlow specializes per input shape**, so warming only at batch 1 leaves the first formed batch of 8 paying the cost — which shows up as an occasional p99 spike after every deploy that nobody can reproduce on demand.
+
+## Shadow traffic
+
+Two hours of mirrored production traffic, 412,000 requests, v3 (serving) against v4 (canary):
+
+```
+disagreement rate            3.4%   (14,008 requests)
+predicted-class distribution EOS +0.4pp   LYM -0.1pp   MON +1.8pp   NEU -2.1pp
+mean confidence              0.912 -> 0.941
+p99 latency                  49 ms -> 57 ms
+error rate                   0.00% -> 0.00%
+```
+
+The **1.8 pp shift towards MONOCYTE** is the interesting signal — that is the class Week 22's error analysis identified as weakest, so a shift towards it is plausibly an improvement rather than a regression. Sampling 200 of the 14,008 disagreements for human labelling: **v4 correct in 141, v3 in 59.** Promoted.
+
+**That loop — mirror, compare distributions, sample the disagreements for labelling — is the strongest model validation available without a full online experiment**, and it cost an ingress annotation and two hours.
+
+<Warning>
+Before enabling the mirror, we audited the request path for side effects. The service writes a
+prediction log row per request. Mirroring would have **doubled** those rows and corrupted the
+delayed-label pipeline (Module 5). The canary Deployment was configured with
+`PREDICTION_LOG_ENABLED=false`. **Check this before you turn mirroring on**, not after.
+</Warning>
+
+## The recommendation
+
+Not "TF Serving is faster" — a regime for each option, with the thresholds derived:
+
+> **Client batch 1, under 60 rps per pod:** keep the FastAPI service with batching **off**.
+> p50 29 ms, p99 44 ms, and a batch window at that arrival rate is pure added latency
+> (the mean batch would be 1.4).
+>
+> **Client batch 1, 60–110 rps per pod:** FastAPI with micro-batching at `max_batch=8,
+> window=5 ms`. 156 rps at p99 94 ms — inside a 150 ms SLO with margin.
+>
+> **Client batch 1, above 110 rps per pod, or whenever clients send batches:** a dedicated
+> server. **Triton, not TF Serving**, because our artifact is ONNX and TF Serving would force a
+> second export path and a second parity test for no benefit.
+>
+> **Regardless of server:** move the client to base64 JPEG with in-graph decode. It is 53×
+> smaller than the float array, faster end to end than gRPC, and it collapses preprocessing to
+> one implementation shipped with the model. **This is the highest-value change on the list and
+> it is independent of the serving question.**
+
+## Why this solution and not the obvious one
+
+**Why verify parity first.** NCHW versus NHWC is a silent difference that produces plausible probabilities. Every number in the table would have been a comparison of two different models, and nothing would have looked wrong.
+
+**Why benchmark at 90% of capacity rather than at saturation.** Saturation numbers describe a regime you should never operate in (Week 23's curve: p99 varies 30× between 80% and 200% of capacity). The comparison at a realistic operating point is the one that predicts production.
+
+**Why report the mean batch size.** It is the diagnostic for whether batching engaged at all. A configuration with `max_batch=32` and a mean of 1.4 is not batching; it is adding a fixed latency, and the throughput number will not reproduce in production.
+
+**Why the recommendation names Triton rather than TF Serving.** TF Serving is the teaching vehicle because it is the simplest way to see the concepts. For an ONNX artifact it is the wrong production choice, and a recommendation that ignored that to stay consistent with the module would be dishonest.
+
+## The two wrong turns worth knowing about
+
+**1. Benchmarking at a synthetic saturation load and deploying at 3 rps per pod.** The module's war story. A 50 ms batch window is 3.1× throughput at 500 rps and pure latency at 3 rps, and the difference is entirely the arrival rate. **Measure the real per-pod arrival rate before choosing a window.**
+
+**2. Migrating to gRPC to fix a payload problem.** gRPC is 4.6× better end to end than JSON floats and 8% *worse* than base64 JPEG — while also introducing the load-balancing problem (one HTTP/2 connection pins to one pod; measured 99.98% of requests to a single replica out of six). The payload was the problem; the transport was a distraction that came with a new failure mode.
+
+## Grading notes
+
+**3/3 on Correctness** — output parity verified before benchmarking, both servers deployed on the cluster with correct readiness probes, warmup covering every batch shape.
+
+**3/3 on Performance** — the six-row table at a fixed offered load with mean batch size reported, the window sweep, and the fitted latency model validated out of sample.
+
+**3/3 on Explanation** — a recommendation with a regime and a derived threshold for each, including the payload change as independent of the serving question.
+
+**The three most common ways submissions lose points**
+
+1. **No parity check.** Roughly a third of first attempts have an NCHW/NHWC or a normalization mismatch, and every subsequent number is meaningless.
+2. **Mean batch size not reported.** Without it a reader cannot tell whether batching engaged, and the throughput number does not transfer.
+3. **"TF Serving is 2.3× faster" as the conclusion.** It is 2.3× faster at client batch 32 and 1.2× at batch 1, and most workloads are batch 1. The regime is the deliverable.
+
+<Card title="Back to the module" icon="arrow-left" href="/curriculum/p3/week-24/4-model-serving-frameworks" horizontal>
+  The `a + b·n` latency model is the same arithmetic that governs continuous batching in Week 26 — where `b` is huge and `a` is small, and the conclusion inverts.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

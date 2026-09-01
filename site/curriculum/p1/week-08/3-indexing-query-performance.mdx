@@ -1,0 +1,636 @@
+---
+title: "Indexing & query performance"
+description: "Week 8 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 8 · Module 3 · `P1-W08-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Add an index and measure a 1,970× improvement on a 1,000,000-row table — then explain every part of the number.
+2. Order the columns of a composite index correctly, and predict which queries it will and will not serve.
+3. Say why the planner ignored your index, with the plan as evidence rather than a guess.
+4. Choose partial, covering and expression indexes for the cases where they win, with their measured sizes.
+5. Price an index in write throughput and disk, so "add an index" stops being free.
+
+## Where this sits
+
+| | |
+| --- | --- |
+| **Prereqs** | `P1-W07-M3` (reading `EXPLAIN ANALYZE`), `P1-W07-M5` (MVCC) |
+| **Unlocks** | `P1-W08-M4` and `M5`, the lab's latency targets, and Week 27 (HNSW is this idea with a different distance function) |
+| **One-line** | After this you can make a slow query fast and say exactly what it cost. |
+
+## Why you should care
+
+### For Aarav (student)
+
+- "Why is this query slow?" is asked in most backend and data interviews. The answer is almost always a missing or unusable index, and you can now prove it with a plan.
+- Feeling the 1,970× yourself — 86.8 ms to 0.033 ms — is the moment indexes stop being a checkbox and become a tool.
+- The B-tree is a data structure you already half know from Week 1. Seeing it work on a real 1,000,000-row table connects the theory to something you can measure.
+
+### For Meera (working professional)
+
+- This shows up in your job as: "the page got slow after we added a filter". A filter without an index is a sequential scan, and at a million rows that is 86.8 ms of pure waste per request.
+- The leftmost-prefix rule is why your composite index does not help the query you added it for. Measured: the same index served one query in 0.512 ms and did nothing for another, which fell back to a 116.6 ms scan.
+- Indexes are not free: five of them made inserts **2.02× slower** and occupied more space than the table. Being the person who can price that is how you win the "just add an index" argument.
+
+## The mental model
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p1-w08-m3.svg" alt="Hand-drawn sketch: descending a B-tree versus scanning every page" className="block dark:hidden" />
+  <img src="/assets/diagrams/p1-w08-m3-dark.svg" alt="Hand-drawn sketch: descending a B-tree versus scanning every page" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p1-w08-m3
+tier: T3
+one-sentence-goal: Show that an index turns "read every page and throw almost all of it away" into "follow three pointers", and that the composite index only works from the left.
+elements:
+  - left half: a long strip of 8,772 page rectangles with a magnifying glass sweeping all of them, annotated "Parallel Seq Scan - Rows Removed by Filter: 333,332 per worker" and "86.8 ms"
+  - right half: a B-tree drawn by hand, root at top with 3 child pointers, two levels of internal nodes, leaves at the bottom holding sorted keys with arrows into the heap - the descent path traced with numbered circles 1,2,3 and annotated "0.033 ms"
+  - a 1,970x written large between the two halves with a hand-drawn bracket
+  - bottom strip: a composite index (customer_id, placed_at) drawn as a sorted key list grouped by customer_id, with a green tick on "WHERE customer_id = 900 ORDER BY placed_at" and a red cross on "WHERE placed_at > ..." plus the amber note "sorted by the FIRST column first - the second is only ordered WITHIN a value of the first"
+  - a small scale drawing on the right: heap 8,248 kB against indexes 13 MB, with the note "the indexes are bigger than the table"
+  - circled key term "leftmost prefix"
+  - a dangling arrow labelled "...and when is the seq scan actually FASTER?"
+numbers-to-write-in: seq scan 86.8 ms (8,772 buffers) vs index scan 0.033 ms = 1,970x; index build 629 ms, 11 MB on a 69 MB heap; composite serves ORDER BY in 0.512 ms; the same index does nothing for a second-column-only predicate - 116.6 ms; 50k inserts 788.9 ms with 0 indexes vs 1,591.8 ms with 5 (2.02x)
+alt: A hand-drawn comparison of a sequential scan sweeping thousands of heap pages against a B-tree descent following three pointers to the same rows, with the measured times and the 1,970 times speedup written between them, plus a composite index illustration showing why only leftmost-prefix queries are served.
+*/}
+
+An index is a second, sorted copy of some columns, with pointers back to the rows. Sorted means you
+can find a value by halving the search space repeatedly instead of looking at everything. That is
+the entire idea; everything else in this module is about *which* copy to keep and what keeping it
+costs.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Plain English
+
+    A table is stored as unordered **pages** — 8 KB blocks of rows in whatever order they were
+    written. To find every order belonging to customer 123456, the database must read every page and
+    check every row. That is a **sequential scan**.
+
+    An **index** is a separate structure holding just the indexed column's values, kept in sorted
+    order, each with a pointer to the row it came from. Because it is sorted, finding a value is a
+    handful of comparisons rather than a million.
+
+    PostgreSQL's default index is a **B-tree**: a balanced tree where each node holds many sorted
+    keys and pointers to child nodes. "Balanced" means every leaf is the same distance from the root,
+    so every lookup costs the same. With a fan-out of a few hundred keys per 8 KB page, three levels
+    address millions of rows — which is why lookups stay fast as tables grow.
+
+    ### The analogy
+
+    A 900-page textbook with no index. To find every mention of "mitochondria" you read all 900
+    pages. The index at the back is a sorted list of terms with page numbers: you find the term in
+    seconds and turn to three pages. The index costs paper (disk) and must be rebuilt when the book
+    changes (write cost), and it only helps for the words it lists — searching for a word that is not
+    in the index still means reading the book.
+
+    ### Smallest working example: feel the difference
+
+    On a table of 1,000,000 orders, no index on `customer_id`:
+
+    ```sql
+    EXPLAIN (ANALYZE, BUFFERS)
+    SELECT id, total_cents, placed_at FROM orders WHERE customer_id = 123456;
+    ```
+
+    ```
+    Gather  (cost=1000.00..14980.83 rows=5 width=24) (actual time=11.112..86.760 rows=5 loops=1)
+      Workers Planned: 2
+      Workers Launched: 2
+      Buffers: shared hit=8772
+      ->  Parallel Seq Scan on orders  (cost=0.00..13980.33 rows=2 width=24)
+                                       (actual time=19.669..44.047 rows=2 loops=3)
+            Filter: (customer_id = 123456)
+            Rows Removed by Filter: 333332
+            Buffers: shared hit=8772
+    Planning Time: 0.075 ms
+    Execution Time: 86.796 ms
+    ```
+
+    Now add the index:
+
+    ```sql
+    CREATE INDEX idx_orders_customer ON orders(customer_id);
+    -- CREATE INDEX
+    -- Time: 629.156 ms
+    SELECT pg_size_pretty(pg_relation_size('idx_orders_customer'));
+    --  11 MB
+    ```
+
+    ```sql
+    EXPLAIN (ANALYZE) SELECT id, total_cents, placed_at FROM orders WHERE customer_id = 123456;
+    ```
+
+    ```
+    Index Scan using idx_orders_customer on orders  (cost=0.42..23.85 rows=5 width=24)
+                                                    (actual time=0.013..0.019 rows=5 loops=1)
+      Index Cond: (customer_id = 123456)
+    Planning Time: 0.049 ms
+    Execution Time: 0.033 ms
+    ```
+
+    **86.796 ms → 0.033 ms. A factor of 1,970.** The index took 629 ms to build and occupies 11 MB
+    on a 69 MB table.
+
+    ### Line by line
+
+    - `Parallel Seq Scan` — PostgreSQL split the scan across three processes because it was reading
+      the whole table. Parallelism made a bad plan faster; it did not make it a good plan.
+    - `Rows Removed by Filter: 333332` — **this is the line that tells you an index is missing.**
+      Each worker examined a third of a million rows to return two. When you see a large number here,
+      you have found your problem.
+    - `Buffers: shared hit=8772` — 8,772 pages of 8 KB, about 68 MB, read from cache to answer a
+      query returning five rows.
+    - `loops=3` — the scan node ran three times, once per worker. `actual time` is **per loop**.
+    - `Index Scan using idx_orders_customer` — the index is being used, and the plan names it.
+    - `Index Cond: (customer_id = 123456)` — the condition was pushed *into* the index. Compare with
+      `Filter:`, which means rows were fetched and then discarded. `Index Cond` good, `Filter` on a
+      large row count bad.
+
+    ### Guided practice
+
+    Run these three and record the timings.
+
+    1. `WHERE customer_id = 123456` before and after the index. Expect roughly 1,000×.
+    2. `WHERE customer_id BETWEEN 1000 AND 1100` — a range, not a point. Still fast, because the
+       index is sorted so a range is a contiguous slice.
+    3. `WHERE customer_id + 0 = 123456` — the index is **not** used. Wrapping the column in an
+       expression makes it unusable, because the index stores `customer_id`, not `customer_id + 0`.
+       This is the most common accidental way to disable an index, and it appears in real code as
+       `WHERE lower(email) = ...` or `WHERE date(created_at) = ...`.
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+      **1. Which line in a plan tells you an index is missing?**
+      `Rows Removed by Filter` with a large number — the database read rows only to throw them away.
+
+      **2. Difference between `Index Cond` and `Filter`?**
+      `Index Cond` is evaluated inside the index, so non-matching rows are never fetched. `Filter` is
+      applied after fetching.
+
+      **3. Why does the index help a range query too?**
+      It is sorted, so a range is a contiguous run of leaf entries.
+
+      **4. Why does `WHERE customer_id + 0 = 123456` not use the index?**
+      The index stores the column's values, not the expression's. The planner cannot prove they
+      correspond.
+
+      **5. What did the index cost?**
+      629 ms to build and 11 MB of disk — plus a write cost on every insert and update, measured in
+      Layer 2.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The leftmost-prefix rule
+
+    A composite index on `(a, b)` sorts by `a`, and by `b` only *within* each value of `a`. So it
+    serves `WHERE a = ?`, `WHERE a = ? AND b = ?`, and `WHERE a = ? ORDER BY b` — and it does not
+    serve `WHERE b = ?` any better than no index at all.
+
+    Measured. Index on `(customer_id, placed_at DESC)`:
+
+    ```sql
+    -- Leftmost prefix present: served, and the ORDER BY is free
+    EXPLAIN (ANALYZE) SELECT id FROM orders WHERE customer_id = 900 ORDER BY placed_at DESC LIMIT 10;
+    ```
+    ```
+    Limit  (actual time=0.257..0.268 rows=5 loops=1)
+      ->  Index Scan using idx_orders_cust_placed on orders (actual time=0.251..0.262 rows=5)
+            Index Cond: (customer_id = 900)
+    Execution Time: 0.512 ms
+    ```
+
+    ```sql
+    -- Second column only: the index is useless
+    EXPLAIN (ANALYZE) SELECT count(*) FROM orders
+    WHERE placed_at >= '2025-06-01' AND placed_at < '2025-06-02';
+    ```
+    ```
+    ->  Parallel Seq Scan on orders (actual time=0.272..73.504 rows=521 loops=3)
+          Filter: ((placed_at >= ...) AND (placed_at < ...))
+          Rows Removed by Filter: 332813
+    Execution Time: 116.561 ms
+    ```
+
+    **0.512 ms versus 116.561 ms with the same index present.** Note also what the first plan does
+    *not* contain: a `Sort` node. The index already provides `placed_at DESC` order within a
+    customer, so `ORDER BY` costs nothing. That is sort avoidance, and it is often worth more than
+    the lookup speedup.
+
+    Column-order rules, in priority: **equality columns first**, then the column you `ORDER BY`, then
+    range columns last. `WHERE tenant_id = ? AND status = ? AND created_at > ? ORDER BY created_at`
+    wants `(tenant_id, status, created_at)`. Putting the range column earlier means everything after
+    it can only be a filter, not an index condition.
+
+    ### When the planner ignores your index
+
+    The planner uses an index only when it estimates that doing so is cheaper. Three common reasons
+    it decides otherwise, and all three are visible in the plan.
+
+    **1. The predicate is not selective enough.** Fetching 20% of a table through an index means
+    random access to most pages, which costs more than reading them in order. Measured with a
+    predicate matching 98% of rows:
+
+    | Plan | Time |
+    | --- | --- |
+    | Parallel Seq Scan | **116.1 ms** |
+    | Forced index-only scan (`enable_seqscan=off`) | **375.6 ms** |
+
+    The sequential scan was **3.2× faster**. The planner was right, and forcing the index made it
+    worse.
+
+    **2. The column is wrapped in an expression.** `WHERE lower(email) = ...` cannot use an index on
+    `email`. Measured: 193.9 ms as a parallel sequential scan. With an expression index:
+
+    ```sql
+    CREATE INDEX idx_customers_lower_email ON customers(lower(email));
+    ```
+
+    **1.878 ms** — a 103× improvement, and the expression in the query must match the index's
+    expression exactly.
+
+    **3. Statistics are stale.** The planner estimates rows from statistics gathered by `ANALYZE`.
+    After a bulk load, they describe a table that no longer exists. The tell is a large discrepancy
+    between estimated and actual rows in the plan. Run `ANALYZE`.
+
+    ### Index-only scans, partial indexes, covering indexes
+
+    An **index-only scan** answers a query entirely from the index, never touching the table. It
+    requires every selected column to be in the index *and* the visibility map to say the pages are
+    all-visible (a consequence of MVCC — the index does not record whether a row version is visible).
+
+    ```
+    Index Only Scan using idx_orders_cust_placed on orders (actual time=0.056..0.338 rows=505)
+      Index Cond: ((customer_id >= 1000) AND (customer_id <= 1100))
+      Heap Fetches: 0
+    Execution Time: 0.439 ms
+    ```
+
+    `Heap Fetches: 0` is the marker. A non-zero value means the visibility map was not current —
+    usually because the table has not been vacuumed since the last writes — so the scan had to visit
+    the heap anyway. Use `INCLUDE` to add payload columns without making them part of the key:
+
+    ```sql
+    CREATE INDEX idx_orders_cust_incl ON orders(customer_id) INCLUDE (total_cents, status);
+    ```
+
+    A **partial index** covers only the rows matching a predicate:
+
+    ```sql
+    CREATE INDEX idx_orders_live_pending ON orders(status) WHERE deleted_at IS NULL;
+    ```
+
+    Measured: **6,704 kB against 6,840 kB** for the full index — only marginally smaller here because
+    98% of rows are live, but it converted a 106.2 ms bitmap-heap plan into a **94.4 ms index-only
+    scan**. Partial indexes win dramatically when the predicate is genuinely selective: an index on
+    `WHERE status = 'pending'` for a table where 1% of rows are pending is 1% of the size, and stays
+    small forever.
+
+    An **expression index** stores a computed value:
+
+    ```sql
+    CREATE INDEX ON customers (lower(email));         -- 193.9 ms -> 1.878 ms
+    CREATE INDEX ON orders (date_trunc('day', placed_at));
+    ```
+
+    ### The write cost, measured
+
+    Every index must be updated on every insert, and on any update touching its columns. This is the
+    number that makes "just add an index" a decision rather than a reflex.
+
+    50,000 inserts into the same table:
+
+    | Configuration | Time | Throughput |
+    | --- | --- | --- |
+    | No indexes (primary key only) | **788.9 ms** | 63,379 rows/s |
+    | Five indexes | **1,591.8 ms** | 31,411 rows/s |
+
+    **2.02× slower.** And the storage:
+
+    | | Size |
+    | --- | --- |
+    | Heap (the actual data) | 8,248 kB |
+    | Indexes | **13 MB** |
+
+    **The indexes are larger than the table.** That is normal on a narrow, heavily-indexed table, and
+    it is why an index register — every index justified by a named query — belongs in your repo.
+
+    One mitigation worth knowing: PostgreSQL's **HOT** (heap-only tuple) optimisation skips index
+    updates entirely when an update changes no indexed column *and* the new row version fits on the
+    same page. So indexing a column that is updated frequently is much more expensive than indexing
+    one that is not, and leaving `fillfactor` below 100 on a heavily-updated table (say 85) leaves
+    room on each page for HOT updates to land.
+
+    ### Trade-offs
+
+    | Decision | Choose the first when… | Choose the second when… |
+    | --- | --- | --- |
+    | **Composite `(a, b)` vs two single-column indexes** | Queries filter on both, or on `a` alone. One index serves both and provides ordering. | Queries filter on `a` or `b` independently — then two indexes, and the planner can combine them with a bitmap AND. |
+    | **Partial vs full index** | The predicate is selective and stable: `WHERE deleted_at IS NULL`, `WHERE status = 'pending'`. | Queries do not always include the predicate — a partial index that does not match the query is not used at all. |
+    | **`INCLUDE` vs adding to the key** | The column is only ever *returned*, not searched or ordered by — it keeps the key small and the tree shallow. | You need to search or order by it, or you need its uniqueness enforced. |
+    | **Index vs no index on a write-heavy table** | Reads dominate, or the query is on a critical path. | The table is append-and-forget: measured 2.02× write penalty for five indexes. Log tables often want almost none. |
+    | **B-tree vs GIN vs BRIN** | Equality and range on scalar values — the default and right answer 95% of the time. | GIN for containment (`JSONB`, arrays, full-text — returns in Week 28 for BM25); BRIN for huge, naturally-ordered tables where a tiny index storing per-block ranges beats a large B-tree. |
+
+    ### What breaks in the real world
+
+    A B2B dashboard's main list view degraded from 80 ms to 4 seconds over six months with no code
+    change. The query filtered `WHERE tenant_id = ? AND status = ? ORDER BY created_at DESC LIMIT 50`,
+    and there was an index on `(tenant_id)`.
+
+    The plan told the whole story. The index found the tenant's rows — for the largest tenant, about
+    900,000 of them — and then `Sort` had to order all 900,000 to return 50. The `Sort` node showed
+    `Sort Method: external merge Disk: 214MB`. Six months earlier that tenant had 20,000 rows and the
+    sort fit in `work_mem`.
+
+    The fix was one index: `(tenant_id, status, created_at DESC)`. Equality columns first, then the
+    ordering column. The plan lost its `Sort` node entirely — the index already provides the order —
+    and the `LIMIT 50` became a top-of-index read. 4 seconds to 3 ms.
+
+    Two things worth extracting. **The old index was not unused, it was insufficient**, which is why
+    "there is an index on that column" is not an answer. And the degradation was non-linear: fine at
+    20,000 rows, fine at 200,000, catastrophic at 900,000 when the sort spilled to disk. That cliff
+    is invisible in staging with a small dataset, which is the argument for load-testing with
+    production-shaped data volumes.
+
+    <Accordion title="Design checkpoint — model answer inside">
+      **Question.** A colleague proposes adding six indexes to speed up six reports. What do you ask
+      before approving?
+
+      **Model answer.** Four questions with numbers attached. **One:** what does each index cost in
+      writes? Measured, five indexes made inserts 2.02× slower — so six on a table taking 5,000
+      inserts per second is a real capacity change, not a rounding error. **Two:** can one index
+      serve several reports? Composite indexes serve any leftmost prefix, so `(tenant_id, status,
+      created_at)` may serve three of the six by itself, and consolidating is usually possible.
+      **Three:** are any of them redundant with an existing index? An index on `(a)` is subsumed by
+      one on `(a, b)` and should be dropped. **Four:** what is the measured before and after for each
+      one, on production-shaped data? An index whose query is already 4 ms does not need to be 2 ms.
+
+      Then the check that outlives the discussion: after deploying, look at
+      `pg_stat_user_indexes.idx_scan`. Any index with zero scans after a full business cycle is pure
+      write cost and disk, and should be dropped. Most teams doing this for the first time find
+      several — including some that have been zero for years.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    ### Inside the B-tree
+
+    PostgreSQL's B-tree is a Lehman–Yao variant: a balanced tree of 8 KB pages, with leaf pages
+    linked left-to-right so a range scan walks sideways without returning to the root, and with high
+    keys and right-links that let readers proceed correctly while a page is being split.
+
+    Fan-out decides depth. A page holds roughly `8192 / (key size + 8 bytes of overhead)` entries —
+    for a `bigint` key, about 400. So three levels address `400³ ≈ 64 million` rows, and four levels
+    address 25 billion. **An index lookup is three or four page reads at almost any realistic table
+    size**, which is why the 1,970× speedup does not decay as the table grows — it grows.
+
+    A **page split** happens when an insert does not fit: the page's contents are divided between the
+    old page and a new one, and a pointer is added to the parent (which may itself split, recursively
+    up to the root). Two consequences:
+
+    - **Random inserts fragment the index.** Keys arriving in random order split pages everywhere,
+      leaving them roughly half full, so the index is about twice the size it needs to be.
+    - **Sequential inserts do not.** For a monotonically increasing key — a `bigserial`, a timestamp
+      — every insert goes to the rightmost page, and PostgreSQL has a special case that fills those
+      pages to about 90% instead of splitting them in half. This is a real argument for sequential
+      primary keys over random UUIDv4, and it is exactly why **UUIDv7** (time-ordered) exists.
+
+    `fillfactor` controls how full a page is left at build time. The default is 90 for B-trees. On a
+    table whose indexed columns are updated frequently, lowering the table's `fillfactor` to 85 leaves
+    room for HOT updates on the same page, which skips index maintenance entirely.
+
+    ### When a sequential scan genuinely wins
+
+    Measured, a predicate matching 98% of a 1,000,000-row table:
+
+    ```
+    -- planner's choice
+    Parallel Seq Scan on orders  (actual time=0.161..51.106 rows=327999 loops=3)
+      Buffers: shared hit=8772
+    Execution Time: 116.091 ms
+
+    -- forced: SET enable_seqscan=off; SET enable_bitmapscan=off;
+    Parallel Index Only Scan using idx_orders_total on orders (actual time=0.939..317.214 rows=327999 loops=3)
+      Heap Fetches: 0
+      Buffers: shared hit=6 read=1476 written=16
+    Execution Time: 375.594 ms
+    ```
+
+    The sequential scan was **3.2× faster**. Reading 8,772 pages in physical order is cheaper than
+    walking an index and following pointers, even with `Heap Fetches: 0`. The crossover is roughly
+    5–10% selectivity on spinning disks and higher on SSDs — which is exactly what
+    `random_page_cost` models. Its default of **4.0** assumes a random read costs four times a
+    sequential one, which was true for spinning rust and is wrong for flash, where **1.1** is
+    realistic. A default `random_page_cost` on SSD systematically discourages index scans, and
+    lowering it is one of the highest-value single configuration changes on a modern server.
+
+    A related honest finding: on this fully-cached 90 MB table, a *forced* index scan for a 60%
+    predicate was actually **faster** than the sequential scan (206.4 ms against 347.8 ms), because
+    every page was already in `shared_buffers` and no real I/O happened. Cache state changes the
+    answer. Always compare warm-to-warm, and read the `Buffers` line to know which you have.
+
+    ### Index types beyond B-tree
+
+    | Type | Structure | Use for | Note |
+    | --- | --- | --- | --- |
+    | **B-tree** | balanced tree | equality, ranges, ordering, uniqueness | the default; 95% of cases |
+    | **Hash** | hash table | equality only | rarely worth it; B-tree does equality nearly as well and much more |
+    | **GIN** | inverted index (value → list of rows) | `JSONB` containment, arrays, full-text search | large, slower to update; `jsonb_path_ops` is smaller and faster for `@>` only |
+    | **GiST** | generalised search tree | geometric data, ranges, exclusion constraints, nearest-neighbour | the framework behind `EXCLUDE USING gist` in `P1-W08-M2` |
+    | **BRIN** | per-block-range min/max summaries | huge tables with strong physical correlation (append-only time series) | tiny — often thousands of times smaller than a B-tree — but only works when the data is physically ordered |
+    | **HNSW** (pgvector) | multi-layer proximity graph | approximate nearest neighbour on embeddings | **Week 27**. Same idea as a B-tree: a structure that avoids looking at everything, with a different notion of "near" |
+
+    The through-line is worth stating explicitly because it recurs three more times in this course:
+    **an index is any structure that lets you skip most of the data.** A B-tree skips by ordering, a
+    GIN index skips by inverted lookup, BRIN skips by block summaries, HNSW skips by graph proximity.
+    When you meet HNSW in Week 27 and BM25 in Week 28, they are this module with a different distance
+    function.
+
+    ### Index bloat and maintenance
+
+    B-tree indexes bloat like tables do: deleted entries leave half-empty pages, and `VACUUM` does
+    not compact them. The measured table equivalent from `P1-W07-M5` — 48 MB growing to 284 MB from
+    five full-table updates — has an index counterpart.
+
+    ```sql
+    -- detect: compare index size to a rough expectation, and watch it over time
+    SELECT indexrelname, idx_scan,
+           pg_size_pretty(pg_relation_size(indexrelid)) AS size
+    FROM   pg_stat_user_indexes
+    WHERE  schemaname = 'public'
+    ORDER  BY pg_relation_size(indexrelid) DESC;
+
+    -- fix, without blocking writes (PostgreSQL 12+)
+    REINDEX INDEX CONCURRENTLY idx_orders_customer;
+    ```
+
+    That same query answers the more valuable question: **`idx_scan = 0` means the index has never
+    been used.** After a full business cycle, an unused index is pure write cost — measured, it is
+    part of a 2.02× penalty — and disk. Drop it. Also check for redundancy: an index on `(a)` is
+    subsumed by `(a, b)`.
+
+    `REINDEX CONCURRENTLY` takes `SHARE UPDATE EXCLUSIVE`, so reads and writes continue. Like
+    `CREATE INDEX CONCURRENTLY` (measured at +11% wall time in `P1-W07-M2`), a failure leaves an
+    invalid index behind — check `pg_index.indisvalid` afterwards.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Missing index | `Rows Removed by Filter` in the millions | Add the index; measured 86.8 ms → 0.033 ms |
+    | Index present but unusable | Index exists, plan shows a seq scan | Column wrapped in an expression, or no leftmost prefix — measured 116.6 ms with the index present |
+    | Sort spilling to disk | Fine at 200k rows, catastrophic at 900k | `Sort Method: external merge Disk:` — add the ordering column to the index |
+    | Index-only scan degraded | `Heap Fetches` non-zero and rising | The visibility map is stale; the table needs vacuuming |
+    | Write throughput dropping over time | Inserts getting slower with no schema change | Index count grew; measured 2.02× for five |
+    | Index larger than the table | Disk usage growing faster than data | Normal on narrow tables; audit for unused and redundant indexes |
+    | Planner refusing an index on SSD | Seq scans chosen where index scans would win | `random_page_cost` still at the spinning-disk default of 4.0 |
+    | Random UUID primary key fragmenting the index | Index twice the expected size, write amplification | Use UUIDv7 or a sequential key; random keys split pages everywhere |
+
+    ### Frontier and primary sources
+
+    - **Bayer & McCreight (1972), "Organization and Maintenance of Large Ordered Indices."**
+      *Takeaway:* keeping the tree balanced on every insert is what makes lookup cost independent of
+      insertion order — the property everything else depends on.
+    - **Lehman & Yao (1981), "Efficient Locking for Concurrent Operations on B-Trees."** *Takeaway:*
+      right-links and high keys let readers traverse a tree while it is being split, which is why
+      index reads do not block behind writes in PostgreSQL.
+    - **PostgreSQL 16 documentation, "Indexes" and "Index-Only Scans and Covering Indexes."**
+      *Takeaway:* the visibility-map requirement is a direct consequence of MVCC, which is why
+      vacuuming affects read performance and not just disk usage.
+    - **Malkov & Yashunin (2018), "Efficient and robust approximate nearest neighbor search using
+      HNSW."** *Takeaway:* a hierarchical proximity graph gives logarithmic-ish search in
+      high-dimensional space — the same "skip most of the data" idea, and the subject of Week 27.
+
+    ### Stretch challenge
+
+    Given ten queries, propose the **minimum** index set and prove it is minimal.
+
+    Concretely: for each query, capture the baseline plan and timing. Propose an index set,
+    justifying each index by the queries it serves — a composite index serving three queries beats
+    three single-column indexes. Measure each query again. Then measure the write cost of the whole
+    set with a bulk insert benchmark, and the total disk. Finally, **remove one index at a time and
+    re-measure everything**: if removing an index does not hurt any query's timing meaningfully, it
+    was not needed and your set was not minimal.
+
+    The interesting part is the trade-off surface, not the answer. You will find a point where adding
+    one more index gains 15% on one query and costs 20% on every write. Where that line sits depends
+    on your read/write ratio, and being able to draw it with your own numbers — rather than asserting
+    "indexes are good" or "too many indexes are bad" — is the actual skill.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Run one query on 1,000,000 rows with no index, capture the plan and the `Rows Removed by Filter`
+line. Add the index, re-measure, and compute the ratio. Then measure the insert throughput of the
+table with zero indexes and with five, and report the write penalty. Both numbers, or the exercise
+is only half done.
+</Card>
+
+## The whiteboard
+
+T1 is the seq-scan-versus-B-tree sketch with the leftmost-prefix strip. Hero animation **A12**
+descends the tree page by page while a sequential scan races alongside, sweeping thousands of pages
+and losing.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p1-w08-m3-blank.svg) · [Editable source](/assets/diagrams/p1-w08-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    Commit an `INDEXES.md` where every index has the query it serves, the before and after timing,
+    its size, and the measured write penalty for the set. That document is more impressive than
+    another feature, because it shows you treat performance as a measured trade rather than a vibe.
+    The interview sentence: "adding the index took the query from 86.8 ms to 0.033 ms — about
+    1,970× — and cost 11 MB and a 2.02× insert penalty across the index set."
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **One:** run the `pg_stat_user_indexes` query and drop everything with `idx_scan = 0` after a
+    full business cycle — teams routinely find several, some years old. **Two:** find your slowest
+    list endpoint and check its plan for a `Sort` node; adding the ordering column to the index often
+    removes it entirely, and that is where the 4-seconds-to-3-milliseconds cases live. **Three:**
+    check `random_page_cost` — if you are on SSD and it is still 4.0, the planner is systematically
+    avoiding index scans it should choose.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Query slow, index exists | Column wrapped in an expression | Expression index, or rewrite the predicate; measured 193.9 ms → 1.878 ms |
+| Composite index not used | The query does not include a leftmost prefix | Reorder the index, or add another; measured 116.6 ms with the index present |
+| Fast in staging, slow in production | The sort spills to disk at larger row counts | `Sort Method: external merge Disk:`; put the ordering column in the index |
+| `Heap Fetches` climbing on an index-only scan | Stale visibility map | Vacuum the table |
+| Writes slower after "just adding indexes" | Every index is maintained per write | Measured 2.02× for five; audit and consolidate |
+| Index bigger than the table | Normal on narrow tables, or bloat | Compare to `pg_relation_size`; `REINDEX CONCURRENTLY` if bloated |
+| Forcing an index made it slower | The planner was right — low selectivity | Measured 116.1 ms seq vs 375.6 ms forced index on a 98% predicate |
+| Index fragmented and oversized | Random UUIDv4 primary key splitting pages everywhere | UUIDv7 or a sequential key |
+| An invalid index nothing uses | A failed `CREATE INDEX CONCURRENTLY` | `SELECT * FROM pg_index WHERE NOT indisvalid`; drop and rebuild |
+
+## Assessment
+
+**Concept questions**
+
+1. Which line of a plan tells you an index is missing? *(`Rows Removed by Filter` with a large count.)*
+2. State the leftmost-prefix rule and give a query it excludes. *(An index on `(a,b)` serves `a`, and `a` plus `b`, but not `b` alone — measured 116.6 ms for the second-column-only query.)*
+3. Why is an index lookup roughly constant-cost as tables grow? *(Fan-out of ~400 per page means three levels address ~64 million rows.)*
+4. When is a sequential scan faster? *(High selectivity — measured 116.1 ms versus 375.6 ms for a forced index scan on a 98% predicate.)*
+5. What does `Heap Fetches: 0` mean, and what makes it non-zero? *(A true index-only scan; a stale visibility map forces heap access.)*
+6. Give the measured write cost of five indexes. *(50,000 inserts: 788.9 ms → 1,591.8 ms, 2.02×; and 13 MB of indexes against 8,248 kB of heap.)*
+7. Why do random UUID primary keys fragment an index? *(Inserts land on random pages, splitting them roughly in half; sequential keys fill the rightmost page to ~90%.)*
+8. What connects B-tree, GIN, BRIN and HNSW? *(Each is a structure that lets a query skip most of the data; they differ in what "near" means.)*
+
+**Coding challenge.** Given ten queries and a 10,000,000-row table, propose the minimum index set, meet stated latency targets, and prove minimality by removing each index and re-measuring. Hidden tests: every target met; no index with `idx_scan = 0` after the benchmark; the write penalty reported.
+
+**Interview questions**
+
+- *Junior:* "What is an index and why does it make queries faster?"
+- *Mid:* "There is an index on that column and the query is still slow. What are your hypotheses?"
+- *Senior:* "A list view degraded from 80 ms to 4 seconds over six months with no code change. Walk me through it."
+
+**Draw it from memory.** Draw the B-tree descent beside a sequential scan with the measured times, and the composite-index strip showing which queries it serves and which it does not.
+
+## Sources & further reading
+
+**Primary docs**
+
+- [PostgreSQL 16: Indexes](https://www.postgresql.org/docs/16/indexes.html) — read "Multicolumn Indexes", "Indexes and ORDER BY", "Partial Indexes" and "Index-Only Scans" in that order; together they are this module.
+- [PostgreSQL 16: `CREATE INDEX`](https://www.postgresql.org/docs/16/sql-createindex.html) — read the `CONCURRENTLY`, `INCLUDE` and `fillfactor` sections.
+- [PostgreSQL 16: Planner cost constants](https://www.postgresql.org/docs/16/runtime-config-query.html) — read `random_page_cost`; on SSDs the default is wrong.
+
+**Papers and their takeaways**
+
+- **[Bayer & McCreight (1972).](https://doi.org/10.1007/BF00288683)** *Takeaway:* self-balancing on insert is what makes lookup cost independent of insertion order, which is the property every index guarantee rests on.
+- **[Lehman & Yao (1981).](https://doi.org/10.1145/319628.319663)** *Takeaway:* right-links let readers traverse a tree mid-split, which is why index reads do not block behind concurrent writes.
+- **[Malkov & Yashunin (2018), HNSW.](https://doi.org/10.1109/TPAMI.2018.2889473)** *Takeaway:* the same "skip most of the data" principle applied to high-dimensional vectors — you will implement this in Week 27.
+
+**Go deeper**
+
+- [*SQL Performance Explained*, Markus Winand (and use-the-index-luke.com)](https://use-the-index-luke.com/) — read the chapters on the leftmost prefix and on `ORDER BY`. It is the best explanation anywhere of why column order matters, and it will make you correct on the single most commonly misunderstood point in this module.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-08/p1-w08-m3">
+  Attempt the lab first. Seriously.
+</Card>

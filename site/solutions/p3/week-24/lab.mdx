@@ -1,0 +1,182 @@
+---
+title: "Lab — Kubernetes model-serving cluster"
+description: "Reference solution — Week 24"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `LAB-P3-W24`
+
+Full manifests are in `labs/p3/week-24/solution/`. This page is the reasoning and the numbers.
+
+## The three things the ticket asked for
+
+### 1. Deploys must not drop requests — proven
+
+22,500 requests during a 75-second rolling update at 300 rps, asserted with a k6 threshold that fails on a single loss.
+
+| Configuration | conn. refused | ingress 503 | timeout | total |
+| --- | --- | --- | --- | --- |
+| Baseline | 41 | 146 | 0 | **187** |
+| + readiness probe | 41 | 0 | 0 | 41 |
+| + `preStop: sleep 8` | 0 | 0 | 3 | 3 |
+| + graceful shutdown | 0 | 0 | 0 | **0** |
+
+p99 during the rollout: **78 ms against 61 ms steady.** Both thresholds asserted:
+
+```javascript
+thresholds: {
+  http_req_failed: ['rate<0.0001'],
+  'http_req_duration{expected_response:true}': ['p(99)<300'],
+}
+```
+
+`preStop: 8` came from 20 measured pod deletions: endpoint-to-iptables convergence **p50 1.19 s, p95 3.37 s, p99 5.03 s** on the slowest node. Roughly 2× the p95, with margin. At `preStop: 1` failures returned at 19 of 22,500 — which is the check that the sizing is doing work rather than being decorative.
+
+### 2. It has to scale, and how fast — a number
+
+| Signal | First scale event | Full capacity | Peak p99 during the ramp |
+| --- | --- | --- | --- |
+| CPU at 60% | **31.0 s** median, 47.2 s p95 | 62 s | 1,840 ms |
+| In-flight requests at 3 (KEDA) | **19.4 s** median, 34 s p95 | 48 s | 910 ms |
+
+Predicted from documented defaults: **27.3 s median, 53.7 s worst case.** Measured median 13% above predicted; the gap is kubelet-side latency the six-component model omits.
+
+And the honest half of the answer, which the ticket did not ask for and needs:
+
+> Our traffic's peak-to-mean ratio is 3.1 with a median ramp of 4 minutes, so autoscaling is
+> **adequate** for the normal shape. It is **not** adequate for the 09:00 batch spike (8× in
+> 90 s) — over the first 60 seconds we would be saturated. **Recommend a `cron` scaler raising
+> `minReplicas` to 24 at 08:55**, which costs ~15 pod-minutes daily against ~250 for holding the
+> capacity all day.
+
+### 3. A runbook someone else can follow
+
+`RUNBOOK.md`, tested by handing it to someone who had not built the service. **It failed that test twice** before it was usable — once because a step said "check the dashboard" without a link, once because §B assumed the reader knew what an EndpointSlice was. Both fixes were one line.
+
+The sections that make it an *ML* runbook rather than a service runbook:
+
+- **§D "the model returns garbage"** — starts with a `curl` against a committed fixture with an expected label and confidence. **30 seconds to distinguish "the model is broken" from "the caller's data changed"**, and it is the check nobody thinks to run while the service panels are green.
+- **§E "input drift"** — contains **"DO NOT roll back the model"** and the reason. The previous version was trained on the same distribution and has the same problem. Rolling back is the trained reflex from every other incident type and it is exactly wrong here.
+
+## The manifests, and the four decisions worth defending
+
+```yaml
+spec:
+  replicas: 6
+  minReadySeconds: 5
+  strategy: {rollingUpdate: {maxSurge: 1, maxUnavailable: 0}}
+  template:
+    spec:
+      # preStop 8s + drain 20s = 28s < 45s. Checked; do not lower without redoing the arithmetic.
+      terminationGracePeriodSeconds: 45
+      topologySpreadConstraints:
+        - {maxSkew: 1, topologyKey: kubernetes.io/hostname,
+           whenUnsatisfiable: ScheduleAnyway, labelSelector: {matchLabels: {app: bloodcell}}}
+      containers:
+        - name: api
+          env:
+            - {name: OMP_NUM_THREADS, value: "1"}     # 1 thread; scale with replicas
+          resources:
+            requests: {cpu: "500m", memory: "1Gi"}    # p95 CPU 412m, max working set 721Mi
+            limits:   {memory: "1Gi"}                 # NO cpu limit — see below
+          lifecycle:
+            preStop: {exec: {command: ["/bin/sh", "-c", "sleep 8"]}}
+          startupProbe:   {httpGet: {path: /readyz, port: http}, periodSeconds: 2,  failureThreshold: 30}
+          readinessProbe: {httpGet: {path: /readyz, port: http}, periodSeconds: 5,  failureThreshold: 2}
+          livenessProbe:  {httpGet: {path: /healthz, port: http}, periodSeconds: 20, failureThreshold: 3}
+```
+
+**No `limits.cpu`.** Measured with `limits.cpu: 500m` and one thread: p50 68 ms, p99 112 ms, 58% of periods throttled. Without it: p50 41 ms, p99 61 ms, 0% throttled — matching the un-containerized baseline exactly. The `requests.cpu` still guarantees our share under contention; the limit only bound us when the node had spare capacity, which is when using it is free. **We lose the Guaranteed QoS class and we documented that trade.**
+
+**Requests from measurement**, not from a guess: 10 minutes of representative load, p95 CPU `412m` and max working set `721Mi` from Prometheus quantiles — not from `kubectl top`, which is a single 15-second sample and misses the peak.
+
+**`startupProbe` separate from liveness**, so a model that occasionally takes 25 s to load (cold page cache) gets 60 s to start while liveness stays tight at ~60 s of sustained failure before a restart. With `initialDelaySeconds` doing both jobs you must pick one number and it is wrong for one of them.
+
+**`minReadySeconds: 5`** so a pod that passes readiness once and then crashes stalls the rollout rather than letting it proceed to break the next pod.
+
+## TF Serving alongside
+
+Parity verified to **3.1e-05** before benchmarking. Note the `transpose(0, 2, 3, 1)` — **ONNX is NCHW and the SavedModel is NHWC**, and getting that wrong produces plausible probabilities from the wrong model.
+
+| Server | Client batch | rps | p50 | p99 |
+| --- | --- | --- | --- | --- |
+| FastAPI + ORT | 1 | 97 | 41 | 61 |
+| TF Serving | 1 | 118 | 34 | 49 |
+| TF Serving | 8 | 289 | 31 | 78 |
+| TF Serving | 32 | 412 | 84 | 143 |
+
+**Recommendation with a regime**, because "TF Serving is faster" is not actionable:
+
+> Our clients send one image at a time at ~16 rps per pod. At that rate the relevant row is
+> batch 1 (1.22×, not 4.2×), and a batch window would be pure added latency. **Keep FastAPI with
+> batching off.** Revisit if client batching is introduced or per-pod rate exceeds ~110 rps —
+> and at that point choose **Triton**, not TF Serving, because our artifact is ONNX.
+>
+> Independently of the serving question: **move clients to base64 JPEG with in-graph decode.**
+> 27 KB against 1.42 MB for a float array, faster end to end than gRPC, and it collapses
+> preprocessing to one implementation shipped with the model.
+
+## Monitoring, SLO and the game day
+
+**SLO:** 99.5% of `POST /v1/predict` return 2xx within 150 ms over 30 days, at loads up to 160 rps. **Budget: 3.6 hours/month.**
+
+Consumption, which reversed our intuition:
+
+| Event | Budget |
+| --- | --- |
+| One rolling update at the 0.83% baseline | **0.015%** |
+| Twelve deploys a month, unfixed | 0.2% |
+| One 20-minute outage | 9.3% |
+| One hour at 15% above capacity | **46%** |
+
+**Deploy losses are trivial; sustained overload is expensive by a factor of ~3,000.** That is where the engineering effort goes.
+
+**Game day: 7 of 10 injected failures produced an alert.** The three that did not — an artifact with the classes in the wrong order, an injected hue shift, and swapped normalization constants — were **all model-quality failures with a perfectly green service dashboard**, found on the model panels. A fourth (deleting the ServiceMonitor) went unnoticed for 14 minutes because nothing alerts on absence; fixed with a `DeadMansSwitch`.
+
+## Why this solution and not the obvious one
+
+**Why apply the zero-downtime fixes one at a time.** All three at once works and teaches nothing. One at a time, watching a specific error category go to zero, is what makes the mechanism transferable to the next cluster where the numbers are different.
+
+**Why a `cron` scaler for the 09:00 spike rather than tuning the HPA.** The lag is 19–31 s and the spike is 90 s at 8×. No amount of HPA tuning closes that; the components are documented defaults and the largest of them is metric staleness. **Predictable load deserves predictable capacity**, and saying so is a better answer than a heroic autoscaler configuration that still fails.
+
+**Why the runbook was tested on a colleague.** A runbook you wrote is always followable by you. Ours had two steps that were not followable by anyone else, and both were invisible until someone tried.
+
+**Why report the game day's miss rate rather than the diagnosis times.** Diagnosis time measures the person; alerted-or-not measures the system, and improving the system is the point. 3 of 10 missed is the number that justified the model dashboard panels existing.
+
+## The two wrong turns worth knowing about
+
+**1. Setting `limits.cpu` because every tutorial does.** It cost 51 ms of p99 for nothing on a single-tenant cluster. The limit only binds when the node has spare capacity — precisely when using that capacity is free. Decide deliberately; the reflexive `limits: cpu: 500m` is the worst of both worlds.
+
+**2. Declaring the rolling update fixed without a threshold.** "It looked fine" is how the baseline's 187 failures went unnoticed for months in the first place. A k6 threshold that fails the run on a single loss is one line, and it is the difference between a claim and a proof.
+
+## Grading notes
+
+**What a 3/3 looks like on each row**
+
+- **Correctness 3** — zero failures asserted by a failing-on-loss threshold with the four-stage error-type breakdown; probes that can disagree; HPA scaling both ways; custom-metric autoscaling working.
+- **Code quality 3** — community label convention, non-root with an explicit UID, requests from measurement, and the `preStop`/grace arithmetic written as a comment in the manifest.
+- **Performance 3** — scaling lag over 30 trials with median and p95, reconciled against the six predicted components, plus the leading-signal comparison and the TF Serving benchmark with verified parity.
+- **Explanation 3** — `RUNBOOK.md` with §D and §E, tested on a colleague; the scaling report with a recommendation naming the traffic shape autoscaling cannot handle; and the game-day miss rate.
+
+**The three most common ways submissions lose points**
+
+1. **No §D in the runbook.** Every deployment portfolio has manifests. The written procedure for "healthy service, wrong answers" is what marks someone who has operated a model rather than deployed one.
+2. **Scaling lag measured but not decomposed.** "31 seconds" is an observation; six components summing to 27.3 with the attribution verified is understanding, and it is what lets you answer the question for a service you have not built yet.
+3. **A `cron` scaler or an HPA tune presented without the traffic measurement behind it.** The peak-to-mean ratio and the ramp duration are what make the recommendation defensible; without them it is a preference.
+
+<Card title="Back to the lab" icon="arrow-left" href="/curriculum/p3/week-24/lab" horizontal>
+  `RUNBOOK.md`, the SLO and the post-mortem template come back unchanged in Week 32, around an LLM agent.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

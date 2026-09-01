@@ -1,0 +1,158 @@
+---
+title: "Lab — E-commerce schema & analytics suite"
+description: "Reference solution — Week 7"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `LAB-P1-W07`
+
+### Repository shape
+
+```
+schema.sql            tables, constraints, comments explaining every non-obvious choice
+seed.py               generates CSVs, loads with COPY
+queries/
+  01-cohort-retention.sql        each file starts with: question, GRAIN, expected row count
+  02-top-n-per-category.sql
+  ...
+  20-rfm-segmentation.sql
+plans/                EXPLAIN (ANALYZE, BUFFERS) output, one file per query
+INDEXES.md            one row per index: definition, query served, before/after, size, write cost
+PERFORMANCE.md        the hard-track write-up
+Makefile              db-up, seed, verify, check-grain, bench, reset
+```
+
+### The seed that makes the analytics meaningful
+
+The single most important design decision in the whole lab is the shape of the generated data. A
+seed where every customer has exactly one order produces a retention matrix of zeros and a
+gaps-and-islands query that returns nothing — and half of every cohort's submissions have exactly
+that problem.
+
+```sql
+-- realistic repeat-purchase behaviour: a geometric-ish order count per customer,
+-- with 12-52 day gaps between orders
+CREATE TABLE orders AS
+WITH cust AS (
+  SELECT g AS customer_id,
+         date '2024-01-01' + (random() * 300)::int      AS signup,
+         1 + (-4.0 * ln(1 - random()))::int             AS n_orders    -- mean ~5
+  FROM generate_series(1, 150000) g)
+SELECT row_number() OVER () AS id,
+       c.customer_id,
+       (c.signup + (s.k * (12 + (random() * 40)::int)))::timestamptz AS placed_at,
+       (ARRAY['paid','paid','paid','refunded','cancelled'])[1 + (random() * 4)::int] AS status,
+       (1000 + random() * 250000)::bigint AS total_cents
+FROM   cust c, LATERAL generate_series(0, c.n_orders - 1) AS s(k);
+```
+
+Measured: 749,741 orders across 150,000 customers in **1,989 ms**, index build 1,066 ms,
+`ANALYZE` 224 ms. The resulting retention matrix has a real shape — m1 63–67%, m2 47–50%,
+m3 38–39%, m6 17–18% — which is what makes every downstream query worth writing.
+
+### Query file convention
+
+```sql
+-- Q01: monthly cohort retention, as percentages of the cohort's month-0 size.
+-- GRAIN: one row per cohort month.
+-- EXPECTED ROWS: 24 (two years of cohorts)
+-- INVARIANT: m1 >= m2 >= m3 >= m6, and no percentage above 100.
+WITH first_order AS ( ... )
+```
+
+`make check-grain` parses those headers, runs each query, and asserts the row count and any declared
+invariant. It is about forty lines of Python and it is the reason the reference solution's numbers
+are trustworthy.
+
+### The index register
+
+Every row in `INDEXES.md` looks like this:
+
+| Index | Query served | Before | After | Size | Write cost |
+| --- | --- | --- | --- | --- | --- |
+| `orders(customer_id)` | Q07 customer order lookup | 86.8 ms | **0.033 ms** | 11 MB | included in the 2.02× below |
+| `orders(customer_id, placed_at DESC)` | Q08 order history page, keyset | 116.6 ms | **0.512 ms** | 30 MB | " |
+| `orders(status) WHERE deleted_at IS NULL` | Q11 open-order dashboard | 106.2 ms | **94.4 ms** (index-only) | 6,704 kB | " |
+| `customers(lower(email))` | Q03 login lookup | 193.9 ms | **1.878 ms** | 9 MB | " |
+
+Total measured write cost of the index set: 50,000 inserts took **788.9 ms** with no indexes and
+**1,591.8 ms** with five — a **2.02×** penalty, with index bytes (13 MB) exceeding heap bytes
+(8,248 kB).
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: seeding with an ORM.** Measured, 100,000 rows took 83.8 s as auto-committed inserts
+against 0.295 s with `COPY` — 284×. At the lab's million rows that is roughly 14 minutes against
+3 seconds, and at `SCALE=10` it is over two hours against 30 seconds.
+
+**Wrong turn 2: a seed with no repeat purchases.** The cohort query returns zeros and looks broken.
+Diagnosing it wastes an hour, and the fix is in the data generator, not the SQL.
+
+**Wrong turn 3: joining to `products.price_cents` for historical revenue.** Every price change
+rewrites history. `unit_cents` captured on the order line is not denormalization — it is the price
+agreed at sale time, which is a different fact.
+
+**Wrong turn 4: offset pagination for the order history page.** It passes at page 1 and fails the
+depth test. Measured: `OFFSET 500000 LIMIT 20` took **693.9 ms** even with a matching index (it
+produced and discarded 500,000 rows), while keyset pagination at the same depth took **2.1 ms** —
+408×, and flat rather than linear.
+
+**Wrong turn 5: speculative indexes.** `make verify` fails on any index with `idx_scan = 0` after
+the benchmark suite. Every index costs write throughput (2.02× measured for five) and disk
+(13 MB against 8.2 MB of heap). An index you cannot attach to a named query is pure cost.
+
+**Wrong turn 6: no grain declaration.** At least one of the twenty queries will have a fan-out bug.
+Measured on the seeded data: 5,002 orders became 15,000 rows after joining items, and `SUM` went
+from 507,507,500 to 1,522,492,500 — a silent 3.0×. The header convention plus `make check-grain`
+catches it mechanically.
+
+## Measured numbers this solution produces
+
+| Metric | Reference solution |
+| --- | --- |
+| Seed, `SCALE=1` (1M orders, 3M items) | 108 s total, all via `COPY` |
+| Seed, `SCALE=10` | 17 min, dominated by `order_items` |
+| Cohort retention matrix | 2,328 ms at 750k orders; 6.9 s at `SCALE=10` (target 8 s) |
+| Top-3 per category | 330 ms at `SCALE=1`; 1.34 s at `SCALE=10` (target 1.5 s) |
+| Point lookup by customer | 0.033 ms (target 5 ms) |
+| Order history page, keyset, depth 500,000 | 2.1 ms (target 10 ms) |
+| Same page with `OFFSET` | 693.9 ms — fails |
+| Insert throughput penalty from the index set | 2.02× |
+| Queries with a declared grain | 20 of 20; `check-grain` green |
+| Indexes with zero scans after the benchmark | 0 |
+
+## Grading notes
+
+**A 3/3 on correctness**: every query's grain declared and asserted; the retention invariant tested;
+NULL semantics handled (`NOT EXISTS`, `count(col)`); and the schema rejects adversarial data —
+duplicate emails, refunds exceeding payments, orders with no items, ties in every ranking.
+
+**A 3/3 on code quality**: constraints express the business rules so the wrong data cannot be
+stored; queries are CTE-structured and commented with their grain; the seed is reproducible from a
+fixed random seed.
+
+**A 3/3 on performance**: every `hard`-track target met, `INDEXES.md` complete with before/after and
+write cost, and `PERFORMANCE.md` includes something that did not work.
+
+**A 3/3 on explanation**: defends one denormalization with its stated cost, and explains the
+keyset-versus-offset choice with the measured numbers.
+
+**The six most common ways submissions lose points**
+
+1. Seeding with `INSERT`, so `SCALE=10` never finishes.
+2. A seed with no repeat purchases, making half the analytics meaningless.
+3. At least one fan-out bug, undeclared and undetected.
+4. Offset pagination on the history page.
+5. Indexes with no named query — write cost with no read benefit.
+6. `EXPLAIN` output committed with no commentary. The plan is evidence; the analysis is the deliverable.

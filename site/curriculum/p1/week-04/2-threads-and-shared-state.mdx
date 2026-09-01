@@ -1,0 +1,686 @@
+---
+title: "Threads and shared state"
+description: "Week 4 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 4 · Module 2 · `P1-W04-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Explain a race condition by pointing at the interleaving that causes it, not by saying "threads are tricky".
+2. Reproduce a lost-update race that loses **64.86% of 16 million increments**, and fix it with a lock.
+3. Cause a deadlock deliberately, capture it with `faulthandler`, and fix it by lock ordering.
+4. Design a threaded system with `queue.Queue` so that no shared mutable state exists to race over.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/P1-W04-M2.svg" alt="Hand-drawn sketch: Threads and shared state" className="block dark:hidden" />
+  <img src="/assets/diagrams/P1-W04-M2-dark.svg" alt="Hand-drawn sketch: Threads and shared state" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: P1-W04-M2
+tier: T2
+one-sentence-goal: A read-modify-write that can be interrupted between the read and the write loses updates, and a lock is a promise that nobody interrupts it.
+elements:
+  - top: two hand-drawn timeline lanes, "Thread A" and "Thread B", running left to right, with a shared box "counter = 5" drawn between them
+  - on lane A: three ticks "READ 5" -> "ADD 1 -> 6" -> "WRITE 6"
+  - on lane B: three ticks drawn INTERLEAVED between A's, "READ 5" -> "ADD 1 -> 6" -> "WRITE 6"
+  - the shared box redrawn at the end holding "6", with a big red circled note "two increments, one result. ONE UPDATE LOST."
+  - amber margin note: "the bug is not the addition. it is that something happened between the READ and the WRITE."
+  - middle band: the same two lanes with a hand-drawn padlock spanning A's three ticks, B's lane greyed out and labelled "blocked", final value "7" with a green tick
+  - lower-left: the deadlock, drawn as two threads and two padlocks in a circle — "A holds L1, wants L2" / "B holds L2, wants L1" — with a red circular arrow through both and the note "cycle = deadlock"
+  - beside it the fix: both lock icons numbered "1" and "2" with the note "ALWAYS acquire in the same order. that breaks the cycle."
+  - lower-right: the queue design drawn as a pipe with producer boxes on the left and consumer boxes on the right, and a hand-written note "no shared mutable state = nothing to race over", with the cost written in: "queue.Queue put+get 654.7 ns vs bare lock 24.9 ns — worth it"
+  - a red cross-out over "counter += 1 is atomic, I tested it" with "0 lost with `+= 1`, 64.86% lost with a function call in the middle. it is ACCIDENTAL."
+  - dangling arrow: "…and what happens when you add more threads? -> contention, Layer 3"
+numbers-to-write-in: 10,377,375 lost of 16,000,000 (64.86%) · with lock: 0 lost · bare op 16.6 ns · with Lock 86.3 ns (5.2x) · Queue put+get 654.7 ns · thread create 126.3 us
+alt: A hand-drawn diagram showing two thread timelines interleaving a read-modify-write on a shared counter so that one update is lost, the same sequence protected by a lock, a two-lock deadlock cycle beside its lock-ordering fix, and a producer-consumer queue design with the measured cost of each primitive.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term is defined where it first appears.
+
+### The one idea
+
+Threads inside one process **share all memory**. That is what makes them fast — no copying, no serialising — and it is what makes them dangerous. When two threads change the same variable, the result depends on the exact order their instructions happened to interleave, and that order changes on every run.
+
+The specific pattern that breaks is **read, modify, write**. If anything happens between the read and the write, the write is based on stale information and one update disappears.
+
+### The analogy
+
+Two people share a bank account with a paper balance sheet.
+
+Both want to deposit £10. The current balance is £100.
+
+- **Person A** reads the balance: £100.
+- **Person B** reads the balance: £100. *(Neither has written yet.)*
+- **A** writes £110.
+- **B** writes £110.
+
+Two deposits of £10 into an account that went from £100 to £110. **Ten pounds vanished**, and nobody did anything wrong individually — every step was correct in isolation.
+
+The fix is a **lock**: a rule that says only one person may hold the balance sheet at a time, from reading it to writing it back. Everyone else waits.
+
+Notice what the lock actually protects. It is not the writing. It is the *gap* between reading and writing.
+
+### The vocabulary, defined
+
+- **Shared state** — data more than one thread can read or write.
+- **Race condition** — a bug where the result depends on the timing of threads, so it happens sometimes and not others.
+- **Lost update** — the specific race above: two read-modify-writes overlap and one is overwritten.
+- **Critical section** — the region of code that must not be interrupted by another thread touching the same data.
+- **Lock (mutex)** — an object that only one thread can hold. Others block until it is released.
+- **`threading.Lock`** — Python's basic lock. Use it with `with`.
+- **`RLock`** — a **re**entrant lock: the thread already holding it can acquire it again. For recursive code.
+- **`Semaphore(n)`** — like a lock, but *n* threads may hold it at once. For limiting concurrency.
+- **`Event`** — a flag threads can wait on. One thread sets it; waiters wake.
+- **`queue.Queue`** — a thread-safe container. Producers put, consumers get, and the queue does all the locking.
+- **Deadlock** — two or more threads each waiting for a lock another holds. Nothing proceeds, ever.
+- **`ThreadPoolExecutor`** — a fixed set of worker threads you submit jobs to.
+- **Daemon thread** — a thread that does not keep the program alive; it is killed when the main thread exits.
+
+### Smallest working example
+
+```python
+import threading
+
+def ident(x):           # a function call, which is where a thread can be interrupted
+    return x
+
+counter = 0
+
+def worker(n: int) -> None:
+    global counter
+    for _ in range(n):
+        counter = counter + ident(1)        # READ, then MODIFY, then WRITE
+
+threads = [threading.Thread(target=worker, args=(2_000_000,)) for _ in range(8)]
+for t in threads: t.start()
+for t in threads: t.join()
+
+expected = 8 * 2_000_000
+print(f"expected {expected:,}   got {counter:,}   lost {expected - counter:,}")
+```
+
+Measured on this machine:
+
+```
+expected 16,000,000   got 5,622,625   lost 10,377,375
+```
+
+**64.86% of the work vanished.** No error, no warning, no crash. Just a wrong number.
+
+### The fix
+
+```python
+counter = 0
+lock = threading.Lock()
+
+def worker(n: int) -> None:
+    global counter
+    for _ in range(n):
+        with lock:                          # only one thread inside this block at a time
+            counter = counter + ident(1)
+```
+
+```
+expected 16,000,000   got 16,000,000   lost 0
+```
+
+### Line-by-line walkthrough
+
+- `global counter` — say that we assign to the module-level `counter` rather than creating a local one. Without it, `counter = ...` creates a local variable and the shared value never changes at all — a different bug with the same symptom of "the number is wrong".
+- `counter = counter + ident(1)` — three separate steps: **read** `counter`, **compute** the sum, **write** it back. Another thread can run in the gap. The `ident(1)` call is deliberately there because it creates an interruption point; Layer 3 explains why that detail matters more than it should.
+- `threading.Thread(target=worker, args=(2_000_000,))` — create a thread. `args` is a tuple; `args=(x)` is a common mistake because it is not a tuple, `args=(x,)` is.
+- `t.start()` — begin running. Calling `t.run()` instead executes it on the *current* thread, which is a silent way to write concurrent-looking code that is not concurrent.
+- `t.join()` — wait for it to finish. Starting all threads and *then* joining all of them is the pattern; starting and joining one at a time runs them sequentially.
+- `with lock:` — acquire on entry, release on exit **even if the body raises**. Always use `with`; a manual `acquire()`/`release()` pair leaks the lock forever on an exception, and every thread then blocks permanently.
+
+### Guided practice
+
+<Steps>
+<Step title="Watch the numbers move">
+Run the unlocked version five times. You will get five different wrong answers. That variability is the signature of a race — a bug that produces a *different* wrong answer each run is almost always a race, and a bug that produces the *same* wrong answer usually is not.
+</Step>
+<Step title="Feel what the lock costs">
+
+```python
+import timeit
+print("no lock ", timeit.timeit("c[0]=c[0]+1", setup="c=[0]", number=2_000_000))
+print("locked  ", timeit.timeit("with l: c[0]=c[0]+1",
+                                setup="import threading;l=threading.Lock();c=[0]", number=2_000_000))
+```
+
+Measured: **16.6 ns** unlocked, **86.3 ns** locked — **5.2×**. That is the price of correctness for one increment. It is irrelevant once per request and significant once per array element, which is the whole art of choosing lock granularity.
+</Step>
+<Step title="Cause a deadlock on purpose">
+
+```python
+import threading, time
+
+lock_a, lock_b = threading.Lock(), threading.Lock()
+
+def task_1():
+    with lock_a:
+        time.sleep(0.1)          # give task_2 time to grab lock_b
+        with lock_b:
+            print("task 1 done")
+
+def task_2():
+    with lock_b:                 # OPPOSITE ORDER — this is the bug
+        time.sleep(0.1)
+        with lock_a:
+            print("task 2 done")
+
+t1 = threading.Thread(target=task_1); t2 = threading.Thread(target=task_2)
+t1.start(); t2.start()
+t1.join(timeout=3); t2.join(timeout=3)
+print("still alive:", t1.is_alive(), t2.is_alive())   # True True — deadlocked
+```
+
+Neither prints. Thread 1 holds A and waits for B; thread 2 holds B and waits for A. Nothing will ever change.
+
+**The fix is one rule: always acquire locks in the same order.** Give them a global order — alphabetical, by `id()`, by a numbered constant — and make every code path follow it. Change `task_2` to take `lock_a` first and both complete.
+</Step>
+<Step title="See the deadlock in a stack dump">
+
+```python
+import faulthandler, threading, sys
+faulthandler.dump_traceback_later(5, exit=True)      # after 5 s, dump ALL threads and abort
+```
+
+Add that line before starting the threads. Five seconds later you get a traceback for every thread, showing exactly which line each is blocked on. That is the standard way to diagnose a hung Python process, and it works in production — `faulthandler.register(signal.SIGUSR1)` lets you dump on demand by sending a signal.
+</Step>
+<Step title="Design the race away with a queue">
+
+```python
+import queue, threading
+
+work = queue.Queue()
+results = queue.Queue()
+
+def worker():
+    while True:
+        item = work.get()
+        if item is None:                # sentinel: tells this worker to stop
+            work.task_done()
+            break
+        results.put(item * 2)
+        work.task_done()
+
+threads = [threading.Thread(target=worker, daemon=True) for _ in range(4)]
+for t in threads: t.start()
+
+for i in range(100): work.put(i)
+for _ in threads: work.put(None)        # one sentinel per worker
+work.join()                             # wait until every task_done() has been called
+
+total = 0
+while not results.empty():
+    total += results.get()
+print(total)                            # 9900
+```
+
+**There is no shared mutable state here**, so there is nothing to race over. The queue does all the locking internally, and the workers only touch data they own. This is the design to reach for first; a lock is what you use when you cannot get here.
+</Step>
+</Steps>
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **What exactly is a lost update?** — two read-modify-write sequences overlap, so the second write is based on a value read before the first write landed.
+2. **What does a lock protect?** — the *gap* between the read and the write, not the write itself.
+3. **Why `with lock:` rather than `acquire()`/`release()`?** — `with` releases even when the body raises. A manual pair leaks the lock on an exception and everything blocks forever.
+4. **What causes a deadlock and what fixes it?** — two threads acquiring the same two locks in opposite orders. Fix: a global lock ordering that every path obeys.
+5. **Why is a queue better than a shared list plus a lock?** — the queue removes the shared mutable state entirely, so there is no critical section for you to get wrong.
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions. Measured with CPython 3.13.2 on an Apple M3 Pro (11 cores), macOS 15, minimum of 7 runs.
+
+### Primitive costs
+
+| Operation | ns/op |
+|---|---|
+| `c[0] = c[0] + 1` (unsynchronised) | **16.6** |
+| `lock.acquire(); lock.release()` | 24.9 |
+| `with lock: c[0] = c[0] + 1` | **86.3** (5.2× the bare op) |
+| `with rlock: pass` (`RLock`) | 83.1 |
+| `queue.Queue` put + get | **654.7** |
+| `deque` append + popleft (no lock) | 13.3 |
+| `threading.Thread` create + join | **126.3 µs** |
+
+Three design consequences.
+
+**A `with lock:` block costs about 70 ns of overhead.** Once per request, invisible. Once per element of a million-element loop, 70 ms. That is the whole argument for **coarse locking around a batch** rather than fine locking around each item.
+
+**`queue.Queue` is 26× a bare lock acquire-release**, because it is a lock plus two condition variables plus counters plus `task_done` bookkeeping. At 655 ns it still handles 1.5 million items/second per queue, so it is the right default — but it is not free, and a hot pipeline moving tens of millions of small items wants batching (put lists of 1,000, not single items) or a lock-free `deque`, whose `append`/`popleft` are atomic under the GIL.
+
+**Threads cost 126 µs to create.** Spawning one per request caps you at about 8,000 requests/second on creation alone, before any work — which is why every real system uses a pool.
+
+### Lock granularity: the actual trade-off
+
+```python
+# COARSE: one lock for the whole cache. Simple, correct, and a bottleneck under load.
+class Cache:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._data: dict[str, bytes] = {}
+    def get(self, k): 
+        with self._lock:
+            return self._data.get(k)
+    def put(self, k, v):
+        with self._lock:
+            self._data[k] = v
+
+# STRIPED: N locks, chosen by hash. N-fold less contention, N-fold more chances to deadlock.
+class StripedCache:
+    def __init__(self, stripes: int = 16):
+        self._locks = [threading.Lock() for _ in range(stripes)]
+        self._maps: list[dict[str, bytes]] = [{} for _ in range(stripes)]
+    def _stripe(self, k: str) -> int:
+        return hash(k) % len(self._locks)
+    def get(self, k):
+        i = self._stripe(k)
+        with self._locks[i]:
+            return self._maps[i].get(k)
+```
+
+Striping is the standard answer to lock contention and it has a real cost: **any operation touching two stripes must order them**, or you have reintroduced the deadlock from Layer 1. A `move(k1, k2)` on the striped cache must acquire `min(i, j)` before `max(i, j)`, always.
+
+Worth knowing before you build either: **CPython's built-in `dict` operations are already atomic under the GIL** — `d[k] = v`, `d.get(k)`, `d.pop(k, None)` each complete without an interruption point. So a cache with no invariant *between* keys often needs no lock at all. What needs a lock is a compound operation: check-then-set, or "read two keys that must be consistent with each other". Layer 3 explains why relying on that is still risky.
+
+### Deadlock: the four conditions, and which one you break
+
+Coffman's four necessary conditions — all four must hold for a deadlock to be possible:
+
+1. **Mutual exclusion** — a resource is held exclusively.
+2. **Hold and wait** — a thread holds one resource while requesting another.
+3. **No preemption** — a resource cannot be forcibly taken.
+4. **Circular wait** — a cycle of threads each waiting on the next.
+
+You break one of them:
+
+| Break | How | Cost |
+|---|---|---|
+| **Circular wait** | **global lock ordering** — every path acquires in the same order | free; needs discipline and review |
+| Hold and wait | acquire all locks at once, or none (`try` all, back off, retry) | livelock risk; needs a backoff |
+| No preemption | `lock.acquire(timeout=…)`, release everything and retry on failure | must make the retry idempotent |
+| Mutual exclusion | remove the shared state — a queue, immutability, one owner thread | usually a redesign, and usually the right one |
+
+**Lock ordering is the fix you should reach for**, and the practical version is: define the order once, document it in the module docstring, and enforce it in review. When ordering is genuinely impossible, `lock.acquire(timeout=0.5)` with a back-off is the fallback:
+
+```python
+def transfer(a: Account, b: Account, amount: int) -> None:
+    first, second = (a, b) if id(a) < id(b) else (b, a)      # a total order on any two objects
+    with first.lock, second.lock:
+        a.balance -= amount
+        b.balance += amount
+```
+
+`id()` gives a stable total order within one process, which is enough. If accounts have numeric IDs, order by those instead — it is more readable and stable across processes.
+
+### Prefer queues to shared state
+
+The design that avoids all of this is a pipeline where each thread owns its data and communicates by passing messages:
+
+```python
+"""Bounded producer-consumer with clean shutdown and error propagation."""
+from __future__ import annotations
+
+import queue
+import threading
+from collections.abc import Callable, Iterable
+from typing import Any
+
+SENTINEL = object()
+
+
+def run_pipeline(items: Iterable[Any], work: Callable[[Any], Any], n_workers: int = 8,
+                 max_queue: int = 1000) -> list[Any]:
+    tasks: queue.Queue = queue.Queue(maxsize=max_queue)     # BOUNDED -> back-pressure
+    results: queue.Queue = queue.Queue()
+    errors: list[BaseException] = []
+    errors_lock = threading.Lock()
+
+    def worker() -> None:
+        while True:
+            item = tasks.get()
+            try:
+                if item is SENTINEL:
+                    return
+                results.put(work(item))
+            except BaseException as exc:                     # never let a worker die silently
+                with errors_lock:
+                    errors.append(exc)
+            finally:
+                tasks.task_done()
+
+    threads = [threading.Thread(target=worker, name=f"worker-{i}", daemon=True)
+               for i in range(n_workers)]
+    for t in threads:
+        t.start()
+
+    for item in items:
+        tasks.put(item)                 # BLOCKS when the queue is full: that is the point
+    for _ in threads:
+        tasks.put(SENTINEL)
+    for t in threads:
+        t.join()
+
+    if errors:
+        raise ExceptionGroup("pipeline failures", errors)    # 3.11+; see Module 4
+    return list(results.queue)
+```
+
+Four decisions worth defending:
+
+- **`maxsize` on the task queue.** An unbounded queue means a fast producer can read a 50 GB file into memory ahead of slow workers. A bounded queue makes `put` block, which propagates back-pressure to the producer for free — the same mechanism as a Unix pipe (Week 2).
+- **`try/except BaseException` in the worker loop.** A worker thread that raises simply dies, silently. The pool then has fewer workers than you think and eventually zero, and the symptom is "it hangs". Catch everything, record it, keep the worker alive.
+- **A sentinel per worker.** `None` works, but a unique `object()` cannot collide with legitimate data.
+- **`ExceptionGroup`** (3.11+) surfaces *all* failures rather than the first one. Concurrent code fails in several ways at once, and reporting one of them hides the pattern.
+
+### Trade-offs table
+
+| Decision | Choose X when… | Choose Y when… |
+|---|---|---|
+| Lock vs queue | **Lock** for a small critical section over state that genuinely must be shared — a counter, a cache with no cross-key invariant | **Queue** whenever the work decomposes into independent items. No shared mutable state means no race to get wrong; 655 ns/item is cheap insurance |
+| Coarse vs striped locking | **Coarse** by default: one lock, obviously correct, and 86 ns per operation | **Striped** only after measuring contention. It cuts contention N-fold and introduces multi-lock ordering, which is where deadlocks come from |
+| `Lock` vs `RLock` | **`Lock`** always by default — if you deadlock against yourself, you have a design problem worth finding | **`RLock`** for genuinely recursive code, or a public method calling another public method that both lock. Costs 83 ns versus 86 ns, so the price is not the reason |
+| Bounded vs unbounded queue | **Bounded** essentially always: back-pressure is a feature, and it bounds memory | **Unbounded** only when the producer is provably finite and small, and you have measured the peak |
+| `ThreadPoolExecutor` vs raw threads | **`ThreadPoolExecutor`** for request/response work: bounded, reusable, futures carry exceptions back | **Raw threads** for long-lived loops (a poller, a scheduler) that are not request-shaped |
+
+### What breaks in the real world
+
+A metrics aggregator collected counters from a thread pool of 16 workers into a shared `dict[str, int]`. The code looked safe:
+
+```python
+counts: dict[str, int] = {}
+lock = threading.Lock()
+
+def record(key: str) -> None:
+    with lock:
+        counts[key] = counts.get(key, 0) + 1
+```
+
+It was correct. It was also the bottleneck: at 400,000 events/second across 16 threads, all sixteen serialised on one lock, and profiling showed 60% of worker time inside `record`. Throughput plateaued at about 250,000 events/second no matter how many workers were added — the shape from Module 1, where more workers stop helping because something is serialised.
+
+The fix was to remove the sharing rather than to make the lock faster: **each worker accumulates into its own local dict**, and a single reducer merges them once per second.
+
+```python
+local = threading.local()
+
+def record(key: str) -> None:
+    d = getattr(local, "counts", None)
+    if d is None:
+        d = local.counts = {}
+        with registry_lock:
+            registry.append(d)          # register once, per thread
+    d[key] = d.get(key, 0) + 1          # NO LOCK: this dict has exactly one writer
+```
+
+Throughput went to 1.4 million events/second and the lock disappeared from the profile. The reducer takes a lock once per second instead of 400,000 times.
+
+Two generalisable points. **Contention is a design problem, not a lock-implementation problem** — a faster lock would have bought a few percent; removing the sharing bought 5.6×. And **`threading.local()` is the standard tool for per-thread accumulation**, but note its trap: under `asyncio` (Module 4) thousands of tasks share one thread, so `threading.local` is *shared* between them and `ContextVar` is the correct replacement.
+
+<Accordion title="Design checkpoint — one question, with a model answer">
+
+**Question.** A colleague's worker pool occasionally hangs in production. Restarting fixes it. They propose adding `lock.acquire(timeout=30)` everywhere and retrying on timeout. What do you propose?
+
+**Model answer.** Diagnose first — you can get the answer in one command — and treat the timeout as a last resort, because it converts a deadlock into a livelock and hides the cause.
+
+**Get the evidence.** A hung Python process gives up its state immediately:
+
+```bash
+py-spy dump --pid <pid>            # every thread's stack, no code changes, no restart
+```
+
+or, if you can add one line ahead of time:
+
+```python
+import faulthandler, signal
+faulthandler.register(signal.SIGUSR1)      # then: kill -USR1 <pid>
+```
+
+Either produces a stack for every thread. A deadlock is unmistakable: two or more threads blocked in `acquire`, and reading the frames above them shows which locks they hold. That takes minutes and it names the exact pair of call paths.
+
+**Then classify what you found.** Three different hangs look identical from outside:
+
+- **A lock-ordering deadlock** — the fix is a global ordering, not a timeout.
+- **A worker that died from an unhandled exception**, so the pool has fewer workers than it thinks and eventually zero. The stack dump shows *missing* threads rather than blocked ones. The fix is `try/except BaseException` in the worker loop.
+- **An unbounded queue plus a slow consumer** — nothing is deadlocked, everything is waiting, and memory is climbing. `queue.qsize()` and RSS tell you immediately.
+
+Only the first is a deadlock, and in my experience the second is more common and is the one a blanket timeout would hide most effectively.
+
+**Why the timeout proposal is wrong as a first move.** It does not remove the cycle; both threads time out, back off, and re-acquire in the same order, so you get repeated near-deadlocks — a livelock with worse latency and no error. It also makes every acquisition path a failure path you must now handle, which is a large amount of new code written to avoid understanding a small amount of old code. And a 30-second timeout means a real deadlock costs 30 seconds of p99 rather than a page.
+
+**What I would actually do:** capture the dump; if it is ordering, define and document a global lock order and enforce it in review; if it is a dying worker, wrap the loop and add a metric for worker count; and add a liveness check — a heartbeat metric per worker, alerting when a worker has not completed an item in N seconds — so the next occurrence pages someone instead of being discovered by a customer. If after all that there remains a path where ordering genuinely cannot be established, `acquire(timeout=...)` with a randomised back-off is a legitimate fallback for *that path*, documented as such.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a measured number. Figures from CPython 3.13.2 on an Apple
+M3 Pro (11 cores, 18 GB), macOS 15. Race results in particular are sensitive to interpreter
+version — that is the point of the first section. If you cannot reproduce a number on your own
+machine, treat the claim as unproven and tell us.
+</Warning>
+
+### Accidental atomicity: the measurement that should change how you review code
+
+Eight threads, 2,000,000 increments each of a shared global, default switch interval (5 ms):
+
+| Statement in the loop | Final value | Lost | Percentage |
+|---|---|---|---|
+| `counter += 1` | 16,000,000 | **0** | **0.00%** |
+| `counter = counter + ident(1)` | 5,622,625 | **10,377,375** | **64.86%** |
+
+Both are read-modify-write races. The first loses **nothing**, across 16 million opportunities, on CPython 3.13.
+
+The reason is the GIL-release mechanism from Module 1. Since CPython 3.10 the eval loop checks for a GIL drop request only at specific instruction boundaries — loop back-edges, function calls, and a handful of others — not between every pair of bytecodes. `counter += 1` compiles to `LOAD_GLOBAL / LOAD_CONST / BINARY_OP / STORE_GLOBAL` with no check point inside, so it is **effectively atomic on this interpreter**. Insert a function call and you insert a check point, and two thirds of the work disappears.
+
+Three things follow, and they are the most important content in this module.
+
+**Never infer thread-safety from a `dis` listing.** It is correct for the version you disassembled and for no other. The 3.9 behaviour differed; the 3.14 behaviour may differ; the free-threaded build definitely differs.
+
+**"I tested it and it was fine" is the failure mode**, not the reassurance. A race that never fires in testing and fires at 64% under a slightly different code shape is worse than one that fails immediately.
+
+**Under free-threaded CPython (3.13t/3.14t) this protection is gone entirely.** Code that has been silently relying on GIL atomicity for a decade — which is a lot of code — becomes genuinely racy. This is the single largest practical risk in the free-threading migration, and it is invisible to type checkers and linters.
+
+The operations CPython documents as atomic (`list.append`, `dict[k] = v`, `deque.append`) are safe by design and remain safe in the free-threaded build because they take internal locks. Everything else needs your own lock.
+
+### Contention: where the throughput goes
+
+Lock cost is not a constant; it depends on whether the lock is held.
+
+- **Uncontended acquire/release: 24.9 ns.** CPython's `Lock` uses a fast atomic compare-and-swap and never enters the kernel.
+- **Contended:** the loser blocks on a futex (Linux) or a Mach semaphore (macOS), which means a syscall, a context switch out and another back in — on the order of **1–10 µs**, or 40–400× the uncontended cost.
+
+That non-linearity is why throughput does not degrade gracefully. Below the contention threshold you pay 25 ns; above it, you pay microseconds *and* the CPU spends its time switching rather than working. The measured shape is a plateau followed by a decline — exactly the metrics-aggregator story, which plateaued at 250,000 events/second and did not improve with more workers.
+
+**Little's law gives you the diagnostic.** For a lock, `throughput = concurrency / service_time`. If the critical section takes 1 µs, one lock caps the whole system at 1,000,000 operations/second *no matter how many cores you have*. Measure your critical section, divide, and compare to your target: if the target exceeds the cap, no amount of tuning helps and the sharing must go.
+
+**False sharing** is the hardware version of the same problem. Two threads updating two different variables that happen to sit in the same 64-byte (or 128-byte on Apple silicon) cache line cause that line to ping-pong between cores, and each access costs a coherence miss. In Python you rarely control layout directly, but it is exactly what happens with reference counts: two threads touching *different* Python objects that share a cache line both dirty it. That is one of the costs PEP 683's immortal objects removes for `None`, `True` and small integers.
+
+### The memory model, and why "visibility" is not your problem (yet)
+
+In C++ or Java you must reason about **memory visibility**: without synchronisation, a write by one thread may not be observed by another for an unbounded time, because of store buffers and compiler reordering.
+
+Under the GIL you get this for free — acquiring and releasing the GIL is a full barrier, so any thread that runs after another sees all its writes. That is a large part of why Python threading feels forgiving.
+
+**Free-threaded CPython changes this.** PEP 703 specifies that the interpreter itself remains internally consistent, but it does *not* promise sequential consistency for your data structures. Code that relied on GIL-provided barriers — a common pattern being "set a flag in one thread, poll it in another" — needs explicit synchronisation. Use `threading.Event` rather than a bare boolean; it is 83 ns and it is correct under every build.
+
+### Diagnosing a hung process, without a restart
+
+```bash
+py-spy dump --pid 4711                 # every thread's Python stack, no code changes
+py-spy top  --pid 4711                 # live: where threads actually are, GIL wait included
+```
+
+```python
+import faulthandler, signal
+faulthandler.register(signal.SIGUSR1)  # kill -USR1 <pid> dumps every thread
+faulthandler.dump_traceback_later(30, exit=True)   # watchdog: dump and abort after 30 s
+```
+
+`py-spy` reads the target process's memory from outside, so it needs no cooperation and no prior instrumentation — it works on a process that is already wedged in production. That is the tool to install before you need it.
+
+Reading the dump, three signatures:
+
+| What you see | Diagnosis |
+|---|---|
+| Two threads in `acquire`, holding each other's locks | ordering deadlock — fix the order |
+| Fewer worker threads than expected, none blocked | workers died on unhandled exceptions |
+| All workers in `queue.get`, producer in `queue.put` | full bounded queue with a stalled consumer, or a missing sentinel |
+| All threads in `<built-in method ... acquire>` on one lock | contention, not deadlock — the aggregator story |
+
+### Thread pools: sizing, and what `concurrent.futures` actually does
+
+`ThreadPoolExecutor` since Python 3.8 defaults to `min(32, os.cpu_count() + 4)`, which is a compromise for I/O-bound work — it deliberately exceeds the core count because the threads are expected to be waiting.
+
+Internally it is a `SimpleQueue` of work items plus lazily-created worker threads, and each worker loops `get`, run, set the future's result. Three behaviours to know:
+
+- **`Future.result()` re-raises the worker's exception in the calling thread**, with the original traceback attached as `__cause__`. That is why `executor.map` looks like it swallowed an error until you iterate the results — the exception is raised at iteration, not at submission.
+- **`shutdown(wait=True)` is implicit on `with` exit**, and it waits for *submitted* work. `cancel_futures=True` (3.9+) drops not-yet-started items.
+- **There is no per-task timeout.** `future.result(timeout=5)` times out *your wait*; the worker keeps running. Cancelling a running thread is not possible in Python, which is a real limitation and one of the strongest arguments for asyncio, where cancellation is first-class (Module 4).
+
+Sizing, from Little's law: for I/O-bound work, `threads ≈ target_throughput × average_latency`. Two hundred requests/second at 100 ms each needs about 20 threads in flight. Adding more does not help once the upstream is saturated, and each costs 512 KB–8 MB of stack plus scheduler pressure.
+
+### Production failure modes and how you detect them
+
+| Failure | Signature | Detection |
+|---|---|---|
+| Race that testing never fires | wrong totals under load, correct in CI; a *different* wrong answer each run | reproduce with `sys.setswitchinterval(1e-6)` and a function call in the critical section; never trust bytecode reasoning |
+| Ordering deadlock | process hangs; restart "fixes" it | `py-spy dump`; two threads in `acquire` holding each other's locks; fix with a global order |
+| Worker died silently | throughput drops in steps; eventually hangs | dump shows missing threads; wrap the worker loop in `try/except BaseException` |
+| Lock contention plateau | throughput flat then declining as workers increase | profile time inside the lock; apply Little's law to the critical section; remove the sharing |
+| Unbounded queue | RSS climbs, no error, consumer keeps up "eventually" | `queue.qsize()` as a metric; set `maxsize` |
+| `threading.local` under asyncio | tasks read each other's "thread-local" data | `ContextVar` instead — one thread, thousands of tasks |
+| Executor swallows an exception | `map` returns and nothing seems wrong | exceptions raise on iteration/`result()`; iterate results, or use `as_completed` |
+| Free-threaded build exposes old races | code that worked for years starts corrupting data | audit every shared mutable structure; `Event` not bare flags; explicit locks |
+
+### Frontier and research pointers
+
+- **Coffman, E. G., Elphick, M. & Shoshani, A. (1971). "System Deadlocks." *ACM Computing Surveys* 3(2).** One-sentence takeaway: deadlock requires four simultaneous conditions, so preventing any one of them prevents deadlock — and breaking circular wait via a global lock order is the cheapest.
+- **Lamport, L. (1979). "How to Make a Multiprocessor Computer That Correctly Executes Multiprocess Programs." *IEEE Trans. Computers* C-28(9).** One-sentence takeaway: sequential consistency is what programmers assume and what hardware does not provide, which is why memory models and barriers exist.
+- **Gross, S. — PEP 703, sections on per-object locking and the memory model.** One-sentence takeaway: free-threaded CPython keeps the interpreter internally consistent but makes no sequential-consistency promise for your data, so GIL-derived safety disappears.
+- **Ousterhout, J. (1996). "Why Threads Are A Bad Idea (for most purposes)."** One-sentence takeaway: shared-memory concurrency makes every variable a potential race and every code path a potential deadlock, which is the argument for message passing and for the event loop.
+- **Herlihy, M. & Shavit, N. (2012). *The Art of Multiprocessor Programming*, revised ed., Chapters 7–8.** One-sentence takeaway: lock contention is a queueing problem, and the throughput cliff when a lock saturates is predictable from the critical-section length via Little's law.
+- **Boehm, H.-J. (2005). "Threads Cannot Be Implemented As a Library." *PLDI*.** One-sentence takeaway: correct threading requires guarantees from the *language*, not just a library, because a compiler that does not know about threads can legally break your synchronisation.
+
+### Stretch challenge
+
+Reproduce a deadlock, capture it, and fix it — then prove the fix.
+
+1. Build a two-account transfer system where `transfer(a, b)` locks both accounts. Write a test that runs `transfer(a, b)` and `transfer(b, a)` concurrently in a loop until it hangs. Record how many iterations it took.
+2. **Capture it with `faulthandler.dump_traceback_later(5, exit=True)` and with `py-spy dump`** against the live process. Show both outputs and identify the two locks and the two call paths from the traces alone.
+3. Fix it by lock ordering. Re-run the test for 100,000 iterations and show it never hangs.
+4. **Now measure the cost of the fix.** Compare throughput before (unsafe, no locks — and check whether it loses money) and after (ordered locks). What did correctness cost you in transfers/second?
+5. Implement the same thing three more ways and measure all four: (a) one global lock, (b) ordered per-account locks, (c) striped locks over account ID, (d) a single-owner thread that processes transfers from a `queue.Queue`. Report throughput at 1, 2, 4, 8 and 16 client threads for each.
+6. Finally, reproduce the accidental-atomicity result on your interpreter: run `counter += 1` and `counter = counter + ident(1)` under 8 threads × 2,000,000 and report lost updates for each. Then vary `sys.setswitchinterval` and see whether it changes the first one.
+
+The open question with no single right answer: design (d) — one owner thread and a queue — has no locks, cannot deadlock, and is trivially correct, but it caps throughput at one thread's speed and adds 655 ns of queue overhead per transfer. At what transfer rate does that become the wrong choice, and does your answer change if the requirement is "no transfer may ever be lost" rather than "maximise throughput"? Bring your numbers from step 5.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Reproduce a deadlock deliberately, capture it with `faulthandler` and `py-spy`, then fix it by lock ordering — and prove the fix over 100,000 iterations.
+</Card>
+
+Acceptance: the deadlock reproduces reliably and you report how many iterations it took; you show both a `faulthandler` dump and a `py-spy dump`, and identify the two locks from the traces alone; the ordered version runs 100,000 iterations without hanging; and you report the throughput cost of the fix in transfers/second.
+
+## The whiteboard
+
+The T1 sketch is the two interleaved timelines losing an update, with the locked version beneath. The T2 build-up frames step through the interleaving one operation at a time, then add the lock, then the deadlock cycle.
+
+<Tip>
+**Draw it yourself.** From memory: the two timelines with READ/ADD/WRITE interleaved and one
+update lost; the same sequence with the lock; and the two-lock deadlock cycle with its ordering
+fix. Then compare.
+[Blank version](/assets/diagrams/P1-W04-M2-blank.svg) · [Editable source](/assets/diagrams/P1-W04-M2.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Portfolio line:** *"A reproducible study of Python threading hazards: a lost-update race that discards 64.86% of 16 million increments, a deliberate deadlock captured with `py-spy` and fixed by lock ordering, and four synchronisation designs benchmarked at 1–16 client threads."* The `py-spy` capture is the part that reads as production experience.
+
+**The interview angle.** "What is a race condition?" invites a vague answer. The one that lands points at the interleaving: *two threads each read the counter as 5, each compute 6, each write 6 — two increments, one result. The lock protects the gap between the read and the write, not the write.*
+
+Then the follow-up that separates you: *and note that on CPython 3.13 `counter += 1` loses zero updates across 16 million tries, because there is no GIL check point inside that bytecode sequence — while the same logic with a function call in the middle loses 64.86%. So it is accidentally atomic, not safe, and it breaks under free-threaded builds. Never reason about thread-safety from a bytecode listing.*
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+Three places this shows up in a normal engineering week:
+
+1. **A service that hangs and is fixed by a restart.** Install `py-spy` now, before you need it — `py-spy dump --pid` gives every thread's stack on a wedged production process with no code change and no restart. Three signatures cover most cases: two threads in `acquire` (ordering deadlock), missing workers (silent exceptions), all threads in `queue.get` (stalled producer or a missing sentinel).
+
+2. **Throughput that plateaus when you add workers.** That is contention, not capacity. Measure the critical section and apply Little's law: a 1 µs critical section caps the whole system at 1,000,000 ops/second regardless of cores. The fix is usually to remove the sharing — per-thread accumulation plus periodic merge — not to make the lock faster.
+
+3. **Any worker loop you review.** Two lines catch most production hangs: `try/except BaseException` around the body so a worker cannot die silently, and `maxsize` on the queue so a fast producer cannot exhaust memory. Both are one-line changes and both prevent an outage class.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Shared counter is wrong under load | lost update: read-modify-write interleaved | `with lock:` around the whole read-modify-write |
+| The count is wrong *and* unchanged | missing `global`, so a local variable was created | declare `global`, or better, avoid module-level mutable state |
+| Everything blocks forever after an exception | `acquire()`/`release()` pair, and the body raised | always `with lock:` |
+| Two threads hang holding each other's locks | opposite acquisition orders | a global lock order; `id()` or a numeric key gives one |
+| Adding workers stops helping, then hurts | lock contention, not capacity | measure the critical section; remove the sharing; per-thread state plus merge |
+| The pool silently stops processing | a worker died on an unhandled exception | `try/except BaseException` in the worker loop; expose a worker-count metric |
+| RSS climbs with no error | unbounded queue and a slow consumer | `queue.Queue(maxsize=N)`; export `qsize()` |
+| `executor.map` seems to swallow errors | exceptions raise on iteration, not submission | iterate the results, or use `as_completed` and check each future |
+| `future.result(timeout=5)` did not stop the work | the timeout bounds your wait, not the thread | threads cannot be cancelled; use asyncio, or make the work check a flag |
+| "Thread-local" data is shared under asyncio | one thread, thousands of tasks | `ContextVar`, not `threading.local` |
+| Race appears only after a refactor | a function call added an interruption point into a previously atomic sequence | it was never safe; lock it |
+
+## Sources & further reading
+
+**Primary docs**
+
+- **[Python `threading` documentation (3.13) — `Lock`, `RLock`, `Semaphore`, `Event`, `Condition`, `local`.](https://docs.python.org/3/library/threading.html)** Read the `Condition` section even if you never use one directly; it is what `queue.Queue` is built from and it explains the wait/notify pattern.
+- **[Python `queue` documentation (3.13), including `task_done`/`join` and `SimpleQueue`.](https://docs.python.org/3/library/queue.html)** Read the `task_done` semantics carefully — the mismatch between `put` count and `task_done` count is a common cause of a hang at `join()`.
+- **[`concurrent.futures` documentation (3.13) — `ThreadPoolExecutor`, `Future`, `as_completed`, `shutdown(cancel_futures=)`.](https://docs.python.org/3/library/concurrent.futures.html)** Read the note that the default worker count is `min(32, cpu_count + 4)` and why it exceeds the core count.
+- **[`faulthandler` documentation (3.13).](https://docs.python.org/3/library/faulthandler.html)** Read `register()` and `dump_traceback_later()`; these two functions turn an unreproducible production hang into a stack trace.
+- **[`py-spy` README and the `dump`/`top` subcommands.](https://github.com/benfred/py-spy)** Read this for the fact that it attaches to a running process without cooperation, which is what makes it usable in an incident.
+
+**Papers**
+
+- **[Coffman, E. G., Elphick, M. J. & Shoshani, A. (1971). "System Deadlocks." *ACM Computing Surveys* 3(2), 67–78.](https://doi.org/10.1145/356586.356588)** One-sentence takeaway: four conditions are jointly necessary for deadlock, so breaking any one prevents it — and circular wait is the cheapest to break.
+- **[Lamport, L. (1979). "How to Make a Multiprocessor Computer That Correctly Executes Multiprocess Programs." *IEEE Transactions on Computers* C-28(9), 690–691.](https://doi.org/10.1109/TC.1979.1675439)** One-sentence takeaway: sequential consistency is the model programmers assume and hardware does not give for free.
+- **[Boehm, H.-J. (2005). "Threads Cannot Be Implemented As a Library." *PLDI*, 261–268.](https://doi.org/10.1145/1065010.1065042)** One-sentence takeaway: a compiler unaware of threads can legally transform code in ways that break library-level synchronisation, so threading must be a language-level guarantee.
+- **[Lu, S., Park, S., Seo, E. & Zhou, Y. (2008). "Learning from Mistakes: A Comprehensive Study on Real World Concurrency Bug Characteristics." *ASPLOS*.](https://doi.org/10.1145/1353536.1346323)** One-sentence takeaway: roughly a third of real concurrency bugs are order violations rather than atomicity violations, so "add a lock" is not the whole answer — many bugs are about *when* things happen, not about mutual exclusion.
+
+**Go deeper**
+
+- **Herlihy, M. & Shavit, N. (2012). *The Art of Multiprocessor Programming*, revised ed., Chapters 2–3 and 7–8.** The best treatment of why lock contention produces a throughput cliff, with the queueing analysis that makes it predictable rather than surprising.
+- **[Ramalho, L., *Fluent Python*, 2nd ed., Chapter 19 ("Concurrency Models in Python").](https://www.fluentpython.com/)** The clearest side-by-side comparison of threads, processes and coroutines in one place, with runnable examples of each hazard.
+- **[Ousterhout, J. (1996). "Why Threads Are A Bad Idea (for most purposes)" (slides).](https://web.stanford.edu/~ouster/cgi-bin/papers/threads.pdf)** Twenty-five slides that predicted the event-loop era; worth reading immediately before Module 4.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-04/p1-w04-m2">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

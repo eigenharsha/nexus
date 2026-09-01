@@ -1,0 +1,1047 @@
+---
+title: "`dlt`: declarative pipelines"
+description: "Week 15 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 15 · Module 4 · `P2-W15-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Write a `dlt` pipeline with **sources**, **resources** and a **destination** — in about 15 lines.
+2. Choose between the three write dispositions — `replace`, `append`, `merge` — deliberately.
+3. Load **incrementally** with a cursor, so the second run is nearly free.
+4. Let `dlt` **infer and evolve** a schema, and know precisely what it does to each kind of change.
+5. Normalize nested JSON into parent and child tables automatically.
+6. Use **schema contracts** (`evolve` / `freeze` / `discard_value` / `discard_row`) to decide what
+   happens when the source surprises you.
+
+<Info>
+**Where this returns.** The schema-contract decision — evolve silently, or fail loudly — is the same
+decision you make in week 16 about missing data, in week 19 about unseen categorical levels, and in
+week 31 about untrusted content from a retrieved document. **"What should happen when the input is
+not what I expected?" is the recurring question**, and this module gives you a concrete vocabulary
+for answering it.
+</Info>
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p2-w15-m4.svg" alt="Hand-drawn sketch: dlt schema evolution and the four contract modes" className="block dark:hidden" />
+  <img src="/assets/diagrams/p2-w15-m4-dark.svg" alt="Hand-drawn sketch: dlt schema evolution and the four contract modes" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p2-w15-m4
+tier: T2
+one-sentence-goal: dlt's default is to silently absorb every upstream change, and the schema contract is the one knob that decides whether a surprise becomes a new column or a failed run - which is a judgement call, not a technical default.
+elements:
+  - Frame 1 (top, the three changes): three small before/after table sketches side by side. (a) NEW FIELD: table gains a "currency" column, old rows filled with NULL, drawn in green with a tick. (b) TYPE CHANGE: a record arriving with amount="40.50" as a quoted string, an arrow through a small box labelled "coerce", emerging as 40.5 DOUBLE. Column type unchanged. Amber note: "it coerced. it did not tell you." (c) FIELD REMOVED: a row arriving without amount, the column staying and the cell filling with NULL. Note: "the column is NOT dropped."
+  - Frame 2 (the contract dial, the centrepiece): a hand-drawn dial or four-way switch labelled "schema_contract: columns". Four positions, each with its measured outcome written beside it - "evolve -> column added, row loaded" (green tick), "freeze -> DataValidationError, NOTHING loaded" (red cross), "discard_value -> row loaded, column silently dropped" (amber), "discard_row -> row silently vanishes" (red, with a small skull or a bin). Circle "discard_row" and write "the row is GONE. no error. think hard."
+  - Frame 3 (nested JSON): a JSON blob on the left with an "items" array, an arrow labelled "normalize", and TWO tables on the right - "orders(id, customer, _dlt_id)" and "orders__items(sku, qty, _dlt_parent_id, _dlt_list_idx)". Draw the join line from _dlt_id to _dlt_parent_id in green. Hand-write "one array = one child table. automatically."
+  - Frame 4 (bottom-left, small): the actual error text hand-lettered in a speech bubble - "Contract on columns with mode freeze is violated. Trying to add column loyalty_tier to table orders but columns are frozen."
+  - amber margin note bottom-right: "the DEFAULT is evolve. that is a choice someone made for you."
+numbers-to-write-in: dlt 1.4.1, duckdb 1.1.3, "40.50" -> 40.5, four contract modes, _dlt_id / _dlt_parent_id / _dlt_list_idx
+alt: A hand-drawn whiteboard sketch showing three upstream schema changes and how dlt handles each - a new field becoming a new column with nulls backfilled, a string value being silently coerced into the existing double column, and a removed field leaving the column in place with nulls - then a four-position dial for the schema contract showing that evolve adds the column, freeze raises a validation error and loads nothing, discard_value loads the row without the column, and discard_row silently drops the entire record; and finally a nested JSON array being normalized into a parent table and a child table joined by generated identifier columns.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+
+    ## The idea in one paragraph
+
+    In module 2 you wrote pagination, retries, watermarks and an idempotent load by hand. That was
+    the right way to learn it, and it is roughly 300 lines you now have to maintain for every source.
+    **`dlt` is a library that does all of it declaratively**: you write a Python generator that
+    yields dictionaries, you say where it should go, and `dlt` infers the schema, creates the tables,
+    flattens nested JSON into child tables, handles incremental cursors, and evolves the schema when
+    the source changes. The interesting part is not that it saves typing — it is that it makes a
+    set of decisions on your behalf, and this module is mostly about knowing which ones and how to
+    override them.
+
+    ### The analogy
+
+    Moving house.
+
+    - **By hand** (module 2), you decide what goes in each box, label them, work out which room each
+      goes to, and discover on arrival that the new house has no room for the piano.
+    - **With `dlt`**, you hand over the contents and it works out the boxes: it looks at what you
+      gave it, infers that plates go with plates, builds shelves that fit, and if you later add a
+      new kind of object it builds another shelf.
+    - **The catch**, and it is the whole module: **its default is to always build the new shelf.**
+      If the movers deliver something unexpected, `dlt` quietly makes room for it. Usually that is
+      what you want. Occasionally the unexpected thing is a sign that something is wrong upstream,
+      and you would much rather have been told.
+
+    ### Every term, defined
+
+    - **`dlt`** — "data load tool". An open-source Python library for the E and L of ELT. Pinned
+      here at **1.4.1**.
+    - **Resource** — a function that yields records, decorated with `@dlt.resource`. It becomes one
+      table.
+    - **Source** — a function that returns one or more resources, decorated with `@dlt.source`. It
+      becomes a group of related tables.
+    - **Pipeline** — the object binding a source to a destination and running the load.
+    - **Destination** — where data lands: `duckdb`, `postgres`, `bigquery`, `snowflake`, `filesystem`.
+    - **Write disposition** — what a run does to what is already there:
+      - **`replace`** — drop and rewrite the table.
+      - **`append`** — add rows, keep everything.
+      - **`merge`** — upsert on a primary key. **The one you usually want.**
+    - **Primary key** — the column(s) identifying a record, used by `merge`.
+    - **Incremental** — `dlt` remembers a cursor value between runs and asks the source only for
+      what is newer.
+    - **Schema inference** — `dlt` looks at the data and works out column names and types.
+    - **Schema evolution** — what happens when a later run's data does not match the existing schema.
+    - **Schema contract** — your policy for evolution: `evolve`, `freeze`, `discard_value`,
+      `discard_row`.
+    - **Normalization** — flattening nested JSON: nested objects become prefixed columns, arrays
+      become child tables.
+    - **State** — `dlt`'s own bookkeeping (cursor values, schema hashes), stored in the destination
+      alongside your data.
+
+    ### The 15-line pipeline
+
+    ```python
+    # simple_pipeline.py — dlt 1.4.1, duckdb 1.1.3
+    import dlt
+    import requests
+
+    @dlt.resource(name="issues", write_disposition="merge", primary_key="id")
+    def github_issues(repo: str = "duckdb/duckdb"):
+        url = f"https://api.github.com/repos/{repo}/issues"
+        params = {"state": "all", "per_page": 100}
+        while url:
+            r = requests.get(url, params=params, timeout=(5, 30))
+            r.raise_for_status()
+            yield r.json()                       # yield the whole page; dlt flattens it
+            url = r.links.get("next", {}).get("url")
+            params = {}                          # the next link already carries them
+
+    pipeline = dlt.pipeline(
+        pipeline_name="github",
+        destination="duckdb",
+        dataset_name="github_data",
+    )
+    info = pipeline.run(github_issues())
+    print(info)
+    ```
+
+    That is the whole thing. What it does that the module-2 version did not:
+
+    - Creates a DuckDB file and a `github_data` schema.
+    - **Infers every column and type** from the JSON — dozens of fields, no DDL written by you.
+    - **Flattens nested objects**: `user.login` becomes a `user__login` column.
+    - **Splits nested arrays into child tables**: `labels` becomes a `issues__labels` table joined
+      back to the parent.
+    - Upserts on `id`, so re-running does not duplicate.
+    - Records its own state, so the next run knows what it already has.
+    - Writes `_dlt_load_id` and `_dlt_id` columns for lineage.
+
+    ### Line-by-line walkthrough
+
+    - `@dlt.resource(name="issues", ...)` — turns a generator into a table definition. The name
+      becomes the table name.
+    - `write_disposition="merge", primary_key="id"` — **upsert.** Running twice does not duplicate.
+      This is the same idempotency property you built by hand in module 2, in two keyword arguments.
+    - `yield r.json()` — yielding a *list* is fine; `dlt` iterates it. You can yield one record, a
+      list, or a generator.
+    - `dlt.pipeline(...)` — `pipeline_name` identifies the state (so runs resume), `dataset_name` is
+      the schema inside the destination.
+    - `pipeline.run(...)` — extract, normalize, load. Three separate stages, and knowing they are
+      separate matters when you read an error message: **a schema-contract violation fails at
+      *normalize*, not at *load***, which is why the traceback mentions `NormalizeJobFailed`.
+
+    ### The three write dispositions
+
+    ```python
+    @dlt.resource(write_disposition="replace")        # drop and rewrite
+    def daily_snapshot(): ...
+    # Use for: small reference tables, full exports where history does not matter.
+    # Risk: the table is briefly empty or locked during the rewrite.
+
+    @dlt.resource(write_disposition="append")         # add rows, keep everything
+    def event_log(): ...
+    # Use for: immutable events, audit logs, anything where a record never changes.
+    # Risk: re-running duplicates. Requires you to never re-run the same window.
+
+    @dlt.resource(write_disposition="merge", primary_key="id")   # upsert
+    def customers(): ...
+    # Use for: almost everything else.
+    # Risk: only that your primary key is wrong. Get the key right and this is safe.
+    ```
+
+    **`merge` is the default you should reach for**, because it is the only one where re-running is
+    unconditionally safe — which is the property that lets the answer to a failed pipeline always be
+    "run it again".
+
+    ### Incremental loading
+
+    ```python
+    @dlt.resource(write_disposition="merge", primary_key="id")
+    def issues(
+        updated_at=dlt.sources.incremental("updated_at", initial_value="2024-01-01T00:00:00Z")
+    ):
+        """dlt persists the maximum `updated_at` it has seen and passes it back
+        on the next run as `updated_at.last_value`."""
+        params = {"since": updated_at.last_value, "per_page": 100, "sort": "updated"}
+        url = "https://api.github.com/repos/duckdb/duckdb/issues"
+        while url:
+            r = requests.get(url, params=params, timeout=(5, 30))
+            r.raise_for_status()
+            yield r.json()
+            url = r.links.get("next", {}).get("url")
+            params = {}
+    ```
+
+    The first run pulls everything since the `initial_value`. The second run pulls only what changed.
+    `dlt` stores `last_value` in its state table in the destination, so it survives restarts and
+    machine changes.
+
+    <Warning>
+    `dlt.sources.incremental` defaults to `last_value_func=max` with an **inclusive** boundary —
+    records equal to `last_value` are re-fetched and deduplicated by the primary key. That is the
+    safe direction, and it is the same overlapping-window principle as module 2. But it only
+    protects you against equality, not against **out-of-order commits** at the source. If your
+    source can commit a record with an older timestamp after you have advanced past it, subtract an
+    explicit overlap:
+
+    ```python
+    since = (datetime.fromisoformat(updated_at.last_value) - timedelta(minutes=15)).isoformat()
+    ```
+    </Warning>
+
+    ### Checkpoint — 5 questions before you continue
+
+    <AccordionGroup>
+      <Accordion title="1. What is the difference between a resource and a source?">
+        A **resource** is one table — a generator yielding records. A **source** groups related
+        resources, typically sharing configuration and credentials. `@dlt.source` returning three
+        `@dlt.resource` functions gives you three tables loaded together in one run, with one state
+        and one schema.
+      </Accordion>
+      <Accordion title="2. Which write disposition should you default to, and why?">
+        `merge` with a primary key. It is the only one where re-running is unconditionally safe.
+        `append` duplicates on a re-run; `replace` throws away history and briefly empties the table.
+        With `merge`, the answer to any failed run is "run it again", which is the property you want
+        at 3 a.m.
+      </Accordion>
+      <Accordion title="3. Where does dlt store its state, and why does that location matter?">
+        In the destination, in a `_dlt_pipeline_state` table alongside your data. That matters
+        because the state and the data are then in the **same transactional store** — the same
+        design you built by hand in module 2 — so they cannot diverge. It also means the state
+        survives losing the machine that ran the pipeline.
+      </Accordion>
+      <Accordion title="4. What happens to a nested array in the source JSON?">
+        It becomes a **child table**, named `parent__field`. `dlt` adds `_dlt_parent_id` (pointing at
+        the parent's `_dlt_id`) and `_dlt_list_idx` (the position in the array), so you can join back
+        and preserve order. Nested *objects* are flattened into prefixed columns instead —
+        `user.login` becomes `user__login`.
+      </Accordion>
+      <Accordion title="5. What is dlt's DEFAULT behaviour when the source adds a new field?">
+        It adds the column and backfills existing rows with `NULL`. No error, no warning. **That
+        default is a choice made on your behalf**, and it is right for most sources and wrong for
+        any source whose schema is supposed to be stable. Layer 2 measures all four alternatives.
+      </Accordion>
+    </AccordionGroup>
+
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+
+    ## Three upstream schema changes, forced and observed
+
+    The task is: force a new field, a type change and a removed field, and record exactly what
+    happens. Here is the run, verbatim, against `dlt` 1.4.1 into `duckdb` 1.1.3.
+
+    **Starting state.** Two records, `merge` on `id`:
+
+    ```
+    ### RUN 1 — baseline
+    columns: id:BIGINT, customer:VARCHAR, amount:DOUBLE
+      id=1 | customer='ann' | amount=10.0
+      id=2 | customer='bob' | amount=20.0
+    ```
+
+    **Change 1 — a new field appears.** The source starts sending `currency`:
+
+    ```
+    ### RUN 2 — NEW FIELD 'currency' appears upstream
+    columns: id:BIGINT, customer:VARCHAR, amount:DOUBLE, currency:VARCHAR
+      id=1 | customer='ann' | amount=10.0 | currency=None
+      id=2 | customer='bob' | amount=20.0 | currency='EUR'
+      id=3 | customer='cy'  | amount=30.0 | currency='USD'
+    ```
+
+    **Column added, existing rows backfilled with `NULL`, run succeeds, no warning.** Note that
+    `id=1` — which was never re-sent — now has a `currency` column containing null. That is correct
+    and it is also the thing to be aware of: **you cannot distinguish "the source did not send a
+    currency for this record" from "this record predates the currency field"** unless you keep the
+    load timestamp, which `dlt` does in `_dlt_load_id`.
+
+    **Change 2 — a type change.** The source sends `amount` as a quoted string, `"40.50"`:
+
+    ```
+    ### RUN 3 — TYPE CHANGE: amount arrives as text '40.50'
+    columns: id:BIGINT, customer:VARCHAR, amount:DOUBLE, currency:VARCHAR
+      ...
+      id=4 | customer='dee' | amount=40.5 | currency='GBP'
+    ```
+
+    **`dlt` coerced the string to `40.5` and left the column as `DOUBLE`.** No error, no new column,
+    no warning. This is the behaviour most people find surprising and it is the most important row
+    in this module: **a type change that is coercible is absorbed silently.**
+
+    That is usually what you want — an API that starts quoting its numbers has not broken anything
+    meaningful. But it means that if `amount` starts arriving as `"40.50 GBP"`, the coercion fails
+    and *then* you get an error, so the failure mode is "works, works, works, suddenly fails on one
+    record". If the type of a field matters, freeze it (below).
+
+    **Change 3 — fields removed.** The source stops sending `amount` and `currency`:
+
+    ```
+    ### RUN 4 — FIELDS REMOVED: amount and currency absent
+    columns: id:BIGINT, customer:VARCHAR, amount:DOUBLE, currency:VARCHAR
+      ...
+      id=5 | customer='ed' | amount=None | currency=None
+    ```
+
+    **The columns stay. The new row gets nulls. Nothing is dropped and nothing is reported.** `dlt`
+    never removes a column, because removing one would destroy history for every existing row. The
+    consequence is that **a removed upstream field is indistinguishable from a null value**, and
+    this is the change most likely to go unnoticed: your `amount` column simply starts filling with
+    nulls, and — exactly as in module 3's war story — `AVG(amount)` silently excludes them.
+
+    <Info>
+    Method: `dlt` 1.4.1 with the `duckdb` destination at 1.1.3, `write_disposition="merge"`,
+    `primary_key="id"`, four sequential `pipeline.run()` calls into the same dataset, table state
+    dumped from `information_schema` after each. Reproduce with `dlt_evolve.py`.
+    </Info>
+
+    ## The four schema contracts, measured
+
+    So the default absorbs everything. The `schema_contract` argument is how you change that. Each
+    mode was tested in an isolated pipeline — a new column `loyalty_tier` arriving on the second run:
+
+    ```
+    ### contract columns='evolve'
+      outcome: LOADED without error
+      columns now: id, customer, amount, loyalty_tier
+        id=1 | customer='ann' | amount=10.0 | loyalty_tier=None
+        id=2 | customer='bob' | amount=20.0 | loyalty_tier='gold'
+
+    ### contract columns='freeze'
+      outcome: RAISED PipelineStepFailed -> root cause DataValidationError
+      message: Contract on columns with mode freeze is violated. Trying to add
+               column loyalty_tier to table orders but columns are frozen.
+      columns now: id, customer, amount
+        id=1 | customer='ann' | amount=10.0
+                                             <- id=2 was NOT loaded
+
+    ### contract columns='discard_value'
+      outcome: LOADED without error
+      columns now: id, customer, amount
+        id=1 | customer='ann' | amount=10.0
+        id=2 | customer='bob' | amount=20.0   <- row loaded, extra column dropped
+
+    ### contract columns='discard_row'
+      outcome: LOADED without error
+      columns now: id, customer, amount
+        id=1 | customer='ann' | amount=10.0
+                                             <- id=2 SILENTLY VANISHED
+    ```
+
+    <Info>
+    Method: `dlt` 1.4.1, four separate pipelines each with its own working directory and DuckDB file,
+    identical baseline, identical incoming record. Reproduce with `dlt_contract.py`.
+    </Info>
+
+    | Mode | New column | The row | Error? | Use it when |
+    | --- | --- | --- | --- | --- |
+    | **`evolve`** (default) | added | loaded | no | exploratory work; sources that legitimately grow |
+    | **`freeze`** | rejected | **not loaded** | **`DataValidationError`** | the schema is a contract; you want a failed run and a human |
+    | **`discard_value`** | dropped | loaded | no | you genuinely only want known columns and the rest is noise |
+    | **`discard_row`** | — | **silently dropped** | no | almost never — see the warning |
+
+    <Warning>
+    **`discard_row` is dangerous and its danger is not obvious from the name.** The record vanishes.
+    No error, no warning, no count. The run reports success. If a source starts adding a field to
+    30% of its records, you silently lose 30% of your data and every health signal stays green —
+    which is precisely the silent-loss failure mode from module 2's war story, except that here you
+    configured it deliberately. If you use it, **you must also assert on row counts**, because
+    nothing else will tell you.
+    </Warning>
+
+    The contract applies at three levels independently, and you will usually want different settings
+    for each:
+
+    ```python
+    pipeline.run(
+        source,
+        schema_contract={
+            "tables": "evolve",        # a new table is fine
+            "columns": "freeze",       # a new column is NOT
+            "data_type": "freeze",     # a type change is NOT
+        },
+    )
+    ```
+
+    **My recommended default for anything a business decision depends on:**
+    `{"tables": "evolve", "columns": "freeze", "data_type": "freeze"}`. New tables are additive and
+    harmless. A new column or a changed type in an existing table means the source changed under
+    you, and you want a failed run and a human looking at it, not a silent adjustment.
+
+    ## Nested JSON, normalized
+
+    ```python
+    pipeline.run([
+        {"id": 1, "customer": "ann", "items": [{"sku": "A1", "qty": 2}, {"sku": "B2", "qty": 1}]},
+        {"id": 2, "customer": "bob", "items": [{"sku": "C3", "qty": 5}]},
+    ], table_name="orders", write_disposition="replace")
+    ```
+
+    Produces:
+
+    ```
+    tables created: orders, orders__items, _dlt_loads, _dlt_pipeline_state, _dlt_version
+
+    orders: id, customer, _dlt_load_id, _dlt_id
+    (1, 'ann', '1788211551.824613', 'OnKUToqw/PCcgg')
+    (2, 'bob', '1788211551.824613', 'ya1O8SrlpXr67Q')
+
+    orders__items: sku, qty, _dlt_parent_id, _dlt_list_idx, _dlt_id
+    ('A1', 2, 'OnKUToqw/PCcgg', 0, '5cYwSbIuHD3KAQ')
+    ('B2', 1, 'OnKUToqw/PCcgg', 1, 'pSrMQ2VuiJqhXQ')
+    ('C3', 5, 'ya1O8SrlpXr67Q', 0, 'V89EZN4XJ99LYA')
+    ```
+
+    Three generated columns do the work:
+
+    - **`_dlt_id`** — a surrogate key per row, on every table.
+    - **`_dlt_parent_id`** — the child's link to the parent's `_dlt_id`. This is your join key.
+    - **`_dlt_list_idx`** — the position in the original array, so order is preserved. JSON arrays
+      are ordered and SQL tables are not, so without this you would lose the ordering permanently.
+
+    ```sql
+    SELECT o.customer, i.sku, i.qty
+    FROM orders o
+    JOIN orders__items i ON i.__dlt_parent_id = o._dlt_id
+    ORDER BY o.id, i._dlt_list_idx;
+    ```
+
+    <Warning>
+    **Deep nesting produces a lot of tables.** A GitHub issue payload nests four levels deep and
+    produces a dozen tables. Control it with `max_table_nesting`:
+
+    ```python
+    @dlt.resource(max_table_nesting=1)     # only one level of child tables
+    def issues(): ...
+    ```
+
+    Beyond that depth `dlt` stores the remaining structure as a JSON column, which DuckDB and
+    Postgres can both query with `->` operators. **This is usually the right trade** — a
+    fifth-level child table is almost never joined and is always in the way.
+    </Warning>
+
+    ## Trade-offs table
+
+    | Situation | Choose | Instead of | Because |
+    | --- | --- | --- | --- |
+    | Standard extract-and-load | `dlt` | hand-rolled | pagination, state, schema and normalization are ~300 lines you no longer maintain per source |
+    | Re-running must be safe | `merge` + `primary_key` | `append` | append plus a retry equals duplicates |
+    | Immutable event stream | `append` | `merge` | no key to merge on, and merge costs a delete-insert per batch |
+    | Small reference table | `replace` | `merge` | simpler, and history does not matter |
+    | Source schema should be stable | `columns: freeze` | the `evolve` default | a surprise should fail the run, not silently reshape the table |
+    | Exploratory work on an unknown API | `evolve` (default) | `freeze` | you do not yet know the schema; the point is to discover it |
+    | You want only known columns | `discard_value` | `discard_row` | keeps the row; `discard_row` deletes data silently |
+    | Deeply nested payloads | `max_table_nesting=1` or `2` | unlimited | a dozen tables per source is unmanageable; deep levels are never joined |
+    | You need heavy transformation | `dlt` for E+L, dbt for T | `dlt` for everything | `dlt`'s job is loading; SQL in the warehouse is where transformation belongs |
+    | Hundreds of sources, no engineers | Fivetran/Airbyte | `dlt` | you are buying connector maintenance, and that is a real product |
+    | Tens of sources, engineers available | `dlt` | Fivetran | ~$0 versus thousands per month, and full control of the code |
+
+    ## Reference implementation: an incremental pipeline with contracts and quality checks
+
+    ```python
+    # pipeline.py — dlt 1.4.1, duckdb 1.1.3
+    from __future__ import annotations
+    from datetime import datetime, timedelta, timezone
+    from typing import Any, Iterator
+
+    import dlt
+    import requests
+    from dlt.sources.helpers.requests import Client
+
+
+    OVERLAP = timedelta(minutes=15)
+
+
+    @dlt.source(name="ledger")
+    def ledger_source(api_url: str = dlt.config.value,
+                      api_key: str = dlt.secrets.value):
+        """A source groups related resources. Config and secrets are injected
+        from config.toml / secrets.toml / environment, never hard-coded."""
+
+        client = Client(
+            request_timeout=(5, 30),
+            raise_for_status=True,
+            request_max_attempts=5,          # dlt's retry helper: backoff + jitter built in
+        ).session
+        headers = {"Authorization": f"Bearer {api_key}"}
+
+        @dlt.resource(
+            name="transactions",
+            write_disposition="merge",
+            primary_key="id",
+            columns={"amount": {"data_type": "decimal", "precision": 18, "scale": 2}},
+        )
+        def transactions(
+            updated=dlt.sources.incremental("updated_at",
+                                            initial_value="2024-01-01T00:00:00+00:00"),
+        ) -> Iterator[list[dict[str, Any]]]:
+            # Overlap the window explicitly. dlt's inclusive boundary handles
+            # equality; it does not handle out-of-order commits at the source.
+            since = datetime.fromisoformat(updated.last_value) - OVERLAP
+            cursor: str | None = None
+            while True:
+                params: dict[str, Any] = {"since": since.isoformat(), "limit": 500}
+                if cursor:
+                    params["after"] = cursor
+                body = client.get(f"{api_url}/transactions",
+                                  params=params, headers=headers).json()
+                rows = body["data"]
+                if not rows:
+                    return
+                yield rows
+                cursor = body.get("next_cursor")
+                if not cursor:
+                    return
+
+        @dlt.resource(name="merchants", write_disposition="replace")
+        def merchants() -> Iterator[list[dict[str, Any]]]:
+            """Small dimension table: a full refresh is simpler and safe."""
+            yield client.get(f"{api_url}/merchants", headers=headers).json()["data"]
+
+        return transactions, merchants
+
+
+    def run() -> None:
+        pipeline = dlt.pipeline(
+            pipeline_name="ledger",
+            destination=dlt.destinations.duckdb("warehouse.duckdb"),
+            dataset_name="ledger",
+            progress="log",
+        )
+
+        info = pipeline.run(
+            ledger_source(),
+            schema_contract={
+                "tables": "evolve",       # a new table is additive; fine
+                "columns": "freeze",      # a new column means the source changed. tell me.
+                "data_type": "freeze",    # a type change means the source changed. tell me.
+            },
+        )
+        print(info)
+
+        # Data-quality assertions AFTER the load. These fail the job.
+        with pipeline.sql_client() as c:
+            (rows,) = c.execute_sql("SELECT count(*) FROM transactions")[0],
+            assert rows > 0, "transactions table is empty"
+
+            (dupes,) = c.execute_sql(
+                "SELECT count(*) FROM (SELECT id FROM transactions "
+                "GROUP BY id HAVING count(*) > 1)")[0]
+            assert dupes == 0, f"{dupes} duplicate ids — the merge key is wrong"
+
+            (null_rate,) = c.execute_sql(
+                "SELECT avg(CASE WHEN amount IS NULL THEN 1.0 ELSE 0.0 END) "
+                "FROM transactions")[0]
+            assert null_rate < 0.02, f"amount null rate {null_rate:.1%} exceeds 2%"
+
+            (lag_hours,) = c.execute_sql(
+                "SELECT date_diff('hour', max(updated_at), now()) FROM transactions")[0]
+            assert lag_hours is not None and lag_hours < 26, \
+                f"freshness: newest record is {lag_hours}h old"
+
+
+    if __name__ == "__main__":
+        run()
+    ```
+
+    <Check>
+    The four assertions at the end are not decoration — they are the difference between a pipeline
+    and a script. **Row count** catches a source returning nothing. **Duplicate count** catches a
+    wrong merge key, which is module 1's war story. **Null rate** catches a removed upstream field,
+    which as measured above produces nulls silently. **Freshness** catches a pipeline that runs
+    successfully and loads nothing new, which is the failure that every "did the job succeed?"
+    monitor misses entirely.
+    </Check>
+
+    ## What breaks in the real world
+
+    A finance team's revenue pipeline pulled invoices from a billing provider with `dlt`, default
+    settings, `merge` on `invoice_id`. It ran nightly for five months without an incident.
+
+    The provider then shipped a feature: invoices could be issued in a customer's local currency,
+    and the API gained a `currency` field and changed `amount` from the invoice total in USD to the
+    total in the *local* currency, adding a separate `amount_usd`.
+
+    **`dlt` handled all of it silently, exactly as designed.** `currency` became a new column.
+    `amount_usd` became a new column. `amount` kept its name and its `DOUBLE` type, and the values
+    continued to load without complaint — because a number is a number, and coercion had nothing to
+    complain about.
+
+    The revenue dashboard summed `amount`. **It had been USD; it was now a mix of USD, EUR, GBP,
+    JPY and others.** Roughly 18% of invoices were non-USD. Reported revenue moved by a few percent
+    in a direction that looked like ordinary variance, and the JPY invoices — where amounts are
+    ~150× larger numerically — created outliers that were dismissed as data-entry errors.
+
+    It was found six weeks later during a quarterly reconciliation against the provider's own
+    statement.
+
+    **No technical failure occurred at any point.** The pipeline ran, the schema evolved, the types
+    were valid, the row counts were normal, the null rates were fine. Every assertion the team had
+    would have passed. **The semantics of a column changed, and there is no schema check for
+    semantics.**
+
+    The fixes were three, and the ordering matters:
+
+    1. **`schema_contract={"columns": "freeze"}` on the invoices resource.** The appearance of
+       `currency` and `amount_usd` would have failed the run on night one with a
+       `DataValidationError` naming both columns. **A human then looks at the source's changelog,
+       which is exactly the outcome you want.** This is the single change that would have prevented
+       the whole incident.
+    2. **A distribution assertion on `amount`.** Compare this run's percentiles against the
+       trailing 30-day distribution and fail on a large shift. A p99 that jumps 150× is detectable
+       even when nothing about the type or the null rate changed. **This is the only check that
+       catches a semantic change**, and it is the same KS-test idea as module 3's silent-breakage
+       detection and week 16's drift monitoring.
+    3. **Reconciliation against a provider-side aggregate.** The provider's API exposed a monthly
+       revenue total. Comparing it nightly would have caught this in one day.
+
+    What generalises, and it is the point of the module:
+
+    - **`dlt`'s default is `evolve`, and `evolve` is a policy, not a neutral behaviour.** It is
+      right for exploration and wrong for anything a business decision depends on. **Choosing it
+      deliberately is the whole lesson.**
+    - **Schema checks catch shape, never meaning.** A column that changes what it *means* passes
+      every type and nullability check ever written. Distribution monitoring and external
+      reconciliation are the only defences.
+    - **"Nothing failed" is not evidence that nothing broke.** Five months of green runs preceded a
+      six-week-old error.
+
+    ### Design checkpoint
+
+    <Accordion title="You are adding 15 new API sources this quarter. Do you use dlt, Airbyte, Fivetran, or hand-rolled? Justify with numbers, and say what you would do differently for source 1 versus source 15.">
+    **Model answer.**
+
+    **The decision is about who maintains connectors, not about features.** All four options extract
+    and load. What differs is who fixes it when the source changes, and what that costs.
+
+    **The arithmetic.** Fivetran prices on monthly active rows; a mid-size deployment across 15
+    sources typically runs **$2,000–8,000/month**, so $24k–96k/year. Airbyte Cloud is comparable;
+    self-hosted Airbyte is free in licence and costs a cluster plus roughly 0.2–0.5 FTE to operate.
+    `dlt` is a library — **$0 in licence, running inside whatever compute you already have** — and
+    costs engineering time per source.
+
+    **My answer: `dlt` for the 15, with two explicit exceptions.**
+
+    - **Use Fivetran or Airbyte for sources where the connector is the product.** Salesforce,
+      NetSuite, Workday, Google Ads. These have enormous, deeply-nested, frequently-changing
+      schemas, and maintaining a connector for one of them is a genuine part-time job. **Paying
+      someone to maintain a Salesforce connector is a good trade at almost any price.**
+    - **Use `dlt` for everything else** — internal APIs, partner REST APIs, files, databases. These
+      are 30–80 lines each with `dlt`, and their schemas change rarely.
+
+    **What I do differently for source 1 versus source 15.**
+
+    - **Source 1** is a learning exercise. Write it carefully, understand every generated table, get
+      the incremental cursor and the contract right, and — critically — **build the shared
+      scaffolding**: config layout, secrets handling, the data-quality assertion helpers, the run
+      report, the alerting. Budget two weeks. Most of that is not the pipeline.
+    - **Sources 2–5** validate the scaffolding. Expect to change it. If source 3 does not fit the
+      abstraction, the abstraction is wrong and it is far cheaper to fix now than at source 12.
+    - **Sources 6–15** should each be a day. If source 12 takes a week, something is wrong with
+      either the scaffolding or that specific source, and it is worth stopping to find out which.
+
+    **The cost comparison, honestly stated.** 15 `dlt` sources is roughly 6–8 engineering weeks
+    initially and perhaps 0.15 FTE ongoing — call it $30k the first year and $25k/year after.
+    Fivetran is $24k–96k/year with near-zero engineering. **If you have engineers and fewer than
+    ~20 sources, `dlt` wins on cost and decisively on control. If you have 100 sources and no data
+    engineers, buy the tool.**
+
+    **The thing I would insist on regardless of the choice:** `schema_contract` with `columns:
+    freeze` on every source that feeds a financial or operational decision, plus the four
+    data-quality assertions. **That decision matters far more than the tool**, and the war story
+    above is why — the tool worked perfectly and the outcome was six weeks of wrong revenue numbers.
+    </Accordion>
+
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+
+    ## What `dlt` actually does, in three stages
+
+    `pipeline.run()` is `extract()` then `normalize()` then `load()`, and they are genuinely separate
+    — separate processes potentially, with files on disk between them. Knowing this is what lets you
+    read an error message correctly.
+
+    ```
+    EXTRACT
+      Iterate your generator. Write raw items to
+      ~/.dlt/pipelines/<name>/normalize/<load_id>/  as JSONL.
+      No schema inference yet. Failures here are your code or the source.
+
+    NORMALIZE
+      Infer types. Flatten nested objects to prefixed columns.
+      Split arrays into child tables, generating _dlt_id / _dlt_parent_id / _dlt_list_idx.
+      APPLY THE SCHEMA CONTRACT.            <- contract violations fail HERE
+      Write typed JSONL or Parquet per table into load/<load_id>/.
+      Compute a schema hash.
+
+    LOAD
+      Create or ALTER tables in the destination to match the schema.
+      For merge: load into a staging table, then DELETE matching keys and INSERT,
+                 inside one transaction.
+      Write _dlt_loads, _dlt_version and _dlt_pipeline_state.
+    ```
+
+    Three consequences worth knowing:
+
+    1. **A schema-contract violation fails at *normalize*, not at *load*.** The traceback says
+       `NormalizeJobFailed`, which is confusing until you know the stages. Nothing has touched the
+       destination at that point.
+    2. **A failed load package stays on disk and is retried on the next run.** This is a feature —
+       it is how `dlt` resumes — and it is also a trap: if you fix your code and re-run, the *old*
+       failed package is retried first with the *old* data. I hit this while measuring the contract
+       modes for this module: my `discard_value` test failed with a `freeze` error, because the
+       previous test's frozen package was still pending. **`pipeline.drop_pending_packages()` is the
+       escape hatch**, and each contract mode had to be measured in its own working directory.
+    3. **The intermediate files are inspectable.** When a load looks wrong, read the JSONL in the
+       `normalize/` directory. It is the single fastest way to find out whether the problem is
+       extraction or loading.
+
+    ## `merge` is implemented as staging plus delete-insert
+
+    ```sql
+    -- Roughly what dlt emits for write_disposition="merge", primary_key="id":
+    BEGIN;
+      CREATE TABLE _dlt_tmp_transactions AS SELECT * FROM read_parquet('.../*.parquet');
+
+      DELETE FROM transactions
+      WHERE id IN (SELECT id FROM _dlt_tmp_transactions);
+
+      INSERT INTO transactions SELECT * FROM _dlt_tmp_transactions;
+      DROP TABLE _dlt_tmp_transactions;
+    COMMIT;
+    ```
+
+    Two consequences with real cost:
+
+    - **`merge` is more expensive than `append`**, by roughly the cost of the delete plus the
+      staging write. On DuckDB at these sizes it is milliseconds. On BigQuery, `DELETE` on a
+      partitioned table can scan a great deal of data and cost real money — which is why BigQuery
+      pipelines often prefer `append` plus a deduplicating view.
+    - **The whole batch is one transaction.** Either the entire load lands or none of it does.
+      That is the property that makes `dlt` safe to re-run, and it is the same
+      "records-and-state-in-one-transaction" rule you implemented by hand in module 2.
+
+    For deduplication *within* a single batch, `dlt` supports a deduplication sort key:
+
+    ```python
+    @dlt.resource(
+        write_disposition="merge",
+        primary_key="id",
+        merge_key="id",
+    )
+    def transactions(
+        updated=dlt.sources.incremental("updated_at", last_value_func=max,
+                                        primary_key="id"),   # dedup within the batch
+    ): ...
+    ```
+
+    Passing `primary_key` to `incremental` makes `dlt` keep only the highest-cursor row per key
+    within a batch, which matters when a source returns several versions of the same record in one
+    page.
+
+    ## Handling a genuinely breaking change
+
+    Type widening (`int` → `float`, `int` → `string`) is coerced. Type *narrowing* and semantic
+    changes are not, and there are four strategies:
+
+    | Strategy | How | When |
+    | --- | --- | --- |
+    | **Version the table** | load into `transactions_v2`; keep v1 until consumers migrate | a breaking change with downstream consumers you do not control |
+    | **Rename in the resource** | map the new field to the old column name in Python | the source renamed a field but the meaning is unchanged |
+    | **Add, do not replace** | keep the old column; land the new semantics in a new column | **the war story's correct fix** — `amount` stays USD, `amount_local` is new |
+    | **Full reload with a new schema** | drop and re-extract from raw | you kept the raw data, so this is cheap; if you did not, it is impossible |
+
+    **The third row is the one to internalise.** When a field's *meaning* changes, do not let the
+    new meaning flow into the old column. Add a column. The old one keeps meaning what it always
+    meant, every historical query stays correct, and the migration becomes a deliberate act by the
+    consumer rather than an invisible reinterpretation of five months of history.
+
+    ## `dlt` versus the alternatives, with numbers
+
+    | | hand-rolled | **`dlt` 1.4.1** | Airbyte (self-hosted) | Fivetran |
+    | --- | --- | --- | --- | --- |
+    | Licence cost | $0 | **$0** | $0 | **$2k–8k/month typical** |
+    | Infrastructure | your compute | **your compute** | a Kubernetes cluster | none (SaaS) |
+    | Lines per simple source | ~300 | **~30** | 0 (if a connector exists) | 0 |
+    | Connectors maintained by | you | you (+ `dlt` verified sources) | Airbyte + community | Fivetran |
+    | Schema evolution | you build it | **built in, configurable** | built in | built in |
+    | Runs in your existing orchestrator | yes | **yes — it is a library** | no, it is a service | n/a |
+    | Custom transformation in Python | yes | **yes** | limited | no |
+    | Debuggability | full | **full — it is your process** | container logs | a support ticket |
+    | Right when | never, past a prototype | **engineers + tens of sources** | many sources, want free, have a platform team | many sources, no data engineers, budget exists |
+
+    **The decisive property of `dlt` is that it is a library, not a service.** It runs inside your
+    existing scheduler, in your existing container, with your existing logging and secrets. There is
+    no cluster, no UI, no separate deployment. That is why it fits a team that already has
+    engineering practices and does not want a second platform to operate.
+
+    **The decisive property of Fivetran is that connector maintenance is someone else's job.** For
+    Salesforce, NetSuite or Workday — schemas with thousands of fields that change quarterly — that
+    is worth a great deal of money, and pretending otherwise is how teams end up with a full-time
+    engineer maintaining a Salesforce connector.
+
+    ## Deduplication correctness
+
+    `merge` on a primary key is exactly-once **if and only if the key genuinely identifies the
+    record**. The failure modes:
+
+    | Problem | Consequence | Fix |
+    | --- | --- | --- |
+    | Key is not unique (`campaign_id` where `(campaign_id, date)` was needed) | rows overwrite each other; data silently lost | composite `primary_key=["campaign_id", "date"]` |
+    | Key is nullable | `NULL = NULL` is false in SQL, so null-keyed rows never match and always insert | assert non-null; use a surrogate key if the source cannot guarantee it |
+    | Key changes when the record is updated | every update inserts a new row | find a stable key, or use `merge_key` on a different column |
+    | Several versions of one key in a batch | the last one wins, and "last" is arrival order, not logical order | `incremental(..., primary_key="id")` to keep the highest cursor per key |
+    | Source soft-deletes | deletions never propagate; the row lives forever | ingest the deletion flag and filter downstream, or use a full `replace` periodically |
+
+    **The last row is the one most pipelines get wrong.** `merge` handles inserts and updates. It
+    does not handle deletes, because a deleted record is simply absent from the source and absence
+    is not a signal. Either the source exposes a `deleted_at` or a tombstone record — ingest it — or
+    you periodically do a full reconciliation. **Otherwise your warehouse accumulates records that
+    no longer exist**, and every count you compute is slightly too high, forever.
+
+    ## Production failure modes
+
+    | Failure mode | Signature | Detection |
+    | --- | --- | --- |
+    | Column meaning changed, type unchanged | numbers drift; every check green | distribution assertion against a trailing window; external reconciliation |
+    | `evolve` absorbing a breaking change | new columns appear silently; downstream ignores them | `columns: freeze` on anything a decision depends on |
+    | `discard_row` dropping records | row counts fall; run succeeds | never use it without a row-count assertion |
+    | Failed load package retried with stale data | a fixed pipeline still fails with the old error | `pipeline.drop_pending_packages()`; isolate working directories in tests |
+    | Wrong or non-unique primary key | rows overwrite each other, or duplicate | `GROUP BY key HAVING count(*) > 1` as a scheduled assertion |
+    | Nullable primary key | those rows insert every run | assert the key is non-null before loading |
+    | Deletes never propagate | counts drift upward over months | ingest tombstones, or reconcile with a periodic full load |
+    | Deep nesting explosion | dozens of tables per source | `max_table_nesting=1` or `2` |
+    | Pipeline succeeds, loads nothing | freshness silently degrades; "job succeeded" every night | freshness assertion on `max(updated_at)` |
+    | Watermark advanced past out-of-order commits | a trickle of missing records | explicit overlap on the incremental window |
+
+    ## Frontier and research pointers
+
+    - **The `dlt` schema and normalization documentation** (dlt 1.4.1). — **Takeaway:** the type
+      inference and coercion rules are documented precisely — which coercions are attempted, and in
+      what order — and reading them is what turns "it silently coerced my string" from a surprise
+      into an expectation.
+    - **Kimball & Ross, *The Data Warehouse Toolkit* 3rd ed. (2013), chapter 19 on ETL
+      subsystems.** — **Takeaway:** the 34 ETL subsystems enumerate every concern a loader must
+      handle; `dlt` implements perhaps a dozen of them, and knowing which ones it does *not* handle
+      (data quality, conformance, deduplication across sources) tells you what you still have to build.
+    - **Kleppmann (2016), "Making Sense of Stream Processing"**, chapters on schema evolution. —
+      **Takeaway:** forward and backward compatibility are distinct properties with distinct rules,
+      and Avro's schema-resolution rules are the clearest existing formalisation of what "safe
+      change" means.
+    - **The Avro specification, "Schema Resolution."** — **Takeaway:** a precise definition of which
+      schema changes a reader can absorb — adding a field with a default is safe, removing a
+      required field is not — which is the rigorous version of what `dlt`'s contract modes
+      approximate.
+    - **Data contracts as practised at GoCardless and PayPal (engineering blogs, 2022–2023).** —
+      **Takeaway:** the enforcement mechanism that matters is not the schema file but the CI check
+      that requires the *consuming* team's review on a breaking change; without that, a contract is
+      documentation.
+    - **Delta Lake and Iceberg schema-evolution semantics.** — **Takeaway:** tracking columns by
+      stable integer ID rather than by name is what makes rename and reorder safe; `dlt` matches on
+      name, which is why a *rename* upstream looks to it like a drop plus an add.
+
+    ## Stretch challenge
+
+    **Build a schema-change detector that tells you what changed and whether it matters.**
+
+    `dlt` tells you *that* the schema evolved by writing a new schema version. It does not tell you
+    whether the change is safe, and it certainly does not tell you when a column's *meaning* changed.
+
+    Build:
+
+    1. **A schema-diff reporter.** After every run, compare the current `dlt` schema against the
+       previous version and emit a structured diff: columns added, columns whose type changed,
+       tables added. `pipeline.default_schema.to_dict()` gives you the schema; store each version
+       and diff them.
+    2. **A change classifier.** Label each change **safe** (a new nullable column), **suspicious**
+       (a type widening, a new column on a table that has been stable for months), or **breaking**
+       (a required column now nullable, a type narrowing). Route the three classes differently: log,
+       warn, fail.
+    3. **A semantic-change detector**, which is the genuinely novel part. For every numeric column,
+       maintain a rolling distribution summary — mean, standard deviation, percentiles, and the
+       distinct-value count for low-cardinality columns. After each load, run a two-sample KS test
+       against the trailing 30-day distribution and flag large shifts. **This is the only thing that
+       would have caught the war story**, because the currency change altered the distribution of
+       `amount` without altering its type.
+    4. **A report** that a human reads in thirty seconds: what changed, how confident you are that
+       it matters, and what to look at.
+
+    The open questions:
+
+    - **What is the false-positive rate of the KS test on real pipeline data?** Genuine seasonality
+      — month-end billing spikes, weekend troughs — will shift distributions legitimately. Find the
+      threshold and the window length at which the detector is usable rather than annoying. **This
+      is the actual research question and it has no clean answer.**
+    - **Can you detect a *unit* change specifically?** A currency change multiplies some values by
+      ~150 (JPY) and some by ~1.1 (EUR). Is a mixture-of-scales signature detectable — for example,
+      by testing whether the distribution of `log(value)` has become bimodal?
+    - **How do you distinguish a semantic change from a business change?** If revenue genuinely
+      doubles, your detector fires. Can it use a *second* signal — a schema change in the same run,
+      or a change in a correlated column — to raise confidence? A distribution shift *concurrent
+      with* a schema change is far more suspicious than either alone.
+    - **What is the right output?** A dashboard nobody opens is worthless. Is the answer a failed
+      run, a Slack message, or an entry in a weekly digest? Argue for one, and consider that a
+      detector which fails the run on a false positive will be disabled within a month.
+
+    A schema-and-semantics change detector that classifies changes by severity is a genuinely
+    reusable piece of data infrastructure. Very few teams have one, every team that has had this
+    incident wishes they did, and it is a strong portfolio artifact precisely because the hard part
+    is the judgement rather than the code.
+
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Force three upstream schema changes — a new field, a type change, and a removed field — and record
+the resulting table state after each. Then repeat with `schema_contract` set to each of `evolve`,
+`freeze`, `discard_value` and `discard_row`, and record what happens to the row in each case.
+</Card>
+
+<Steps>
+  <Step title="Use a list of dicts, not a real API">
+    `pipeline.run([{...}, {...}], table_name="orders")`. You need to control the payload exactly,
+    change one field at a time, and re-run instantly. A real API gives you none of that.
+  </Step>
+  <Step title="Dump the table state after every run">
+    Query `information_schema.columns` for the schema and `SELECT *` for the rows. **The column list
+    is the interesting half** — the row values will not tell you that a column was added and
+    backfilled.
+  </Step>
+  <Step title="Isolate each contract test">
+    A separate working directory and DuckDB file per contract mode. A failed package from a previous
+    test is retried on the next run and will contaminate your result — this happened to me while
+    producing the numbers in Layer 2, and the wrong answer looked entirely plausible.
+  </Step>
+  <Step title="Write down which default you would ship">
+    For a source feeding a business decision, and for an exploratory source. They are different, and
+    articulating why is the point of the exercise.
+  </Step>
+</Steps>
+
+## The whiteboard
+
+The T2 build-up has four frames: the three schema changes and their outcomes, the four-position
+contract dial with each measured result, the nested-JSON normalization into parent and child tables,
+and the verbatim `freeze` error message.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p2-w15-m4-blank.svg) · [Editable source](/assets/diagrams/p2-w15-m4.excalidraw)
+</Tip>
+
+The thing to get right on redraw: the dial's four positions with their *outcomes*, especially that
+`discard_row` loses the record with no error. If your sketch shows four modes without showing what
+each does to the row, it is a list of options rather than a decision aid.
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    **Portfolio line:** "Built an incremental `dlt` pipeline into DuckDB with schema contracts and
+    four data-quality assertions; empirically documented how `dlt` 1.4.1 handles a new field, a type
+    coercion and a removed field, and measured all four `schema_contract` modes including that
+    `discard_row` drops records silently."
+
+    **The interview move.** "How do you handle schema changes in a pipeline?" is a strong
+    data-engineering question and most candidates say "we use a tool that handles it". The better
+    answer is a policy: *"The default in most tools is to evolve silently, which is right for
+    exploration and wrong for anything feeding a decision. I'd freeze columns and types on
+    business-critical sources so a change fails the run, and evolve on exploratory ones. And I'd
+    add a distribution check, because a schema check can't catch a column whose meaning changed —
+    which is the failure that actually costs money."*
+
+    That last sentence is the one that lands, because it names a failure mode the interviewer has
+    probably experienced and rarely hears articulated.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **1. Find out what your ingestion tool does by default on a new column.** Fivetran, Airbyte,
+    `dlt`, a hand-rolled loader — check, do not assume. Almost all of them evolve silently. Then ask
+    whether that is the right default for each source, and change it on the ones feeding financial
+    or operational decisions. This is a configuration change with a very high ratio of value to effort.
+
+    **2. Add the four assertions to your most important pipeline this week.** Row count above zero,
+    zero duplicates on the merge key, null rate below a threshold, and freshness. Roughly 20 lines
+    of SQL that fail the job. **The freshness one is the most valuable** — it catches the pipeline
+    that runs successfully every night and loads nothing, which "did the job succeed?" monitoring
+    misses completely.
+
+    **3. Replace one hand-rolled extractor with `dlt` and count the lines you delete.** Pick the
+    simplest one. Typically ~300 lines becomes ~40. The point is not the line count — it is that
+    pagination, state, schema evolution and nested normalization become someone else's maintenance
+    burden. That is an easy thing to demonstrate in a sprint review and it usually leads to being
+    asked to do the rest.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| New columns appear and nothing notices | `evolve` is the default and was never chosen deliberately | `schema_contract={"columns": "freeze"}` on business-critical sources |
+| Records silently missing, run succeeds | `discard_row` contract mode | never use it without a row-count assertion; prefer `discard_value` |
+| A fixed pipeline still fails with the old error | A failed load package is on disk and is retried first | `pipeline.drop_pending_packages()`; isolate test working directories |
+| Rows overwrite each other | Primary key is not unique — a composite key was needed | `primary_key=["a", "b"]`; assert zero duplicates |
+| Rows duplicate every run despite `merge` | Primary key column is nullable; `NULL = NULL` is false in SQL | assert the key is non-null, or use a surrogate key |
+| Deleted source records live forever in the warehouse | `merge` handles insert and update, not delete | ingest tombstones, or reconcile with a periodic full load |
+| Numbers drift with no failure anywhere | A column's *meaning* changed; type and nullability unchanged | distribution assertion against a trailing window; external reconciliation |
+| Dozens of tables from one source | Deep nesting normalized in full | `max_table_nesting=1` or `2`; deeper levels become JSON columns |
+| A string value silently became a number | `dlt` coerces where it can, without warning | `data_type: "freeze"` if the type matters |
+| Pipeline succeeds nightly but data is stale | Cursor stuck, or the source returns nothing | freshness assertion on `max(cursor_column)` |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [`dlt` schema and normalization](https://dlthub.com/docs/general-usage/schema) (dlt 1.4.1) — read this for the exact type-inference and coercion rules; knowing which coercions are attempted is what makes the string-to-double behaviour predictable instead of surprising.
+- [`dlt` schema contracts](https://dlthub.com/docs/general-usage/schema-contracts) — read this for the three levels (`tables`, `columns`, `data_type`) and the four modes; the table there is the reference for the measurements in Layer 2.
+- [`dlt` incremental loading](https://dlthub.com/docs/general-usage/incremental-loading) — read this for `last_value_func`, the inclusive-boundary behaviour, and `primary_key` on the incremental cursor for within-batch deduplication.
+- [`dlt` destination: DuckDB](https://dlthub.com/docs/dlt-ecosystem/destinations/duckdb) — read this for the file-versus-`:memory:` semantics, and note the catalogue-name collision if your database file shares a name with your dataset.
+- [`dlt` REST API source](https://dlthub.com/docs/dlt-ecosystem/verified-sources/rest_api) — read this after building your own extractor in module 2; it implements every paginator declaratively and the comparison is instructive.
+
+**Papers and specifications**
+
+- [Apache Avro specification, *Schema Resolution*.](https://avro.apache.org/docs/1.12.0/specification/) — **Takeaway:** a precise definition of which schema changes a reader can absorb; adding a field with a default is safe, removing a required field is not — the rigorous version of what contract modes approximate.
+- Kleppmann (2016), *Making Sense of Stream Processing*, O'Reilly, chapters on schema evolution. — **Takeaway:** forward and backward compatibility are separate properties with separate rules, and most "we handle schema evolution" claims mean only one of them.
+- [Kimball & Ross, *The Data Warehouse Toolkit* 3rd ed. (2013), **Chapter 19**](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/books/data-warehouse-dw-toolkit/) — **Takeaway:** the 34 ETL subsystems; `dlt` implements roughly a dozen, and the ones it does not (data quality, conformance, cross-source deduplication) are exactly what you still have to build.
+- [Armbrust et al. (2020), *Delta Lake*, VLDB 13(12), and the Apache Iceberg spec.](https://doi.org/10.14778/3415478.3415560) — **Takeaway:** tracking columns by stable ID makes rename and reorder safe; name-based matching, which `dlt` uses, cannot distinguish a rename from a drop-plus-add.
+
+**Go deeper**
+
+- Joe Reis & Matt Housley, *Fundamentals of Data Engineering* (2022), **Chapter 8 (Queries, Modeling and Transformation)** — read this for where the boundary between load and transform belongs, which is the argument for `dlt` plus dbt rather than `dlt` doing everything.
+- Chad Sanderson & Adrian Kreuziger, *Data Contracts* (2024) — read the enforcement chapters; the key insight is that the contract's power comes from requiring the consumer's review on a breaking change, not from the schema file itself.
+- [The `dlt` source code, `dlt/normalize/`](https://github.com/dlt-hub/dlt/tree/master/dlt/normalize) — read `normalize.py` and the schema-contract application; it is a compact, readable implementation of a problem most people hand-roll badly.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p2/week-15/p2-w15-m4">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

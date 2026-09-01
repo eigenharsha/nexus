@@ -1,0 +1,602 @@
+---
+title: "Feature selection & dimensionality"
+description: "Week 20 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+{/* AUTHORED */}
+
+<Note>
+**Week 20 · Module 3 · `P3-W20-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+**Where the numbers on this page come from.** Every table introduced by *Measured* was produced by
+running the code shown, on an Apple M3 Pro (11 cores, 18 GB, macOS arm64, **no GPU**) with
+Python 3.12.9 and numpy 2.5.2, scikit-learn 1.9.0 — the same environment as the rest of Phase 3, so you can
+re-run any of it. Anything introduced by *Derived* is arithmetic, shown term by term; check it with
+a pencil. A result attributed to a paper is that paper's measurement, not ours.
+See [About the numbers](/start/about-the-numbers).
+</Info>
+
+
+## Where this sits
+
+- **Prereqs:** `P3-W18-M2` (permutation importance and the impurity trap), `P3-W19-M4` (selection is Leak 5), `P3-W20-M1` and `M2` (you have just made 200 features)
+- **Unlocks:** `P3-W20-M5` (fewer features means fewer things to serve and monitor), `P3-W24` (serving cost)
+- **One line:** you will cut 200 features to 25 for under one point of AUC, and you will know that the win is upstream dependencies, not inference latency.
+
+## What you'll be able to do
+
+1. Name the four families of selection method and what each costs
+2. Run selection inside cross-validation, and measure what happens when you do not
+3. Compare filter, wrapper, embedded and permutation-based selection on the same data
+4. Handle correlated features, where permutation importance gives both of them zero
+5. Measure selection *stability* across bootstraps and report it
+6. Say honestly where the serving win comes from — and where it does not
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w20-m3.svg" alt="Hand-drawn sketch: four selection families and where the serving win actually comes from" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w20-m3-dark.svg" alt="Hand-drawn sketch: four selection families and where the serving win actually comes from" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w20-m3
+tier: T2
+one-sentence-goal: Show that cutting features is nearly free in accuracy down to a cliff, and that the payoff is upstream dependencies rather than model latency.
+elements:
+  - main panel: a line chart drawn freehand, x-axis "features kept" reading 200, 100, 50, 25, 15, 10, 5 and y-axis "test AUC". The line is flat at 0.979 from 200 to 50, dips slightly to 0.971 at 25, then falls off a cliff through 0.952, 0.905 to 0.806. The flat portion is highlighted in yellow and the cliff is drawn steeply with a red arrow
+  - amber note over the flat part: "200 -> 50 costs 0.01 AUC points. that is FREE."
+  - amber note at the cliff: "25 -> 15 costs 1.87. the cliff is where the information runs out, and it is dataset-specific. MEASURE IT."
+  - second panel below: two bars side by side labelled "model inference" — one for 200 features at 1.47 us/row and one for 25 at 1.83 us/row, drawn the SAME height, with a heavy red cross-out over the pair and the note "no. this is not where the win is."
+  - third panel: a stack of 200 small boxes shrinking to 25, with 175 of them being swept into a bin labelled "175 upstream columns: joins, backfills, monitors, on-call pages", drawn with a green tick and the note "THIS is the win"
+  - side note in a box: "model artifact 773.7 KB -> 411.4 KB (-47%)"
+  - bottom strip: four selector rows drawn as a scoreboard — "filter (ANOVA) 0.0s, -3.47 | L1 logistic 6.3s, -2.60 | RFE 0.4s, -2.48 | permutation 38.5s, -0.89" with permutation circled
+  - bottom-right corner in red: "selection OUTSIDE the CV, pure noise: 0.7550 vs 0.5750 -> +18.00 points"
+  - dangling arrow: "...and if 99% of your rows are one class? -> M4"
+numbers-to-write-in: 0.97944 / 0.97930 / 0.97051 / 0.95181 / 0.90541 / 0.80608, 1.47 vs 1.83 us, 773.7 -> 411.4 KB, -0.89 at 38.5s, +18.00 points
+alt: A hand-drawn sketch with an AUC-versus-feature-count curve that stays flat from 200 down to 50 features then falls off a cliff below 25, a crossed-out pair of equal-height bars showing that model inference latency does not improve, and a stack of feature boxes being swept into a bin labelled with the upstream dependencies removed.
+*/}
+
+## Why you should care
+
+**For Aarav (student).**
+- "How do you decide which features to keep?" is a standard question, and the four-family answer with costs attached is much better than "I use feature importance".
+- The correlated-features problem — where permutation importance gives two identical strong features **zero** each — is a genuinely counter-intuitive result you can demonstrate in ten lines.
+- Selection inside versus outside cross-validation is Week 19's leak with a number on it: +18.00 accuracy points on pure noise.
+
+**For Meera (professional).**
+- Every feature you keep is a column somebody has to compute, backfill, version, monitor and be paged about. That cost never appears in an accuracy metric and it is most of the total cost of ownership.
+- This shows up in your job as: a 200-feature model where 40 of the features come from a system that is being decommissioned next quarter.
+- The measurement below will surprise you: **cutting from 200 features to 25 did not make inference faster.** Knowing where the win actually is changes what you optimise.
+
+## The mental model
+
+You have 200 features. Some carry signal, some are copies of each other, and most are noise. Selection is choosing a subset, and there are exactly four ways to do it: score each feature alone and keep the best (**filter**); repeatedly fit the model with subsets (**wrapper**); let the model's own training pick (**embedded**); or fit once and measure what breaks when you destroy each feature (**permutation**). They differ by orders of magnitude in cost and by a few points in quality. The trap that unites them is that any method using the target must live inside the cross-validation, or it manufactures signal from noise. And the payoff is not what people expect: a smaller model is barely faster, but it has far fewer upstream dependencies, and that is what you were actually buying.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+
+### Why cut features at all
+
+Four reasons, and they are not equally important:
+
+1. **Fewer things to break.** Each feature is an upstream dependency: a table, a join, a job, a schema. This is the big one and it is invisible to every metric.
+2. **Less overfitting.** With `p` close to `n`, noise features let the model memorise. Week 17 Module 4 measured a model's variance exploding as capacity grew.
+3. **Faster to serve.** Partly true, and Layer 2 measures exactly how partly.
+4. **Easier to explain.** A 25-feature model can be described. A 200-feature one cannot.
+
+### Drop the useless ones and watch nothing happen
+
+Start with 40,000 rows and 200 features, of which 25 are genuinely informative, 40 are redundant combinations of those, 10 are exact repeats, and 125 are pure noise.
+
+```python
+# pip install "scikit-learn==1.9.0" "numpy==2.5.2"
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import roc_auc_score
+import numpy as np
+
+X, y = make_classification(n_samples=40000, n_features=200, n_informative=25,
+                           n_redundant=40, n_repeated=10, class_sep=0.8,
+                           flip_y=0.03, random_state=0)
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=0, stratify=y)
+
+full = HistGradientBoostingClassifier(random_state=0).fit(Xtr, ytr)
+pi = permutation_importance(full, Xte[:6000], yte[:6000], n_repeats=5,
+                            random_state=0, scoring="roc_auc", n_jobs=-1)
+order = np.argsort(-pi.importances_mean)
+
+for k in (200, 100, 50, 25, 15, 10, 5):
+    idx = order[:k]
+    m = HistGradientBoostingClassifier(random_state=0).fit(Xtr[:, idx], ytr)
+    print(f"k={k:>3}  test AUC {roc_auc_score(yte, m.predict_proba(Xte[:, idx])[:, 1]):.5f}")
+```
+
+```
+k=200  test AUC 0.97944
+k=100  test AUC 0.97980
+k= 50  test AUC 0.97930
+k= 25  test AUC 0.97051
+k= 15  test AUC 0.95181
+k= 10  test AUC 0.90541
+k=  5  test AUC 0.80608
+```
+
+**Going from 200 features to 50 cost 0.01 AUC points.** Not 1 point — one hundredth of a point. Three quarters of the feature set was contributing nothing measurable.
+
+Then there is a **cliff**. From 25 to 15 costs 1.87 points; from 15 to 10 costs 4.64; from 10 to 5 costs 9.93. The information runs out abruptly.
+
+Two things to take from that shape. **The flat part is free** — take it, always. And **the cliff position is dataset-specific**, so you have to measure it; there is no rule that says 25 or 50 or 10% of the original.
+
+### The four families
+
+| Family | How | Example | Cost |
+| --- | --- | --- | --- |
+| **Filter** | score each feature against the target independently, keep the top `k` | `SelectKBest(f_classif)`, mutual information, correlation | ~zero |
+| **Wrapper** | repeatedly fit the model on subsets and search | `RFE`, forward/backward selection | many fits |
+| **Embedded** | the model's own fitting picks | L1/Lasso, tree gain importance | one fit |
+| **Permutation** | fit once, then shuffle each feature and measure the damage | `permutation_importance` | one fit plus `p * n_repeats` scorings |
+
+Filters are instant and blind — they cannot see that two features are redundant, because they score each one alone. Wrappers are thorough and expensive. Embedded is nearly free because you were fitting anyway. Permutation is the most honest, because it measures the effect on *held-out* performance of the actual model you are shipping.
+
+### The rule that matters more than the method
+
+**Selection that uses the target must happen inside the cross-validation loop.**
+
+```python
+# WRONG — SelectKBest sees every row's label, including the validation folds
+X_sel = SelectKBest(f_classif, k=25).fit_transform(X, y)
+score = cross_val_score(model, X_sel, y, cv=5)
+
+# RIGHT — selection is refitted inside each fold
+score = cross_val_score(make_pipeline(SelectKBest(f_classif, k=25), model), X, y, cv=5)
+```
+
+Measured on 400 rows and 3,000 columns of **pure noise**, where the true accuracy is 0.50:
+
+```
+select-then-CV                  0.7550
+selection inside the pipeline   0.5750
+inflation                      +18.00 accuracy points
+```
+
+**75.5% cross-validated accuracy on data containing nothing.** This is Week 19 Module 4's Leak 5, and it is the reason `Pipeline` exists.
+
+### Guided practice
+
+1. Repeat the `k` sweep using `SelectKBest` instead of permutation importance. Where is its cliff?
+2. Add 300 more pure-noise columns and re-run at `k=25`. Does the selected set change?
+3. Duplicate one informative feature three times. What does permutation importance say about the copies?
+
+<Accordion title="Answers">
+1. Earlier and steeper — the filter ranking is worse, so at any `k` it has kept a poorer subset. Measured at `k=25`, ANOVA F gave 0.94471 against permutation's 0.97051, a 2.58-point difference for the same budget. Filters pay for their speed in quality.
+2. The selected set stays mostly stable but not entirely — a few noise columns will beat genuine weak features by chance, and more noise columns means more chances. This is the multiple-comparisons problem again and it is exactly why selection stability is worth measuring (Layer 2).
+3. All four copies get importance near **zero**. Permuting one leaves three identical copies for the model to read, so nothing breaks. This is the single most important caveat about permutation importance and Layer 2 shows the fix.
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+  <Accordion title="1. Why is a filter method blind to redundancy?">
+  It scores each feature against the target in isolation, so two identical informative features both score highly and both get selected. It has no mechanism to notice they carry the same information.
+  </Accordion>
+  <Accordion title="2. What does L1 regularization do that makes it a selection method?">
+  Its penalty has a constant derivative, so the optimum for a weak feature is exactly zero — Week 17 Module 4 derived this as soft thresholding, `w = sign(z) * max(|z| - alpha, 0)`. Ridge only shrinks toward zero and never arrives.
+  </Accordion>
+  <Accordion title="3. Where must selection live in a pipeline?">
+  Inside it, as a step, so it is refitted on each fold's training rows. Outside it, the selector sees the validation labels and the estimate is inflated — measured at 18 accuracy points on noise.
+  </Accordion>
+  <Accordion title="4. Your model has 200 features and 800 rows. What do you do first?">
+  Cut features before anything else. At `p/n = 0.25` you are in the regime where selection leakage is worth tens of points (Week 19 Module 4 measured +33.50 at `p/n = 50`) and where every model overfits. Reduce first, tune later.
+  </Accordion>
+  <Accordion title="5. Should you use PCA instead of selection?">
+  Different tool. PCA *extracts* new features that are combinations of all the originals — so you still have to compute all 200 inputs at serving time, and you have lost interpretability. Selection *removes* features, so the upstream dependency goes away. When the goal is fewer things to maintain, selection is the answer.
+  </Accordion>
+</AccordionGroup>
+
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+
+### The four selectors, head to head
+
+Same data, same target of 25 features, same downstream model.
+
+| Selector | Selection time | Test AUC | vs all 200 |
+| --- | --- | --- | --- |
+| filter (ANOVA F) | **0.0 s** | 0.94471 | −3.47 |
+| wrapper (RFE, logistic, step=0.2) | 0.4 s | 0.95464 | −2.48 |
+| embedded (L1 logistic, C=0.05) | 6.3 s | 0.95339 | −2.60 |
+| **permutation (held-out)** | 38.5 s | **0.97051** | **−0.89** |
+
+**Permutation importance is 4x better than the filter and 96x slower.** On a dataset where a fit takes seconds that is an obvious trade; on one where a fit takes an hour it is not, and the filter's 3.5-point cost may be what you accept.
+
+Two things worth noticing in that table.
+
+**RFE with a logistic regression selected features for a *boosted tree*.** It scored 0.95464 — better than L1 and worse than permutation — because a linear model's view of which features matter is not the tree's view. If you use a wrapper, wrap the model you are actually shipping, and pay for it.
+
+**The filter is genuinely instant.** `f_classif` is a vectorised ANOVA over columns; it does not fit anything. When you have 50,000 candidate features, a filter down to 1,000 followed by permutation importance on those is the standard two-stage pattern, and it is much better than either alone.
+
+### Correlated features break permutation importance
+
+This is the caveat that matters most in practice, and it is not a subtlety — it inverts the answer.
+
+Permutation importance asks: *if I destroy this column, how much worse does the model get?* If two columns are near-duplicates, destroying one leaves the other, the model reads that instead, and **nothing breaks**. Both features score approximately zero.
+
+```python
+# two identical strong features
+X2 = np.c_[X, X[:, 0]]                        # duplicate the strongest column
+m = HistGradientBoostingClassifier(random_state=0).fit(X2tr, ytr)
+pi = permutation_importance(m, X2te, yte, n_repeats=10, scoring="roc_auc")
+# pi.importances_mean for BOTH copies is near zero
+```
+
+The two standard failure modes, side by side:
+
+| | Impurity importance | Permutation importance |
+| --- | --- | --- |
+| two identical strong features | credit is **split** between them, each looks half as important | both look **useless** |
+| a high-cardinality noise column | ranks **first** (Week 18 Module 2: 81.8% of total) | correctly demoted |
+
+Neither is broken; they answer different questions. The fix for both is the same: **define groups and permute the group together.**
+
+```python
+def grouped_permutation_importance(model, X, y, groups, scoring, n_repeats=20, rng=None):
+    """Shuffle every column in a group with the SAME permutation index."""
+    rng = rng or np.random.default_rng(0)
+    base = scoring(model, X, y)
+    out = {}
+    for name, cols in groups.items():
+        drops = []
+        for _ in range(n_repeats):
+            Xp = X.copy()
+            perm = rng.permutation(len(X))               # ONE index for the whole group
+            Xp[:, cols] = Xp[perm][:, cols]
+            drops.append(base - scoring(model, Xp, y))
+        out[name] = (float(np.mean(drops)), float(np.std(drops)))
+    return out
+```
+
+Build the groups from a correlation clustering — `scipy.cluster.hierarchy` on `1 - |spearman|` with a threshold around 0.2 is the standard recipe — or from domain knowledge, which is usually better because the groups then have names a stakeholder recognises.
+
+### Selection stability
+
+A selected feature set is an estimate, and estimates have variance. Refit the selector on 20 bootstrap resamples and count how often each feature survives:
+
+```python
+from collections import Counter
+counts = Counter()
+for r in range(20):
+    i = rng.integers(0, len(ytr), len(ytr))
+    counts.update(SelectKBest(f_classif, k=25).fit(Xtr[i], ytr[i]).get_support(indices=True).tolist())
+freq = np.array([counts.get(j, 0) for j in range(200)]) / 20
+```
+
+Measured:
+
+```
+selected in ALL 20 bootstraps : 18
+selected in >= 80%            : 20
+selected in 20-80% (unstable) : 9
+never selected                : 169
+```
+
+**Only 18 of the 25 features are stable.** Nine features hover in the 20–80% band, meaning which ones you get depends on which rows you happened to have.
+
+Two uses for this number. **Report it** — a feature list presented as a finding should carry its selection frequency, exactly as Week 18 Module 1 argued for tree rules. And **use it to choose `k`** — take the features that survive in 80% or more of bootstraps rather than a fixed count, which is a data-driven cut rather than a guessed one.
+
+### Where the serving win actually is
+
+This is the part that will surprise you, and it changes what you optimise.
+
+| Features | Test AUC | µs/row (batched) | ms/row (single) | Model artifact |
+| --- | --- | --- | --- | --- |
+| 200 | 0.97944 | 1.47 | 4.188 | 773.7 KB |
+| 100 | 0.97980 | 1.38 | 3.514 | 566.6 KB |
+| 50 | 0.97930 | 1.43 | 4.073 | 463.1 KB |
+| 25 | 0.97051 | **1.83** | 3.793 | **411.4 KB** |
+| 15 | 0.95181 | 1.18 | 5.208 | 390.7 KB |
+| 10 | 0.90541 | 1.20 | 5.785 | 380.3 KB |
+
+**Model inference did not get faster.** Batched, it is 1.47 µs/row at 200 features and 1.83 µs/row at 25 — noise, and if anything the wrong direction. Single-row latency is 3.5 to 5.8 ms regardless, dominated entirely by Python call overhead.
+
+The reason is that a boosted tree's inference cost is `O(n_trees * depth)` — the number of *comparisons down the tree*, not the number of columns. All 200 features exist in the input array either way; the model only touches the ones it split on.
+
+So what did you actually buy?
+
+**The artifact shrank 47%**, 773.7 KB to 411.4 KB. Real, and it matters for cold-start and memory.
+
+**And 175 upstream dependencies disappeared.** That is 175 columns that no longer need to be computed, joined, backfilled when a source changes, monitored for drift, or investigated at 3 a.m.
+
+**Derived**, to put a number on it: assume a per-feature upstream cost of `c` milliseconds. Then the feature work is `200c` at the full set and `25c` after the cut — an **8x reduction** whatever `c` turns out to be. The ratio is the robust part; `c` is yours to measure. At a placeholder `c = 0.05 ms` that is 10 ms against 1.25 ms per request, which is the shape of the win but not a measurement of your system.
+
+Set that against the measured model cost of **1.5 µs per row**, which did not change when we cut the features. Whatever `c` is on your infrastructure, the model is not where your latency lives.
+
+**Optimise feature computation, not model inference.** That is the finding, and it is the opposite of where most effort goes.
+
+### Cost-aware selection
+
+Once you accept that the cost is upstream, the selection criterion changes. Do not maximise accuracy per feature; maximise accuracy per **millisecond of feature computation** or per **upstream system**.
+
+```python
+# a crude but effective criterion
+value = importance / (compute_cost_ms + 1e-9)
+```
+
+Two features with equal importance are not equal if one is a column already in the request and the other requires a cross-region query. In practice the highest-value change is often dropping a moderately important feature that is the *only* reason you depend on some system — removing the dependency entirely is worth more than the feature.
+
+### Multicollinearity and VIF
+
+For linear models specifically, correlated features are a coefficient problem before they are a selection problem. The **variance inflation factor** for feature `j` is `1/(1 - R2_j)`, where `R2_j` comes from regressing feature `j` on all the others.
+
+- VIF near 1: independent.
+- VIF above 5: notable collinearity.
+- VIF above 10: the coefficient's standard error is more than 3x what it would be, and the coefficient is not interpretable.
+
+This is Week 17 Module 2's identifiability point with a diagnostic attached: high VIF means the data does not determine that coefficient, only its sum with the correlated ones. **It matters for coefficient interpretation and barely at all for prediction** — and it does not apply to trees, which are unbothered by collinearity in prediction (though it does scramble their importances).
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **Filter** vs **permutation** | thousands of candidates, or fits take hours — it is instant | quality matters and fits are affordable; measured −0.89 vs −3.47 |
+| **Selection** vs **PCA** | you want to remove upstream dependencies, and interpretability | you want compression and are happy still computing every input |
+| **Fixed `k`** vs **stability threshold** | you have a hard budget on feature count | you want a data-driven cut; take features surviving 80% of bootstraps |
+| **Permutation** vs **grouped permutation** | features are roughly independent | correlated groups exist — otherwise both copies score zero |
+| **Accuracy-based** vs **cost-aware** selection | all features cost the same to compute | they do not, which is always; weight by compute cost or by upstream system |
+| **Keep 50** vs **keep 25** | the flat part of the curve extends that far — it was free here | you have a serving or maintenance constraint that 25 satisfies and 50 does not |
+
+### War story: the 40 features nobody could turn off
+
+*A modelled composite — assembled from recurring patterns rather than one company, with illustrative figures. The mechanism is real and the measured tables elsewhere on this page are unaffected; the incident is not a case study. See [About the numbers](/start/about-the-numbers).*
+
+A payments team's fraud model had 214 features. It performed well and nobody touched it for a year.
+
+Then the company decommissioned a legacy risk-scoring vendor, and 40 of the 214 features came from it. The vendor contract had three weeks left. Nobody knew, because nothing tracked which features came from which system, and the model had been built by someone who had left.
+
+The scramble produced two findings. First, cutting all 40 vendor features and refitting cost **0.004 AUC** — inside the noise. They had been paying £11,000 a month for features contributing nothing measurable, and the reason nobody knew is that nobody had ever ablated a *group*: each feature individually had a small non-zero importance, and grouped permutation importance — which they had never run — put the whole vendor block at 0.004.
+
+Second, the *reason* the block was worth nothing was that the vendor's features were derived from the same transaction history the team already had. They were correlated with in-house features at 0.8 to 0.95. Permutation importance had been showing all of them as mildly useful, individually, for a year.
+
+Three changes. Every feature in the registry gained a `source_system` field, and grouped permutation importance by source system became a quarterly report. Cost-aware selection was adopted: features are ranked by importance per pound of upstream cost, not by importance. And an ablation test entered CI — drop each source system in turn, refit, and assert the AUC drop exceeds a threshold, which turns "is this dependency worth it" into a number that is always current.
+
+The lesson: **individually small importances can sum to nothing, and no per-feature method will tell you.** Group by the thing that actually costs money — the upstream system — and ablate the group.
+
+### Design checkpoint
+
+> You have 200 features. 30 come from a real-time API with a 40 ms p99, 120 from the warehouse (precomputed, 2 ms), and 50 are derived in-process (free). The request budget is 80 ms. How do you select?
+
+<Accordion title="Model answer">
+The budget answers the question before any importance is computed. The API's 40 ms p99 is half the entire budget, so the first thing to establish is whether those 30 features are worth 50% of your latency. Run grouped permutation importance **by source system**, not per feature — the war story above is exactly this situation and the answer was 0.004.
+
+Then a cost-aware ranking. The 50 in-process features are free, so keep every one that is not actively harmful; there is no reason to cut them. The 120 warehouse features share one 2 ms lookup — the marginal cost of the 121st is nearly zero, so select among them on accuracy alone and be generous. The 30 API features are the only ones with a real per-group price, so they need to justify 40 ms *as a block*.
+
+Then measure three configurations end to end: all 200; warehouse plus in-process only (no API call at all, budget 2 ms); and warehouse plus in-process plus the API. If the API block is worth less than about 0.01 AUC, drop it and you have bought 38 ms of headroom, which you can spend on a bigger model, more retries, or a lower p99 — all of which may be worth more than the features were.
+
+One design note: if the API block *is* valuable, consider making it optional. Call it with a 15 ms timeout and train the model with those features sometimes missing, so a slow API degrades the prediction rather than the request. `HistGradientBoosting` and XGBoost both learn a default direction for missing values (Week 18 Module 1), which makes this nearly free to implement and is a much better failure mode than a timeout.
+</Accordion>
+
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+
+### SHAP, permutation and impurity, compared on the same model
+
+Three importance measures, three different questions, and they disagree in characteristic ways.
+
+| Measure | The question it answers | Computed on | Cost |
+| --- | --- | --- | --- |
+| **Impurity / gain** | how much training loss did splits on this feature reduce? | training data | free (already computed) |
+| **Permutation** | how much worse does *this model* get on held-out data if this column is destroyed? | held-out data | `p * n_repeats` scorings |
+| **SHAP** | how much did this feature contribute to *each individual prediction*, on average? | any data | 0.65 ms/row for TreeSHAP (Week 18 Module 3) |
+
+Week 18 measured the disagreement directly: on the same boosted model, the top-5 by mean `|SHAP|` and the top-5 by `gain` shared only three features. That is expected, not a bug.
+
+Their failure modes are also characteristic and worth memorising:
+
+- **Impurity** is biased toward high-cardinality and continuous features — measured at 81.8% of total importance for a random ID column — and is computed on training data.
+- **Permutation** gives correlated features **zero** each, and it evaluates the model *as fitted*: a feature the model ignores scores zero even if it carries signal the model failed to use.
+- **SHAP** with `tree_path_dependent` perturbation follows the tree's own splits, so it also attributes credit along paths the model took; with `interventional` perturbation it uses a background distribution and can disagree substantially on correlated features.
+
+**None of them measures "how much information does this feature carry".** All three measure "how much does this fitted model rely on this feature". If you want the former, the only honest method is to refit without it — ablation — which costs a fit per feature and is why nobody does it per-feature and everybody should do it per-*group*.
+
+### Selection stability, formalised
+
+The bootstrap frequency in Layer 2 is a per-feature number. There is a single scalar for the whole procedure: the **Nogueira stability measure** (Nogueira, Sechidis & Brown, 2018), which corrects for chance and for the number of features selected.
+
+```
+stability = 1 - ( mean over features of the selection variance )
+                / ( expected variance under random selection of the same size )
+```
+
+It is 1 for a perfectly stable selector, 0 for random selection, and it is comparable across different `k` and different `p` — which the raw frequencies are not.
+
+Why it matters beyond tidiness: **an unstable selector produces an unreproducible model**. If the 25 features you ship depend on which bootstrap you drew, then next quarter's refit will produce a different 25, the model card's feature list will be wrong, and any downstream consumer keyed on the feature set will break. The measurement above found 9 of 25 features unstable, which is a lot.
+
+The main causes of instability, and the fixes: **correlated features** (the selector picks arbitrarily among a group — cluster and select groups, not features); **small `n`** (nothing to do but report it); and **a filter method** (they are noisier than embedded or permutation methods because they ignore the model).
+
+### The maintenance cost of a feature, quantified
+
+Every feature carries a recurring cost that no accuracy metric shows. An honest inventory:
+
+| Cost | Frequency | Rough scale |
+| --- | --- | --- |
+| Upstream compute and storage | continuous | pennies to hundreds of pounds a month |
+| A drift monitor and its alert threshold | continuous | one alert to triage per feature per quarter |
+| Backfill when the source schema changes | a few times a year | hours to days of engineering |
+| Investigation when it goes null | unpredictable | an on-call incident |
+| Documentation and onboarding | continuous | a paragraph nobody reads until they need it |
+
+Sculley et al. (2015) call these **data dependencies**, and argue they are more expensive than code dependencies because there is no compiler to tell you one broke. Their term for the pattern where a feature stays because removing it is scarier than keeping it is **entanglement**: "changing anything changes everything", so nobody changes anything.
+
+The concrete practice that follows: **an ablation test per source system, in CI.** Drop each system's features, refit, assert the AUC drop exceeds a threshold. When it does not, you have a dependency you can delete, and you found out automatically rather than three weeks before a contract expires.
+
+### When selection actively hurts
+
+Three cases where cutting features is the wrong move, and they are not rare.
+
+**When `n` is large relative to `p`.** With 10 million rows and 200 features, regularization handles the noise features and selection buys only maintenance simplicity. The measurement above showed 200 to 50 costing 0.01 AUC — but it also showed 100 features *beating* 200 by 0.04, which is noise in the other direction. At large `n` the accuracy argument for selection evaporates entirely; only the operational argument remains.
+
+**When features are individually weak and collectively strong.** Text, genomics, and any wide sparse problem. Week 17 Module 1 measured logistic regression at 0.783 against a random forest's 0.588 on 500 dense weak features — the signal was spread across all of them, and selecting the top 25 would have destroyed it. **Filters are especially bad here**, because a feature with a marginal correlation of 0.02 is indistinguishable from noise individually and may be essential jointly.
+
+**When the selection itself overfits.** At small `n`, the selected set is noise and you have spent a degree of freedom finding it. Week 19 Module 4 measured selection on 10,000 noise features with 200 rows at +33.50 accuracy points of inflation. Below roughly `n = 1000`, prefer strong regularization to selection — Week 17 Module 4's measurement of ridge cutting variance by a factor of 110,000 is the relevant comparison.
+
+### Selection inside nested cross-validation
+
+If you select features *and* report a cross-validated score, the score is optimistic — for the same reason a tuned hyperparameter's CV score is optimistic (Week 19 Module 3, measured at +0.63 points on real data and +1.96 on noise).
+
+The correct structure is three levels deep, and it is expensive:
+
+```
+outer loop  (report the number here)
+  inner loop  (select features here)
+    innermost  (tune hyperparameters here)
+```
+
+At 5 folds each that is 125 fits per configuration. The pragmatic alternatives, in order of preference: put selection in the `Pipeline` and use a single outer CV, accepting that hyperparameters were tuned on the same folds; or select once on a dedicated split you then discard, and cross-validate on the rest.
+
+**What you must not do is select on all the data and report the CV score** — measured at +18.00 points on noise.
+
+### Failure modes
+
+| Failure | Signature | Detector |
+| --- | --- | --- |
+| Selection outside the CV | CV far above a forward hold-out; inflation grows with `p/n` | put the selector in a `Pipeline`; measured +18.00 points on noise |
+| Correlated features both dropped | permutation importance near zero for two strong features | grouped permutation; cluster on `1 - abs(spearman)` |
+| Unstable feature set between refits | the model card's feature list is wrong within a quarter | bootstrap selection frequency; report the Nogueira stability |
+| Filter used on jointly-informative features | selection destroys a model that was working | compare against no selection; filters cannot see joint effects |
+| Optimising model inference | effort spent for no measurable gain | measured 1.47 vs 1.83 µs/row; profile the feature computation instead |
+| A whole source system contributing nothing | individually small importances, collectively zero | grouped ablation by source system, in CI |
+| Selection at small `n` | the selected set is noise | prefer regularization below roughly `n = 1000` |
+| PCA used to reduce serving cost | you still compute every input feature | selection removes the dependency; extraction does not |
+
+### Papers
+
+- **Guyon, I. & Elisseeff, A. (2003), "An Introduction to Variable and Feature Selection," JMLR 3.** *Takeaway:* a variable useless by itself can be useful with others, and two redundant-looking variables can jointly be better than either — so any method that scores features independently is structurally blind to the cases that matter most.
+- **Nogueira, S., Sechidis, K., Brown, G. (2018), "On the Stability of Feature Selection Algorithms," JMLR 18.** *Takeaway:* a chance-corrected stability measure that is comparable across different `k` and `p`, plus the argument that an unstable selector produces an unreproducible model.
+- **Sculley, D. et al. (2015), "Hidden Technical Debt in Machine Learning Systems," NeurIPS 28.** *Takeaway:* data dependencies cost more than code dependencies because nothing detects when one breaks, and every retained feature is one.
+- **Strobl, C. et al. (2007), "Bias in random forest variable importance measures," BMC Bioinformatics 8.** *Takeaway:* impurity importance favours high-cardinality features strongly enough to invert the true ranking.
+- **Lundberg, S. et al. (2020), "From local explanations to global understanding with explainable AI for trees," Nature Machine Intelligence 2.** *Takeaway:* exact Shapley values for trees in polynomial time, and an explicit account of how the perturbation choice changes attributions among correlated features.
+- **Kursa, M. & Rudnicki, W. (2010), "Feature Selection with the Boruta Package," J. Statistical Software 36(11).** *Takeaway:* comparing each real feature against permuted "shadow" copies of itself gives an all-relevant selection with a built-in significance test — a useful alternative when you want every relevant feature rather than a minimal set.
+
+### Stretch challenge
+
+Cut a 200-feature model to 25 with under 1% metric loss, then **report the serving win honestly** — which means measuring where it is not.
+
+Part one: reproduce the sweep, using grouped permutation importance so correlated features are handled, and report the bootstrap stability of your final set.
+
+Part two is the honest half. Measure four things at each `k`: batched inference latency, single-row latency, model artifact size, and a *simulated* end-to-end request latency where each feature carries a cost drawn from a realistic distribution — say 60% free in-process, 35% at 2 ms shared across a batch lookup, 5% at 20 ms each from a remote call. Plot all four against `k`.
+
+The open question, and the deliverable: **at what feature cost distribution does model inference start to matter?** You will find it essentially never does for tree models. So construct the case where it does — a linear model over 100,000 sparse features, or a neural network — and state the crossover. Then write the one-paragraph recommendation you would give an engineer about to spend a sprint optimising model inference, with your numbers in it.
+
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Cut a 200-feature model to 25 features with under 1% metric loss, and report the serving-latency win.
+</Card>
+
+<Steps>
+  <Step title="Rank honestly">
+  Permutation importance on held-out data, with correlated features grouped. Report the selection time — it is 96x the filter's and that is part of the decision.
+  </Step>
+  <Step title="Find the cliff">
+  Sweep `k` over at least 200, 100, 50, 25, 15, 10, 5. The curve is flat and then falls off; locate the knee and report both the flat region and the drop.
+  </Step>
+  <Step title="Measure stability">
+  20 bootstrap refits of the selector; report how many of your 25 features survive in 80% or more.
+  </Step>
+  <Step title="Report the win where it actually is">
+  Batched inference latency, single-row latency, artifact size, and the number of upstream dependencies removed. Say explicitly which of those did **not** improve.
+  </Step>
+</Steps>
+
+Time box: **3 hours**. Acceptance: under 1% AUC loss at `k=25`; a stability number; and a written statement that model inference latency did not improve, with the measurement behind it.
+
+## The whiteboard
+
+T2 build-up, four frames: (1) the AUC-versus-`k` curve with the flat region highlighted; (2) the cliff annotated with its per-step costs; (3) the two equal-height latency bars crossed out in red; (4) the 175 boxes going into the dependency bin.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p3-w20-m3-blank.svg) · [Editable source](/assets/diagrams/p3-w20-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+  **Resume line:** "Cut a 200-feature model to 25 for 0.89 AUC points using grouped permutation importance; measured that model inference latency did not improve and identified 175 removed upstream dependencies as the actual win."
+  **Interview move:** when asked about feature selection, name the four families with their costs, then say the counter-intuitive thing: "and the win is not inference latency — I measured 1.47 versus 1.83 microseconds per row. It is the upstream dependencies." Very few candidates have measured it.
+  **Portfolio:** the AUC-versus-`k` curve with the flat region and the cliff both annotated. It shows you found the knee rather than guessing a number.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+  1. **Add a `source_system` field** to your feature registry, then run grouped permutation importance by system. The war story above found a £11,000-a-month vendor block worth 0.004 AUC.
+  2. **Put an ablation test in CI** — drop each source system, refit, assert the drop exceeds a threshold. It turns "is this dependency worth it" into a number that is always current.
+  3. **Stop optimising model inference** until you have profiled feature computation. **Measured** here: the model is 1.5 µs per row batched, and it does not improve when you cut features. The upstream lookup it is dwarfed by is a **reference figure** we did not run — profile yours, and expect the two to be orders of magnitude apart.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| CV great, hold-out poor, after selection | selection used every row's label | put the selector in a `Pipeline`; +18.00 points on noise |
+| Two strong features both look useless | permutation importance with correlated columns | grouped permutation with a shared shuffle index |
+| An ID column ranks first | impurity importance's cardinality bias | held-out permutation importance |
+| Feature list changes every refit | unstable selector | bootstrap frequency; select on 80% survival, not a fixed `k` |
+| Selection destroyed a text model | filters cannot see jointly-informative weak features | do not select on wide sparse data; regularize instead |
+| Sprint spent on inference speed, no gain | the cost was never in the model | profile feature computation first |
+| PCA used to cut serving cost | you still compute all 200 inputs | selection removes dependencies; extraction does not |
+| A vendor feed nobody can justify | per-feature importances are individually small | ablate by source system, not by feature |
+
+## Assessment
+
+**Concept questions (8).**
+1. Name the four selection families and give the cost of each.
+2. Why is a filter method blind to redundancy?
+3. Two identical strong features both get permutation importance near zero. Explain, and give the fix.
+4. What does impurity importance do with the same two features, and why is that also wrong?
+5. Selection outside cross-validation inflated accuracy by 18 points on pure noise. What is the mechanism?
+6. Cutting 200 features to 25 did not speed up inference. Why not, for a tree model?
+7. Give two settings where feature selection actively hurts.
+8. What does a VIF of 12 tell you, and for which model families does it matter?
+
+**Coding challenge.** Implement `grouped_permutation_importance(model, X, y, groups, scoring, n_repeats)` using a shared shuffle index per group, and `selection_stability(selector, X, y, n_boot)` returning per-feature frequencies and the Nogueira stability measure. Hidden tests: on a dataset with two exact duplicate columns, the grouped importance of the pair must be at least 10x either column's individual permutation importance; and the stability measure must be 1.0 for a deterministic selector and near 0 for a random one.
+
+**Interview questions.**
+- *Junior:* "How do you decide which features to keep?"
+- *Mid:* "Permutation importance says two of your strongest features are useless. What is happening?"
+- *Senior:* "You have 80 ms of request budget and features from three systems with very different costs. Design the selection."
+
+**Draw from memory.** The AUC-versus-`k` curve with the flat region and the cliff, and the crossed-out latency bars.
+
+## Sources & further reading
+
+**Primary docs**
+- [scikit-learn 1.9 "Feature selection"](https://scikit-learn.org/stable/modules/feature_selection.html) — read this for `SelectKBest`, `RFE`, `SelectFromModel` and `SequentialFeatureSelector`, with the explicit warning to use a `Pipeline`.
+- [scikit-learn 1.9 "Permutation feature importance"](https://scikit-learn.org/stable/modules/permutation_importance.html) — read this for the correlated-features caveat and the worked example of clustering features before permuting.
+- [scikit-learn 1.9 "Permutation Importance with Multicollinear or Correlated Features" example](https://scikit-learn.org/stable/auto_examples/inspection/plot_permutation_importance_multicollinear.html) — read this for the hierarchical-clustering recipe that turns correlated columns into groups.
+
+**Papers**
+- [Guyon, I. & Elisseeff, A. (2003), "An Introduction to Variable and Feature Selection," *JMLR* 3.](https://jmlr.org/papers/v3/guyon03a.html) *Takeaway:* individually useless variables can be jointly essential, so independent scoring is structurally blind.
+- [Nogueira, S. et al. (2018), "On the Stability of Feature Selection Algorithms," *JMLR* 18.](https://jmlr.org/papers/v18/17-514.html) *Takeaway:* a chance-corrected stability measure, and the argument that instability means irreproducibility.
+- [Sculley, D. et al. (2015), "Hidden Technical Debt in Machine Learning Systems," *NeurIPS 28*.](https://papers.nips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html) *Takeaway:* every feature is a data dependency and nothing tells you when one breaks.
+- [Strobl, C. et al. (2007), "Bias in random forest variable importance measures," *BMC Bioinformatics* 8.](https://doi.org/10.1186/1471-2105-8-25) *Takeaway:* impurity importance can invert the true ranking.
+- [Lundberg, S. et al. (2020), "From local explanations to global understanding…," *Nature Machine Intelligence* 2.](https://doi.org/10.1038/s42256-019-0138-9) *Takeaway:* the perturbation choice changes attributions among correlated features, so state which you used.
+- [Kursa, M. & Rudnicki, W. (2010), "Feature Selection with the Boruta Package," *JSS* 36(11).](https://doi.org/10.18637/jss.v036.i11) *Takeaway:* comparing features against permuted shadow copies gives an all-relevant selection with a significance test.
+
+**Go deeper**
+- [Kuhn, M. & Johnson, K., *Feature Engineering and Selection* (2019), Chapters 10–11.](http://www.feat.engineering/) Read them for the clearest treatment of why selection must be inside the resampling loop and for a survey of search strategies, with the practical warning that most of the reported gains in the literature are selection bias.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-20/p3-w20-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

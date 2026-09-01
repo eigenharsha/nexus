@@ -1,0 +1,122 @@
+---
+title: "ER modelling & schema design"
+description: "Reference solution — Week 7"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W07-M2`
+
+The exercise: the zero-downtime plan for renaming a heavily-used column.
+
+### The five phases, with lock levels and measured costs
+
+Renaming `orders.total` to `orders.total_cents` on a live table. `RENAME COLUMN` is instant but
+**breaks every running instance of the old code**, which is why this is five deploys, not one.
+
+| Phase | Statement | Lock | Measured (1M rows) | Reversible? |
+| --- | --- | --- | --- | --- |
+| 1 expand | `ALTER TABLE orders ADD COLUMN total_cents bigint;` | ACCESS EXCLUSIVE, metadata only | 577 ms (with a default) | yes — drop it |
+| 2 dual write | deploy code writing both; add a `BEFORE INSERT OR UPDATE` trigger | ACCESS EXCLUSIVE briefly for the trigger | ms | yes — drop the trigger, redeploy |
+| 3 backfill | batched `UPDATE`, 5,000 rows per transaction | row locks only | **62.7 s as one statement**; ~65 s total in batches but no long lock | yes — the old column is untouched |
+| 4 switch reads | deploy code reading the new column; `ADD CONSTRAINT ... CHECK (total_cents IS NOT NULL) NOT VALID` then `VALIDATE` | ACCESS EXCLUSIVE 51 ms, then **SHARE UPDATE EXCLUSIVE** 133 ms | 184 ms total | yes — redeploy the previous version |
+| 5 contract | drop the trigger, `ALTER TABLE orders DROP COLUMN total;` | ACCESS EXCLUSIVE, metadata only | ms | **NO — point of no return** |
+
+```sql
+-- Every migration file starts with these two lines.
+SET lock_timeout = '3s';
+SET statement_timeout = '60s';
+```
+
+### The batched backfill
+
+```sql
+DO $$
+DECLARE rows_done integer;
+BEGIN
+  LOOP
+    UPDATE orders SET total_cents = total
+    WHERE  id IN (SELECT id FROM orders WHERE total_cents IS NULL LIMIT 5000);
+    GET DIAGNOSTICS rows_done = ROW_COUNT;
+    EXIT WHEN rows_done = 0;
+    COMMIT;
+    PERFORM pg_sleep(0.05);
+  END LOOP;
+END $$;
+```
+
+Measured: the one-statement version of this backfill took **62,693 ms** on 1,000,002 rows. Batched,
+the total wall time is similar but no single transaction holds locks for more than a few
+milliseconds, autovacuum can keep up with the dead tuples, and the operation can be stopped and
+resumed at any point.
+
+Projection for the ticket's 40-million-row table: 62.7 s per million means roughly **42 minutes**.
+As one statement that is 42 minutes of held locks, unbounded WAL growth and a table that cannot be
+vacuumed. In batches it is 42 minutes of background work nobody notices.
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: `ALTER TABLE ... RENAME COLUMN`.** It takes milliseconds and it is the wrong answer.
+During a rolling deploy both code versions are running; the instant the rename lands, every instance
+still running the old code fails on every query touching that column. The rename is only safe when
+you can stop the world, which is the thing you were asked to avoid.
+
+**Wrong turn 2: forgetting `lock_timeout`.** `ALTER TABLE ADD COLUMN` is a metadata change and
+completed in 577 ms — but it needs `ACCESS EXCLUSIVE`, and PostgreSQL's lock queue is FIFO. If any
+long-running query holds even `ACCESS SHARE`, the `ALTER` waits *and every query behind it waits
+too*. This is the mechanism behind the six-minute outage in the module's war story. `lock_timeout`
+turns it into a failed migration you retry.
+
+**Wrong turn 3: `SET NOT NULL` directly.** Measured 2,026 ms under `ACCESS EXCLUSIVE` on 1M rows —
+so on 40M rows, roughly 80 seconds of total table lockout. The `CHECK ... NOT VALID` then `VALIDATE`
+pair achieves the same guarantee at 51 ms of strong lock plus 133 ms under `SHARE UPDATE EXCLUSIVE`,
+during which reads and writes continue.
+
+**Wrong turn 4: a plan with no rollback for phases 3 and 4.** Most submitted plans stop at "then
+drop the old column". The important content is the *point of no return*: phases 1–4 are individually
+reversible, phase 5 is not, and the plan must state what must be true before crossing it — typically
+"a full deploy cycle has passed with zero reads of the old column, verified by a query counter or by
+`pg_stat_statements` showing no query referencing it".
+
+**Wrong turn 5: `CREATE INDEX` without `CONCURRENTLY` during a migration.** Measured 549.6 ms
+against 611.6 ms — the concurrent version costs **11% more wall time** and does not block writes.
+There is no version of this trade that favours the blocking form on a live table. Do check
+`pg_index.indisvalid` afterwards: a failed concurrent build leaves an invalid index behind.
+
+## Measured numbers this solution produces
+
+| Operation | Lock | Time on 1M rows |
+| --- | --- | --- |
+| `ADD COLUMN ... DEFAULT 'web'` | ACCESS EXCLUSIVE | 577 ms |
+| Backfill `UPDATE` (one statement) | row locks | **62,693 ms** |
+| `SET NOT NULL` | ACCESS EXCLUSIVE + scan | 2,026 ms |
+| `ADD CONSTRAINT ... NOT VALID` | ACCESS EXCLUSIVE, no scan | **51 ms** |
+| `VALIDATE CONSTRAINT` | SHARE UPDATE EXCLUSIVE | **133 ms** |
+| `CREATE INDEX` | SHARE (blocks writes) | 549.6 ms |
+| `CREATE INDEX CONCURRENTLY` | SHARE UPDATE EXCLUSIVE | 611.6 ms (+11%) |
+
+## Grading notes
+
+**A 3/3 on correctness**: five phases, each independently deployable; a trigger for writers you do
+not control; a batched backfill with a projected runtime for the real row count; `CHECK ... NOT VALID`
+rather than `SET NOT NULL`; `lock_timeout` at the top of every file.
+
+**A 3/3 on explanation**: states the point of no return and the precondition for crossing it, and
+gives the rollback for every earlier phase.
+
+**The four most common ways submissions lose points**
+
+1. `RENAME COLUMN` proposed as the solution.
+2. No `lock_timeout`, so the plan is correct in isolation and dangerous in production.
+3. An unbatched backfill, with no projection of what 62.7 s per million means at the real table size.
+4. No rollback for phase 4, and no statement of where reversibility ends.

@@ -1,0 +1,154 @@
+---
+title: "Docker"
+description: "Reference solution — Week 23"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P3-W23-M3`
+
+The hands-on was: take a 4 GB image to under 600 MB and cut rebuild time by 80%, documenting each change and its saving.
+
+### The table, with the arithmetic check
+
+Docker 24.0.7 with BuildKit. **Sizes are measured** from `docker images` and do not depend on the host — you should reproduce them exactly. Build, pull and Lambda cold-start columns are **reference figures** (Machine B / ECR / Lambda, modelled — see [About the numbers](/start/about-the-numbers)).
+
+| # | Change | Size | Δ | Effort |
+| --- | --- | --- | --- | --- |
+| 0 | Baseline: `python:3.12`, single stage, pip cache kept, `build-essential` | 3,140 MB | — | — |
+| 1 | `.dockerignore` (`data/`, `.git`, `notebooks/`, `.venv`) | 2,890 MB | −250 MB | 2 min |
+| 2 | `python:3.12.6-slim-bookworm` base | 2,000 MB | −890 MB | 1 min + 2 `ImportError`s |
+| 3 | Multi-stage: compilers and headers stay in the builder | 1,585 MB | −415 MB | 20 min |
+| 4 | BuildKit cache mount instead of a baked pip cache | 1,317 MB | −268 MB | 10 min |
+| 5 | ONNX Runtime replaces PyTorch in the runtime image | **466 MB** | **−851 MB** | 30 min |
+| | **Total** | | **−2,674 MB (85.2%)** | ~65 min |
+
+`3,140 − 250 − 890 − 415 − 268 − 851 = 466` ✓
+
+And the finished image, accounted for byte by byte (`du -sh` inside the container):
+
+```
+python:3.12.6-slim-bookworm base       130 MB
+libgomp1 + libglib2.0-0                  3 MB
+onnxruntime stack (excl. numpy)        111 MB    <- sympy is 58 MB of this
+numpy                                   25 MB
+fastapi + uvicorn + pydantic            45 MB
+pillow                                  12 MB
+opencv-python-headless                  95 MB
+artifacts/v3/model.onnx                 47 MB
+application code                         1 MB
+                                       -------
+                                       469 MB    (reported 466; 3 MB is layer overhead)
+```
+
+<Tip>
+**The arithmetic check is the deliverable, not the final number.** If your savings do not sum to
+your total, you made a change you did not record — and it is usually a base-image bump or a
+dependency you removed while doing something else. Reconciling it is where you learn what
+actually happened.
+</Tip>
+
+### Rebuild time
+
+| Scenario | Time |
+| --- | --- |
+| Cold build, no cache | 94 s |
+| **Code change, bad ordering (`COPY . .` first)** | **214 s** |
+| **Code change, good ordering** | **11 s** |
+| Dependency change, no cache mount | 88 s |
+| Dependency change, with cache mount | 23 s |
+
+**94.9% reduction on the common case** — comfortably past the 80% target, from moving three lines.
+
+The dependency-change row is worth its own note: the BuildKit cache mount saves 65 s and, unlike the layer cache, **survives across branches and across images**, because it is a persistent volume keyed by target path rather than by a layer hash. On a repository where several people add dependencies, that compounds.
+
+### The two `ImportError`s you get from switching to slim
+
+Both appear the first time the container runs, not at build time.
+
+```
+ImportError: libgomp.so.1: cannot open shared object file: No such file or directory
+ImportError: libGL.so.1: cannot open shared object file: No such file or directory
+```
+
+- The first is `onnxruntime` wanting OpenMP → `apt-get install libgomp1` (1.2 MB).
+- The second is `opencv-python` (non-headless) wanting a GUI stack → switch to `opencv-python-headless`, which is also **142 MB smaller**. If you install `libgl1` instead you have fixed the symptom and kept the 142 MB.
+
+Diagnose either one in one command rather than by guessing:
+
+```bash
+docker run --rm -it --entrypoint bash bloodcell:v3 -c \
+  'ldd /app/.venv/lib/python3.12/site-packages/onnxruntime/capi/*.so | grep "not found"'
+```
+
+### Where the last 100 MB is, and whether to take it
+
+Once at 466 MB every further saving is a trade with a number on both sides:
+
+| Change | Saving | Cost |
+| --- | --- | --- |
+| Pillow instead of `opencv-python-headless` | **−87 MB** | +2.1 ms per request (decode 5.8 → 7.9 ms) |
+| `gcr.io/distroless/python3-debian12` | **−78 MB** | No shell. `kubectl debug` or a `:debug` variant needed |
+| int8 quantized model | −36 MB | −0.2 accuracy points, **and 1.6× faster** |
+| Vendoring `sympy` out of `onnxruntime` | −58 MB | Fragile; breaks on the next ORT upgrade. **Do not.** |
+
+The reference solution takes the int8 model (it is a net win on both axes) and stops at **430 MB**. Distroless is the right next step for a security-sensitive deployment and the wrong one for a team that has never used `kubectl debug` and will meet it during an incident.
+
+### What the size actually buys
+
+| Image | Pull (cold, ECR same region) | Container start → ready | Lambda cold start |
+| --- | --- | --- | --- |
+| 3,140 MB | 71 s | 79 s | 21.4 s |
+| 1,317 MB | 31 s | 37 s | 8.7 s |
+| 466 MB | **14 s** | **19 s** | **3.2 s** |
+| 430 MB (int8) | 13 s | 18 s | 3.0 s |
+
+**Pod start time is roughly linear in image size**, and pod start is the dominant term in autoscaling lag (Week 24 Module 3). A 3 GB image means the autoscaler reacts about a minute after a spike — usually after it has passed.
+
+Registry cost, at 100 builds/month retained 90 days: 942 GB versus 140 GB stored, which is **$94 versus $14 monthly** on ECR.
+
+## Why this solution and not the obvious one
+
+**Why `.dockerignore` first even though it is not the biggest saving.** It is two minutes and it also shrinks the build context from 312 MB to 8 MB, which speeds up every subsequent build's context upload. Cheapest first, and it makes the later measurements cleaner.
+
+**Why the multi-stage build before the ONNX migration.** The ONNX migration is the biggest saving and the most work, and it can fail (an unsupported operator, a parity mismatch). Doing the mechanical 1,555 MB first means you have a deliverable even if the migration stalls.
+
+**Why `opencv-python-headless` rather than installing `libgl1`.** Both fix the error. One is 142 MB smaller and removes a GUI stack from a server. Fixing the symptom rather than the cause is how images grow.
+
+**Why pin the base by digest in the final version.** `python:3.12.6-slim-bookworm` was rebuilt eleven times in the past year with different contents. Two builds of the same commit on different days can differ, which makes "it worked yesterday" unanswerable.
+
+## The two wrong turns worth knowing about
+
+**1. Trying Alpine.** It is the intuitive move and it is wrong here: no musl wheels for NumPy and OpenCV means source builds needing `gcc`, `g++`, `gfortran` and OpenBLAS headers, and `onnxruntime` publishes **no musl wheel at all**. Reference figure — Machine B (RTX 4090, modelled): 1,284-second build, a **612 MB** result (larger than slim), and p50 latency 58 ms versus 41 ms because musl's allocator is slower for Python's patterns. Alpine is excellent for static Go and Rust binaries and wrong for the Python scientific stack.
+
+**2. "Cleaning up" in a later `RUN`.** `RUN apt-get remove -y build-essential` after installing it removes nothing from the image — the bytes are in the earlier layer and a whiteout marker is added in the later one. `docker history` shows the original layer unchanged, and the "cleanup" commit shows a diff and no size change. Same `RUN`, or multi-stage.
+
+## Grading notes
+
+**3/3 on Performance** — the six-row table with savings that sum to the total, the finished image accounted for byte by byte, both rebuild times, and the cache-mount measurement.
+
+**3/3 on Correctness** — multi-stage, non-root with an explicit UID, a `HEALTHCHECK` that does not require `curl`, and `trivy --ignore-unfixed` passing.
+
+**3/3 on Explanation** — the last-100-MB trade table with the cost on both sides, and a stated decision about which trades you took and why.
+
+**The three most common ways submissions lose points**
+
+1. **All changes applied at once.** One number, no attribution, and no way to know which change mattered. Change one thing, rebuild, measure.
+2. **The savings do not reconcile.** Usually a base-image bump made while doing something else. Reconciling is the exercise.
+3. **Rebuild time not measured.** The size table is the headline and the 214 s → 11 s is what developers actually feel every day. Report both.
+
+<Card title="Back to the module" icon="arrow-left" href="/curriculum/p3/week-23/3-docker" horizontal>
+  The 851 MB from dropping PyTorch is 5.5 seconds of Lambda cold start in Module 5.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

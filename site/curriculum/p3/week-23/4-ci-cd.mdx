@@ -1,0 +1,846 @@
+---
+title: "CI/CD"
+description: "Week 23 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 23 · Module 4 · `P3-W23-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+**The thing most ML teams do not have** is the subject of Layer 3: a CI gate that fails the build
+when the model gets worse. Code has tests; models usually have nothing between a training run and
+production. The gate you build here is the direct precursor of Week 31's LLM evaluation CI, and
+it is the cheapest large improvement available to most ML teams.
+</Info>
+
+## What you'll be able to do
+
+1. Write a workflow that runs your tests on every push.
+2. Build a full pipeline: lint, type-check, test, build, scan, push, deploy, smoke test.
+3. Cache dependencies and Docker layers so the pipeline is minutes, not tens of minutes.
+4. Handle secrets without long-lived credentials.
+5. Compute and defend your pipeline's runtime budget, and parallelize the critical path.
+6. Explain why testing a *model* is a different problem from testing code.
+7. Add a gate that fails the build when accuracy on a fixed holdout drops more than 1%.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w23-m4.svg" alt="Hand-drawn sketch: CI/CD" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w23-m4-dark.svg" alt="Hand-drawn sketch: CI/CD" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w23-m4
+tier: T2
+one-sentence-goal: A code pipeline has gates for correctness that a model pipeline has no equivalent of, and the missing gate is the one that compares this model's metric against the committed baseline.
+elements:
+  - a horizontal pipeline drawn as a chain of hand-drawn gates left to right, each gate a small portcullis symbol with its name and duration written under it: "ruff 6s" / "mypy 42s" / "pytest 71s" / "docker build 38s (cached)" / "trivy 9s" / "push 52s" / "deploy 34s" / "smoke 14s"
+  - a second parallel track drawn ABOVE the first, branching after checkout and rejoining before deploy, showing the two jobs that run concurrently, with "critical path 3m03s" written along it and "serial would be 4m42s" struck through
+  - in the MIDDLE of the chain, a gate drawn in a different, heavier line weight and circled, labelled "MODEL QUALITY GATE"
+  - inside that gate: a small hand-drawn balance scale with "baselines/model_metrics.json  acc 0.938" on the left pan and "this build  acc 0.931" on the right, tipping, and "delta -0.007  threshold -0.010  PASS" written beside it
+  - a second copy of the scale beside it with "this build  acc 0.918", tipping hard, "delta -0.020  FAIL, build red" in red
+  - amber margin note on the model gate: "code has tests. Models usually have NOTHING between the training run and prod. This gate is the whole module."
+  - a red cross-out over a box "long-lived AWS_SECRET_ACCESS_KEY in repo secrets" with a green replacement "OIDC: short-lived token, no stored secret"
+  - a small rollback arrow curving backwards from "deploy" to a box labelled "previous image DIGEST (not tag)"
+  - dangling arrow: "...and how do you gate an LLM? -> Week 31"
+numbers-to-write-in: "serial 4m42s -> parallel 3m03s", "cold build 4m12s vs cached 38s", "gate: -1.0% threshold", "eval 1,879 images = 43 s"
+alt: A hand-drawn CI pipeline with eight gates and their durations, showing two parallel job tracks that rejoin before deploy, with a heavier circled gate in the middle representing a model quality check drawn as a balance scale comparing this build's accuracy against a committed baseline, one passing and one failing.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The one idea
+
+CI is a robot that runs your checks on every push, so that "it works on my machine" stops being a sentence anyone says. CD extends that to deploying automatically when the checks pass.
+
+For an ML project there is one extra check nobody thinks of: **does the model still work?** Code tests do not catch a model that got worse, because the code is fine — the numbers changed. That gate is the point of this module.
+
+### Vocabulary, defined before use
+
+- **CI** — continuous integration. Run checks automatically on every change.
+- **CD** — continuous delivery/deployment. Ship automatically when the checks pass.
+- **Workflow** — a YAML file describing what to run and when. In GitHub Actions, `.github/workflows/*.yml`.
+- **Job** — a set of steps running on one machine. Jobs can run in parallel.
+- **Step** — one command or action inside a job.
+- **Runner** — the machine a job runs on. GitHub provides them; you can host your own.
+- **Action** — a reusable step someone published, e.g. `actions/checkout@v4`.
+- **Artifact** — a file a job produces that later jobs (or you) can download.
+- **Secret** — a value (token, password) stored encrypted and injected at runtime.
+- **Branch protection** — a rule that a branch cannot be merged into unless certain checks pass.
+- **Smoke test** — a tiny test run against the *deployed* thing, confirming it is alive.
+- **Rollback** — going back to the previously deployed version.
+- **Lint** — a tool that flags style and likely-bug patterns (`ruff`).
+- **Type check** — a tool that verifies type annotations are consistent (`mypy`).
+
+### Your first workflow
+
+```yaml
+# .github/workflows/test.yml
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.4.18"
+          enable-cache: true
+
+      - run: uv sync --frozen --extra dev
+
+      - run: uv run pytest -q
+```
+
+Push that and GitHub runs it. A green tick means the tests passed on a clean machine — which is a genuinely different claim from "they passed on my laptop", because your laptop has files, environment variables and installed packages the repository does not describe.
+
+**Reference figures** — modelled for `ubuntu-24.04` runners on the blood-cell repo. No CI has run for this course (there is no workflow directory in the repository), so these are estimates from GitHub's published runner specs and typical tool timings; see [About the numbers](/start/about-the-numbers). The *ordering* — lint seconds, types tens of seconds, tests minutes — is the claim:
+
+| Step | Time |
+| --- | --- |
+| `actions/checkout` | 4 s |
+| `setup-uv` (cache hit) | 12 s |
+| `uv sync --frozen --extra dev` | 8 s |
+| `pytest` (47 tests) | 71 s |
+| **Total** | **1 m 35 s** |
+
+### Adding the other checks
+
+```yaml
+      - run: uv run ruff check src/ tests/          #  6 s
+      - run: uv run ruff format --check src/ tests/ #  3 s
+      - run: uv run mypy src/                       # 42 s
+      - run: uv run pytest -q --cov=src             # 71 s
+```
+
+Order them **cheapest first**. `ruff` takes 6 seconds and catches an unused import; `mypy` takes 42; `pytest` takes 71. Failing fast on the cheap check saves a minute of runner time and, more importantly, gives the developer feedback sooner.
+
+### The one that is different: testing a model
+
+Here is the situation code CI does not cover. Someone retrains the model with new data and opens a PR that changes only `artifacts/v4/model.onnx`. Every test passes — the code did not change. The model is 4 points worse.
+
+**Nothing catches this.** That is the normal state of affairs at most companies.
+
+The gate:
+
+```python
+"""tests/test_model_quality.py — the gate. Runs in CI on every PR."""
+from __future__ import annotations
+import json
+from pathlib import Path
+import numpy as np
+from bloodcell.predict import Predictor
+
+BASELINE = json.loads(Path("baselines/model_metrics.json").read_text())
+TOLERANCE = 0.01           # 1 accuracy point
+
+def test_accuracy_has_not_regressed():
+    predictor = Predictor("artifacts/v4")
+    correct, total = 0, 0
+    for img_path, true_label in load_holdout("tests/holdout/"):
+        pred = predictor.predict(img_path.read_bytes())
+        correct += int(pred["label"] == true_label)
+        total += 1
+    accuracy = correct / total
+
+    baseline = BASELINE["test_accuracy"]
+    assert accuracy >= baseline - TOLERANCE, (
+        f"model accuracy regressed: {accuracy:.4f} vs baseline {baseline:.4f} "
+        f"(drop {baseline - accuracy:.4f} exceeds tolerance {TOLERANCE})"
+    )
+```
+
+```json
+// baselines/model_metrics.json — committed, changed only by an explicit PR
+{
+  "test_accuracy": 0.938,
+  "macro_f1": 0.939,
+  "n_holdout": 1879,
+  "model_version": "v3",
+  "updated": "2026-08-30",
+  "updated_by_pr": 412
+}
+```
+
+Now the retrain PR goes red with a message that says exactly what happened. To ship a worse model you must **edit the baseline file**, which shows up in the diff, which means someone has to approve it. That is the whole mechanism: it converts a silent regression into a visible, reviewable decision.
+
+**Reference figure:** evaluating 1,879 holdout images with the ONNX model on a GitHub runner takes about **43 s**, plus about 25 s to fetch the artifact. **68 seconds** on every PR to make model regressions impossible to merge accidentally.
+
+<Warning>
+**The holdout used by the gate must be fixed and versioned**, and it must not be the set you tune
+on. If the holdout changes at the same time as the model, the comparison is meaningless — you
+cannot tell whether the number moved because the model changed or because the test changed.
+Commit the holdout (or a manifest of its file hashes) and treat a change to it as seriously as a
+change to the baseline.
+</Warning>
+
+### Guided practice
+
+```yaml
+# TODO 1: this workflow runs on every push to every branch. Make it run on PRs and main only.
+on: push
+
+# TODO 2: this job has no timeout. What happens if a step hangs?
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+
+# TODO 3: why is this ordering wrong?
+      - run: uv run pytest
+      - run: uv run ruff check src/
+```
+
+**Answers.** TODO 1: the `on:` block from the first example — `push: branches: [main]` plus `pull_request:`. Running on every push to every branch multiplies your runner minutes by the number of intermediate commits people push. TODO 2: it runs until GitHub's default 6-hour job limit, burning runner minutes and blocking a concurrency slot. Add `timeout-minutes: 15` to every job; a job that legitimately takes longer than your expectation is telling you something. TODO 3: `pytest` takes 71 s and `ruff` takes 6 s. Put the fast check first so a formatting error fails in 6 seconds rather than 77.
+
+### Checkpoint — five questions
+
+<AccordionGroup>
+<Accordion title="1. What does CI prove that running tests locally does not?">
+That the tests pass on a machine described entirely by the repository — no stray files, no locally-installed packages, no environment variables you forgot you set. It makes the repository, rather than your laptop, the source of truth.
+</Accordion>
+<Accordion title="2. Why do code tests not catch a model regression?">
+Because the code did not change. A retrain PR that swaps a model file passes every unit test while shipping a model that is several points worse. You need a check that runs the model on fixed data and compares against a committed number.
+</Accordion>
+<Accordion title="3. Why must the baseline metric be committed to the repo?">
+So that lowering it is a visible diff that a human approves. If the baseline is computed at runtime, or read from a database, a regression can slip through with no record of the decision.
+</Accordion>
+<Accordion title="4. What is a smoke test and why does it run after deployment?">
+A tiny check against the deployed service — usually a health endpoint and one real prediction. It runs after deploy because everything before it tested the artifact, not the deployment; the artifact can be perfect and the deployment still broken by a bad config or a missing permission.
+</Accordion>
+<Accordion title="5. Why order the checks cheapest first?">
+Feedback speed. A style error should fail in 6 seconds, not after a 71-second test suite. It also saves runner minutes, but the human feedback loop is the bigger win.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### The full pipeline
+
+Two jobs that run concurrently, then a third that depends on both.
+
+```yaml
+# .github/workflows/deploy.yml
+name: build-and-deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:                       # cancel superseded runs on the same ref
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ${{ vars.ECR_REGISTRY }}/bloodcell
+  AWS_REGION: eu-west-1
+
+permissions:
+  contents: read
+  id-token: write                  # required for OIDC. No stored AWS keys.
+
+jobs:
+  # ---------------- job A: code quality + model quality ----------------
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: {lfs: true}
+
+      - uses: astral-sh/setup-uv@v3
+        with: {version: "0.4.18", enable-cache: true}
+
+      - run: uv sync --frozen --extra dev
+
+      - name: lint
+        run: uv run ruff check src/ tests/ && uv run ruff format --check src/ tests/
+
+      - name: type check
+        run: uv run mypy src/
+
+      - name: unit tests
+        run: uv run pytest -q --cov=src --cov-report=xml --cov-fail-under=80
+
+      - name: preprocessing parity        # Module 1's highest-value test
+        run: uv run pytest -q tests/test_preprocess_parity.py
+
+      - name: model quality gate          # THE ML-SPECIFIC ONE
+        run: uv run python -m bloodcell.eval_gate
+              --artifact artifacts/v4
+              --holdout tests/holdout
+              --baseline baselines/model_metrics.json
+              --tolerance 0.01
+
+  # ---------------- job B: build, scan, push ----------------
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}   # OIDC, no secrets
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: scan
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.55.2
+          trivy image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed \
+            ${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: push
+        if: github.ref == 'refs/heads/main'
+        run: |
+          docker push ${{ env.IMAGE }}:${{ github.sha }}
+          echo "digest=$(docker inspect --format='{{index .RepoDigests 0}}' \
+            ${{ env.IMAGE }}:${{ github.sha }})" >> "$GITHUB_OUTPUT"
+        id: push
+
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+
+  # ---------------- job C: deploy + smoke ----------------
+  deploy:
+    needs: [check, image]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: production          # can require a manual approval
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: record the current version for rollback
+        id: current
+        run: |
+          echo "previous=$(aws lambda get-function --function-name bloodcell \
+            --query 'Code.ImageUri' --output text)" >> "$GITHUB_OUTPUT"
+
+      - name: deploy
+        run: |
+          aws lambda update-function-code --function-name bloodcell \
+            --image-uri ${{ needs.image.outputs.digest }}
+          aws lambda wait function-updated --function-name bloodcell
+
+      - name: smoke test
+        run: |
+          set -euo pipefail
+          URL=${{ vars.SERVICE_URL }}
+          curl -sf "$URL/healthz" > /dev/null
+          BODY=$(curl -sf -X POST "$URL/v1/predict" \
+                   -F "file=@tests/fixtures/cell.jpg")
+          echo "$BODY" | python -c \
+            'import json,sys; d=json.load(sys.stdin); assert d["label"], d; print(d)'
+
+      - name: rollback on smoke failure
+        if: failure()
+        run: |
+          aws lambda update-function-code --function-name bloodcell \
+            --image-uri ${{ steps.current.outputs.previous }}
+          exit 1
+```
+
+Six decisions worth defending:
+
+1. **OIDC, not stored AWS keys.** `id-token: write` plus `role-to-assume` gives the job a short-lived token minted for this specific repository and branch. There is no long-lived `AWS_SECRET_ACCESS_KEY` in repository secrets, so there is nothing to leak, rotate or exfiltrate. If your pipeline has static cloud credentials, this is the highest-value change on this page.
+2. **Deploy by digest, not tag.** `needs.image.outputs.digest` is `sha256:…`. Tags are mutable; a digest names exactly the bytes that were tested. Deploying `:latest` means you do not know what you shipped.
+3. **`concurrency` with `cancel-in-progress`.** Three pushes in a minute would otherwise run three full pipelines. Modelled saving on an active repo: about 40% of runner minutes.
+4. **Rollback recorded *before* the deploy.** You cannot look up the previous version after you have overwritten it. Capture it first, and use `if: failure()` so it fires automatically.
+5. **The smoke test posts a real image and asserts on the response body.** Checking that `/healthz` returns 200 proves the process started; it does not prove the model loaded or that the artifact is the right one. Assert on a prediction.
+6. **`--cov-fail-under=80`.** A coverage number that is not enforced is decoration. Pick a threshold you currently meet and ratchet it upward.
+
+### Caching, and what it buys
+
+| What | Mechanism | Cold | Warm |
+| --- | --- | --- | --- |
+| Python dependencies | `setup-uv` with `enable-cache: true` | 71 s | **8 s** |
+| Docker layers | `cache-from/to: type=gha` | 4 m 12 s | **38 s** |
+| `pip`/`apt` inside the build | BuildKit cache mounts (Module 3) | — | 65 s saved per dependency change |
+
+The Docker layer cache is the big one. `type=gha` stores layer blobs in GitHub's Actions cache (10 GB per repository, evicted LRU after 7 days of no use). `mode=max` caches intermediate stages too, which matters for multi-stage builds — with `mode=min` only the final stage is cached and a builder-stage change costs you the full build.
+
+<Warning>
+The GitHub Actions cache is scoped by branch: a PR branch can read `main`'s cache but not the
+other way round, and caches created on a PR branch are not visible to other PRs. So the **first**
+build on a new branch is warm (it reads `main`'s), and iterating on that branch is warm, but a
+colleague's branch starts from `main` too. This is usually what you want; it does mean cache-hit
+rates look worse than expected on repositories with long-lived feature branches.
+</Warning>
+
+### Pipeline runtime budget
+
+Reference figures — modelled for `ubuntu-24.04`, blood-cell repository, warm caches (see [About the numbers](/start/about-the-numbers)).
+
+| Step | Time | Job |
+| --- | --- | --- |
+| checkout | 4 s | both |
+| `setup-uv` + `uv sync` | 20 s | check |
+| `ruff check` + `format --check` | 9 s | check |
+| `mypy src/` | 42 s | check |
+| `pytest` (47 tests) | 71 s | check |
+| preprocessing parity | 3 s | check |
+| **model quality gate** | **68 s** | check |
+| buildx setup | 6 s | image |
+| docker build (cached) | 38 s | image |
+| trivy scan | 9 s | image |
+| ECR push | 52 s | image |
+| deploy + wait | 34 s | deploy |
+| smoke test | 14 s | deploy |
+
+```
+Serial total                          : 6 m 10 s
+Two parallel jobs, then deploy        : max(217 s, 109 s) + 48 s = 4 m 25 s
+Cold Docker build (parallel)          : max(217 s, 323 s) + 48 s = 6 m 11 s
+```
+
+**The critical path with a warm cache is the `check` job at 217 s**, dominated by `pytest` (71 s) and the model gate (68 s). With a cold Docker build the critical path flips to the `image` job. Knowing which job is on the critical path tells you where optimization is worth anything — speeding up `trivy` saves nothing, because it is not on the path.
+
+<Tip>
+**Target: under 10 minutes for a PR to go green.** Beyond that people stop waiting for it, start
+merging on a green-ish feeling, and the pipeline's value collapses. This is a human threshold,
+not a technical one, and it is the number to design against.
+</Tip>
+
+### Secrets, done properly
+
+| Approach | Risk | Use when |
+| --- | --- | --- |
+| Long-lived keys in repo secrets | High — leaks via logs, forks, a compromised action | Never, if OIDC is available |
+| **OIDC federation** | **Low — short-lived, audience-scoped, no stored credential** | **Default for AWS, GCP, Azure** |
+| Secrets from a manager (Vault, AWS Secrets Manager) at runtime | Low, but the pipeline still needs credentials for the manager — usually OIDC | Application secrets, not deploy credentials |
+| Environment protection rules | Adds a human approval gate to a job | Production deploys |
+
+The trust policy that makes OIDC scope correctly — the `sub` condition is the part people get wrong:
+
+```json
+{
+  "Effect": "Allow",
+  "Principal": {"Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"},
+  "Action": "sts:AssumeRoleWithWebIdentity",
+  "Condition": {
+    "StringEquals": {
+      "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+      "token.actions.githubusercontent.com:sub": "repo:myorg/bloodcell:ref:refs/heads/main"
+    }
+  }
+}
+```
+
+Without the `sub` condition — or with a wildcard like `repo:myorg/*` — **any workflow in any of your repositories can assume the deploy role**, including one added by a first-time contributor's PR if your workflow triggers on `pull_request_target`. Pin `sub` to the specific repository and ref.
+
+### Branch protection
+
+Settings that make the pipeline mean something:
+
+- Require the `check` and `image` jobs to pass before merge.
+- Require branches to be up to date with `main` (prevents "both PRs passed separately, `main` is broken").
+- Require at least one review, and require review from a code owner for `baselines/` and `artifacts/`.
+- Dismiss stale approvals on new pushes.
+
+The `CODEOWNERS` line that makes the model gate a social mechanism rather than a technical one:
+
+```
+# .github/CODEOWNERS
+/baselines/       @ml-leads
+/artifacts/       @ml-leads
+/.github/workflows/ @platform
+```
+
+Now lowering the accuracy baseline requires an ML lead's approval. **The gate stops a regression; `CODEOWNERS` stops the gate from being quietly disabled.**
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **Deploy on merge vs manual approval** | Low blast radius, good tests, fast rollback. Deploy frequency is the strongest single predictor of low change-failure rate (DORA). | Regulated environments, or a service where a bad deploy is expensive to reverse. Use an `environment` with required reviewers — the approval is one click and it is recorded. |
+| **Matrix builds vs one configuration** | You genuinely support several Python versions or OSes and users hit them. | You control the runtime — which for a containerized service you do. The container *is* the environment. A matrix here multiplies runner minutes for a claim you do not need. |
+| **GitHub-hosted vs self-hosted runners** | Default. No maintenance, and the cost is small at this scale. | You need a GPU for the model gate, a large Docker cache, or access to a private network. Self-hosted runners on public repositories are a serious security hazard — a fork's PR can run arbitrary code on your machine. |
+| **Model gate on full test set vs a sampled holdout** | The set is small enough to evaluate in a minute or two. 1,879 images is 43 s; use all of it. | Evaluation takes more than ~5 minutes. Then a fixed stratified sample with a wider tolerance derived from its sampling error — and say so in the failure message. |
+
+### War story — the gate that was disabled by a green build
+
+A team added a model-quality gate and it worked: two months later it caught a retrain that had silently dropped a feature, and the PR went red.
+
+The author, under deadline pressure, "fixed" it by regenerating `baselines/model_metrics.json` from the new model as part of the same PR. The gate compared the new model against itself and passed. Nobody noticed in review because the diff to the baseline file was two numbers among 400 changed lines, and the model shipped 4.1 points worse.
+
+Three changes came out of the post-mortem, and they are all cheap:
+
+1. **`CODEOWNERS` on `baselines/`.** Changing it now requires a specific approval from someone whose job is to ask why.
+2. **A second check that fails when the baseline file changes in the same commit as a model artifact**, unless the PR body contains an explicit `BASELINE-CHANGE:` line with a justification. Fifteen lines of shell.
+3. **The failure message tells you what to do.** The original said `assert 0.897 >= 0.928`. It now says: "Model accuracy regressed by 3.1 points (0.897 vs baseline 0.928). If this is intentional, update `baselines/model_metrics.json` in a **separate PR** with justification, and tag @ml-leads."
+
+The general principle: **a gate that can be satisfied by editing the gate is not a gate.** Whatever the check compares against needs a different, higher-friction change path than the thing being checked. This applies to test thresholds, coverage floors, performance budgets and CVE allowlists equally.
+
+### Design checkpoint
+
+<Accordion title="Your PR pipeline takes 24 minutes and people have started merging without waiting for it. You have one day. What do you do?">
+**First, measure where the 24 minutes are.** GitHub's job timing view gives per-step durations. Do this before changing anything — the intuition about which step is slow is wrong roughly half the time.
+
+**Then, in order of expected value per hour of work:**
+
+**1. Find the critical path.** If jobs are serial, splitting them into parallel jobs is often a 40–50% cut for a YAML change. In the pipeline above, `check` (217 s) and `image` (323 s cold) run concurrently rather than consecutively, which is 217 s saved.
+
+**2. Turn on caching if it is not on.** `setup-uv` with `enable-cache` and `cache-from/to: type=gha` on the Docker build. Reference figures here: dependencies 71 s → 8 s, Docker 4 m 12 s → 38 s. That alone is often most of the problem.
+
+**3. Add `concurrency` with `cancel-in-progress`.** Does not reduce a single run's time but stops three-deep queues, which is a large part of *perceived* slowness on a busy repository.
+
+**4. Split the test suite.** Fast unit tests block the merge; slow integration tests run on `main` after merge or nightly. This is a judgement call — you are trading some safety for feedback speed — so be explicit about which tests moved and why, and keep anything that has ever caught a production bug in the blocking set.
+
+**5. Look hard at the slowest single step.** If it is `mypy`, `--incremental` with a cached `.mypy_cache` typically halves it. If it is `pytest`, `pytest-xdist` (`-n auto`) parallelizes across cores — 71 s → 24 s on a 4-core runner. If it is the Docker build, check `mode=max` on the cache and whether a `COPY` early in the file is invalidating everything (Module 3).
+
+**What I would not do:** delete the model quality gate to save 68 s. It is 5% of the runtime and it is the only thing standing between a bad retrain and production.
+
+**And the thing to fix that is not technical:** if people are merging without waiting, branch protection is not enforcing the checks. Turn it on. A pipeline nobody waits for is worse than no pipeline, because it creates a false sense that something is being verified.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a number, and in this module every pipeline timing is a
+**reference figure**: modelled for GitHub Actions `ubuntu-24.04` (4 vCPU, 16 GB) on the
+blood-cell repository, August 2026. No pipeline was ever run for this course — there is no
+workflow directory in the repository — so treat the durations as the right shape and the right
+ordering, not the right seconds. The **billing arithmetic is derived** from GitHub's published
+minute multipliers and free-tier allowance, and the critical-path analysis is **derived** from the
+job graph. Both of those hold whatever your runner does. See [About the numbers](/start/about-the-numbers).
+</Warning>
+
+### The model CI problem
+
+Testing code asks "does this function return the right value?" — deterministic, cheap, binary. Testing a model asks "is this model good enough?", and every word in that is contested.
+
+Four categories of test, in increasing order of how few teams have them:
+
+**1. Data tests** — run before training, cheap, and they catch the majority of real incidents.
+
+```python
+"""tests/test_data.py — assertions about the training data itself."""
+import pandas as pd, pytest
+
+def test_schema_matches_contract(df: pd.DataFrame):
+    expected = {"age": "int64", "tenure_months": "int64",
+                "monthly_charge": "float64", "contract": "object"}
+    assert dict(df.dtypes.astype(str)) == expected
+
+def test_no_nulls_in_required(df):
+    required = ["age", "monthly_charge", "contract"]
+    nulls = df[required].isna().sum()
+    assert (nulls == 0).all(), f"nulls found: {nulls[nulls > 0].to_dict()}"
+
+def test_ranges(df):
+    assert df["age"].between(0, 120).all()
+    assert df["monthly_charge"].between(0, 10_000).all()
+
+def test_no_train_test_overlap(train_ids, test_ids):
+    overlap = set(train_ids) & set(test_ids)
+    assert not overlap, f"{len(overlap)} ids in both splits"
+
+def test_class_balance_has_not_shifted(df, baseline_props: dict[str, float]):
+    """Catches an upstream pipeline change that altered the label distribution."""
+    props = df["label"].value_counts(normalize=True).to_dict()
+    for cls, base in baseline_props.items():
+        assert abs(props.get(cls, 0) - base) < 0.05, \
+            f"class {cls}: {props.get(cls, 0):.3f} vs baseline {base:.3f}"
+```
+
+**2. Model-quality gates** — the accuracy threshold from Layer 1, plus the two refinements below.
+
+**3. Behavioural tests** — assertions about specific *cases*, not aggregate metrics. Ribeiro et al.'s CheckList framing: invariance tests (a small perturbation should not change the prediction), directional tests (this change should move the prediction this way), and minimum-functionality tests (these specific examples must be right).
+
+```python
+def test_invariance_to_horizontal_flip(predictor, fixture_images):
+    """A cell has no left/right orientation. Flipping must not change the class."""
+    for img in fixture_images:
+        a = predictor.predict(img)["label"]
+        b = predictor.predict(flip_horizontal(img))["label"]
+        assert a == b, f"flip changed prediction {a} -> {b}"
+
+def test_known_hard_cases(predictor):
+    """Five images the model got wrong historically. These must stay right."""
+    for path, expected in load_regression_cases("tests/regression_cases.json"):
+        assert predictor.predict(path.read_bytes())["label"] == expected
+```
+
+The `regression_cases.json` pattern is the most useful and least-used idea here: **every production misclassification that someone investigated becomes a permanent test case.** It is the ML equivalent of writing a regression test for a fixed bug, and it accumulates value with no ongoing cost.
+
+**4. Slice tests** — aggregate metrics per subgroup, so an improvement on average that is a regression for one group fails the build.
+
+```python
+def test_per_class_recall_floor(predictor, holdout):
+    """Overall accuracy can rise while one class collapses. This catches it."""
+    recalls = per_class_recall(predictor, holdout)
+    for cls, r in recalls.items():
+        assert r >= 0.85, f"recall for {cls} is {r:.3f}, floor is 0.85"
+```
+
+### Getting the tolerance right
+
+`tolerance = 0.01` is a placeholder until you derive it. Two sources of variation set the floor:
+
+**Sampling error on the holdout.** With `n = 1,879` and accuracy near 0.94, the standard error is `sqrt(0.94 × 0.06 / 1879) = 0.0055`. A 95% interval is ±0.011. **So a 1-point tolerance is roughly one standard error — and about a third of *identical* models would fail it by chance if the holdout were resampled.** Since the holdout is fixed, resampling noise does not apply to a re-evaluation of the *same* model, but it does bound how confidently you can compare two models on this set.
+
+**Training run-to-run variance.** Reference figure over 5 seeds on this task: **standard deviation 0.4 points.** So two runs of the same code can differ by 1 point purely from seed.
+
+Combining them, a defensible tolerance for *this* task is **1.5 points**, and the honest thing to write in the failure message is:
+
+```python
+TOLERANCE = 0.015
+REASON = (
+    "Derived from: seed-to-seed sd 0.004 (5 runs) and holdout sampling "
+    "se 0.0055 (n=1879). 1.5 points is ~2 combined sd. Tightening this "
+    "requires either a larger holdout or averaging over seeds."
+)
+```
+
+**A tolerance nobody derived is a tolerance that gets widened the first time it is inconvenient.** Deriving it takes an hour and it makes the number defensible in the conversation where it matters.
+
+The stronger alternative, when you can afford it: evaluate `k` seeds and compare *distributions*, not point estimates. Cost: `k×` the training. For a model retrained weekly, that is often affordable and it removes the argument entirely.
+
+### Pipeline economics
+
+The billing arithmetic below is **derived** from published rates; the wall-clock inputs to it are
+reference figures. GitHub Actions billing (2026): `ubuntu` runners 1× minutes, `windows` 2×, **`macos` 10×**. Free tier for private repositories is 2,000 minutes/month.
+
+| Configuration | Wall clock | Billed minutes/run | Runs/month (20 devs) | Monthly minutes |
+| --- | --- | --- | --- | --- |
+| Serial, no caching | 14 m 20 s | 14.3 | 400 | 5,720 |
+| Parallel, cached | 4 m 25 s | **8.9** (two jobs overlap) | 400 | 3,560 |
+| + `cancel-in-progress` | 4 m 25 s | 8.9 | **240** | **2,136** |
+| Matrix over 2 Python × 2 OS (incl. macos) | 4 m 25 s | 48.4 | 240 | 11,616 |
+
+Two things to notice:
+
+- **Billed minutes are the sum across jobs, not the wall clock.** Parallelizing improves developer experience and does *not* reduce cost. It is still the right move; just do not claim it saves money.
+- **A macOS job costs 10× minutes.** The matrix row is 5.4× the cost of the baseline for a claim — "works on macOS" — that a containerized service does not need. If your service ships as a Linux container, the container is the compatibility guarantee.
+
+Self-hosted runners flip the economics above roughly 15,000 minutes/month, at the cost of maintenance and a real security consideration: **never run self-hosted runners on public repositories**, because a fork's pull request can execute arbitrary code on your machine with whatever credentials and network access it has.
+
+### The parallelization decision, formalized
+
+For jobs with dependencies, the pipeline is a DAG and its runtime is the longest path — that is **derived**, whatever the step durations turn out to be. From the table above:
+
+```
+check : 4 + 20 + 9 + 42 + 71 + 3 + 68 = 217 s
+image : 4 + 6 + 38 + 9 + 52          = 109 s   (warm) / 323 s (cold build)
+deploy: 34 + 14                       =  48 s
+
+warm : max(217, 109) + 48 = 265 s = 4 m 25 s
+cold : max(217, 323) + 48 = 371 s = 6 m 11 s
+```
+
+To cut the warm path you must attack `check`, and within it `pytest` (71 s) and the model gate (68 s) are 64% of it. Options with measured effects:
+
+| Change | Saving | Cost |
+| --- | --- | --- |
+| `pytest -n auto` (xdist, 4 cores) | 71 s → 24 s | Flaky tests that share state now fail; fix them |
+| `mypy --incremental` with a cached `.mypy_cache` | 42 s → 19 s | Cache invalidation subtleties on dependency bumps |
+| Move the model gate to its own parallel job | 68 s off the path | Needs the artifact fetched twice, +25 s to that job |
+| Split integration tests to post-merge | 31 s | Less pre-merge safety — decide deliberately |
+
+Doing the first three takes the warm critical path to **131 s**, and the `image` job at 109 s becomes co-critical. **Past that point, further work on `check` buys nothing**, which is exactly the kind of thing a critical-path analysis tells you and intuition does not.
+
+### Production failure modes
+
+<AccordionGroup>
+<Accordion title="The gate satisfied by editing the gate">
+**Signature:** a regression ships despite a green build; the baseline file changed in the same commit. **Detection:** a check that fails when `baselines/` and `artifacts/` change together without an explicit justification line. **Fix:** `CODEOWNERS` on the baseline directory plus the same-commit check. **Measured cost of not having it:** 4.1 accuracy points shipped to production.
+</Accordion>
+<Accordion title="OIDC role scoped too widely">
+**Signature:** none until it is exploited. **Cause:** a trust policy with `sub` set to `repo:myorg/*` or omitted, so any workflow in the org — including one added by a PR — can assume the deploy role. **Detection:** read the trust policy; look for a wildcard in `sub`. **Fix:** pin to `repo:org/name:ref:refs/heads/main`, and never use `pull_request_target` with a checkout of the PR's code.
+</Accordion>
+<Accordion title="Deploying a tag rather than a digest">
+**Signature:** the deployed image is not the one that was tested; a rollback restores something unexpected. **Cause:** `:latest` or `:main` is mutable and may have been overwritten between build and deploy. **Detection:** compare the running image's digest against the CI run's. **Fix:** deploy `sha256:…` and record it in the release notes.
+</Accordion>
+<Accordion title="Cache poisoning across branches">
+**Signature:** a build on `main` succeeds using layers built from an unreviewed branch. **Cause:** a shared cache scope with write access from any branch. **Detection:** GitHub scopes caches by branch with read-down-from-default semantics, so this is mostly handled — but a self-hosted runner with a shared local Docker cache is wide open. **Fix:** scope caches by branch; on self-hosted runners, prune between jobs or use isolated builders.
+</Accordion>
+<Accordion title="Model gate passing because the holdout leaked into training">
+**Signature:** the gate never fails, even for models that are visibly worse in production. **Cause:** the holdout directory is included in the training data glob. **Detection:** assert that the intersection of training file hashes and holdout file hashes is empty — as a test. **Fix:** the assertion, plus keeping the holdout outside the training data root entirely.
+</Accordion>
+<Accordion title="A flaky test that is retried until green">
+**Signature:** `continue-on-error` or a retry action wrapping a test, and a bug that reaches production anyway. **Cause:** a genuinely flaky test was made to pass rather than fixed. **Detection:** track per-test failure rates across runs; anything failing 1–20% of the time is flaky, not broken. **Fix:** quarantine flaky tests into a non-blocking job with an owner and a deadline. Retrying until green trains everyone to ignore red.
+</Accordion>
+</AccordionGroup>
+
+### Papers and specs
+
+- **Breck, Cai, Nielsen, Salib &amp; Sculley (2017), "The ML Test Score: A Rubric for ML Production Readiness and Technical Debt Reduction," IEEE Big Data.** *Takeaway:* 28 specific tests across data, model, infrastructure and monitoring, scored 0–2 each; the paper reports most teams scoring below 5 out of 28, and the highest-value missing items are exactly the data schema tests and the model-quality gate built here.
+- **Ribeiro, Wu, Guestrin &amp; Singh (2020), "Beyond Accuracy: Behavioral Testing of NLP Models with CheckList," ACL (best paper).** *Takeaway:* aggregate accuracy hides systematic failures; testing with minimum-functionality, invariance and directional expectations found bugs in commercial models that held state-of-the-art benchmark scores — the framing behind the behavioural tests above and behind Week 31's LLM evals.
+- **Sculley et al. (2015), "Hidden Technical Debt in Machine Learning Systems."** *Takeaway:* undeclared consumers, entanglement and configuration debt make ML systems fragile in ways code review does not surface; automated gates on data and metrics are the mechanism the paper implicitly argues for.
+- **Forsgren, Humble &amp; Kim (2018), *Accelerate*.** *Takeaway:* deployment frequency, lead time, change-failure rate and time-to-restore are measurable, correlate with organizational performance, and improve *together* — small frequent deploys with automated verification are safer than large infrequent ones, which is the argument for deploy-on-merge.
+- **Zhang, Harman, Ma &amp; Liu (2022), "Machine Learning Testing: Survey, Landscapes and Horizons," IEEE TSE.** *Takeaway:* a taxonomy of what "testing" can mean for a model — correctness, robustness, fairness, interpretability, efficiency — with the observation that the oracle problem (knowing the right answer) is what makes ML testing structurally different from software testing.
+
+### Stretch challenge
+
+**Add a CI gate that fails the build if model accuracy on a fixed holdout drops more than 1% versus the committed baseline — then make it robust against the three ways it gets defeated.**
+
+Part one: build the gate. A committed baseline JSON, a versioned holdout, an evaluation script, and a workflow step. Prove it works both ways: submit a PR with a deliberately degraded model and watch it go red; submit an equivalent model and watch it go green. **Both directions.** A gate you have only seen pass is not a gate you have tested.
+
+Part two: derive the tolerance rather than choosing it. Measure seed-to-seed standard deviation over at least 5 training runs, compute the holdout's sampling standard error, and write the derivation into the failure message. Then state honestly what regression size your gate *cannot* detect.
+
+Part three, the open one: **defeat your own gate three ways, then close each hole.**
+
+1. Edit the baseline in the same PR as the model. (Close with `CODEOWNERS` plus a same-commit check.)
+2. Let the holdout leak into training. (Close with a file-hash intersection assertion.)
+3. Improve overall accuracy while a minority class collapses. (Close with per-class floors — and now you must choose the floors, which is the same tolerance problem one level down.)
+
+Then the genuinely open question: **what is the right gate for a model where the metric is not accuracy?** For a ranking model it might be NDCG with a confidence interval from bootstrapping; for a generative model there is no scalar at all, and Week 31 confronts that directly. Sketch what your gate would look like for a model whose output is text, and identify which of the three holes above still exist and which new ones appear. There is no settled answer, and the current industry practice — LLM-as-judge with a fixed rubric on a fixed prompt set — has all three holes plus a fourth: the judge itself drifts.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Add a CI gate that fails the build if model accuracy on a fixed holdout drops more than 1%
+versus the committed baseline. Then prove it fails.
+</Card>
+
+<Steps>
+<Step title="A workflow that runs your tests (20 min)">
+Checkout, `setup-uv`, `uv sync`, `pytest`. Push it and watch it go green. Then break a test deliberately and watch it go red — you need to have seen both.
+</Step>
+<Step title="Add lint and type checks, cheapest first (20 min)">
+`ruff check`, `ruff format --check`, `mypy src/`. Record each step's duration from the Actions timing view; you will need them for the budget.
+</Step>
+<Step title="Build and scan the image in a second job (35 min)">
+`docker/build-push-action` with `cache-from/to: type=gha, mode=max`, then `trivy --ignore-unfixed`. Measure the cold build and the warm build. Expect roughly 4 m 12 s and 38 s.
+</Step>
+<Step title="Commit a baseline and a holdout (25 min)">
+`baselines/model_metrics.json` with the accuracy from your Week-22 model, and `tests/holdout/` (or a manifest of file hashes if the images are large). Assert in a test that no holdout file hash appears in the training set.
+</Step>
+<Step title="Write the gate (35 min)">
+`bloodcell/eval_gate.py` — load the artifact, evaluate the holdout, compare to the baseline, exit non-zero with a message that says exactly what to do. Time it; expect roughly 43 s for 1,879 images.
+</Step>
+<Step title="Prove it fails (25 min)">
+Open a PR that swaps in a deliberately worse model — train for 3 epochs instead of 30, or quantize aggressively. **Watch the build go red and read the message.** Then fix it and watch it go green. This step is the deliverable.
+</Step>
+<Step title="Derive the tolerance (40 min)">
+Train 5 seeds, compute the standard deviation. Compute the holdout's sampling standard error. Set the tolerance from those two numbers and write the derivation into the failure message.
+</Step>
+<Step title="Close the self-defeat hole (25 min)">
+`CODEOWNERS` on `baselines/`, plus a check that fails when `baselines/` and `artifacts/` change in the same commit without a `BASELINE-CHANGE:` line in the PR body. Test it by trying to defeat your own gate.
+</Step>
+<Step title="Write the pipeline budget (15 min)">
+The per-step table, the serial total, the parallel critical path, and one sentence naming which job is on the critical path and what you would optimize next.
+</Step>
+</Steps>
+
+## The whiteboard
+
+The T2 build-up is the gate chain appearing left to right with durations, then the two parallel tracks, then the model-quality gate drawn heavier and circled with its two balance scales. The point of drawing the scales is that a model gate is a *comparison against a committed number*, not a pass/fail on the model alone.
+
+<Tip>
+**Draw it yourself.** The eight gates with their durations, the parallel tracks with the critical
+path marked, and the model-quality gate with both balance scales — one passing, one failing.
+If you can draw the failing scale with its numbers you can explain to a sceptical team in thirty
+seconds what the gate does and why it is not optional.
+[Blank version](/assets/diagrams/p3-w23-m4-blank.svg) · [Editable source](/assets/diagrams/p3-w23-m4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Built a CI/CD pipeline with a model-quality gate that fails the build when holdout accuracy regresses more than a derived tolerance (1.5 points, from measured seed variance of 0.4 and holdout sampling error of 0.55), plus `CODEOWNERS` protection so the baseline cannot be lowered in the same PR as the model — and a critical-path analysis taking the pipeline from 6 m 10 s serial to 4 m 25 s."
+
+**The interview question this earns you.** "How do you test a machine-learning system?" separates people fast. The weak answer is "unit tests for the preprocessing". Yours: "Four layers. Data tests — schema, ranges, nulls, no train/test overlap, class balance versus a baseline — which catch most real incidents and run in seconds. A model-quality gate comparing this build's holdout metric against a committed baseline, with the tolerance derived from seed variance and sampling error rather than picked. Behavioural tests in the CheckList sense — invariance under a horizontal flip, and every historical production misclassification as a permanent regression case. And slice tests with per-class floors, because overall accuracy can rise while one class collapses."
+
+Then the detail that shows you have operated it: "The gate's real failure mode is that someone regenerates the baseline in the same PR. `CODEOWNERS` on the baseline directory and a same-commit check close it. A gate you can satisfy by editing the gate isn't a gate."
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Add the model-quality gate to one model this week.** A committed baseline, a fixed holdout, one test. If your team retrains anything on a schedule, this is the single highest-value engineering change available, and it takes an afternoon. Then deliberately break it once so the team has seen it fire.
+
+**2. Replace long-lived cloud credentials with OIDC.** Check your repository secrets right now. If there is an `AWS_SECRET_ACCESS_KEY`, that is a permanent credential in a place many people can read and any workflow can print. OIDC removes it entirely. Pin the `sub` condition to your repository and branch — a wildcard there is the whole hole reopened.
+
+**3. Measure your pipeline's critical path.** Most teams optimize whatever feels slow. The Actions timing view plus five minutes of arithmetic tells you which job is actually on the path, and it is regularly not the one people complain about. Then put the number in the README and treat 10 minutes as the line you do not cross.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Model regression ships with a green build | No model-quality gate | Committed baseline + fixed holdout + a test |
+| Gate passes on a model that is clearly worse | Baseline regenerated in the same PR | `CODEOWNERS` on `baselines/`, plus a same-commit check |
+| Gate never fails, even for bad models | Holdout leaked into training | Assert an empty intersection of file hashes, as a test |
+| Deployed image differs from the tested one | Deployed a mutable tag rather than a digest | Deploy `sha256:…` from the build job's output |
+| Rollback restores something unexpected | Previous version looked up after the deploy overwrote it | Capture the current version *before* deploying |
+| Any workflow in the org can assume the deploy role | OIDC trust policy with a wildcard `sub` | Pin `sub` to `repo:org/name:ref:refs/heads/main` |
+| Pipeline takes 20+ minutes; people stop waiting | No caching, serial jobs, no cancellation | `enable-cache`, `cache-from/to: type=gha`, parallel jobs, `cancel-in-progress` |
+| CVE gate disabled two weeks after adding it | It fails on unpatchable vulnerabilities | `--ignore-unfixed`; a gate that cannot be satisfied gets removed |
+| A flaky test wrapped in a retry, bug ships anyway | Flakiness treated as noise rather than a defect | Quarantine flaky tests to a non-blocking job with an owner and a deadline |
+| Runner minutes bill is enormous | A matrix including macOS (10× multiplier) for a Linux container service | Drop the matrix; the container is the environment guarantee |
+| Smoke test passes on a broken deploy | It only checks `/healthz`, which proves the process started | Post a real input and assert on the response body |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [GitHub Actions — Workflow syntax](https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions) — read `concurrency`, `needs`, `outputs` and `permissions`. Those four are what turn a script into a pipeline.
+- [GitHub Actions — OIDC with AWS](https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services) — read the trust-policy example and the `sub` claim format carefully; the wildcard mistake is the one that matters.
+- [`docker/build-push-action` — cache](https://docs.docker.com/build/ci/github-actions/cache/) — read the `type=gha` section including `mode=max` and the branch-scoping rules, which explain otherwise confusing cache-miss patterns.
+- [pytest — good integration practices](https://docs.pytest.org/en/8.3.x/explanation/goodpractices.html) — read the layout and the `conftest.py` fixture-scoping sections; the model gate wants a session-scoped predictor fixture.
+- [Trivy — filtering](https://trivy.dev/latest/docs/configuration/filtering/) — `--ignore-unfixed` and `.trivyignore` with expiry dates, which is what makes a security gate survive contact with a deadline.
+
+**Papers**
+
+- [Breck et al. (2017)](https://doi.org/10.1109/BigData.2017.8258038) — *28 production-readiness tests; most teams score under 5, and data tests plus a quality gate are the cheapest points on the board.*
+- [Ribeiro et al. (2020)](https://doi.org/10.18653/v1/2020.acl-main.442) — *aggregate accuracy hides systematic failures; invariance, directional and minimum-functionality tests find them.*
+- [Sculley et al. (2015)](https://papers.nips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html) — *entanglement and undeclared consumers make ML fragile in ways code review does not see.*
+- Forsgren, Humble &amp; Kim (2018) — *deployment frequency and change-failure rate improve together; small frequent verified deploys are the safe option.*
+- [Zhang et al. (2022)](https://arxiv.org/abs/1906.10742) — *a taxonomy of ML testing, and why the oracle problem makes it structurally different from software testing.*
+
+**Go deeper**
+
+- Google, ["Testing and Debugging in Machine Learning"](https://developers.google.com/machine-learning/testing-debugging) — read the "Testing Pipeline Components" section for the data-validation patterns that became TFX's `SchemaGen` and `ExampleValidator`. It is the most concrete treatment of data tests available for free.
+- Chip Huyen, *Designing Machine Learning Systems*, **Chapter 9, "Continual Learning and Test in Production"** — read the section on evaluation in production and shadow deployment; it is where the model gate goes next, and Week 24 Module 4 builds the shadow-traffic mechanism.
+- [`actions/dependency-review-action`](https://github.com/actions/dependency-review-action) and [`step-security/harden-runner`](https://github.com/step-security/harden-runner) — read both READMEs. Supply-chain attacks via compromised third-party actions are a real and growing class of incident, and pinning actions by SHA plus egress monitoring is the current baseline defence.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-23/p3-w23-m4">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

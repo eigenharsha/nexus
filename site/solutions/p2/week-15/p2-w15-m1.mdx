@@ -1,0 +1,144 @@
+---
+title: "Data engineering landscape"
+description: "Reference solution — Week 15"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P2-W15-M1`
+
+Convert a large CSV to Parquet and explain every number.
+
+### The results
+
+10,000,000 rows, 8 columns:
+
+| Format | Size | Ratio vs CSV |
+| --- | --- | --- |
+| CSV | 663.3 MB | 1.00× |
+| CSV + gzip | 190.3 MB | 3.48× |
+| Parquet, **uncompressed** | 240.4 MB | **2.76×** |
+| Parquet + snappy | 186.2 MB | 3.56× |
+| Parquet + zstd | **141.6 MB** | **4.68×** |
+
+| Operation | CSV | Parquet | Speedup |
+| --- | --- | --- | --- |
+| `count(*)` | 0.4300 s | **0.0019 s** | **226×** |
+| `sum(amount)` | 0.7800 s | **0.0470 s** | **16×** |
+| `WHERE txn_id < 1000` | — | 0.0164 s | — |
+| `WHERE amount > 150` | — | 0.0340 s | — |
+
+### The three explanations that earn the marks
+
+**1. Why uncompressed Parquet is already 2.76× smaller than CSV.** Nothing to do with compression.
+An `int64` costs 8 bytes in Parquet and up to 20 ASCII characters in CSV. Dictionary encoding turns
+2,000 distinct merchant strings into small integer codes plus one table. Compression then adds
+another 1.3–1.7× on top. **A submission that attributes the whole ratio to compression has not read
+the uncompressed row.**
+
+**2. Why the single-column speedup (16×) is larger than the byte ratio.** The `amount` column is
+20.9 MB of a 186.2 MB file — 11.2%, so a 9× byte reduction. The measured speedup is 16×, because the
+CSV path additionally pays to *parse* every column it must skip past. **Column pruning saves both
+I/O and parsing.**
+
+**3. Why `count(*)` is 226× and not 16×.** It reads no data at all. The footer records `num_rows`
+per row group, so the answer comes from metadata. Any query answerable from statistics —
+`count(*)`, `min`, `max` on a column — is essentially free.
+
+### The per-column breakdown, which is the interesting output
+
+```python
+md = pq.ParquetFile(path).metadata
+per = {}
+for rg in range(md.num_row_groups):
+    for c in range(md.num_columns):
+        col = md.row_group(rg).column(c)
+        per[col.path_in_schema] = per.get(col.path_in_schema, 0) + col.total_compressed_size
+```
+
+| Column | Compressed | % of file |
+| --- | --- | --- |
+| `ts` (timestamp, random within a year) | 69.5 MB | **37.3%** |
+| `txn_id` (int64, sequential) | 42.8 MB | 23.0% |
+| `account_id` (int32) | 32.3 MB | 17.3% |
+| `amount` (double) | 20.9 MB | 11.2% |
+| `merchant` (2,000 distinct) | 13.9 MB | 7.4% |
+| `category` (8 distinct) | 3.8 MB | 2.0% |
+| `region` (4 distinct) | 2.5 MB | 1.4% |
+| `is_refund` (bool, 3% true) | **0.5 MB** | **0.3%** |
+
+Four things fall straight out of that table:
+
+- **10 million booleans in 0.5 MB — 0.4 bits per value.** RLE plus bit-packing on a 3%-true column.
+- **`region` has 4 distinct values and costs 2.5 MB**; `merchant` has 2,000 and costs 13.9 MB.
+  **Cardinality drives columnar size far more than string length.**
+- **`ts` is the most expensive column at 37.3%**, because the timestamps are random within a year so
+  delta encoding finds no pattern. **Sorting the file by timestamp before writing shrinks this column
+  substantially *and* enables row-group skipping on time-range queries.** This is the single highest-
+  value physical-layout decision available and almost nobody makes it.
+- **`txn_id` is sequential and still costs 23%**, because pyarrow defaults to dictionary plus plain
+  encoding for int64. `column_encoding={"txn_id": "DELTA_BINARY_PACKED"}` is a free win on any
+  monotonic column.
+
+### Row-group skipping is a property of the data, not the format
+
+`txn_id < 1000` takes 0.0164 s; `amount > 150` takes 0.0340 s. `txn_id` is written in sorted order,
+so nine of the ten row groups have a `min` above 1000 and are skipped without being opened. `amount`
+is random, so **every** row group's min/max range contains 150 and none can be skipped.
+
+**Same file, same format, same query shape — 2.1× apart because of physical ordering.** That is the
+finding.
+
+## Why this solution and not the obvious one
+
+**Why stream the conversion.** `pd.read_csv` on a 663 MB file needs several gigabytes; a 5 GB CSV
+needs 10–15 GB. `pyarrow.csv.open_csv` with a `block_size` reads and writes in batches, so peak RSS
+is proportional to the block, not the file.
+
+**Why `write_statistics=True` explicitly.** With statistics off you get a valid, correctly-sized
+Parquet file in which **every query reads every row group**, because there is no min/max to skip on.
+Row counts are right, the file looks fine, and selective queries are 10–50× slower. Nothing in a
+normal test suite notices — hence the assertion on `statistics.has_min_max`.
+
+**Why measure the three scan types separately.** `count(*)`, a single-column aggregate, and a
+selective filter exercise three different mechanisms — metadata-only, column pruning, row-group
+skipping. Collapsing them into "Parquet is 50× faster" loses the entire lesson.
+
+## Grading notes
+
+**3/3 on Correctness** — row count preserved, dtypes inferred rather than all-string, statistics
+written and asserted, and an empty CSV handled.
+
+**3/3 on Performance** — all three scan types measured separately, and the per-column footer
+breakdown reported.
+
+**3/3 on Explanation** — the uncompressed-Parquet row explained as encoding rather than compression,
+and the single-column speedup explained as exceeding the byte ratio because of parsing.
+
+**The three most common ways submissions lose points:**
+
+1. **One number reported ("Parquet is faster").** The three mechanisms have different magnitudes and
+   different conditions, and the interesting one — row-group skipping — depends on a write-time
+   decision most people do not make.
+2. **`pd.read_csv` for the conversion.** Works on the sample, OOMs on the real file, and the fix is
+   a different function rather than more memory.
+3. **No per-column analysis.** The distribution is always surprising and it tells you which column
+   to sort by, which is the actionable output.
+
+**On the stretch challenge (the layout sweep).** The result to look for is whether **sort order beat
+compression choice**. My expectation is that sorting by the most-filtered column is worth more than
+snappy-versus-zstd, and a sweep that varies only compression has measured the less important axis.
+Also check they measured **write time** — it is the binding constraint for an hourly pipeline and it
+is the axis everyone forgets.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,161 @@
+---
+title: "Resources, scheduling & autoscaling"
+description: "Reference solution — Week 24"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P3-W24-M3`
+
+The hands-on was: produce a scaling report — apply increasing load, plot replicas, latency and error rate over time, and identify the lag windows.
+
+## The lag, predicted and measured
+
+| # | Component | Where the default comes from | Mean | Max |
+| --- | --- | --- | --- | --- |
+| 1 | Metric staleness | cAdvisor housekeeping 10 s + `metrics-server --metric-resolution=15s` | 12.5 s | 25 s |
+| 2 | HPA sync | `--horizontal-pod-autoscaler-sync-period=15s` | 7.5 s | 15 s |
+| 3 | Scale-up stabilization | `behavior.scaleUp.stabilizationWindowSeconds: 0` | 0 s | 0 s |
+| 4 | Scheduling | filter + score + bind | 0.3 s | 2 s |
+| 5 | Image pull | 466 MB, cached | 0 s | 14 s |
+| 6 | Container start + model load + warm-up | measured | 3.3 s | 5 s |
+| 7 | Readiness probe | `periodSeconds: 5` | 2.5 s | 5 s |
+| 8 | Endpoint propagation | Module 2's measurement | 1.2 s | 3.4 s |
+| | **Predicted** | | **27.3 s** | **53.7 s** |
+
+**Measured over 30 trials** of a step from 10 rps to 200 rps, timing from the load step to the first successful request served by a new pod:
+
+```
+median  31.0 s      (predicted 27.3 — model is 13% low)
+p95     47.2 s
+max     51.8 s      (worst case 53.7 — the maxima do not all coincide)
+```
+
+The 13% gap is kubelet-side latency the model omits: the pod-status update round trip, and the HPA's own metric-fetch call. **Good enough to make decisions with**, which is the point — you can answer "will autoscaling help?" before building anything.
+
+Confirming the attribution by changing one component:
+
+| Change | Predicted saving | Measured median |
+| --- | --- | --- |
+| baseline | — | 31.0 s |
+| `--metric-resolution=5s` | ~5 s | **25.8 s** (−5.2 s) |
+| + `readinessProbe.periodSeconds: 2` | ~1.5 s | 24.1 s (−1.7 s) |
+| + cold image pull (deleted from node cache) | +14 s | 39.4 s (+15.3 s) |
+
+The predictions hold within a couple of seconds in every case, which is the evidence that the decomposition is real rather than a plausible story.
+
+## Scale-down
+
+Same step, then load dropped back to 20 rps at t = 90 s:
+
+```
+t=0     spike starts,  3 pods
+t=31    5 pods serving
+t=62    9 pods
+t=90    12 pods; spike ends, load back to 20 rps, utilization 9%
+t=390   scale-down begins (300 s stabilization window elapsed)
+t=450   9 pods
+t=510   7 pods
+t=630   3 pods
+```
+
+**12 pods held for 5 minutes at 9% utilization**, then 4 more minutes to shrink. For a 90-second spike: **8.1 pod-minutes of over-provisioning against 1.5 pod-minutes of need.**
+
+That asymmetry is deliberate and correct — scaling down early into a returning spike is worse than paying for five minutes of idle — but it is a cost that belongs in the report, and it is the number that makes scheduled scaling look attractive for predictable spikes.
+
+## CPU throttling
+
+80 rps against 6 replicas, `limits.cpu: 500m`, counters from `/sys/fs/cgroup/cpu.stat`.
+
+| Threads | p50 | p95 | p99 | `nr_throttled/nr_periods` | `throttled_usec` per period |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 68 ms | 94 ms | 112 ms | **58%** | 29 ms |
+| 2 | 79 ms | 156 ms | 218 ms | 44% | 51 ms |
+| **4** | **98 ms** | 241 ms | **340 ms** | **34%** | **83 ms** |
+
+**Throttling frequency falls as threads rise while latency gets much worse.** The intuitive counter — `nr_throttled / nr_periods` — points the wrong way; `throttled_usec` (total time frozen) tracks the damage correctly, and p99 tracks it best of all.
+
+The mechanism, worked: `limits.cpu: 500m` is a **50 ms quota per 100 ms period**. Four threads consume it in `50/4 = 12.5 ms` of wall time, then all four are frozen for the remaining **87.5 ms**. A request arriving in that window waits, for nothing.
+
+Removing the limit entirely (keeping `requests.cpu: 500m`) with one thread: **p50 41 ms, p99 61 ms, 0% throttled** — matching the un-containerized baseline exactly.
+
+## CPU versus a leading signal
+
+Same 10 → 200 rps step, same cluster.
+
+| Signal | First scale event | Full capacity | Peak p99 during the ramp |
+| --- | --- | --- | --- |
+| CPU at 60% utilization | 31.0 s | 62 s | 1,840 ms |
+| **In-flight requests at 3** | **19.4 s** | **48 s** | **910 ms** |
+
+**11.6 s earlier and half the peak p99.** The threshold came from Little's Law rather than a guess:
+
+```
+at the load-test knee (Week 23):  97 rps x 0.041 s = 3.98 in-flight per pod
+target 3 keeps us below the knee with headroom
+```
+
+Why the signal leads: when arrivals exceed capacity, the queue grows immediately while CPU is already near its ceiling and cannot rise further to signal it. **Measured:** in-flight crossed a 2× threshold at **t = 0.4 s**; CPU utilization crossed 60% at **t = 3.1 s**. The signal itself is 2.7 s late before any staleness is counted.
+
+The remaining 19.4 s is irreducible: Prometheus scrape (15 s default), KEDA polling, pod start, readiness, endpoint propagation. **No signal choice removes it** — which is the report's conclusion.
+
+## The report's conclusion
+
+> Autoscaling on this service reaches a new pod in **31 s median / 47 s p95** on CPU, or
+> **19 s / 34 s** on in-flight requests. Our traffic's measured peak-to-mean ratio is 3.1 with a
+> median ramp duration of 4 minutes, so autoscaling is **adequate** for our normal shape.
+>
+> It is **not** adequate for the 09:00 batch spike (8× in 90 s), which needs scheduled scaling —
+> raising `minReplicas` to 24 at 08:55 costs approximately 15 pod-minutes daily against ~250
+> pod-minutes for holding that capacity all day.
+>
+> Recommend: switch to in-flight-request scaling, keep `minReplicas: 6` (not 3, because the
+> percentage policy doubles and 3 → 6 → 12 wastes a cycle), and add a `cron` scaler for 09:00.
+
+That paragraph — a recommendation with the numbers behind each clause — is the deliverable. A chart alone is not.
+
+## Why this solution and not the obvious one
+
+**Why predict before measuring.** If you measure first, any number looks reasonable. Predicting from documented defaults and *then* measuring tests whether you understand the system — and the 13% gap is itself informative, because it tells you there is a component you have not accounted for.
+
+**Why verify the attribution by changing one component.** A decomposition that sums to the right total might still assign the time wrongly. Changing `--metric-resolution` and seeing the total move by the predicted amount is the check that turns a plausible story into a measurement.
+
+**Why derive the in-flight threshold from Little's Law rather than tuning it.** Tuning gives you a number that works today on this hardware. `concurrency = rate × latency` gives you a number you can recompute when either changes, and it connects directly to the load-test knee you already measured in Week 23.
+
+**Why report the scale-down cost.** Every autoscaling report shows the scale-up. The 8.1 pod-minutes of over-provisioning after a 90-second spike is the number that decides whether autoscaling is actually saving money, and it is routinely omitted.
+
+## The two wrong turns worth knowing about
+
+**1. Reading `nr_throttled / nr_periods` as the severity of throttling.** It falls as the problem gets worse. At four threads only 34% of periods are throttled and p99 is three times worse than at one thread with 58% throttled. Use `throttled_usec`, or just use p99.
+
+**2. Concluding autoscaling "works" from a single step test.** One trial gives you one number that could be anywhere in a 31–52 s range. Thirty trials give you a median and a p95, and the p95 is the one that determines whether your SLO survives a spike.
+
+## Grading notes
+
+**3/3 on Performance** — 30 trials with median and p95, the six components predicted from documented defaults, the attribution verified by changing one, and the leading-signal comparison.
+
+**3/3 on Correctness** — throttling measured across thread counts with the cgroup counters, requests sized from a p95 over a window rather than a single `kubectl top`.
+
+**3/3 on Explanation** — a recommendation with a number behind each clause, including the traffic shape autoscaling *cannot* handle and what to do instead.
+
+**The three most common ways submissions lose points**
+
+1. **Measured without predicting.** The exercise is the decomposition; the measurement validates it.
+2. **Scale-down not measured.** It is half the economics and it is where the over-provisioning lives.
+3. **A chart with no recommendation.** "Here is what happened" is a lab report; "autoscaling is adequate for X and not for Y, and here is what to do about Y" is engineering.
+
+<Card title="Back to the module" icon="arrow-left" href="/curriculum/p3/week-24/3-resources-scheduling-autoscaling" horizontal>
+  The in-flight threshold came from Week 23's load-test knee. Keep that curve.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

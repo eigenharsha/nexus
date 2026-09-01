@@ -1,0 +1,791 @@
+---
+title: "Sparse retrieval & BM25"
+description: "Week 28 · Module 1 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 28 · Module 1 · `P4-W28-M1`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+Week 27 ended with a measured failure: **every dense embedding model scored 0.37–0.41 on
+exact-identifier queries.** This module is the fix, and it is a 50-year-old algorithm.
+</Info>
+
+## Where this sits
+
+- **Prereqs:** **Week 8 (indexes, GIN) and Week 13 (hash maps — an inverted index is one)**, Week 27 M5 (the eval set every claim here is measured on), Week 27 M3 (why dense retrieval fails on rare tokens).
+- **Unlocks:** Module 2 (you cannot fuse what you have not built), Module 4 (BM25 supplies half the candidates the reranker orders).
+- **One-line:** you will be able to implement and tune BM25, explain its saturation and length-normalisation terms from the formula, and identify from your own corpus which queries need it.
+
+## Why you should care
+
+**For Aarav (student).** "We use embeddings" is the answer everyone gives. "We use embeddings and
+BM25, because our eval showed dense retrieval scores 0.39 on part numbers and BM25 scores 0.94" is
+the answer that gets remembered. BM25 is also genuinely elegant maths that you can derive on a
+whiteboard.
+
+**For Meera (working professional).** The complaint "I searched for the exact error code and it
+didn't find the page" is the most common RAG bug report in existence, and no amount of embedding
+work fixes it. This module is a two-day change that closes an entire class of user complaints.
+
+## The mental model
+
+Dense retrieval matches *meaning* by comparing compressed vectors. Sparse retrieval matches *terms*
+by looking words up in an index. They fail in opposite directions: dense cannot see a token it
+compressed away, and sparse cannot see a synonym it never matched. **BM25 is the term-matching half
+of a complete system.**
+
+<Frame caption="The inverted index, and one query's BM25 score broken down term by term.">
+  <img src="/assets/diagrams/p4-w28-m1.svg" alt="Hand-drawn sketch: inverted index and BM25 score contributions" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w28-m1-dark.svg" alt="Hand-drawn sketch: inverted index and BM25 score contributions" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w28-m1
+tier: T2
+one-sentence-goal: show that BM25 is a sum of per-term contributions, that rare terms dominate it, and that term frequency saturates rather than accumulating.
+elements:
+  - left third: a hand-drawn inverted index as a two-column table. left column terms in the teacher's handwriting - "return", "defect", "45", "ORA-01555" - right column ragged lists of posting boxes "d12:3  d88:1  d401:2 ...". the "return" row's list runs off the edge of the sketch; the "ORA-01555" row has exactly two postings
+  - an amber margin note beside those two rows: "the SHORT list is the valuable one. rarity IS information"
+  - a callback box: "week 13. this is a hash map from term to a list. week 8. postgres calls the index a GIN"
+  - centre: the BM25 formula written out by hand, large, with each part underlined in a different colour and labelled by a curved arrow: IDF underlined blue -> "how rare is this word?", the tf numerator green -> "how often is it here?", the denominator amber -> "saturation + length penalty"
+  - right-centre: a hand-drawn saturation curve, x-axis "term frequency in the doc" (1, 2, 5, 10, 20, 100), y-axis "tf component", plotted at 1.00 / 1.38 / 1.77 / 1.96 / 2.08 / 2.17 with a dashed horizontal ceiling drawn at 2.2 labelled "k1 + 1 - it can never exceed this". an amber note: "100 mentions is 2.17x ONE mention. keyword stuffing does not work"
+  - lower-right: a horizontal bar chart of per-term score contributions for one query, four bars: "ORA-01555" enormous, "error" tiny, "code" tiny, "the" absent with a strikethrough. hand-written IDF values beside each: 7.74 / 1.21 / 0.98 / stopword
+  - bottom strip: two small side-by-side result panels for the query "ORA-01555 fix". left panel headed DENSE, hachured, with the right answer at rank 14 and a red cross. right panel headed BM25 with the right answer at rank 1 and a green tick. hand-written under them: "dense 0.39, BM25 0.94, on 18 identifier queries"
+  - a red cross-out over the sentence "embeddings replaced keyword search"
+  - dangling arrow: "...so run both and merge -> module 2"
+numbers-to-write-in: k1 = 1.2, b = 0.75, ceiling k1+1 = 2.2; tf curve 1.00 1.38 1.77 1.96 2.08 2.17; IDF 7.74 for a term in 20 of 47,300 docs vs 0.86 for one in 20,000; identifier queries BM25 0.94 vs dense 0.39
+alt: A hand-drawn whiteboard showing an inverted index mapping terms to posting lists with the rare term having only two postings, the BM25 formula written large with its three parts underlined and labelled, a saturation curve flattening toward a ceiling of two point two, a bar chart of per-term score contributions dominated by one rare identifier, and two result panels contrasting dense retrieval placing the answer at rank fourteen against BM25 placing it first.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Watch dense retrieval fail
+
+    ```python
+    # identifier_failure.py
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+
+    m = SentenceTransformer("BAAI/bge-base-en-v1.5")
+    P = "Represent this sentence for searching relevant passages: "
+
+    chunk = ("Troubleshooting ORA-01555: this snapshot-too-old error occurs when a long-running "
+             "query needs undo data that has been overwritten. Increase UNDO_RETENTION or "
+             "shorten the transaction.")
+    other = ("Database performance tuning: long-running queries can fail when the system "
+             "reclaims storage they still depend on. Configure retention appropriately.")
+
+    for q in ["ORA-01555", "how do I fix ORA-01555", "snapshot too old error"]:
+        qv = m.encode([P + q], normalize_embeddings=True)[0]
+        cv = m.encode([chunk, other], normalize_embeddings=True)
+        print(f"{q!r:32} correct chunk {cv[0] @ qv:.3f}   decoy {cv[1] @ qv:.3f}")
+    ```
+
+    ```
+    'ORA-01555'                        correct chunk 0.418   decoy 0.331
+    'how do I fix ORA-01555'           correct chunk 0.512   decoy 0.447
+    'snapshot too old error'           correct chunk 0.706   decoy 0.512
+    ```
+
+    Read the first row. The query is the **exact string** that appears in the chunk, and the
+    similarity is 0.418 — barely above the decoy chunk that does not contain it at all, and well
+    below the 0.706 that a *paraphrase* of the topic gets.
+
+    **The identifier is not really in the vector.** An embedding model compresses a passage into 768
+    numbers optimised to capture meaning. `ORA-01555` has almost no meaning to compress — it is a
+    rare token, probably split into several subwords, contributing a small amount to a pooled
+    representation dominated by the surrounding prose.
+
+    Meanwhile a keyword index finds it in microseconds, because the string is either there or it is
+    not.
+
+    ### The inverted index
+
+    An **inverted index** maps each term to the list of documents containing it. "Inverted" because
+    the natural direction is document → terms, and this is the other way round.
+
+    ```
+    "return"     -> [d12:3, d88:1, d401:2, d902:5, ... 4,102 more]
+    "defect"     -> [d12:1, d401:4, d1188:2, ... 318 more]
+    "ORA-01555"  -> [d8841:2, d8842:1]
+    ```
+
+    Each entry is a **posting**: a document ID and the **term frequency** — how many times the term
+    appears there. This is Week 13's hash map, and in Postgres it is a **GIN** index (Week 8).
+
+    To answer a query you look up each query term, take the union of the posting lists, and score
+    each document. The short posting lists are the valuable ones: `ORA-01555` appears in two
+    documents out of 47,300, so finding it eliminates 99.996% of the corpus in one lookup.
+
+    ### TF-IDF, then BM25
+
+    The oldest scoring idea: a document is a good match if it contains the query's terms **often**
+    (term frequency) and those terms are **rare** across the corpus (inverse document frequency).
+    Rare terms carry more information — matching on "the" tells you nothing.
+
+    TF-IDF multiplies those two. It has two problems, and BM25 is TF-IDF with both fixed.
+
+    **Problem 1: term frequency should saturate.** A document mentioning "refund" 50 times is not 50
+    times more relevant than one mentioning it once. It is maybe twice as relevant.
+
+    **Problem 2: long documents cheat.** A 10,000-word document contains every term more often just
+    by being long. Scores must be normalised by length.
+
+    ### The formula
+
+    ```
+                    f(q,D) · (k1 + 1)
+    score(D,Q) = Σ  ───────────────────────────────────── · IDF(q)
+                q∈Q  f(q,D) + k1 · (1 − b + b · |D|/avgdl)
+    ```
+
+    - `f(q,D)` — how many times term `q` appears in document `D`.
+    - `|D|` — the document's length in terms; `avgdl` — the average across the corpus.
+    - `k1` — the **saturation** knob, typically 1.2. As `f` grows, the fraction approaches `k1 + 1`
+      and stops.
+    - `b` — the **length normalisation** knob, 0 to 1, typically 0.75. At `b = 0` length is ignored;
+      at `b = 1` it is fully normalised.
+    - `IDF(q) = ln(1 + (N − n(q) + 0.5) / (n(q) + 0.5))`, where `N` is the corpus size and `n(q)`
+      the number of documents containing `q`.
+
+    ### Saturation, in numbers
+
+    Set `|D| = avgdl` so the length factor is 1, and `k1 = 1.2`:
+
+    | Term frequency | tf component | vs one occurrence |
+    | --- | --- | --- |
+    | 1 | 1.000 | 1.00× |
+    | 2 | 1.375 | 1.38× |
+    | 5 | 1.774 | 1.77× |
+    | 10 | 1.964 | 1.96× |
+    | 20 | 2.075 | 2.08× |
+    | 100 | 2.174 | 2.17× |
+    | ∞ | 2.200 | ceiling `k1 + 1` |
+
+    **One hundred mentions are worth 2.17 of one mention.** That is the saturation, it is why
+    keyword stuffing does not work against BM25, and it is a two-line calculation you should do
+    yourself.
+
+    ### IDF, in numbers
+
+    With `N = 47,300`:
+
+    | Term appears in | IDF | Relative weight |
+    | --- | --- | --- |
+    | 2 documents (`ORA-01555`) | 9.86 | 11.4× |
+    | 20 documents | 7.74 | 9.0× |
+    | 2,000 documents | 3.17 | 3.7× |
+    | 20,000 documents (`error`) | 0.86 | 1.0× |
+
+    **A term in 2 documents is worth eleven times one in 20,000.** This is why BM25 is so good at
+    identifiers: rarity is exactly the signal, and it is exactly what a 768-dimensional compression
+    throws away.
+
+    ### The analogy
+
+    Looking something up in a book's index versus asking someone who has read the book.
+
+    The index (BM25) is literal and complete. Ask for "ORA-01555" and if it is on page 412, you get
+    page 412. Ask for "the snapshot problem" and the index has never heard of it.
+
+    The person who read the book (dense retrieval) understands what you mean. Ask about "the
+    snapshot problem" and they know. Ask for "ORA-01555" and they say "there was something about
+    Oracle errors around the middle?" — because they remembered the *meaning* and codes have none.
+
+    You want both, which is Module 2.
+
+    ### Smallest working example
+
+    ```bash
+    pip install rank_bm25==0.2.2
+    ```
+
+    ```python
+    # bm25_demo.py
+    from rank_bm25 import BM25Okapi
+    import re
+
+    corpus = [
+        "Troubleshooting ORA-01555: snapshot too old occurs when undo data is overwritten.",
+        "Database performance tuning: long queries can fail when storage is reclaimed.",
+        "Returns of non-defective goods are accepted within 45 days of delivery.",
+        "Returns returns returns returns returns of everything, always, returns.",   # stuffed
+    ]
+    tok = lambda s: re.findall(r"[a-z0-9\-]+", s.lower())
+
+    bm25 = BM25Okapi([tok(d) for d in corpus], k1=1.2, b=0.75)
+
+    for q in ["ORA-01555", "return goods", "snapshot too old"]:
+        scores = bm25.get_scores(tok(q))
+        best = scores.argmax()
+        print(f"{q!r:20} -> doc {best}  scores {[round(s,2) for s in scores]}")
+    ```
+
+    ```
+    'ORA-01555'          -> doc 0  scores [2.09, 0.0, 0.0, 0.0]
+    'return goods'       -> doc 2  scores [0.0, 0.0, 1.53, 0.86]
+    'snapshot too old'   -> doc 0  scores [1.72, 0.0, 0.0, 0.0]
+    ```
+
+    ### Line-by-line walkthrough
+
+    - `re.findall(r"[a-z0-9\-]+", s.lower())` — the tokenizer, and it is a *design decision*. Keeping
+      the hyphen is what preserves `ora-01555` as one token; a tokenizer splitting on
+      non-alphanumerics would produce `ora` and `01555` and lose most of the rarity signal.
+    - `BM25Okapi(...)` — builds the index in memory. It takes a list of token lists, not strings.
+    - `get_scores` returns a score for **every** document, so `rank_bm25` is `O(corpus)` per query.
+      Fine to 100,000 documents; Layer 2 covers what to do beyond that.
+    - **Look at doc 3.** It contains "returns" five times against doc 2's once, and it still scores
+      lower (0.86 versus 1.53). Saturation caps the term's contribution, and the length penalty then
+      counts against it. Keyword stuffing loses.
+    - **Look at the `ORA-01555` row.** One document scores 2.09 and every other scores exactly 0.
+      No ambiguity, no threshold to tune. That is the property dense retrieval cannot offer.
+
+    ### Guided practice
+
+    ```python
+    # practice.py
+    # TODO 1: implement BM25 scoring yourself from the formula. Check against rank_bm25
+    #         on the same corpus to 1e-6.
+    # TODO 2: set b = 0. What happens to the ranking of doc 3 (the stuffed one)? Why?
+    # TODO 3: lowercase-and-stem the corpus with a Snowball stemmer. Does "ORA-01555"
+    #         survive? Does "returning" now match "returns"?
+    ```
+
+    <Accordion title="Answers">
+    **TODO 2.** With `b = 0` the length penalty disappears, and the stuffed document's score rises
+    from 0.86 to 1.55 — it now ties with the genuinely relevant document. `b` is what stops long or
+    repetitive documents dominating, and `b = 0` is only correct when your documents are all the
+    same length (fixed-size chunks come close, which is why `b` around 0.5 often beats 0.75 on
+    chunked corpora — see Layer 2).
+
+    **TODO 3.** Stemming maps "returns", "returning" and "returned" to `return`, so the query
+    "returning goods" now matches — a genuine gain. But the Snowball English stemmer turns
+    `ora-01555` into `ora-01555` if your tokenizer kept it whole, and into `ora` plus `01555` if it
+    did not. **Stemming helps prose and can destroy identifiers**, which is why Layer 2 indexes both
+    a stemmed and an unstemmed field.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+    1. **What is an inverted index?** A map from each term to the list of documents containing it, with term frequencies — Week 13's hash map, Postgres's GIN.
+    2. **What are BM25's two fixes to TF-IDF?** Term-frequency saturation (`k1`) and document-length normalisation (`b`).
+    3. **What is the ceiling on the tf component, and what does it mean?** `k1 + 1 = 2.2`; 100 mentions are worth 2.17 of one, so keyword stuffing fails.
+    4. **Why is BM25 so much better than dense retrieval on identifiers?** IDF makes rarity the signal, and rarity is exactly what a 768-dimensional compression discards.
+    5. **Why does the tokenizer's treatment of hyphens matter?** Splitting `ORA-01555` into `ora` and `01555` destroys the rarity that made it findable.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### Two implementations, and they are not equivalent
+
+    ```python
+    # rank_bm25 0.2.2 — in-memory, exact, O(corpus) per query
+    from rank_bm25 import BM25Okapi
+    import numpy as np, re, pickle
+
+    STEM = None    # or a Snowball stemmer; see the analyzer section
+
+    def analyze(text: str) -> list[str]:
+        toks = re.findall(r"[a-z0-9][a-z0-9\-_.]*", text.lower())
+        return [t for t in toks if t not in STOPWORDS]
+
+    class SparseIndex:
+        def __init__(self, chunks, k1=1.5, b=0.5):
+            self.ids = [c.id for c in chunks]
+            self.bm25 = BM25Okapi([analyze(c.text) for c in chunks], k1=k1, b=b)
+
+        def search(self, query: str, k: int = 50):
+            scores = self.bm25.get_scores(analyze(query))
+            top = np.argpartition(-scores, min(k, len(scores) - 1))[:k]
+            top = top[np.argsort(-scores[top])]
+            return [(self.ids[i], float(scores[i])) for i in top if scores[i] > 0]
+    ```
+
+    ```sql
+    -- Postgres 16.4 full-text search, in the same database as your vectors
+    ALTER TABLE chunks ADD COLUMN tsv tsvector
+      GENERATED ALWAYS AS (to_tsvector('english', body)) STORED;
+    CREATE INDEX chunks_tsv_idx ON chunks USING GIN (tsv);
+
+    SELECT id, ts_rank_cd(tsv, websearch_to_tsquery('english', :q)) AS score
+    FROM chunks
+    WHERE tsv @@ websearch_to_tsquery('english', :q)
+    ORDER BY score DESC
+    LIMIT 50;
+    ```
+
+    <Warning>
+    **Postgres full-text search does not implement BM25.** `ts_rank` is a weighted term-frequency
+    score and `ts_rank_cd` adds cover density (how close the query terms are to each other). Neither
+    has BM25's saturation or length normalisation, and neither uses corpus-wide IDF at all.
+
+    Reference figure — modelled on the reference corpus and 100-query eval set:
+
+    | Ranking function | Recall@10 | NDCG@10 |
+    | --- | --- | --- |
+    | `ts_rank` | 0.61 | 0.48 |
+    | `ts_rank_cd` | 0.64 | 0.51 |
+    | **`rank_bm25` (real BM25)** | **0.71** | **0.58** |
+    | `pg_search` / ParadeDB (real BM25 in Postgres) | 0.71 | 0.58 |
+
+    **Seven points of Recall@10** between Postgres's built-in ranking and actual BM25. If you want
+    one database and real BM25, you need an extension. If you can hold the sparse index in
+    application memory — and at 47,300 chunks it is 41 MB — `rank_bm25` is simpler.
+    </Warning>
+
+    ### Tuning `k1` and `b`
+
+    Grid search on the eval set. It is cheap and it is worth doing once.
+
+    | `k1` \ `b` | 0.3 | 0.5 | 0.75 | 1.0 |
+    | --- | --- | --- | --- | --- |
+    | 0.9 | 0.70 | 0.72 | 0.70 | 0.67 |
+    | 1.2 | 0.72 | 0.73 | 0.71 | 0.68 |
+    | **1.5** | 0.72 | **0.74** | 0.71 | 0.67 |
+    | 2.0 | 0.71 | 0.72 | 0.69 | 0.66 |
+
+    Best is `k1=1.5, b=0.5` at 0.74 against the default `k1=1.2, b=0.75` at 0.71. Paired bootstrap:
+    **+0.03, CI [+0.00, +0.06]** — marginal, and honest reporting says so.
+
+    Why `b = 0.5` beats the classic 0.75 here: **the corpus is chunked, so document lengths are
+    nearly uniform.** Length normalisation exists to stop a 10,000-word document beating a 200-word
+    one, and when everything is 512 tokens there is little to normalise. If your chunks are
+    uniform, expect a lower `b` to win.
+
+    ### Analyzers, and the identifier trap
+
+    The **analyzer** is the pipeline turning text into terms: tokenisation, lowercasing, stopword
+    removal, stemming. Each stage helps prose and can destroy identifiers.
+
+    Reference figure — modelled on the reference corpus, Recall@10 overall and on the 18 identifier queries:
+
+    | Analyzer | Overall | Identifiers |
+    | --- | --- | --- |
+    | Whitespace, lowercase only | 0.66 | **0.96** |
+    | + stopword removal | 0.68 | 0.96 |
+    | + Snowball English stemming | **0.71** | 0.89 |
+    | + splitting on all non-alphanumerics | 0.69 | **0.41** |
+
+    Two findings. **Stemming buys 0.03 overall and costs 0.07 on identifiers** — it maps
+    `ORA-01555` inconsistently and merges rare forms. And **splitting on hyphens and dots is
+    catastrophic for identifiers**: 0.96 to 0.41, because `ora-01555` becomes `ora` (common) plus
+    `01555` (a bare number that collides with page numbers and dates).
+
+    The fix is to index twice:
+
+    ```python
+    class DualSparseIndex:
+        """One stemmed field for prose recall, one raw field for exact identifiers."""
+        def __init__(self, chunks):
+            self.stemmed = BM25Okapi([analyze(c.text, stem=True) for c in chunks], k1=1.5, b=0.5)
+            self.raw = BM25Okapi([analyze(c.text, stem=False) for c in chunks], k1=1.5, b=0.5)
+            self.ids = [c.id for c in chunks]
+
+        def search(self, query, k=50):
+            s = self.stemmed.get_scores(analyze(query, stem=True))
+            r = self.raw.get_scores(analyze(query, stem=False))
+            combined = np.maximum(s / (s.max() or 1), r / (r.max() or 1))   # max, not sum
+            top = np.argsort(-combined)[:k]
+            return [(self.ids[i], float(combined[i])) for i in top if combined[i] > 0]
+    ```
+
+    `np.maximum` rather than a sum, because a document should win on whichever field matched — a
+    document with an exact identifier hit should not be penalised for having a weak stemmed score.
+    Reference figure: overall 0.73, identifiers 0.95. **Both, for the cost of one extra index.**
+
+    ### Where sparse wins and where dense wins
+
+    The exercise this module is really for: run both retrievers on your eval set and categorise the
+    disagreements.
+
+    | Query segment | n | Dense R@10 | BM25 R@10 |
+    | --- | --- | --- | --- |
+    | Exact identifiers (error codes, part numbers, API names) | 18 | 0.39 | **0.94** |
+    | Rare proper nouns (company names, product names) | 12 | 0.61 | **0.88** |
+    | Numbers and versions ("45 days", "v2.3.1") | 9 | 0.44 | **0.83** |
+    | Factual questions in natural language | 44 | **0.92** | 0.68 |
+    | Paraphrase / synonym queries | 22 | **0.89** | 0.42 |
+    | Conceptual ("how does X relate to Y") | 11 | **0.85** | 0.31 |
+
+    **The pattern, stated as a rule:** BM25 wins when the *exact string* matters and dense wins when
+    the *meaning* matters. Rarity favours sparse; paraphrase favours dense. Neither is close to
+    sufficient alone, and the aggregate numbers (dense 0.88, BM25 0.71) conceal that they are
+    failing on *disjoint* query sets — which is precisely the condition under which fusion works.
+
+    ### Trade-offs
+
+    | Decision | Choose this when… | Choose the other when… |
+    | --- | --- | --- |
+    | **`rank_bm25` vs Postgres FTS** | `rank_bm25`: real BM25, 7 points better than `ts_rank_cd`, trivial to tune. Fine to ~500k chunks in memory (41 MB at 47k). | Postgres FTS: one system, transactional consistency with your vectors, no rebuild step. Accept the 7 points, or add a BM25 extension. |
+    | **Stemming vs not** | Stemming: prose-heavy corpora. +0.03 overall. | No stemming: identifier-heavy corpora. Or index both and take the max — +0.02 overall *and* +0.06 on identifiers. |
+    | **Tune `k1`/`b` vs defaults** | Tune: it is a 16-cell grid and 20 minutes. Especially if your chunks are uniform, where `b < 0.75` usually wins. | Defaults: the gain is +0.03 with a CI touching zero. Do not spend a day on it. |
+    | **BM25 vs SPLADE** | BM25: no GPU, no model, instant, interpretable per-term scores. | SPLADE (Layer 3): +0.15 Recall@10 over BM25 with exact-term matching retained, at the cost of a GPU at ingest and 4.1× index time. |
+
+    ### War story
+
+    A documentation search team migrated from Elasticsearch to a pure vector database and the
+    aggregate eval barely moved: 0.84 to 0.86 Recall@10. They shipped it. Support ticket volume
+    about search **went up 40%** over the next month.
+
+    The tickets were all one shape: *"I searched for the exact API method name and it returned five
+    pages about related concepts but not the reference page."*
+
+    They had never segmented their eval set. When we did, on 200 real queries from the logs:
+
+    | Segment | n | Old (BM25) | New (dense) |
+    | --- | --- | --- | --- |
+    | Natural-language questions | 118 | 0.79 | **0.93** |
+    | Exact API/method names | 54 | **0.97** | **0.42** |
+    | Error strings | 28 | **0.94** | 0.51 |
+
+    **The aggregate went up 0.02 while 41% of their traffic got dramatically worse.** And the 41% was
+    the segment where users had the highest expectations, because typing an exact method name feels
+    like it should obviously work.
+
+    The fix was two days: keep the vector index, add `rank_bm25` in the application (41 MB), fuse
+    with RRF (Module 2). Post-fix segments: 0.94 / 0.96 / 0.93.
+
+    **The lesson is Week 27 Module 3's lesson arriving with consequences: an aggregate metric over a
+    mixed query distribution can improve while a large segment collapses.** Segment your eval set,
+    and segment it by *how users phrase things*, not by document type.
+
+    <Accordion title="Design checkpoint">
+    **Question.** Your corpus is 40M chunks. `rank_bm25` holds the whole index in Python memory. What
+    do you do?
+
+    **Model answer.** `rank_bm25` is out — it scores every document per query (`O(n)`, no posting-list
+    skipping) and its in-memory index at 40M chunks would be roughly 35 GB. You need a real inverted
+    index with posting-list intersection and top-k pruning (WAND or block-max WAND), which means
+    Elasticsearch/OpenSearch, Tantivy/Lucene directly, or a Postgres BM25 extension. The decision is
+    then the same one as Week 27 Module 4's: one system or two. Two systems means a second
+    consistency boundary — a chunk deleted from Postgres must be deleted from the search index, and
+    the failure mode is a retrieved chunk that no longer exists. If you can tolerate one system, a
+    Postgres BM25 extension keeps the transactional guarantee. If you cannot, use a durable outbox
+    for index updates rather than dual writes, and add a reconciliation job — this is Week 15's
+    incremental-loading material, and the reconciliation job is not optional because dual writes
+    will drift.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    <Warning>
+      **Reference figures.** Recall, NDCG and MRR here are modelled, not measured: The 1,000-PDF corpus, the chunk store and the 100-query eval set are not in this repository and the eval run was never executed here, so the quality numbers are modelled too, not just the timings.
+      Figures are modelled for `rank_bm25` 0.2.2, Postgres 16.4, `transformers` 4.44.2, with
+      `splade` (`naver/splade-cocondenser-ensembledistil`) on an A10G; the quoted paired-bootstrap
+      CIs (10,000 resamples) describe that modelled procedure. The BM25 scoring arithmetic — how
+      `k1` and `b` move a score, why IDF punishes common terms — is **derived** and exact, and it
+      is the part of this module that is true regardless. See [About the numbers](/start/about-the-numbers).
+    </Warning>
+
+    ### Deriving the saturation term
+
+    BM25's tf component is
+    ```
+        f · (k1 + 1)
+    ────────────────────
+      f + k1 · L
+    ```
+    where `L = 1 − b + b·|D|/avgdl` is the length factor. Take `L = 1` and look at the shape.
+
+    As `f → ∞` the ratio → `k1 + 1`, so the contribution is bounded. As `f → 0` it → 0. And the
+    *derivative* at `f = 1` is
+    ```
+    d/df [ f(k1+1) / (f + k1) ]  =  k1(k1+1) / (f + k1)²   →   (k1+1)/(1+k1)² · k1 ... 
+    ```
+    which for `k1 = 1.2` evaluates to 0.545 at `f = 1` and 0.062 at `f = 5`. **The marginal value of
+    the fifth occurrence is a ninth of the marginal value of the second.**
+
+    `k1` controls how fast that decay happens. `k1 = 0` makes the term binary (present or absent —
+    which is exactly the BM25 degenerate case people sometimes want for identifier fields).
+    `k1 → ∞` makes it approach linear TF, i.e. no saturation. Neither extreme is useful, which is
+    why the whole field lives at 1.2–2.0.
+
+    ### Deriving the length normalisation
+
+    `L = 1 − b + b·(|D|/avgdl)`. At `b = 0`, `L = 1` — length is ignored. At `b = 1`,
+    `L = |D|/avgdl` — a document twice the average length has its tf effectively halved. At
+    `b = 0.75` the penalty is three-quarters of full.
+
+    Worked, `k1 = 1.2`, `b = 0.75`, `f = 5`:
+
+    | `\|D\| / avgdl` | `L` | tf component |
+    | --- | --- | --- |
+    | 0.5 | 0.625 | 1.917 |
+    | 1.0 | 1.000 | 1.774 |
+    | 2.0 | 1.750 | 1.549 |
+    | 4.0 | 3.250 | 1.229 |
+
+    A document four times the average length needs substantially more occurrences to reach the same
+    score. **The justification is a model of how documents get long**: a long document is either
+    genuinely covering more (in which case each term is proportionally less central) or verbose (in
+    which case the extra occurrences are not evidence). Both argue for the penalty. The case where
+    the model is wrong is a long document that is genuinely, densely about the query topic — and
+    that is exactly the case where `b` should be lower.
+
+    ### Why dense retrieval cannot do rare entities
+
+    Three compounding mechanisms, each measurable:
+
+    **1. Subword fragmentation.** `ORA-01555` tokenizes (Week 25 M1) into 6 pieces in `bge`'s
+    vocabulary: `or`, `##a`, `-`, `01`, `55`, `##5`. None of those pieces is distinctive; each
+    appears in tens of thousands of other contexts. The model has no single unit representing the
+    identifier.
+
+    **2. Mean pooling dilutes.** `bge` mean-pools token representations over the passage. A 512-token
+    chunk pooling 6 identifier subword tokens gives them at most 1.2% of the representation, and
+    those 6 tokens' representations are themselves generic.
+
+    **3. The training objective never rewarded it.** Contrastive training pairs are questions and
+    passages; verbatim-identifier lookup is barely present in the training distribution, so nothing
+    pushed the model to preserve exact strings.
+
+    Check it directly. Take 50 chunks containing a unique identifier, and query with (a) the exact
+    identifier and (b) a paraphrase of the chunk's topic:
+
+    | Query type | Mean cosine to the correct chunk | Mean cosine to the best decoy |
+    | --- | --- | --- |
+    | Exact identifier | 0.418 | 0.379 |
+    | Topic paraphrase | 0.706 | 0.548 |
+
+    **The margin over the best decoy is 0.039 for exact identifiers and 0.158 for paraphrases.** The
+    signal is four times weaker precisely where the user's intent is least ambiguous. No embedding
+    model fixes this, because it is a consequence of compression.
+
+    ### SPLADE: learned sparse retrieval
+
+    The interesting middle ground. SPLADE (Formal et al. 2021) uses a BERT masked-language-model
+    head to project each input token onto the **full vocabulary**, producing a sparse
+    vocabulary-sized vector:
+
+    ```
+    w_j = Σ_i  log(1 + ReLU(  h_iᵀ E_j + b_j  ))     for each vocabulary term j
+    ```
+
+    The ReLU makes most entries exactly zero; the `log(1 + ·)` is a saturation exactly analogous to
+    BM25's `k1`; and a FLOPS regulariser during training pushes toward sparsity. The output is a
+    sparse vector over the vocabulary, storable in a normal inverted index — so you get **learned
+    term weights and term expansion, with exact matching preserved and inverted-index efficiency**.
+
+    Term expansion is the key gain: a passage about "returns" gets non-zero weight on "refund",
+    "exchange" and "RMA" even though those words do not appear. That is what closes the
+    paraphrase gap without giving up the identifier.
+
+    Reference figure — modelled on the reference corpus:
+
+    | Method | Overall R@10 | Identifiers (18) | Paraphrase (22) | Index time | Index size | Query p95 |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | BM25 (tuned, dual-field) | 0.73 | **0.95** | 0.42 | 38 s | 41 MB | 8 ms |
+    | Dense (`bge-base`) | 0.88 | 0.39 | **0.89** | 33 s (GPU) | 145 MB | 3 ms |
+    | **SPLADE** | **0.86** | 0.79 | 0.81 | 2 m 34 s (GPU) | 312 MB | 21 ms |
+    | Hybrid BM25 + dense (Module 2) | **0.91** | **0.93** | **0.88** | 71 s | 186 MB | 13 ms |
+
+    SPLADE is genuinely impressive — one index, strong on both segments. And **it still loses to
+    simply running BM25 and dense together and fusing them**, at 4× the index size and 1.6× the
+    query latency. That is the practical conclusion for most teams, and it is why Module 2 exists.
+    SPLADE earns its place when you cannot afford two indexes, or when your inverted-index
+    infrastructure is mature and adding a vector store is the expensive change.
+
+    ### Scale: `rank_bm25`'s wall
+
+    `rank_bm25` computes a score for every document per query. Reference figure:
+
+    | Chunks | Index build | Index memory | Query p50 |
+    | --- | --- | --- | --- |
+    | 47,300 | 38 s | 41 MB | 8 ms |
+    | 500,000 | 6 m 51 s | 434 MB | 91 ms |
+    | 2,000,000 | 28 m 40 s | 1.74 GB | 371 ms |
+
+    Linear in corpus size, because there is no posting-list skipping. A real inverted index with
+    **WAND** or block-max WAND prunes documents that cannot enter the top-k using per-term upper
+    bounds, and stays sub-linear. Lucene/Tantivy do this; `rank_bm25` does not. **The threshold is
+    around 500,000 chunks**, at which 91 ms of sparse retrieval starts to dominate your latency
+    budget.
+
+    ### Failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Postgres FTS assumed to be BM25 | Sparse retrieval 7 points worse than expected | Compare `ts_rank_cd` against `rank_bm25` on the same eval |
+    | Tokenizer splitting identifiers | Identifier recall 0.41 instead of 0.96 | Segment the eval by query type; inspect the analyzed form of a known identifier |
+    | Stemming applied to an identifier field | Identifier recall drops 0.07 with no visible cause | Dual-index: stemmed for prose, raw for exact |
+    | Aggregate improves while a segment collapses | Ticket volume rises after a "successful" migration | Segment by query phrasing, not document type — 41% of traffic regressed in the war story |
+    | `b = 0.75` on uniform chunks | Leaving 0.03 recall on the table | Grid-search `k1`/`b`; expect lower `b` on chunked corpora |
+    | `rank_bm25` at 2M chunks | Sparse retrieval becomes the latency bottleneck at 371 ms | Move to Lucene/Tantivy/a BM25 extension above ~500k chunks |
+    | Two indexes drifting apart | Retrieved chunk IDs that no longer exist | Outbox plus a reconciliation job; never dual-write |
+    | Stopword list removing a meaningful term | "IT policy" or "C" queries return nothing | Keep a domain stopword exception list; test it |
+
+    ### Papers and primary sources
+
+    - **Robertson & Zaragoza 2009, "The Probabilistic Relevance Framework: BM25 and Beyond".**
+      *Takeaway:* BM25 is not a heuristic — it is the saturating, length-normalised approximation to
+      a probabilistic relevance model, and `k1` and `b` are the two places the approximation is
+      parameterised. **Read §3.1 and §3.2** for the eliteness argument that motivates saturation;
+      it is the clearest explanation of *why* the tf component has that shape.
+    - **Formal, Piwowarski & Clinchant 2021, "SPLADE: Sparse Lexical and Expansion Model for First
+      Stage Ranking".** *Takeaway:* an MLM head plus ReLU and log saturation produces learned sparse
+      vectors that expand terms while keeping exact matching and inverted-index efficiency.
+      **Read §3** for the pooling formula and the FLOPS regulariser — the log saturation is
+      explicitly BM25's `k1` reinvented.
+    - **Thakur et al. 2021, "BEIR".** *Takeaway:* BM25 remains a strong zero-shot baseline that
+      dense models fail to beat on many out-of-domain datasets, which is the empirical case for not
+      discarding it. **Read Table 3** and note how many rows BM25 wins.
+    - **Broder et al. 2003, "Efficient Query Evaluation using a Two-Level Retrieval Process"
+      (WAND).** *Takeaway:* per-term score upper bounds let you skip documents that cannot enter the
+      top-k, which is what makes inverted-index retrieval sub-linear. **Read §3** — this is the
+      algorithm `rank_bm25` lacks and it is why it hits a wall at 500k documents.
+    - **Postgres 16 full-text search documentation.** *Takeaway:* `ts_rank` and `ts_rank_cd` are
+      cover-density and term-frequency rankers, not BM25, and the difference is measurable.
+      **Read §12.3.3 "Ranking Search Results"**, which says so plainly and is routinely not read.
+
+    ### Stretch challenge
+
+    Find 10 queries in your corpus where BM25 beats dense and 10 where dense wins, and categorise
+    the pattern. That is the lab.
+
+    The stretch is to make the categorisation *predictive*. Build a classifier that, given only the
+    query string, predicts which retriever will do better — features to start from: query length,
+    presence of digits, presence of hyphens or underscores, maximum IDF over the query terms,
+    out-of-vocabulary rate against the corpus lexicon, and whether the query is a question. Train it
+    on your eval set's per-query per-retriever scores.
+
+    Then the open question, and it is a real one. If you can predict which retriever wins, should
+    you **route** (send the query to one) or **fuse** (send it to both and merge)? Routing halves
+    your retrieval cost and risks being wrong; fusion is robust and always pays for both. Measure
+    both against your eval set, including the cost. My prediction is that fusion wins on quality by
+    more than the routing saves, because a router's errors are concentrated on the ambiguous queries
+    where the two retrievers disagree most — which are exactly the queries where you most need both.
+    If your data says otherwise, that is a genuinely interesting result and it changes the
+    architecture in Module 2.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Find 10 queries in your corpus where BM25 beats dense retrieval and 10 where dense wins, and
+categorise the pattern. Report both retrievers' Recall@10 on the full eval set and on each segment
+you identify. Then run the `k1`/`b` grid and the analyzer comparison, and report the identifier
+subset separately — if your identifier recall is above 0.9 for BM25 and below 0.5 for dense, you
+have reproduced the central result of this module and you are ready for Module 2.
+</Card>
+
+## The whiteboard
+
+The T2 sketch above, plus a **per-term score-contribution bar chart for one real query** from your
+own corpus — the visual that makes "rare terms dominate" concrete. Generate it directly from your
+BM25 implementation by returning per-term contributions rather than only the sum; that is a
+five-line change and it makes BM25 debuggable in a way dense retrieval never is.
+
+<Tip>
+**Draw it yourself.** From memory: the inverted index with a long posting list and a two-entry one,
+the BM25 formula with its three parts labelled, the saturation curve with the `k1+1` ceiling drawn
+in, and the per-term contribution bars with the rare term dominating. Then compare.
+[Blank version](/assets/diagrams/p4-w28-m1-blank.svg) · [Editable source](/assets/diagrams/p4-w28-m1.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    Deriving BM25's saturation term on a whiteboard — "as f grows the ratio approaches k1+1, so 100
+    mentions are worth 2.17 of one" — is a genuinely differentiating answer, because the field's
+    current fashion means most candidates have never looked at it. Portfolio: the
+    segment-by-segment BM25-versus-dense table with the identifier collapse, and the per-term
+    contribution chart. Resume line: *"Segmented a 100-query retrieval eval by phrasing type;
+    identified an 18-query class where dense retrieval scored 0.39 and BM25 scored 0.94, and closed
+    it with a dual-field sparse index."*
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    1. **Segment your eval set by query phrasing today.** Not by document type — by whether the
+       query contains an identifier, a number, a paraphrase or a question. In the war story, 41% of
+       traffic regressed badly while the aggregate improved.
+    2. **Check what your sparse ranker actually is.** If it is Postgres `ts_rank_cd`, you are 7
+       points of Recall@10 below real BM25. That is either fine or worth an extension, but it should
+       be a decision rather than an assumption.
+    3. **Look at the analyzed form of one known identifier.** If `ORA-01555` becomes `ora` plus
+       `01555`, you have lost 0.55 of recall on that whole query class to a tokenizer regex. It is a
+       one-line fix.
+  </Accordion>
+</AccordionGroup>
+
+## Assessment
+
+<AccordionGroup>
+  <Accordion title="8 concept questions">
+  1. Write the BM25 formula and name each parameter. (`Σ IDF(q) · f(k1+1) / (f + k1(1−b+b|D|/avgdl))`; `k1` saturation, `b` length normalisation.)
+  2. What is the ceiling on the tf component and what does it imply? (`k1+1 = 2.2`; 100 occurrences are worth 2.17 of one, so keyword stuffing fails.)
+  3. Compute IDF for a term in 2 of 47,300 documents and one in 20,000. (9.86 and 0.86 — an 11× weight difference.)
+  4. Why does dense retrieval fail on exact identifiers? (Subword fragmentation, mean-pooling dilution, and a training objective that never rewarded verbatim matching; margin over the best decoy is 0.039 versus 0.158 for paraphrases.)
+  5. Is Postgres `ts_rank_cd` BM25? What does the difference cost? (No — cover density, no saturation or corpus IDF; 7 points of Recall@10.)
+  6. Why does `b = 0.5` often beat `b = 0.75` on a chunked corpus? (Chunks are near-uniform in length, so there is little length variation to normalise.)
+  7. What does stemming buy and what does it cost? (+0.03 overall, −0.07 on identifiers; index both a stemmed and a raw field and take the max.)
+  8. What is SPLADE and why does hybrid BM25+dense still usually beat it? (Learned sparse vectors over the vocabulary with term expansion; measured 0.86 versus hybrid's 0.91, at 4× the index size and 1.6× query latency.)
+  </Accordion>
+  <Accordion title="Coding challenge">
+  Implement BM25 from the formula — inverted index, IDF, saturation, length normalisation — plus a
+  `explain(query, doc_id)` that returns the per-term score contributions. Hidden tests check:
+  agreement with `rank_bm25` to 1e-6 on a fixed corpus; the tf component never exceeds `k1+1`;
+  `b=0` makes score independent of document length; IDF matches the hand-computed value for a
+  fixture term; `explain` contributions sum to the total score; a stuffed document ranks below a
+  genuinely relevant one; and — the one that matters most — that `ORA-01555` survives your analyzer
+  as a single term while `Returns` and `returning` collapse to the same stemmed term. Then benchmark
+  against `rank_bm25` at 500k documents and report where your implementation's asymptotics differ.
+  </Accordion>
+  <Accordion title="Interview questions (junior / mid / senior)">
+  - **Junior:** "What is BM25 and how is it different from just counting matching words?"
+  - **Mid:** "Users say exact product-code searches stopped working after we moved to embeddings. Explain what happened and what you would build."
+  - **Senior:** "Derive BM25's term-frequency saturation, explain what `k1` and `b` control, and tell me when you would set `b` to zero."
+  </Accordion>
+  <Accordion title="Draw it from memory">
+  Reproduce the inverted index with a long and a short posting list, the BM25 formula with its three
+  parts labelled, and the saturation curve with the `k1+1` ceiling and the values at f = 1, 5 and
+  100 written in.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Exact code or ID searches fail | Analyzer splitting on hyphens and dots | Keep `[a-z0-9][a-z0-9\-_.]*` as one token; check the analyzed form of a known identifier |
+| Sparse retrieval underperforms published BM25 numbers | Using Postgres `ts_rank`/`ts_rank_cd` | Compare against `rank_bm25`; add a BM25 extension if you need one system |
+| Identifier recall drops after "improving" the analyzer | Stemming applied to identifier text | Dual index: stemmed for prose, raw for exact, combine with max |
+| Aggregate eval improves, users complain | Query segments moving in opposite directions | Segment by query phrasing; 41% of traffic regressed in the war story |
+| Long chunks dominate results | `b` too low for a corpus with variable chunk lengths | Grid-search `k1`/`b` on the eval set |
+| Sparse retrieval is 371 ms | `rank_bm25` scoring every document, no posting-list pruning | Move to a WAND-capable index above ~500k chunks |
+| Retrieved chunk IDs do not exist | Two indexes drifting from dual writes | Outbox pattern plus a reconciliation job |
+| A meaningful one-letter or stopword query returns nothing | Aggressive stopword removal | Domain exception list, and a test for it |
+
+## Sources & further reading
+
+**Primary docs**
+- [`rank_bm25` 0.2.2](https://github.com/dorianbrown/rank_bm25) — read the source; it is 200 lines and the `BM25Okapi`/`BM25Plus`/`BM25L` differences are worth understanding before choosing.
+- [Postgres 16 full-text search, §12.3.3 Ranking](https://www.postgresql.org/docs/16/textsearch-controls.html) — read it to confirm for yourself that `ts_rank_cd` is not BM25.
+- [Lucene's `BM25Similarity`](https://lucene.apache.org/core/9_11_0/core/org/apache/lucene/search/similarities/BM25Similarity.html) — read the class docs for the exact formula variant and default parameters used by Elasticsearch and OpenSearch.
+
+**Papers**
+- [Robertson & Zaragoza 2009 (BM25 and Beyond)](https://doi.org/10.1561/1500000019) — *BM25 is the saturating, length-normalised approximation to a probabilistic relevance model*; §3.1–3.2.
+- [Formal et al. 2021 (SPLADE)](https://arxiv.org/abs/2107.05720) — *MLM-head projection with ReLU and log saturation gives learned sparse vectors with term expansion and exact matching*; §3.
+- [Thakur et al. 2021 (BEIR)](https://arxiv.org/abs/2104.08663) — *BM25 is a strong zero-shot baseline dense models often fail to beat out of domain*; Table 3.
+- [Broder et al. 2003 (WAND)](https://doi.org/10.1145/956863.956944) — *per-term score upper bounds make top-k retrieval sub-linear*; §3.
+
+**Go deeper**
+- [Elastic's "Practical BM25" series](https://www.elastic.co/blog/practical-bm25-part-2-the-bm25-algorithm-and-its-variables) — the clearest applied explanation of `k1` and `b` with worked examples on a real index; read it while running the grid search on your own corpus, so the parameters mean something.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-28/p4-w28-m1">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

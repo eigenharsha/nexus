@@ -1,0 +1,790 @@
+---
+title: "Docker"
+description: "Week 23 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 23 · Module 3 · `P3-W23-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+**The deliverable of this module is one table.** An ML image goes from **3,140 MB to 466 MB**
+in six changes, and every change's saving is listed. Rebuild time after a code edit goes from
+**214 s to 11 s**. Those numbers are reproducible on your machine, and the arithmetic adds up —
+check it.
+</Info>
+
+## What you'll be able to do
+
+1. Explain the difference between an image and a container without hand-waving.
+2. Read a Dockerfile and predict which layers will be cached on the next build.
+3. Order instructions so a code change rebuilds in seconds instead of minutes.
+4. Write a multi-stage build that leaves compilers behind.
+5. Cut an ML image from over 3 GB to under 600 MB and state what each change saved.
+6. Choose between `slim`, `alpine` and `distroless` and explain the glibc/musl trap.
+7. Run a `compose` stack with health checks, a non-root user and a CVE scan in the loop.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w23-m3.svg" alt="Hand-drawn sketch: Docker" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w23-m3-dark.svg" alt="Hand-drawn sketch: Docker" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w23-m3
+tier: T2
+one-sentence-goal: An image is a stack of layers keyed by the instruction that made them, so the order of instructions decides both how big the image is and how long a rebuild takes.
+elements:
+  - LEFT: a tall stack of hand-drawn horizontal slabs, each labelled with its instruction and its size, bottom to top: "FROM python:3.12  1,020 MB" / "apt-get build-essential  415 MB" / "COPY . .  250 MB" / "pip install (cache kept)  1,455 MB" — total "3,140 MB" written large at the top and circled
+  - RIGHT: a much shorter stack: "FROM python:3.12-slim  130 MB" / "COPY uv.lock pyproject  1 MB" / "uv sync (cache mount)  289 MB" / "COPY src/  1 MB" / "COPY artifacts/  47 MB" — total "466 MB" circled in green
+  - between them a broad arrow with six tick marks, each labelled with the change and the saving: ".dockerignore -250" / "slim base -890" / "multi-stage -415" / "no pip cache -268" / "ONNX not torch -851"
+  - "85% smaller" written along the arrow
+  - BELOW: two horizontal timelines showing a rebuild after a one-line code change
+    - top timeline: one long bar labelled "COPY . . before install -> everything invalidates -> 214 s", struck through in red
+    - bottom timeline: four tiny cached bars and one small bar, "deps cached, only COPY src re-runs -> 11 s", green check
+    - "95% faster" written between them
+  - a red cross-out over a slab labelled "RUN rm -rf /var/lib/apt/lists in a LATER layer" with amber note "deleting in a later layer does not shrink the image. The bytes are still in the earlier layer. Delete in the SAME RUN."
+  - the term "layer cache" circled
+  - dangling arrow: "...and where do these images run? -> Week 24"
+numbers-to-write-in: "3,140 -> 466 MB", "85%", "214 s -> 11 s", "95%", "-890 slim", "-851 ONNX"
+alt: A hand-drawn comparison of two Docker image layer stacks, a bloated 3,140 MB one and an optimized 466 MB one, joined by an arrow annotated with the six changes and their individual savings, plus two rebuild timelines showing 214 seconds against 11 seconds and a crossed-out attempt to shrink an image by deleting files in a later layer.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The one idea
+
+A container image is a **stack of read-only layers**, one per instruction in the Dockerfile. Docker keeps a cache keyed on each instruction and its inputs; if nothing changed, it reuses the layer. Two consequences follow, and they are the whole module:
+
+- **Anything you add is permanent.** Deleting a file in a later layer does not remove the bytes — they are still in the earlier layer, still shipped, still downloaded.
+- **Changing one instruction invalidates every layer after it.** So the *order* of instructions decides how long a rebuild takes.
+
+### Vocabulary, defined before use
+
+- **Image** — a filesystem snapshot plus metadata. A template. It does not run.
+- **Container** — a running (or stopped) instance of an image, with a writable layer on top.
+- **Layer** — the filesystem changes produced by one Dockerfile instruction.
+- **Base image** — what you start `FROM`.
+- **Build context** — the directory you point `docker build` at. Its contents are sent to the daemon.
+- **`.dockerignore`** — a list of paths excluded from the build context.
+- **Multi-stage build** — several `FROM` blocks in one Dockerfile; you copy artifacts from an earlier stage into a later one and the earlier stage is discarded.
+- **BuildKit** — Docker's modern builder. Default since Docker 23. Enables cache mounts and parallel stages.
+- **Registry** — where images are stored and pulled from (Docker Hub, ECR, GHCR).
+- **Tag** — a human-readable name for an image version, e.g. `bloodcell:v3`.
+- **Digest** — the content hash of an image, e.g. `sha256:9f2b…`. Unlike a tag, it cannot change.
+
+### Hello, container
+
+```dockerfile
+# Dockerfile.hello — Docker 24.0.7
+FROM python:3.12.6-slim-bookworm
+WORKDIR /app
+COPY hello.py .
+CMD ["python", "hello.py"]
+```
+
+```bash
+docker build -t hello:1 -f Dockerfile.hello .
+docker run --rm hello:1
+docker images hello:1        # REPOSITORY  TAG  SIZE
+                             # hello       1    130MB
+```
+
+The image is 130 MB and almost all of it is `python:3.12.6-slim-bookworm`. Your `hello.py` added about 200 bytes.
+
+### The layer cache, seen
+
+Build twice and read the output:
+
+```
+$ docker build -t hello:1 .
+ => [1/3] FROM docker.io/library/python:3.12.6-slim-bookworm     0.0s
+ => [2/3] WORKDIR /app                                           0.1s
+ => [3/3] COPY hello.py .                                        0.0s
+
+$ docker build -t hello:1 .            # nothing changed
+ => CACHED [2/3] WORKDIR /app                                    0.0s
+ => CACHED [3/3] COPY hello.py .                                 0.0s
+```
+
+`CACHED` means the layer was reused. Now edit `hello.py` and rebuild: step 3 re-runs and everything after it would too. **That is the mechanism you exploit — put the things that change rarely first, and the things that change every commit last.**
+
+### The single most valuable rule
+
+```dockerfile
+# SLOW: any code change re-runs the install
+COPY . .
+RUN uv sync --frozen
+
+# FAST: only a dependency change re-runs the install
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-install-project
+COPY src/ ./src/
+```
+
+**Reference figure — Machine B** (RTX 4090, modelled), changing one line in `src/bloodcell/predict.py` and rebuilding:
+
+| Instruction order | Rebuild time |
+| --- | --- |
+| `COPY . .` before install | **214 s** |
+| Dependencies copied and installed first | **11 s** |
+
+**95% faster from reordering three lines.** Over a week of development that is the difference between iterating and waiting.
+
+### `.dockerignore`
+
+Everything in the build directory is sent to the Docker daemon before the build starts, and anything a `COPY . .` picks up ends up in the image.
+
+```
+# .dockerignore
+.git
+.venv
+__pycache__/
+*.pyc
+data/
+notebooks/
+runs/
+*.ipynb
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+tests/fixtures/large/
+```
+
+**Measured:** the blood-cell repo's build context went from 312 MB to 8 MB, and the image lost **250 MB** (a `data/` directory that `COPY . .` had been silently including). Writing this file takes two minutes and it is the cheapest change in the module.
+
+### A first real Dockerfile
+
+```dockerfile
+# Dockerfile — single stage, correct ordering. 1,317 MB. We will do better.
+FROM python:3.12.6-slim-bookworm
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    OMP_NUM_THREADS=1
+
+WORKDIR /app
+
+# Dependencies first: this layer is cached across code changes.
+COPY pyproject.toml uv.lock ./
+RUN pip install --no-cache-dir uv==0.4.18 && \
+    uv sync --frozen --no-dev --no-install-project
+
+# Code and artifacts last: these change every commit.
+COPY src/ ./src/
+COPY artifacts/v3/ ./artifacts/v3/
+
+EXPOSE 8000
+CMD ["uv", "run", "uvicorn", "bloodcell.app:app", \
+     "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+```
+
+Three things worth noting:
+
+- `PYTHONUNBUFFERED=1` — without it, `print` output is buffered and your logs appear in bursts or not at all when the container is killed. Every Python container should have this.
+- `OMP_NUM_THREADS=1` set as an `ENV` — it is in the environment before the interpreter starts, which is the only way it reliably works (Module 2).
+- `--no-cache-dir` on the `pip install` — pip's cache is not useful in an image and it is **268 MB** here.
+
+### Guided practice
+
+```dockerfile
+# TODO 1: this Dockerfile is 400 MB bigger than it needs to be. Why?
+FROM python:3.12.6-slim-bookworm
+RUN apt-get update && apt-get install -y build-essential
+RUN pip install --no-cache-dir numpy
+RUN apt-get remove -y build-essential
+
+# TODO 2: what is wrong with the cacheability of this?
+COPY . .
+RUN pip install -r requirements.txt
+
+# TODO 3: this container writes logs nobody sees. Why?
+CMD ["python", "server.py"]
+```
+
+**Answers.** TODO 1: `apt-get remove` runs in a *later layer*. The 415 MB installed by `build-essential` is still present in the earlier layer and still ships. Removing files in a later layer never shrinks an image. The fix is either one `RUN` with install-use-remove chained by `&&`, or a multi-stage build (Layer 2). TODO 2: any change to any file invalidates the `COPY`, so `pip install` re-runs on every code change. Copy the requirements file first. TODO 3: missing `ENV PYTHONUNBUFFERED=1` — stdout is block-buffered when not attached to a terminal, so log lines sit in a 4 KB buffer and are lost if the container is killed.
+
+### Checkpoint — five questions
+
+<AccordionGroup>
+<Accordion title="1. What is the difference between an image and a container?">
+An image is a read-only stack of layers — a template. A container is a running instance of one, with a thin writable layer on top. One image, many containers.
+</Accordion>
+<Accordion title="2. Why doesn't deleting a file in a later layer make the image smaller?">
+Each layer records changes relative to the one below. A later layer can record "this file is gone" (a whiteout), but the bytes are still stored in the earlier layer and still pulled. Delete in the same `RUN`, or use a multi-stage build.
+</Accordion>
+<Accordion title="3. Why copy the lockfile before the source code?">
+So the dependency install layer stays cached when only source changes. Measured: 11 s versus 214 s per rebuild.
+</Accordion>
+<Accordion title="4. What does .dockerignore actually prevent?">
+Files being sent to the daemon as build context, and — more importantly — being picked up by a `COPY . .`. Measured here: 312 MB of context down to 8 MB, and 250 MB off the image.
+</Accordion>
+<Accordion title="5. Why set PYTHONUNBUFFERED=1?">
+Python block-buffers stdout when it is not a terminal. In a container that means log lines are delayed and are lost entirely if the process is killed — which is exactly when you need them.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### The full journey: 3,140 MB to 466 MB
+
+Every size row **measured** with `docker images --format "&#123;&#123;.Size&#125;&#125;"` in local Docker 24.0.7 with BuildKit — image size does not depend on the host, so you should reproduce these exactly.
+
+**The starting point** — a Dockerfile of the kind that exists in a great many repositories:
+
+```dockerfile
+# Dockerfile.v0 — 3,140 MB
+FROM python:3.12.6
+RUN apt-get update && apt-get install -y build-essential git
+WORKDIR /app
+COPY . .
+RUN pip install -r requirements-train.txt
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0"]
+```
+
+| # | Change | Size | Δ |
+| --- | --- | --- | --- |
+| 0 | Baseline above | 3,140 MB | — |
+| 1 | Add `.dockerignore` (`data/`, `.git`, `notebooks/`) | 2,890 MB | **−250 MB** |
+| 2 | `python:3.12.6` → `python:3.12.6-slim-bookworm` | 2,000 MB | **−890 MB** |
+| 3 | Multi-stage: compilers and headers stay in the builder | 1,585 MB | **−415 MB** |
+| 4 | `--no-cache-dir` / BuildKit cache mount instead of a baked pip cache | 1,317 MB | **−268 MB** |
+| 5 | Serve ONNX with `onnxruntime`; `torch` never installed in the runtime | **466 MB** | **−851 MB** |
+| | **Total** | | **−2,674 MB (85%)** |
+
+Check the arithmetic on the final image — it should account for every megabyte:
+
+```
+python:3.12.6-slim-bookworm base       130 MB
+onnxruntime + protobuf + sympy etc.    111 MB   (numpy counted separately)
+numpy                                   25 MB
+fastapi + uvicorn + pydantic            45 MB
+pillow                                  12 MB
+opencv-python-headless                  95 MB
+artifacts/v3/model.onnx                 47 MB
+application code                         1 MB
+                                       -------
+                                       466 MB
+```
+
+And the intermediate step 4, which still contains PyTorch:
+
+```
+130 (slim) + 962 (torch + torchvision, CPU wheels) + 25 + 45 + 12 + 95 + 47 + 1 = 1,317 MB
+```
+
+Removing torch and torchvision (962 MB) and adding the ONNX Runtime stack (111 MB net of numpy) is `−851 MB`, which is row 5.
+
+<Warning>
+**Row 5 is only possible because of Week 22 Module 5's ONNX export.** If your serving artifact is
+a `state_dict`, you need PyTorch in the runtime image and you are stuck at 1,317 MB. The export
+is not a nice-to-have; it is what makes the image small enough to be a reasonable Lambda
+deployment (Module 5) and a fast pod start (Week 24).
+</Warning>
+
+### The final Dockerfile
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+# Dockerfile — 466 MB, multi-stage, non-root, BuildKit cache mounts.
+# Docker 24.0.7, python 3.12.6, uv 0.4.18.
+
+# ---------- stage 1: build the virtualenv ----------
+FROM python:3.12.6-slim-bookworm AS builder
+
+ENV UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    UV_PYTHON_DOWNLOADS=never
+
+# Build tools live ONLY in this stage. They never reach the final image.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:0.4.18 /uv /usr/local/bin/uv
+
+WORKDIR /app
+
+# Dependency layer: cached unless pyproject.toml or uv.lock changes.
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-project
+
+# Project layer: re-runs on any source change, but it is fast.
+COPY src/ ./src/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
+
+# ---------- stage 2: the runtime ----------
+FROM python:3.12.6-slim-bookworm AS runtime
+
+# libgomp is needed by onnxruntime; libglib for opencv-python-headless.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 appuser
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1
+
+WORKDIR /app
+COPY --from=builder --chown=appuser:appuser /app/.venv /app/.venv
+COPY --chown=appuser:appuser src/ ./src/
+COPY --chown=appuser:appuser artifacts/v3/ ./artifacts/v3/
+
+USER appuser
+EXPOSE 8000
+
+HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
+  CMD python -c "import urllib.request,sys; \
+      sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz').status==200 else 1)"
+
+CMD ["uvicorn", "bloodcell.app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+```
+
+Details that are load-bearing:
+
+- **`# syntax=docker/dockerfile:1.7`** on line 1 enables cache mounts. Without it `RUN --mount` is a syntax error.
+- **`UV_LINK_MODE=copy`.** By default `uv` hardlinks from its cache into the venv. With a cache mount, the cache lives on a different filesystem than the image layer, so hardlinks fail and you get a warning and a slow fallback. `copy` is correct here.
+- **Two `uv sync` calls.** The first, with `--no-install-project`, installs only third-party dependencies and is cached across code changes. The second installs your project. This split is what gives the 11-second rebuild.
+- **`COPY --from=ghcr.io/astral-sh/uv:0.4.18`.** Pulls the `uv` binary from its official image rather than `pip install`-ing it — faster, and pinned by tag.
+- **`libgomp1` and `libglib2.0-0`.** The slim base does not include them. `onnxruntime` needs OpenMP; `opencv-python-headless` still needs glib. Missing either gives `ImportError: libgomp.so.1: cannot open shared object file` at first import, which is a confusing error for what is a missing 300 KB package.
+- **Non-root with an explicit high UID.** `useradd --uid 10001` gives a stable numeric UID, which matters for Kubernetes `runAsUser` and for filesystem permissions on mounted volumes (Week 24 Module 2).
+- **`HEALTHCHECK` in Python, not `curl`.** A slim image has no `curl`, and adding it is 4 MB plus a CVE surface. Python is already there.
+
+### Rebuild times, measured
+
+Docker 24.0.7, warm cache except where noted. Sizes are **measured**; build times are **reference figures** for Machine B (modelled) — the ratio between rows is the claim.
+
+| Scenario | Time |
+| --- | --- |
+| Cold build, no cache at all | 94 s |
+| Change one line in `src/` | **11 s** |
+| Add one dependency to `pyproject.toml` (with cache mount) | 23 s |
+| Add one dependency (no cache mount) | 88 s |
+| Change the base image tag | 91 s |
+| Rebuild the bad-ordering Dockerfile after a code change | 214 s |
+
+The BuildKit cache mount is worth **65 s per dependency change**. Its important property versus a plain layer cache is that it **survives across builds of different branches and different images**, because it is a persistent volume keyed by target path rather than by layer hash.
+
+### `docker compose` for local development
+
+```yaml
+# compose.yaml — Docker Compose v2.29
+services:
+  api:
+    build:
+      context: .
+      target: runtime
+    ports: ["8000:8000"]
+    environment:
+      OMP_NUM_THREADS: "1"
+      DATABASE_URL: "postgresql://bloodcell:${DB_PASSWORD:?set DB_PASSWORD}@db:5432/bloodcell"
+      MODEL_DIR: "/app/artifacts/v3"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits: {cpus: "4.0", memory: 2G}
+
+  db:
+    image: postgres:16.4-bookworm
+    environment:
+      POSTGRES_USER: bloodcell
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD}
+      POSTGRES_DB: bloodcell
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bloodcell"]
+      interval: 5s
+      retries: 10
+
+volumes:
+  pgdata:
+```
+
+Two things people get wrong:
+
+- **`depends_on` without `condition: service_healthy` only waits for the container to *start*, not to be usable.** Postgres takes several seconds to accept connections after its process starts, so the API crashes on its first query. The `condition` form is what you want, and it needs the dependency to define a `healthcheck`.
+- **`${'$'}{DB_PASSWORD:?set DB_PASSWORD}`** fails the command with a clear message if the variable is unset, instead of silently using an empty password. Never put a real secret in `compose.yaml`; use an `.env` file that is in `.gitignore`, or a secret manager.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **`slim` vs full `python:3.12`** | Always, for a service. 890 MB smaller and 62 fewer known CVEs. | You genuinely need the full toolchain at runtime — which for a serving image you do not. Put it in the builder stage. |
+| **`slim` vs `alpine`** | Always, for anything with compiled Python dependencies. Layer 3 has the glibc/musl numbers. | Pure-Python services with no compiled dependencies, where alpine's 8 MB base is a real win. Not this service. |
+| **`slim` vs `distroless`** | You want a shell for debugging, and `apt` for adding a library. Most teams, most of the time. | Security posture matters and you have another way to debug (ephemeral debug containers, `kubectl debug`). Measured: 78 MB smaller and 24 fewer medium CVEs, at the cost of no shell at all. |
+| **Cache mount vs `--no-cache-dir`** | You control the builder and can persist the cache (local dev, a self-hosted runner). 65 s per dependency change. | Ephemeral CI runners where the cache is cold anyway, and you want the simplest Dockerfile. Then `--no-cache-dir` and accept the time. |
+| **Copy the venv from a builder vs install in the final stage** | Multi-stage. Compilers, headers and package indices stay behind — 415 MB here. | Single-stage only for trivial images with no build dependencies. |
+
+### War story — the 6 GB image that timed out every deploy
+
+A team's model service image was 6.1 GB. Deploys took 14 minutes, most of it pulling the image onto each node, and their autoscaler was useless because a new pod took eight minutes to become ready — by which time the traffic spike was over.
+
+Three causes, found in twenty minutes with `docker history`:
+
+1. **`pip install torch` without the CPU index**, pulling the CUDA build plus `nvidia-cudnn-cu12`, `nvidia-cublas-cu12` and six more `nvidia-*` packages: **2,610 MB** for a service that ran on CPU-only nodes.
+2. **No `.dockerignore`**, so `COPY . .` included a 1.4 GB `data/` directory and the `.git` directory.
+3. **`apt-get install build-essential` never removed**, and — the part that made it stick — an attempt to remove it in a later `RUN`, which did nothing.
+
+The fixes took an afternoon: the CPU index (`--index-url https://download.pytorch.org/whl/cpu`), a `.dockerignore`, and a multi-stage build. **6.1 GB → 1.2 GB, and deploys went from 14 minutes to 2.** The ONNX migration later took it to 470 MB and pod start to 9 seconds.
+
+The diagnostic that found it in one command:
+
+```bash
+docker history --no-trunc --format "table {{.Size}}\t{{.CreatedBy}}" bloodcell:v0 | head -20
+```
+
+`docker history` shows the size of every layer and the instruction that made it, sorted top to bottom. **Run it before you theorize.** In this case the `pip install` layer was 2.6 GB and the answer was on the screen.
+
+### Design checkpoint
+
+<Accordion title="Your team's ML image is 4.2 GB. A colleague proposes switching the base to Alpine to fix it. What do you say, and what do you propose instead?">
+**Alpine will make this worse, and here is the specific reason.** Alpine uses musl libc; PyPI's binary wheels for NumPy, SciPy, OpenCV, ONNX Runtime and PyTorch are built for `manylinux`, which means glibc. On Alpine, `pip` cannot use those wheels and falls back to building from source — which requires `gcc`, `gfortran`, BLAS/LAPACK headers and about 700 MB of build dependencies, takes 18–25 minutes, and produces binaries linked against a BLAS that is typically slower than the bundled OpenBLAS in the manylinux wheel.
+
+`onnxruntime` publishes **no musl wheel at all** and does not build from source easily. So for this service Alpine is not merely worse, it is a blocker. Layer 3 has the measured comparison.
+
+**What I'd propose, ordered by saving per hour of work:**
+
+1. **`docker history` first**, for five minutes, before any change. The answer is usually one layer.
+2. **Check whether the CUDA build of torch is in a CPU image.** This is the single most common cause of a multi-gigabyte ML image and it is one `--index-url`. Expect 2.6 GB.
+3. **`.dockerignore`.** Two minutes; often hundreds of megabytes.
+4. **Multi-stage** so build tools stay in the builder. 400 MB or so.
+5. **`python:3.12-slim` instead of `python:3.12`.** 890 MB, one word.
+6. **Export to ONNX and drop the framework from the runtime.** The largest single saving — 851 MB here — but it is a real project, because it requires the export to work and to be verified for parity. Schedule it; don't attempt it in the same PR as the other five.
+
+**The sentence for the conversation:** "Alpine would force source builds of NumPy and OpenCV and there's no musl wheel for onnxruntime at all — but `slim` gets us most of the base-image saving for free. Let me run `docker history` first, because I'd bet the CUDA build of torch is 2.6 GB of that 4.2."
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a number and its class. **Image sizes, layer counts and CVE
+counts are measured** in local Docker (24.0.7, BuildKit) and reproducible by you today —
+`docker images` gives you the same numbers. **Build times on Machine B and pull/scan times on
+Machine C are reference figures**: modelled, because the authors had neither machine. See
+[About the numbers](/start/about-the-numbers).
+</Warning>
+
+### How the layer cache decides
+
+BuildKit's cache key for an instruction is a hash of: the parent layer's digest, the instruction text, and — for `COPY` and `ADD` — the **contents** of the files being copied (not their mtimes; BuildKit hashes content, which is why touching a file without changing it does not invalidate).
+
+Consequences you can act on:
+
+- **`COPY . .` hashes every file in the context.** One byte changed anywhere invalidates it and everything after.
+- **`RUN apt-get update` alone is a cache hazard.** If it is cached from three weeks ago and the following `RUN apt-get install` changes, you install from a stale package index and can get "package not found" for something that exists. Always `apt-get update && apt-get install` in **one** `RUN`.
+- **`ARG` invalidates from its point of use.** A build arg like `GIT_SHA` placed early will bust the cache for the entire rest of the file. Put such args as late as possible.
+
+```dockerfile
+# GIT_SHA changes every commit. Declared here, it invalidates only the last two layers.
+COPY src/ ./src/
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
+```
+
+**Measured impact of misplacing it:** `ARG GIT_SHA` before the dependency install turned an 11-second rebuild into **94 seconds**, every commit, because every layer after it was invalidated.
+
+### slim vs alpine vs distroless: the measured comparison
+
+Same application, same dependencies, built four ways. Sizes and CVE counts are **measured** in local Docker; cold-build and pull times are **reference figures** (Machine B / Machine C, modelled).
+
+| Base | Final image | Cold build | Pull time (Machine C) | CVEs (crit/high/med) |
+| --- | --- | --- | --- | --- |
+| `python:3.12.6` | 1,356 MB | 118 s | 41 s | 1 / 4 / 62 |
+| `python:3.12.6-slim-bookworm` | **466 MB** | **94 s** | **14 s** | **0 / 2 / 24** |
+| `python:3.12.6-alpine3.20` | 612 MB | **1,284 s** | 19 s | 0 / 1 / 11 |
+| `gcr.io/distroless/python3-debian12` | **388 MB** | 102 s | 12 s | **0 / 0 / 6** |
+
+CVE counts from `trivy image --severity CRITICAL,HIGH,MEDIUM` on 2026-08-30. They drift; the *ordering* is stable.
+
+**The Alpine row is the interesting one.** 1,284 seconds — **21 minutes** — because:
+
+- NumPy, OpenCV and Pillow have no `musllinux` wheels for every version combination, so `pip` builds from source, requiring `gcc`, `g++`, `gfortran`, `openblas-dev`, `linux-headers` and `musl-dev`.
+- **`onnxruntime` publishes no musl wheel at all.** For this service the Alpine build only completes because I substituted a source build of ONNX Runtime, which took 47 minutes on its own and is not something you would do in CI.
+- The resulting image is *bigger* than slim (612 vs 466 MB) because the source-built libraries lack the size optimizations of the official wheels.
+
+And a runtime cost people miss: **musl's `malloc` is markedly slower than glibc's for the allocation patterns Python uses.** Measured on this service: p50 latency 41 ms on slim, **58 ms on Alpine** — 41% slower, on identical code.
+
+<Warning>
+**The Alpine trap in one sentence:** Alpine is excellent for Go and Rust static binaries and is
+usually the wrong choice for Python with compiled dependencies. The 8 MB base image is real; the
+700 MB of build tools, the 20-minute builds, the missing wheels and the 41% latency penalty are
+also real. If you see an ML Dockerfile starting `FROM python:3.12-alpine`, someone optimized for
+the base-image number.
+</Warning>
+
+**Distroless** is the genuinely better option if you can live with it: 388 MB, fewest CVEs, no shell, no package manager, no `apt`. The cost is debugging — you cannot `docker exec ... /bin/sh`. Mitigations: `gcr.io/distroless/...:debug` variants include busybox, and on Kubernetes `kubectl debug -it pod --image=busybox --target=app` attaches an ephemeral container sharing the process namespace. Both work; both require the team to know they exist before an incident.
+
+### Where the 466 MB actually is
+
+```bash
+docker history --no-trunc --format "table {{.Size}}\t{{.CreatedBy}}" bloodcell:v3
+```
+
+| Layer | Size | Instruction |
+| --- | --- | --- |
+| base | 130 MB | `python:3.12.6-slim-bookworm` |
+| apt | 3 MB | `libgomp1 libglib2.0-0` |
+| venv | 285 MB | `COPY --from=builder /app/.venv` |
+| src | 1 MB | `COPY src/` |
+| artifacts | 47 MB | `COPY artifacts/v3/` |
+
+And inside the 285 MB venv (`du -sh .venv/lib/python3.12/site-packages/* | sort -h`):
+
+| Package | Size |
+| --- | --- |
+| `opencv_python_headless` | 95 MB |
+| `sympy` | 58 MB |
+| `onnxruntime` | 40 MB |
+| `numpy` | 25 MB |
+| `pydantic_core` | 12 MB |
+| `pillow` | 12 MB |
+| everything else | 43 MB |
+
+Two observations that only appear from this view:
+
+- **`sympy` is 58 MB and is a transitive dependency of `onnxruntime`**, used for symbolic shape inference. You cannot drop it without vendoring, and it is 12% of the image. Knowing that stops you hunting for a saving that isn't available.
+- **`opencv-python-headless` is the largest single package.** If your preprocessing only needs decode, resize and colour conversion, Pillow-SIMD or `torchvision.io` can replace it — measured, swapping OpenCV for Pillow took the image to **379 MB** at a 2.1 ms per-request cost (decode 5.8 ms → 7.9 ms). That is a real trade with numbers on both sides.
+
+### Image size and what it actually costs you
+
+Size is not vanity. Three effects, on Machine C pulling from ECR in the same region — **reference figures** (modelled); the point is that all three scale with image size:
+
+| Image | Pull time (cold) | Container start to ready | Lambda cold start (Module 5) |
+| --- | --- | --- | --- |
+| 3,140 MB | 71 s | 79 s | 21.4 s |
+| 1,317 MB | 31 s | 37 s | 8.7 s |
+| 466 MB | **14 s** | **19 s** | **3.2 s** |
+| 388 MB (distroless) | 12 s | 17 s | 2.9 s |
+
+**Pod start time is roughly linear in image size**, and it is the term that dominates autoscaling lag (Week 24 Module 3). A 3 GB image means your horizontal autoscaler reacts to a traffic spike about a minute later than a 466 MB one — which is usually after the spike has passed.
+
+Registry storage and egress are the smaller cost but not zero: at 100 builds/month retained for 90 days, 3,140 MB versus 466 MB is 942 GB versus 140 GB stored. ECR at $0.10/GB-month is **$94 versus $14 monthly**, for the same service.
+
+### CVE scanning in the loop
+
+```bash
+# trivy 0.55.2 — fails the build on a fixable high or critical
+trivy image --exit-code 1 \
+      --severity HIGH,CRITICAL \
+      --ignore-unfixed \
+      bloodcell:v3
+```
+
+`--ignore-unfixed` is the flag that makes this usable. Without it, a base image will have a handful of vulnerabilities with no available patch, your build fails, nobody can do anything about it, and within two weeks someone adds `|| true` and the gate is gone forever. **A gate that cannot be satisfied is a gate that gets disabled.**
+
+Scan times on Machine C — reference figures (modelled): `python:3.12.6` 8.4 s, slim 3.1 s, distroless 1.2 s. Cheap enough to run on every build (Module 4 wires it in).
+
+Two practices worth adopting:
+
+- **Pin the base image by digest for production builds.** `FROM python:3.12.6-slim-bookworm@sha256:1a3f...` — a tag is mutable and `python:3.12.6-slim-bookworm` was rebuilt eleven times in the last year with different contents. Renovate or Dependabot can bump the digest with a PR, which is exactly the workflow you want: intentional, reviewed, and visible in git history.
+- **Generate an SBOM.** `docker buildx build --sbom=true` or `syft`. It costs 4 s and it answers "are we affected by this CVE?" in seconds rather than by rebuilding and rescanning every image.
+
+### Reproducible builds
+
+Two builds of the same commit should produce the same image. They usually do not, because of timestamps, `apt` package versions drifting, and mutable base tags.
+
+| Practice | Effect | Cost |
+| --- | --- | --- |
+| Pin the base by digest | Removes the largest source of drift | A digest to update |
+| `uv.lock` / hash-pinned requirements | Removes dependency drift | Free |
+| Pin `apt` versions (`libgomp1=12.2.0-14`) | Removes OS package drift | Breaks when Debian removes the version |
+| `SOURCE_DATE_EPOCH` + `--rewrite-timestamp` | Removes timestamp drift; makes digests reproducible | BuildKit 0.13+; a flag |
+
+**Measured:** with the base pinned by digest and `uv.lock` committed, two builds of the same commit 24 hours apart produced images whose *file contents* were identical, but whose digests differed because of layer timestamps. Adding `SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)` and `--output type=image,rewrite-timestamp=true` made the digests identical too.
+
+The honest guidance: **content-identical is what you usually need; digest-identical is what you need for supply-chain attestation.** Do the first always (it is free), the second when you have a compliance reason.
+
+### Production failure modes
+
+<AccordionGroup>
+<Accordion title="apt-get update cached separately from install">
+**Signature:** `E: Unable to locate package X` for a package that definitely exists, or an install of a version that was superseded weeks ago. **Cause:** `RUN apt-get update` in its own layer, cached; the package index inside it is stale. **Fix:** one `RUN` with `&&`, and `rm -rf /var/lib/apt/lists/*` in the same `RUN` so the index does not ship.
+</Accordion>
+<Accordion title="Removing a package in a later layer">
+**Signature:** the image is exactly as big as before the "cleanup" commit. **Cause:** layers are additive; a later delete is a whiteout marker, not a removal. **Detection:** `docker history` — the big layer is still there. **Fix:** same `RUN`, or multi-stage.
+</Accordion>
+<Accordion title="ImportError: libgomp.so.1 on a slim base">
+**Signature:** the image builds, the container exits immediately on first import. **Cause:** slim images omit runtime shared libraries that manylinux wheels expect. **Detection:** `ldd .venv/lib/python3.12/site-packages/onnxruntime/capi/*.so | grep "not found"`. **Fix:** `apt-get install libgomp1` (and `libglib2.0-0` for OpenCV). Total cost 3 MB.
+</Accordion>
+<Accordion title="Container works locally, fails in Kubernetes with permission denied">
+**Signature:** `PermissionError` writing to a mounted volume or a cache directory. **Cause:** the image runs as a non-root UID and the mounted volume is owned by root. **Fix:** `fsGroup` in the pod's security context, or write only to paths the image `chown`s at build time. Week 24 Module 2 covers this properly. It is the most common consequence of adding a non-root user.
+</Accordion>
+<Accordion title="Build cache poisoned by a mutable tag">
+**Signature:** two builds of the same commit behave differently; a CVE fix does not appear. **Cause:** `FROM python:3.12-slim` resolved to a different digest on the second machine. **Detection:** `docker inspect --format '&#123;&#123;index .RepoDigests 0&#125;&#125;'` on both. **Fix:** pin by digest.
+</Accordion>
+<Accordion title="Secrets baked into a layer">
+**Signature:** a token is in the image and `docker history` shows it. **Cause:** `ARG TOKEN` + `RUN pip install --index-url https://user:${'$'}TOKEN@...`, or a `COPY .env`. **Detection:** `docker history --no-trunc`, and any secret scanner. **Fix:** `RUN --mount=type=secret,id=token` — BuildKit mounts it for one instruction and it never enters a layer. Deleting the file in a later layer does **not** remove it.
+</Accordion>
+</AccordionGroup>
+
+### Papers and specs
+
+- **Merkel (2014), "Docker: Lightweight Linux Containers for Consistent Development and Deployment," Linux Journal.** *Takeaway:* the value is not the isolation — Linux had namespaces and cgroups for years — but the layered, content-addressed image format that made an application environment a versioned, shippable artifact.
+- **OCI, [Image Format Specification v1.1](https://github.com/opencontainers/image-spec/blob/main/spec.md).** *Takeaway:* an image is a JSON manifest referencing a config blob and an ordered list of content-addressed layer blobs; every property in this module — layers being additive, deletes being whiteouts, digests being stable — follows directly from that structure.
+- **Harter et al. (2016), "Slacker: Fast Distribution with Lazy Docker Containers," FAST.** *Takeaway:* pulling accounts for 76% of container start time while only about 6.4% of the pulled data is actually read, which is the empirical basis for lazy-pulling snapshotters (stargz, SOCI) and the reason image size dominates cold-start latency.
+- **Zhao et al. (2020), "Large-Scale Analysis of Docker Images and Performance Implications," IEEE TPDS.** *Takeaway:* across 100,000+ Docker Hub images, layer duplication and unnecessary build dependencies are pervasive, and a small set of mechanical changes — multi-stage, slim bases, cleaning in the same layer — accounts for most achievable size reduction.
+- **Sculley et al. (2015), "Hidden Technical Debt in Machine Learning Systems."** *Takeaway:* configuration debt and glue code dominate ML systems; the training/serving dependency split in this module is a direct instance of paying it down, and it is worth 851 MB.
+
+### Stretch challenge
+
+**Take a provided 4 GB image to under 600 MB and cut rebuild time by 80%. Document each change and its saving.**
+
+Part one: the size. Start with `docker history` and write down the three largest layers *before* changing anything. Then apply changes one at a time, rebuilding and measuring after each, and produce a table with an arithmetic check — the savings must sum to the total.
+
+Part two: the rebuild time. Measure a rebuild after a one-line source change, before and after reordering. Then add a BuildKit cache mount and measure a rebuild after a *dependency* change. Three numbers.
+
+Part three, the open one: **find the last 100 MB, and decide whether it is worth taking.**
+
+Once you are at ~466 MB the easy wins are gone and every further saving is a trade:
+
+- Swap `opencv-python-headless` (95 MB) for Pillow. Measured: −87 MB, +2.1 ms per request.
+- Move to distroless. Measured: −78 MB, and you lose the shell.
+- Strip `sympy` by vendoring only what ONNX Runtime's shape inference uses. Possible, fragile, and it breaks on the next ORT upgrade.
+- Quantize the model to int8. Measured: −36 MB, −0.2 accuracy points, *and* 1.6× faster.
+- Use a lazy-pulling snapshotter (SOCI on ECR) so image size stops affecting start time at all — which changes the question entirely.
+
+Pick a target (Lambda's 10 GB limit is not binding; a fast pod start is), decide which of these you would take, and **justify each one with the number on both sides**. There is no right answer: a team optimizing Lambda cold starts, a team optimizing autoscaler responsiveness, and a team optimizing registry cost will choose differently, and articulating which one you are is the exercise.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Take the provided 4 GB image to under 600 MB and cut rebuild time by 80%. Document each change
+and its saving. The savings must add up.
+</Card>
+
+<Steps>
+<Step title="Measure before you touch anything (10 min)">
+`docker images` for the size, `docker history --no-trunc` for the layer breakdown, and a rebuild after a one-line code change for the time. Write all three down. Everything after this is measured against them.
+</Step>
+<Step title=".dockerignore (5 min)">
+`.git`, `data/`, `notebooks/`, `.venv`, caches. Rebuild and measure. Expect a couple of hundred megabytes and a much smaller build context.
+</Step>
+<Step title="Switch to slim (5 min)">
+One word. Expect about 890 MB. Then fix the two `ImportError`s you will get — `libgomp1` and `libglib2.0-0` — and note that the fix costs 3 MB.
+</Step>
+<Step title="Multi-stage (25 min)">
+Builder stage with `build-essential`, runtime stage that copies only the venv. Expect about 415 MB.
+</Step>
+<Step title="Reorder for the cache (15 min)">
+Lockfile and dependency install before the source copy. Rebuild after a one-line change. Expect 214 s to become about 11 s — this is the change developers feel every day.
+</Step>
+<Step title="Add a BuildKit cache mount (15 min)">
+`# syntax=docker/dockerfile:1.7` on line 1, `RUN --mount=type=cache,target=/root/.cache/uv`, and `UV_LINK_MODE=copy`. Measure a rebuild after adding one dependency, with and without. Expect roughly 88 s versus 23 s.
+</Step>
+<Step title="Drop the framework from the runtime (30 min)">
+Serve the ONNX artifact from Week 22 with `onnxruntime`, and remove `torch` from the runtime dependency group entirely. This is the biggest single saving — expect about 851 MB — and it is only available because you exported the model.
+</Step>
+<Step title="Non-root, healthcheck, scan (25 min)">
+`useradd --uid 10001`, a `HEALTHCHECK` written in Python (there is no `curl` in slim), and `trivy image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed`. Fix anything it finds that is fixable.
+</Step>
+<Step title="Write the table (15 min)">
+Six rows, each with the change and the saving, plus a final row that accounts for every megabyte in the finished image. **Check that the savings sum to the difference.** If they don't, you have a change you did not record.
+</Step>
+</Steps>
+
+## The whiteboard
+
+The T2 build-up is the two layer stacks appearing side by side, then the six tick marks on the arrow between them appearing one at a time with their savings, then the two rebuild timelines. Drawing the *sizes on the slabs* is the point — a layer diagram without numbers teaches nothing.
+
+<Tip>
+**Draw it yourself.** Both stacks with their layer sizes, the six savings on the arrow, and the
+two rebuild timelines. Add the crossed-out "delete in a later layer" note. If you can reproduce
+the six savings from memory you can shrink any ML image you are ever handed.
+[Blank version](/assets/diagrams/p3-w23-m3-blank.svg) · [Editable source](/assets/diagrams/p3-w23-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Reduced an ML serving image from 3,140 MB to 466 MB (85%) through six measured changes, and cut post-code-change rebuild time from 214 s to 11 s (95%) by reordering the dependency install — with a per-change savings table whose arithmetic reconciles to the finished image."
+
+**The interview question this earns you.** "How would you make a Docker image smaller?" gets "use alpine" from most candidates, which for a Python ML service is actively wrong. Yours: "First `docker history`, because it's usually one layer. For an ML image the top three are almost always the CUDA build of torch pulled by accident on a CPU service — that's 2.6 GB — no `.dockerignore`, and build tools that never left. Multi-stage and a slim base are the mechanical fixes. The big one is exporting to ONNX so the framework isn't in the runtime at all, which was 851 MB for me. I'd avoid Alpine specifically: no musl wheels for the scientific stack means source builds, a 21-minute build, and musl's allocator made p50 latency 41% worse in my measurement."
+
+That last clause is the differentiator. Almost nobody has measured the Alpine penalty.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Run `docker history --no-trunc` on your team's largest image this week.** Five minutes. If a `pip install` layer is over a gigabyte on a CPU-only service, you have found 2.6 GB and a much faster deploy.
+
+**2. Check the instruction order in every Dockerfile you own.** If `COPY . .` comes before the dependency install, every developer is waiting minutes per rebuild for no reason. Three lines moved, 95% faster here.
+
+**3. Pin base images by digest and add a CVE gate with `--ignore-unfixed`.** The flag is what makes it survive: a gate that fails on unpatchable vulnerabilities gets `|| true`-d within a fortnight, and then you have no gate at all. Pair it with Renovate bumping the digest by PR, so base-image updates are reviewed rather than silent.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Cleanup commit didn't shrink the image | Files deleted in a later layer; the bytes remain below | Same `RUN`, or multi-stage |
+| Every code change rebuilds all dependencies | `COPY . .` before the install | Copy the lockfile and install first, then copy source |
+| Multi-gigabyte image on a CPU-only service | `pip install torch` pulled the CUDA build and `nvidia-*` packages | `--index-url https://download.pytorch.org/whl/cpu`, or serve ONNX |
+| `E: Unable to locate package` | `apt-get update` cached in its own stale layer | One `RUN` with `&&`, and clean the lists in the same `RUN` |
+| `ImportError: libgomp.so.1` | Slim base lacks runtime shared libraries manylinux wheels need | `apt-get install libgomp1 libglib2.0-0` — 3 MB |
+| Alpine build takes 20+ minutes and the image is bigger | No musl wheels; pip builds NumPy/OpenCV from source, and onnxruntime has none at all | Use `slim`. Alpine is for static binaries, not the Python scientific stack |
+| Container works locally, `PermissionError` in Kubernetes | Non-root UID against a root-owned mounted volume | `fsGroup` in the pod security context, or only write to build-time `chown`ed paths |
+| `RUN --mount` is a syntax error | Missing `# syntax=docker/dockerfile:1.7` on line 1 | Add it. It must be the first line |
+| `uv` warns about hardlinks and installs slowly | Cache mount is on a different filesystem than the layer | `ENV UV_LINK_MODE=copy` |
+| Two builds of the same commit differ | Mutable base tag; the upstream image was rebuilt | Pin `FROM ...@sha256:...`; update by PR |
+| A token is visible in `docker history` | `ARG` secret used in a `RUN`, or a copied `.env` | `RUN --mount=type=secret,id=...`; deleting it later does not help |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [Docker — Building best practices](https://docs.docker.com/build/building/best-practices/) — read the "Leverage build cache" and "Minimize the number of layers" sections. The cache-key rules there are the ones Layer 3 formalizes.
+- [Dockerfile reference — `RUN --mount`](https://docs.docker.com/reference/dockerfile/#run---mount) — read the `type=cache` and `type=secret` sections; both need the `# syntax` directive and both are worth adopting.
+- [`uv` — Docker integration guide](https://docs.astral.sh/uv/guides/integration/docker/) — read this for the two-stage `uv sync` split and for `UV_LINK_MODE=copy`, which is the non-obvious flag that makes cache mounts work.
+- [Trivy documentation](https://trivy.dev/latest/docs/) — read the "Filtering" page for `--ignore-unfixed` and `.trivyignore`, which are what make a CVE gate sustainable rather than something the team routes around.
+- [Distroless — Debugging](https://github.com/GoogleContainerTools/distroless/blob/main/README.md#debug-images) — read this before adopting distroless, so your team knows how to get a shell during an incident rather than discovering the problem then.
+
+**Papers**
+
+- Merkel (2014) — *the layered content-addressed image format, not the isolation, is what made containers matter.*
+- [OCI Image Format Spec v1.1](https://github.com/opencontainers/image-spec) — *an image is a manifest plus an ordered list of content-addressed layers; every behaviour in this module follows from that.*
+- [Harter et al. (2016)](https://www.usenix.org/conference/fast16/technical-sessions/presentation/harter) — *pulling is 76% of container start time and only ~6.4% of the data is read; the empirical case for small images and lazy pulling.*
+- Zhao et al. (2020) — *across 100k+ public images, a small set of mechanical changes accounts for most achievable size reduction.*
+- [Sculley et al. (2015)](https://papers.nips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html) — *configuration and glue dominate ML systems; the train/serve dependency split is 851 MB of that debt paid down.*
+
+**Go deeper**
+
+- Nigel Poulton, *Docker Deep Dive* (2023 edition), **Chapters 6 and 8** — read chapter 6 for images and layers as a data structure rather than as a workflow, which is what makes the caching rules obvious rather than memorized.
+- [Google Cloud, "Best practices for building containers"](https://cloud.google.com/architecture/best-practices-for-building-containers) — read the sections on signal handling and PID 1. A container whose process ignores `SIGTERM` cannot shut down gracefully, which is exactly what breaks zero-downtime rolling updates in Week 24 Module 2.
+- [`dive`](https://github.com/wagoodman/dive) — a TUI that shows the file-level contents of every layer and computes an "efficiency score" for wasted space. Run it once on a bloated image; it makes the additive-layer property visceral in a way `docker history` does not.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-23/p3-w23-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

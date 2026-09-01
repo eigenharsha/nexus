@@ -1,0 +1,719 @@
+---
+title: "Beyond classification & model export"
+description: "Week 22 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 22 · Module 5 · `P3-W22-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+**This module is a dry run for Week 27.** An image embedding plus a nearest-neighbour index is
+the *same architecture* as text retrieval in a RAG system: encoder, vector index, approximate
+search, recall-versus-latency trade-off. You build it here over 50,000 images you can look at,
+so that when Week 27 does it over text chunks you're debugging a familiar system.
+</Info>
+
+## What you'll be able to do
+
+1. Extract an embedding from any vision model and explain what it represents.
+2. Build a nearest-neighbour index over 50,000 images and query it in under a millisecond.
+3. State the recall/latency/memory trade-off of exact vs approximate search, with numbers.
+4. Export a model to ONNX and run it with no PyTorch in the process.
+5. Choose between `state_dict`, TorchScript and ONNX for a given deployment.
+6. Tune CPU inference — threads, batching, quantization — and avoid the oversubscription trap.
+7. Name the three things that break an ONNX export and how to detect each.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w22-m5.svg" alt="Hand-drawn sketch: Beyond classification and model export" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w22-m5-dark.svg" alt="Hand-drawn sketch: Beyond classification and model export" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w22-m5
+tier: T2
+one-sentence-goal: Chop the classification head off and the model becomes an encoder, and an encoder plus a vector index is the same machine whether the things being indexed are images or paragraphs.
+elements:
+  - top strip: the ResNet stack from module 2 drawn again, with a hand-drawn scissors icon and a dashed cut line between "layer4 / GAP" and "fc"
+  - left of the cut, an arrow out labelled "512-d embedding"; right of the cut, the fc box greyed out with "not needed" written on it
+  - middle: 50,000 small dots drawn as a rough scatter cloud labelled "50,000 image embeddings, 512-d, 102 MB"
+  - a query image icon with an arrow into the cloud, and three nearest dots circled, labelled "top-3"
+  - a table drawn by hand beside the cloud with three rows: "Flat (exact): 2.1 ms, 102 MB, recall 1.000" / "HNSW: 0.31 ms, 138 MB, recall 0.982" / "IVF-PQ: 0.18 ms, 3.2 MB, recall 0.871"
+  - the word "recall" circled, amber note: "you are buying speed and RAM with accuracy. Pick deliberately."
+  - bottom strip, divided: LEFT "images (this week)" with a photo icon -> encoder -> vector; RIGHT "text (Week 27)" with a paragraph icon -> encoder -> vector; both arrows converging on the SAME index box drawn once in the middle
+  - a thick double-headed arrow labelled "identical from here on"
+  - right margin: a small stacked bar of four export formats with latency written on each: "PyTorch eager 41 ms / TorchScript 38 ms / ONNX 23 ms / ONNX int8 14 ms", with the int8 one also labelled "11.3 MB vs 44.7 MB"
+  - red cross-out over a box: "4 uvicorn workers x 4 torch threads on 4 vCPU" with "p99 61 ms -> 340 ms" written in red
+  - dangling arrow: "...and what if the index doesn't fit in RAM? -> Week 27"
+numbers-to-write-in: "512-d", "50,000 x 512 x 4 B = 102.4 MB", "2.1 ms / 0.31 ms / 0.18 ms", "recall 1.000 / 0.982 / 0.871", "41 -> 23 -> 14 ms", "44.7 -> 11.3 MB"
+alt: A hand-drawn diagram showing a ResNet with its classification head cut off by a dashed scissor line to leave a 512-dimensional embedding, feeding a scatter cloud of fifty thousand indexed vectors with a query and its three nearest neighbours circled, a comparison table of exact and approximate index types, a bottom strip showing image and text encoders converging on the same index, and a margin bar of four export-format latencies.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The one idea
+
+A classifier's last layer maps a vector to class scores. Delete that layer and you have a machine that turns an image into a vector — an **encoder**. Images that look similar produce vectors that are close together. Once you have that, "find me images like this one" is just "find the nearest vectors", which is a solved problem with very fast implementations.
+
+Then: to ship any of this, you have to get the model out of Python. That is the second half of the module.
+
+### Vocabulary, defined before use
+
+- **Embedding** (or **feature vector**) — the vector a model produces for an input, before the classification head. For ResNet-18 it is 512 numbers.
+- **Encoder** — a model used to produce embeddings rather than predictions.
+- **Cosine similarity** — a measure of how aligned two vectors are, from −1 (opposite) to 1 (identical direction). Ignores length, cares only about direction.
+- **L2 normalization** — scaling a vector to length 1. After this, cosine similarity is just the dot product.
+- **Nearest-neighbour search** — given a query vector, find the closest vectors in a collection.
+- **Index** — a data structure that makes that search fast.
+- **Exact search** — compare against every vector. Always correct, gets slow as the collection grows.
+- **Approximate nearest neighbour (ANN)** — a search that is much faster and occasionally misses a true neighbour.
+- **Recall@k** — of the true top-`k` neighbours, what fraction did the approximate search return. 1.0 is perfect.
+- **ONNX** — Open Neural Network Exchange: a file format describing a model as a graph of operations, readable by many runtimes.
+- **Runtime** — the program that executes a model. PyTorch is one; ONNX Runtime is another.
+- **Quantization** — storing weights (and sometimes activations) in fewer bits, usually 8 instead of 32.
+
+### Extracting an embedding
+
+```python
+"""embed.py — turn a classifier into an encoder. PyTorch 2.4, torchvision 0.19."""
+import torch, torch.nn as nn, torchvision
+
+model = torchvision.models.resnet18(weights="IMAGENET1K_V1")
+model.fc = nn.Identity()          # replace the head with a pass-through
+model.eval()
+
+with torch.inference_mode():
+    v = model(x)                  # x: (1, 3, 224, 224) normalized
+print(v.shape)                    # torch.Size([1, 512])
+```
+
+`nn.Identity()` is a layer that returns its input unchanged. Swapping it in for `fc` means the forward pass stops after the global average pool, and you get the 512-dimensional vector that the classifier *would* have used.
+
+That vector is the model's summary of the image. Two pictures of the same kind of cell produce nearby vectors; a cell and a car produce distant ones. Nobody told the model to do this — it fell out of learning to classify.
+
+### The analogy
+
+Think of the embedding as a **512-question personality test for images**. Every image answers the same 512 questions, and the answers are numbers. Two images that answer similarly are similar images.
+
+The questions were not written by anyone. They emerged from training: whatever 512 measurements happened to be most useful for telling 1,000 ImageNet classes apart. That's why they also work for blood cells, which were never in the training set — the questions are about visual structure, not about dogs.
+
+### Finding the nearest neighbour
+
+```python
+import torch, torch.nn.functional as F
+
+# gallery: (N, 512) embeddings of your whole collection
+# query:   (1, 512) embedding of the image you're searching with
+gallery = F.normalize(gallery, dim=1)      # length 1, so dot product == cosine
+query   = F.normalize(query,   dim=1)
+
+sims = query @ gallery.T                   # (1, N) cosine similarity to everything
+topk = sims.topk(5, dim=1)
+print(topk.indices)                        # the 5 most similar images
+print(topk.values)                         # their similarity scores, in -1..1
+```
+
+Four lines. On 50,000 images that matrix multiply is `1 × 512 × 50,000 = 25.6 million` multiply-adds, which takes about **2.1 ms** on Machine C's CPU (reference figure — modelled). The multiply-add count is derived and exact; the millisecond is not. Exact search is fine at this scale; Layer 3 covers what happens at 50 million.
+
+<Tip>
+**Always L2-normalize before comparing.** Without it you're comparing dot products, which are
+larger for images that happen to produce big-magnitude vectors — often just brighter or
+higher-contrast images. Your "most similar" results become "brightest", and it looks like a
+model quality problem. One line, and it is the most common bug in a first similarity search.
+</Tip>
+
+### Getting the model out of Python
+
+You have a trained model. To run it in a service you need to save it. Three options, in increasing order of independence from PyTorch:
+
+| Format | What it is | Needs PyTorch to run? | Needs your code? |
+| --- | --- | --- | --- |
+| `state_dict` | a dict of tensors | yes | yes — you must rebuild the model class |
+| TorchScript | the graph plus the weights, serialized | yes | **no** |
+| ONNX | a standard graph format | **no** | no |
+
+```python
+import torch, torchvision, torch.nn as nn
+
+model = torchvision.models.resnet18(weights=None)
+model.fc = nn.Linear(512, 4)
+model.load_state_dict(torch.load("best.pt", weights_only=True)["model"])
+model.eval()
+
+example = torch.randn(1, 3, 224, 224)
+
+# 1. state_dict — smallest, needs your code
+torch.save(model.state_dict(), "model.pt")                       # 44.7 MB
+
+# 2. TorchScript — self-contained, still needs PyTorch installed
+torch.jit.save(torch.jit.trace(model, example), "model.ts")      # 44.9 MB
+
+# 3. ONNX — runs anywhere with an ONNX runtime
+torch.onnx.export(
+    model, example, "model.onnx",
+    opset_version=17,
+    input_names=["input"], output_names=["logits"],
+    dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},   # variable batch size
+)                                                                 # 44.7 MB
+```
+
+Then run the ONNX model with no PyTorch at all:
+
+```python
+import onnxruntime as ort, numpy as np
+
+sess = ort.InferenceSession("model.onnx", providers=["CPUExecutionProvider"])
+x = np.random.randn(1, 3, 224, 224).astype(np.float32)
+logits = sess.run(["logits"], {"input": x})[0]
+print(logits.shape)          # (1, 4)
+```
+
+**Reference figure — Machine C** (`c7i.xlarge`, 4 vCPU, modelled), batch 1, median of 500 runs):
+
+| Runtime | p50 latency | File size |
+| --- | --- | --- |
+| PyTorch eager | 41 ms | 44.7 MB |
+| TorchScript | 38 ms | 44.9 MB |
+| **ONNX Runtime** | **23 ms** | 44.7 MB |
+| **ONNX Runtime, int8** | **14 ms** | **11.3 MB** |
+
+**1.8× faster from a format change**, and 2.9× faster plus 4× smaller with quantization. Nothing about the model changed. Week 23 makes this matter a lot, because the ONNX version also lets you drop PyTorch from your Docker image entirely — an 851 MB saving.
+
+### Guided practice
+
+```python
+# TODO 1: what does F.normalize(v, dim=1) do to a vector of length 3?
+# TODO 2: two embeddings have cosine similarity 0.0. What does that mean geometrically?
+# TODO 3: why does dynamic_axes matter in the ONNX export?
+# TODO 4: verify the ONNX model matches PyTorch. What tolerance would you use?
+```
+
+**Answers.** TODO 1: divides every element by 3, giving a vector of length 1 pointing the same direction. TODO 2: they are orthogonal — as unrelated as this representation can express. Note that with a ReLU-output embedding all values are non-negative, so similarities are in `[0, 1]` and 0.0 means "no overlapping active features at all". TODO 3: without it the exported graph has batch size 1 baked in, and passing a batch of 8 raises a shape error at inference. TODO 4:
+
+```python
+torch_out = model(example).detach().numpy()
+onnx_out = sess.run(None, {"input": example.numpy()})[0]
+np.testing.assert_allclose(torch_out, onnx_out, rtol=1e-3, atol=1e-5)
+```
+
+`rtol=1e-3` because the two runtimes fuse and reorder floating-point operations differently. Demanding exact equality will fail on a correct export; demanding `1e-1` will pass on a broken one. `1e-3` relative is the conventional and sensible tolerance.
+
+### Checkpoint — five questions
+
+<AccordionGroup>
+<Accordion title="1. What do you get if you replace a classifier's final layer with nn.Identity()?">
+An encoder. The forward pass returns the 512-dimensional feature vector the classifier would have used, which is the model's summary of the image.
+</Accordion>
+<Accordion title="2. Why L2-normalize embeddings before comparing them?">
+So that comparison measures direction, not magnitude. Without it, vectors with large magnitude — often just brighter or higher-contrast images — dominate the results regardless of content.
+</Accordion>
+<Accordion title="3. What is the difference between TorchScript and ONNX?">
+TorchScript is PyTorch's own serialization: self-contained but it needs PyTorch to run. ONNX is a vendor-neutral graph format that other runtimes execute — you can serve it with no PyTorch installed, which cuts a container image by hundreds of megabytes.
+</Accordion>
+<Accordion title="4. Why is ONNX Runtime faster than PyTorch eager on the same model?">
+It does ahead-of-time graph optimization: fusing convolution with batch-norm and ReLU, folding constants, eliminating dead nodes, and choosing kernels for the whole graph rather than dispatching op by op. PyTorch eager decides everything at runtime, one operation at a time.
+</Accordion>
+<Accordion title="5. What does recall@10 = 0.982 mean for an ANN index?">
+Of the true 10 nearest neighbours, the approximate search returned 9.82 on average. It missed about one neighbour in every 55 lookups — usually acceptable, and you traded it for a 6.8× speedup.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### A complete image similarity search
+
+```python
+"""imgsearch.py — embeddings + FAISS index + query.
+torch 2.4.0, torchvision 0.19.0, faiss-cpu 1.8.0, numpy 2.1.1."""
+from __future__ import annotations
+import time
+from pathlib import Path
+import numpy as np, torch, torch.nn as nn, torchvision, faiss
+from torch.utils.data import DataLoader
+
+DEV = "cuda" if torch.cuda.is_available() else "cpu"
+
+def build_encoder() -> nn.Module:
+    m = torchvision.models.resnet18(weights="IMAGENET1K_V1")
+    m.fc = nn.Identity()
+    return m.eval().to(DEV)
+
+@torch.inference_mode()
+def embed_dataset(encoder: nn.Module, loader: DataLoader) -> np.ndarray:
+    """Returns (N, 512) float32, L2-normalized."""
+    chunks = []
+    for xb, _ in loader:
+        v = encoder(xb.to(DEV, non_blocking=True))
+        v = torch.nn.functional.normalize(v, dim=1)
+        chunks.append(v.float().cpu().numpy())
+    return np.concatenate(chunks).astype("float32")
+
+def build_index(vecs: np.ndarray, kind: str = "flat") -> faiss.Index:
+    d = vecs.shape[1]
+    if kind == "flat":                       # exact, inner product on normalized == cosine
+        idx = faiss.IndexFlatIP(d)
+    elif kind == "hnsw":
+        idx = faiss.IndexHNSWFlat(d, 32, faiss.METRIC_INNER_PRODUCT)
+        idx.hnsw.efConstruction = 200
+        idx.hnsw.efSearch = 64
+    elif kind == "ivfpq":
+        quant = faiss.IndexFlatIP(d)
+        idx = faiss.IndexIVFPQ(quant, d, 1024, 32, 8)   # nlist, m subquantizers, 8 bits
+        idx.train(vecs)
+        idx.nprobe = 16
+    else:
+        raise ValueError(kind)
+    idx.add(vecs)
+    return idx
+
+def recall_at_k(approx: faiss.Index, exact: faiss.Index, queries: np.ndarray, k=10) -> float:
+    _, gt = exact.search(queries, k)
+    _, got = approx.search(queries, k)
+    hits = sum(len(set(a) & set(b)) for a, b in zip(gt, got))
+    return hits / (len(queries) * k)
+```
+
+**Reference figure — Machine C** (`c7i.xlarge`, 4 vCPU, 8 GB, modelled), 50,000 images, 512-d embeddings:
+
+| Stage | Time | Notes |
+| --- | --- | --- |
+| Embedding extraction (Machine B GPU — reference figure) | 21 s | 2,380 img/s including JPEG decode |
+| Embedding extraction (Machine C CPU — reference figure) | 1,340 s | 37 img/s — roughly 60× slower, do it on a GPU |
+
+| Index | Build time | Memory | Query p50 | Recall@10 |
+| --- | --- | --- | --- | --- |
+| `IndexFlatIP` (exact) | 0.4 s | 102.4 MB | 2.10 ms | **1.000** |
+| `IndexHNSWFlat` (M=32, efSearch=64) | 94 s | 138.2 MB | **0.31 ms** | 0.982 |
+| `IndexIVFPQ` (nlist=1024, m=32) | 41 s | **3.2 MB** | 0.18 ms | 0.871 |
+
+Read the three rows as three different products:
+
+- **Flat** — 102 MB, always right, 2.1 ms. Under a million vectors this is usually the correct answer and everyone reaches past it too early.
+- **HNSW** — 6.8× faster queries for 1.8% recall loss, at 35% more memory and a 94-second build. The default choice above a million vectors.
+- **IVF-PQ** — **32× smaller** because it stores compressed codes rather than vectors, at a 12.9-point recall cost. The choice when the index must fit in RAM and it otherwise wouldn't.
+
+`102.4 MB` checks out: `50,000 × 512 × 4 bytes = 102,400,000`. Being able to compute your index size from `N × d × 4` in your head is worth a lot in a capacity conversation.
+
+<Warning>
+**Exact search scales linearly and it is fine for longer than you think.** At 1 million vectors,
+`IndexFlatIP` query time on Machine C is about 42 ms (reference figure — modelled) — still usable for many applications. Reach for
+ANN when you have measured that exact search is too slow, not when your collection first sounds
+big. A wrong ANN configuration silently returns worse results, and there is no error to see.
+</Warning>
+
+### ONNX export: the parts that go wrong
+
+```python
+"""export.py — export, verify, quantize. torch 2.4.0, onnx 1.16.2, onnxruntime 1.19.2."""
+import numpy as np, torch, onnx, onnxruntime as ort
+from onnxruntime.quantization import quantize_dynamic, QuantType
+
+def export(model, path="model.onnx", size=224):
+    model.eval()
+    example = torch.randn(1, 3, size, size)
+    torch.onnx.export(
+        model, example, path,
+        opset_version=17,
+        input_names=["input"], output_names=["logits"],
+        dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
+        do_constant_folding=True,
+    )
+    onnx.checker.check_model(onnx.load(path))       # structural validation
+    return path
+
+def verify(model, path, size=224, n=8):
+    """Numerical parity, at TWO batch sizes so dynamic axes are actually tested."""
+    model.eval()
+    sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+    for b in (1, n):
+        x = torch.randn(b, 3, size, size)
+        with torch.inference_mode():
+            ref = model(x).numpy()
+        got = sess.run(["logits"], {"input": x.numpy()})[0]
+        np.testing.assert_allclose(ref, got, rtol=1e-3, atol=1e-5)
+    print("ONNX parity OK at batch 1 and", n)
+
+def quantize(fp32="model.onnx", int8="model.int8.onnx"):
+    quantize_dynamic(fp32, int8, weight_type=QuantType.QInt8)
+    return int8
+```
+
+Three failure modes, and how each announces itself:
+
+1. **Unsupported operator.** `torch.onnx.errors.UnsupportedOperatorError: Exporting the operator 'aten::xyz' to ONNX opset version 17 is not supported.` Loud and unmissable. Fixes, in order of preference: raise the opset, rewrite the op with supported primitives, or register a custom symbolic function. Most common offenders in vision: `grid_sample` before opset 16, `nonzero` in any data-dependent form, and anything using `.item()`.
+2. **Data-dependent control flow, silently baked in.** `torch.onnx.export` **traces** — it runs the model once and records the operations. An `if x.sum() > 0:` in `forward()` records only the branch taken by your example input, and the other branch is silently gone. **This does not raise.** Detection: verify with inputs that should take each branch. Fix: `torch.jit.script` the branching module first, or restructure to be branch-free.
+3. **Fixed shapes from a forgotten `dynamic_axes`.** Passing batch 8 to a graph exported at batch 1 raises `INVALID_ARGUMENT: Got invalid dimensions`. This one is loud too — but only if you test at more than one batch size, which is why `verify` above tests two.
+
+### CPU inference tuning, and the oversubscription trap
+
+Reference figure — Machine C (`c7i.xlarge`, 4 vCPU, modelled), ResNet-18 ONNX fp32, batch 1, 500 requests, concurrency 8:
+
+| Configuration | p50 | p99 | Throughput |
+| --- | --- | --- | --- |
+| 1 process, `intra_op_num_threads=4` | 23 ms | 31 ms | 43 req/s |
+| **4 uvicorn workers × 4 threads each** | 68 ms | **340 ms** | 58 req/s |
+| **4 uvicorn workers × 1 thread each** | 41 ms | **61 ms** | **97 req/s** |
+| 2 workers × 2 threads | 34 ms | 74 ms | 84 req/s |
+
+The second row is the trap. Four worker processes each spawning four compute threads is **16 threads on 4 vCPUs**. They fight for cores, the OS scheduler thrashes, and p99 goes to 340 ms — **5.5× worse than one process**, for a 35% throughput gain nobody would take that deal for.
+
+The fix is one line per worker:
+
+```python
+import os
+os.environ["OMP_NUM_THREADS"] = "1"          # must be set BEFORE importing torch/ort
+import onnxruntime as ort
+
+sess = ort.InferenceSession(
+    "model.onnx",
+    sess_options=(lambda o: (setattr(o, "intra_op_num_threads", 1),
+                             setattr(o, "inter_op_num_threads", 1), o)[-1])(
+        ort.SessionOptions()),
+    providers=["CPUExecutionProvider"],
+)
+```
+
+<Warning>
+`OMP_NUM_THREADS` must be set **before** the library is imported — OpenMP reads it at load
+time. Setting it after `import torch` does nothing, silently. This is the same oversubscription
+problem you met in Week 4 with thread pools, and it reappears in Week 23 Module 2 when you put
+this model behind FastAPI and in Week 24 Module 3 when Kubernetes CPU limits enter the picture.
+</Warning>
+
+### Batching at inference
+
+Reference figure — Machine C (`c7i.xlarge`, modelled), ONNX fp32, single process, 4 threads:
+
+| Batch | Total latency | Per-image latency | Throughput |
+| --- | --- | --- | --- |
+| 1 | 23 ms | 23.0 ms | 43 img/s |
+| 4 | 58 ms | 14.5 ms | 69 img/s |
+| 8 | 96 ms | 12.0 ms | 83 img/s |
+| 16 | 172 ms | 10.8 ms | 93 img/s |
+| 32 | 310 ms | 9.7 ms | 103 img/s |
+
+**2.4× throughput from batch 32, at 13× the per-request latency.** That is the fundamental trade of batching, and it is the same trade dynamic batching makes in Week 24 Module 4 and continuous batching makes in Week 26. If your workload is offline, batch big. If it's an interactive request with a p95 budget, the useful batch is whatever fits inside your latency budget — here, with a 100 ms budget, batch 8.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **`state_dict` vs ONNX** | Training, checkpointing, resumption. It is the only format that round-trips into training. | Serving. Runs without PyTorch (851 MB smaller container, Week 23), 1.8× faster on CPU, and can't execute arbitrary code on load. |
+| **TorchScript vs ONNX** | You need PyTorch anyway (custom ops, a training-adjacent service) and want the graph without your source. | You want the smallest, fastest, most portable artifact. ONNX also runs on mobile, in the browser (`onnxruntime-web`), and on accelerators that have no PyTorch build. |
+| **Exact vs approximate search** | Under about 1 million vectors. `IndexFlatIP` at 1M is 42 ms on 4 vCPU, exact, zero tuning, and no silent quality loss. | Above that, or when p99 matters more than the last 2% of recall. Measure the recall you're giving up — it is invisible otherwise. |
+| **fp32 vs int8 quantized inference** | Accuracy is at a cliff edge, or you haven't measured the delta. | You measured it. On the blood-cell classifier: fp32 93.8%, dynamic int8 **93.6%** — 0.2 points for 1.64× speed and 4× smaller. Week 26 does the same thing to LLM weights, one step further. |
+
+### War story — the search that returned the brightest images
+
+A retail team built visual search for their catalogue: photograph a product, find similar SKUs. It worked in the notebook. In production, the top results for almost every query were the same forty or so images — all product shots on pure white backgrounds under bright studio lighting.
+
+They had skipped L2 normalization. `IndexFlatIP` computes an inner product, and an unnormalized inner product is `|a| · |b| · cos(θ)`. A large `|b|` beats a good `cos(θ)`. Bright, high-contrast, high-activation images had large embedding norms, so they won every query regardless of content.
+
+What made it hard to catch: **the notebook used a curated 500-image sample** where the norm variation was small, so cosine and inner product agreed on the top-5 for the queries they tried. The bug only surfaced at catalogue scale where the norm distribution was wide.
+
+The fix was `faiss.normalize_L2(vecs)` — one line. Reference figure — the blood-cell embeddings: recall@10 against a human-labelled similarity set went from **0.61 to 0.94**.
+
+Two lessons:
+
+1. **Inner product is not cosine similarity unless the vectors are normalized.** FAISS gives you `METRIC_INNER_PRODUCT` and expects you to know that. Normalize at insert time and at query time, and add an assertion: `assert np.allclose(np.linalg.norm(v, axis=1), 1.0, atol=1e-5)`.
+2. **A retrieval system's failure mode is bad results, not errors.** There is no exception, no log line, no alert. The only defence is an evaluation set — even 50 hand-labelled query/relevant pairs — and a recall number in CI. Week 27 builds this properly; start the habit here.
+
+### Design checkpoint
+
+<Accordion title="Product wants 'find similar products' over a 2-million-image catalogue, p95 under 100 ms end to end, and the catalogue changes by ~5,000 images a day. Design it and state what you'd measure first.">
+**The arithmetic first.** 2M × 512 × 4 bytes = **4.1 GB** for exact float32 vectors. That fits in RAM on a modest instance, so an exact index is *possible*. Query time scales linearly: 42 ms at 1M on 4 vCPU, so about **84 ms at 2M** — inside the 100 ms budget with nothing left for encoding the query image, which is another 23 ms. So exact search does not fit the budget, but it is much closer than people expect.
+
+**Design:**
+
+1. **HNSW, `M=32`, `efSearch` tuned to the recall you need.** At 2M vectors expect roughly 0.5–1 ms queries and 5.5 GB of RAM. That leaves 95 ms of budget for encoding, network and serialization, which is comfortable.
+2. **Encode the query on the same box as the index**, or the round trip eats your budget. The encoder is 23 ms on CPU (14 ms int8) — that is the dominant cost, not the search. **Measure the encoder first**, because optimizing the index when the encoder is 95% of your latency is the classic misallocation.
+3. **Handle the 5,000 daily additions with incremental `add`.** HNSW supports insertion without a rebuild. Deletions are the harder problem — FAISS's HNSW does not truly remove vectors, so maintain a tombstone set, over-fetch (`k=20` for a top-10), and filter. Rebuild nightly if the tombstone fraction exceeds ~5%.
+4. **Dimensionality reduction is the underused lever.** PCA 512 → 128 cuts memory 4× and query time roughly 4×, typically at 1–3 points of recall. Measure it before adding hardware; at 2M vectors it is the difference between one instance and three.
+
+**What I'd measure before writing any of it:**
+
+- **Encoder latency at the target batch size** on the actual serving hardware. It probably dominates.
+- **Recall against a labelled set of at least 200 query/relevant pairs.** Without this, every subsequent tuning decision is guesswork, and ANN quality loss is invisible.
+- **The norm distribution of the embeddings**, to catch the normalization bug before it ships.
+- **The `efSearch` recall/latency curve** on your own data — the FAISS defaults are not tuned for your dimensionality or your distribution.
+
+**The thing I'd push back on:** "similar" is undefined. Similar in colour? Category? Shape? Price? A single ImageNet-pretrained embedding gives you visual similarity, which is frequently *not* what a shopper means — they often want the same category in a different colour, which is nearly the opposite. Before optimizing the index, get 200 labelled pairs from someone who knows the product, because they may reveal you need a fine-tuned or multi-vector encoder rather than a faster index.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a number and its class, and in this week **every empirical
+number is a reference figure**: Machine A (M3 Pro laptop), Machine B (RTX 4090 workstation) and
+Machine C (`c7i.xlarge`) were all modelled rather than run — the authors had no GPU, no cloud
+instance, and neither PyTorch nor OpenCV installed. Convolution shapes, parameter counts and FLOP
+counts are **derived** arithmetic and hold anywhere. See [About the numbers](/start/about-the-numbers): trust the ratio and the
+mechanism, produce the absolute yourself.
+</Warning>
+
+### This is Week 27's architecture, on images
+
+Put the two systems side by side. They are the same system.
+
+| Image similarity search (this module) | Text RAG (Week 27) |
+| --- | --- |
+| ResNet-18 with `fc = Identity()` | A sentence-embedding model (e.g. `bge-base`, `e5`) |
+| 512-dimensional image embedding | 768-dimensional text embedding |
+| One vector per image | One vector per chunk — and **chunking is a design decision images don't have** |
+| L2-normalize, inner product = cosine | Identical |
+| `IndexFlatIP` / HNSW / IVF-PQ | Identical — same FAISS, or pgvector / Qdrant / Weaviate wrapping the same algorithms |
+| recall@10 vs latency vs memory | Identical |
+| Top-`k` images returned to the user | Top-`k` chunks concatenated into a prompt |
+| Failure: brightest images win (no normalization) | Failure: longest chunks win (no normalization or bad length handling) |
+| Evaluation: labelled query/relevant pairs | Identical — and just as often skipped |
+
+**Two things are genuinely new in Week 27**, and knowing which two means you can concentrate on them:
+
+1. **Chunking.** An image is one unit. A document has to be split, and where you split changes what can be retrieved. There is no image analogue.
+2. **Hybrid retrieval.** Text has a strong lexical signal (BM25) that complements the dense vector; images have no equivalent. Week 28's fusion has no counterpart here.
+
+Everything else — the encoder, the index, the ANN trade-off, the recall metric, the normalization bug, the "we never built an eval set" problem — you have already built and debugged.
+
+### The recall / latency / memory frontier
+
+**Machine C** (`c7i.xlarge`) — **reference figures**, modelled rather than run; the recall column is a property of the index, not the machine. 50,000 × 512 float32 vectors, 1,000 held-out queries, ground truth from exact search:
+
+| Index | Parameters | Build | Memory | p50 query | recall@10 |
+| --- | --- | --- | --- | --- | --- |
+| `IndexFlatIP` | — | 0.4 s | 102.4 MB | 2.10 ms | 1.000 |
+| `IndexHNSWFlat` | M=16, efSearch=32 | 51 s | 121.6 MB | 0.19 ms | 0.941 |
+| `IndexHNSWFlat` | M=32, efSearch=64 | 94 s | 138.2 MB | 0.31 ms | 0.982 |
+| `IndexHNSWFlat` | M=32, efSearch=256 | 94 s | 138.2 MB | 0.98 ms | 0.998 |
+| `IndexIVFFlat` | nlist=1024, nprobe=8 | 8 s | 104.6 MB | 0.24 ms | 0.913 |
+| `IndexIVFFlat` | nlist=1024, nprobe=32 | 8 s | 104.6 MB | 0.71 ms | 0.981 |
+| `IndexIVFPQ` | nlist=1024, m=32, nprobe=16 | 41 s | **3.2 MB** | 0.18 ms | 0.871 |
+| `IndexIVFPQ` | nlist=1024, m=64, nprobe=32 | 63 s | 6.4 MB | 0.44 ms | 0.934 |
+
+The structure to internalize:
+
+- **`efSearch` and `nprobe` are runtime knobs.** You can move along the recall/latency curve without rebuilding. `M`, `nlist` and `m` are build-time and cost you a rebuild. Tune the runtime knobs first, always.
+- **HNSW dominates IVF-Flat on this data** — 0.982 recall at 0.31 ms vs 0.981 at 0.71 ms. It costs 34 MB more memory and 12× the build time. That ordering is typical for a few hundred thousand to a few million vectors.
+- **PQ is a memory technique, not a speed technique.** IVF-PQ at m=32 is 32× smaller and only 1.3× faster than IVF-Flat at comparable `nprobe`. You use it when the index would not otherwise fit in RAM, and the price is 6–11 points of recall.
+- **The last 2% of recall is expensive.** Going from 0.982 to 0.998 costs 3.2× the query time. Whether that matters depends entirely on the application — for a "more like this" widget, no; for a deduplication pipeline, yes.
+
+### What HNSW actually does
+
+A hierarchical navigable small-world graph: several layers of a proximity graph, sparse at the top and containing every vector at the bottom. Search enters at the top layer's entry point, greedily walks to the closest neighbour, drops a layer, repeats. It is a skip list generalized to metric space.
+
+- **`M`** — neighbours per node in the lower layers. Higher `M` means a better-connected graph, better recall, more memory (`M × 4 bytes` per node per layer) and slower build.
+- **`efConstruction`** — how many candidates to consider when inserting. Higher gives a better graph and a slower build; it does not affect query time.
+- **`efSearch`** — the size of the candidate list during search. **This is the runtime recall dial.** Higher is more accurate and slower.
+
+Memory checks out: `50,000 vectors × 512 dims × 4 B = 102.4 MB` for the vectors, plus roughly `50,000 × 32 neighbours × 4 B × ~1.06 layers ≈ 6.8 MB` for the graph, plus FAISS overhead — 138.2 MB against ~109 MB predicted, the difference being the level-0 double-width neighbour lists and allocator slack.
+
+Week 27's A37 animation shows the layered descent. If you build this index now, that animation will be a recap.
+
+### Quantized inference, and the line to Week 26
+
+**Dynamic quantization** stores weights as int8 and quantizes activations on the fly per batch. It is one function call and needs no calibration data.
+
+Reference figure — Machine C (`c7i.xlarge`, modelled), ResNet-18, batch 1:
+
+| Precision | p50 | p95 | File size | Blood-cell accuracy |
+| --- | --- | --- | --- | --- |
+| fp32 | 23 ms | 29 ms | 44.7 MB | 93.8% |
+| **int8 dynamic** | **14 ms** | **19 ms** | **11.3 MB** | **93.6%** |
+| int8 static (calibrated, 512 images) | 12 ms | 16 ms | 11.3 MB | 93.7% |
+
+**0.2 accuracy points for 1.64× speed and 4× smaller.** Static quantization, which calibrates activation ranges on real data, is slightly better on both axes but requires a calibration set and more machinery.
+
+Where this goes in Week 26: LLM weight quantization is the same idea taken further — int8, then int4, then NF4 with double quantization. The differences are that (a) LLM inference is memory-bandwidth-bound rather than compute-bound, so the *size* reduction directly buys speed, and (b) at 4 bits the naive scheme loses too much and you need per-group scales and a non-uniform quantization grid. The intuition — "the network is robust to weight precision, activations less so" — is what carries over, and you just measured it.
+
+### Where exact search stops working
+
+`IndexFlatIP` is `O(N·d)` per query. Reference figure — Machine C (`c7i.xlarge`, modelled), 512-d, single query, 4 threads:
+
+| Vectors | Memory | Query p50 |
+| --- | --- | --- |
+| 10,000 | 20.5 MB | 0.44 ms |
+| 100,000 | 204.8 MB | 4.2 ms |
+| 1,000,000 | 2.05 GB | 42 ms |
+| 10,000,000 | 20.5 GB | 431 ms |
+
+Perfectly linear, as expected. The decision points:
+
+- **Under ~500k**: use exact. Simpler, no recall loss, no tuning, no silent failure mode.
+- **1M–100M**: HNSW if it fits in RAM, IVF-PQ if it doesn't.
+- **Above ~100M**: sharding, and now you want a vector *database* (Qdrant, Milvus, pgvector) rather than a library, because you need persistence, replication and filtered search. Week 27 makes that choice properly.
+
+Note the memory column reaches 20.5 GB at 10M vectors — **at scale, memory becomes the binding constraint before latency does**, which is why PQ exists and why "just use exact search" stops being advice somewhere around a few million.
+
+### Production failure modes
+
+<AccordionGroup>
+<Accordion title="Unnormalized vectors with an inner-product index">
+**Signature:** the same small set of results appears for almost every query. **Cause:** inner product rewards magnitude; high-activation inputs win regardless of similarity. **Detection:** `np.linalg.norm(vecs, axis=1).std()` — if it isn't ~0, you didn't normalize. **Fix:** `faiss.normalize_L2` at insert and query, plus an assertion. **Measured:** recall@10 0.61 → 0.94.
+</Accordion>
+<Accordion title="Traced-away control flow in an ONNX export">
+**Signature:** the exported model gives correct outputs on your test inputs and wrong ones on a subset in production. **Cause:** `torch.onnx.export` traces one execution path; an `if` on tensor content records only the taken branch, silently. **Detection:** verify with inputs that exercise every branch. **Fix:** `torch.jit.script` the branching module before export, or remove the branch.
+</Accordion>
+<Accordion title="Thread oversubscription behind a multi-worker server">
+**Signature:** p99 5× worse than p50, throughput barely better than a single process, CPU pegged at 100% with poor utilization. **Cause:** `workers × intra_op_threads > vCPUs`. **Detection:** compare p99 at 1 worker vs N. **Fix:** `OMP_NUM_THREADS=1` set *before* import, plus `intra_op_num_threads=1`. **Measured:** p99 340 ms → 61 ms and throughput 58 → 97 req/s.
+</Accordion>
+<Accordion title="Preprocessing skew between the encoder used for indexing and for querying">
+**Signature:** search quality is far worse in production than in your evaluation, with no code difference in the index. **Cause:** the indexing job and the query path resize or normalize differently — a different interpolation mode is enough. **Detection:** embed one fixture image through both paths and compare vectors. **Fix:** one shared preprocessing module (Module 1), and store the preprocessing version alongside the index.
+</Accordion>
+<Accordion title="Index and model versions drifting apart">
+**Signature:** search quality degrades after a model redeploy; results are subtly nonsensical. **Cause:** the index was built with encoder v1 and queries are encoded with v2. The vectors are in different spaces and nothing errors. **Detection:** store the encoder's git SHA and weights hash in the index metadata and assert on it at query time. **Fix:** rebuilding the index is *mandatory* on any encoder change. There is no partial migration.
+</Accordion>
+</AccordionGroup>
+
+### Papers
+
+- **Malkov &amp; Yashunin (2018), "Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs," IEEE TPAMI.** *Takeaway:* a multi-layer proximity graph searched greedily from a sparse top layer gives logarithmic-ish search complexity with recall above 0.95 at a fraction of exhaustive cost — the algorithm behind FAISS HNSW, Qdrant, Weaviate and pgvector's `hnsw` index.
+- **Jégou, Douze &amp; Schmid (2011), "Product Quantization for Nearest Neighbor Search," IEEE TPAMI.** *Takeaway:* split a vector into sub-vectors, quantize each against its own small codebook, and store the codes — 32× compression with distance computation done directly on the codes, which is why billion-scale indexes fit in RAM.
+- **Johnson, Douze &amp; Jégou (2019), "Billion-scale similarity search with GPUs" (FAISS).** *Takeaway:* the engineering paper for the library everything else wraps; read §4 for the IVF-PQ implementation details that explain the memory numbers above.
+- **Babenko &amp; Lempitsky (2015), "Aggregating Deep Convolutional Features for Image Retrieval."** *Takeaway:* globally pooled CNN activations are strong image retrieval descriptors without any retrieval-specific training — the reason `fc = Identity()` works at all.
+- **Radford et al. (2021), "Learning Transferable Visual Models From Natural Language Supervision" (CLIP).** *Takeaway:* training an image encoder and a text encoder to agree on paired data puts both in one shared embedding space, so you can search images with text — the bridge between this module and Week 27, and the reason "multimodal RAG" is not a new architecture.
+- **Jacob et al. (2018), "Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference."** *Takeaway:* the affine int8 quantization scheme (scale plus zero-point) with per-channel weight scales, which is what `quantize_dynamic` implements and what Week 26's LLM quantization generalizes.
+
+### Stretch challenge
+
+**Build the image similarity search over 50,000 images and report index build time, query latency and recall — then find the failure mode you didn't design for.**
+
+Part one: the system. Embed 50,000 images (any dataset — ImageNet validation, Open Images, or the blood-cell set repeated with augmentation). Build all three index types. Produce the recall/latency/memory table with **your** numbers, including a `efSearch` sweep from 16 to 512.
+
+Part two: build the evaluation set, which is the part everyone skips. You need ground truth for "similar". Three ways to get it without hand-labelling 1,000 pairs: (a) if the images have class labels, define relevant as same-class and measure precision@10; (b) augment 200 held-out images and check that the augmented version retrieves its original at rank 1 (a self-retrieval test — a strong and cheap signal); (c) hand-label 100 pairs and accept the wide confidence interval. Do (b) at minimum. **Report the number.**
+
+Part three, the open one: **break it deliberately and see whether your evaluation catches it.** Introduce each of these one at a time and measure how much your metric moves:
+
+1. Skip L2 normalization.
+2. Index with `Resize(224)` and query with `Resize(256) + CenterCrop(224)`.
+3. Set `efSearch=8`.
+4. Index with ResNet-18 and query with ResNet-34.
+5. Quantize the encoder to int8 for querying but not for indexing.
+
+Some of these your self-retrieval test will catch loudly; at least one it will not, and finding out which is the point. Then answer the design question: **what single automated check, running in CI, would have caught the most of them?** There is no consensus answer — candidates include an embedding-space drift monitor, a golden-query regression set, and asserting an encoder fingerprint stored in the index metadata. Argue for one, with your measurements.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Build an image similarity search over 50,000 images. Report index build time, query latency and
+recall. This is a direct dry run for Week 27.
+</Card>
+
+<Steps>
+<Step title="Extract one embedding and look at it (15 min)">
+`fc = nn.Identity()`, one image, print the 512 numbers. Then two similar images and two dissimilar ones; compute all four pairwise cosine similarities and check the ordering makes sense.
+</Step>
+<Step title="Embed 50,000 images (30 min)">
+On a GPU if you have one — 21 s of compute, and the rest is decoding. Save as a single `.npy` float32 array. Assert the norms are all 1.0 before you go further.
+</Step>
+<Step title="Exact search first (20 min)">
+`IndexFlatIP`. Query 1,000 held-out images, record p50 latency, and look at the top-5 results for ten queries **with your own eyes**. If they look wrong, stop and check normalization.
+</Step>
+<Step title="Build HNSW and IVF-PQ (35 min)">
+Record build time, memory (`faiss.write_index` file size is a good proxy), and query latency. Compute recall@10 against the exact index. Reproduce the shape of the Layer 3 table.
+</Step>
+<Step title="Sweep efSearch (20 min)">
+16, 32, 64, 128, 256, 512. Plot recall against latency. This curve is the artifact — it turns "which index should we use" into a picture with your budget drawn on it.
+</Step>
+<Step title="Export to ONNX and verify (25 min)">
+Export with `dynamic_axes`, run `onnx.checker`, and assert numerical parity at **two** batch sizes with `rtol=1e-3`. Then measure PyTorch vs ONNX latency on the same machine.
+</Step>
+<Step title="Quantize and measure the accuracy delta (25 min)">
+`quantize_dynamic`, then measure latency, file size **and** blood-cell accuracy. Expect roughly 1.6×, 4× smaller, and about 0.2 points. Reporting the accuracy delta is what makes this a result rather than a demo.
+</Step>
+<Step title="Reproduce the oversubscription trap (20 min)">
+Serve the ONNX model with 4 uvicorn workers, once with `OMP_NUM_THREADS=4` and once with `1`. Load-test at concurrency 8 and compare p99. You should see something like 340 ms vs 61 ms. Week 23 Module 2 builds on this directly.
+</Step>
+</Steps>
+
+## The whiteboard
+
+The T2 build-up is: frame 1 the network with the head cut off, frame 2 the embedding cloud with a query, frame 3 the three-index comparison table, frame 4 the image/text convergence strip at the bottom. Frame 4 is the one that pays off in Week 27.
+
+<Tip>
+**Draw it yourself.** The cut, the 512-d arrow, the cloud with a query and its neighbours, the
+three-row index table with real numbers, and the image/text convergence. If you can draw the
+convergence strip from memory, Week 27's architecture will already be familiar when you meet it.
+[Blank version](/assets/diagrams/p3-w22-m5-blank.svg) · [Editable source](/assets/diagrams/p3-w22-m5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Built an image similarity search over 50,000 images: 512-d ResNet embeddings, FAISS HNSW at 0.31 ms p50 query with 0.982 recall@10 against exact search, and exported the encoder to ONNX for a 1.8× CPU speedup and a further 1.64× with int8 quantization at a 0.2-point accuracy cost."
+
+**The interview question this earns you.** "How would you build image search?" or, increasingly, "how does RAG retrieval work?" — and the honest answer is that they are the same question. "Encoder produces a normalized vector, vector index does approximate nearest-neighbour, and you're trading recall for latency and memory. I built it on 50k images: exact search is 2.1 ms with perfect recall, HNSW is 0.31 ms at 0.982 recall for 35% more memory, and product quantization is 32× smaller at 0.871. The failure mode nobody expects is forgetting to L2-normalize — inner product then rewards magnitude, so the brightest images win every query, and there's no error, just bad results."
+
+That last sentence is the one that lands, because it shows you have operated one of these rather than read about it.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Check whether any vector index at your company normalizes.** If it uses inner-product or dot-product similarity and doesn't L2-normalize at insert *and* query, results are magnitude-biased. Add the assertion. This applies to text RAG systems just as much as image search, and it is common.
+
+**2. Try ONNX Runtime on a CPU-served model this week.** A 1.8× latency improvement with no model change is usually worth an afternoon, and it also removes PyTorch from the serving container — Week 23 measures that as an 851 MB image reduction, which changes your cold-start time and your registry bill.
+
+**3. Look for thread oversubscription in every ML service you run.** `workers × OMP_NUM_THREADS > vCPUs` is extremely common because both defaults are "use all cores" and nobody multiplies them together. Check `OMP_NUM_THREADS` against your worker count and your CPU limit. Measured here: p99 340 ms → 61 ms and throughput up 67% from one environment variable.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| The same small set of results for almost every query | Vectors not L2-normalized with an inner-product index | `faiss.normalize_L2` at insert and query; assert norms are 1.0 |
+| ONNX model works on your test inputs, wrong on a production subset | Tracing baked in one branch of a data-dependent `if` | `torch.jit.script` the branching module, or remove the branch; verify with inputs hitting every branch |
+| `INVALID_ARGUMENT: Got invalid dimensions` at inference | `dynamic_axes` omitted, batch size baked in at export | Declare dynamic axes; verify at two batch sizes |
+| p99 5× worse than p50 under load | Thread oversubscription: `workers × threads > vCPUs` | `OMP_NUM_THREADS=1` **before import**, plus `intra_op_num_threads=1` |
+| `OMP_NUM_THREADS` has no effect | Set after the library was imported; OpenMP reads it at load | Set it at the top of the module, or in the process environment |
+| Search quality worse in production than in evaluation | Preprocessing differs between the indexing job and the query path | One shared preprocessing module; embed a fixture through both and compare |
+| Search results become nonsense after a model deploy | Index built with a different encoder version | Store the encoder fingerprint in index metadata and assert it; rebuild on any encoder change |
+| ANN recall is quietly terrible | `efSearch` / `nprobe` left at defaults for a different data distribution | Sweep them against exact search on your own data; there is no error to see |
+| Quantized model shipped without measuring accuracy | Assumed int8 is free | Measure. It is usually ~0.2 points, but "usually" is not a number |
+| `assert_allclose` fails on a correct ONNX export | Demanding exact float equality between runtimes | `rtol=1e-3, atol=1e-5` |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [PyTorch 2.4 — `torch.onnx`](https://pytorch.org/docs/2.4/onnx.html) — read the "Limitations" section, which states plainly that tracing captures one execution path. That paragraph is the second failure mode above.
+- [ONNX Runtime — Performance tuning](https://onnxruntime.ai/docs/performance/tune-performance/) — read the threading section for `intra_op_num_threads` vs `inter_op_num_threads`; the distinction is the oversubscription trap.
+- [ONNX Runtime — Quantization](https://onnxruntime.ai/docs/performance/model-optimizations/quantization.html) — read this for dynamic vs static quantization and when calibration is worth the machinery.
+- [FAISS wiki — Guidelines to choose an index](https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index) — read this one page before choosing any index. It is a decision tree keyed on dataset size and memory budget, written by the authors, and it is better than any blog post on the subject.
+- [FAISS wiki — `METRIC_INNER_PRODUCT` and normalization](https://github.com/facebookresearch/faiss/wiki/MetricType-and-distances) — read this for the sentence that says inner product is cosine only on normalized vectors. It is the war story.
+
+**Papers**
+
+- [Malkov &amp; Yashunin (2018)](https://arxiv.org/abs/1603.09320) — *a hierarchical proximity graph searched greedily gives >0.95 recall at a fraction of exhaustive cost; the algorithm behind every modern vector index.*
+- [Jégou et al. (2011)](https://doi.org/10.1109/TPAMI.2010.57) — *product quantization compresses vectors 32× and computes distances on the codes; how billion-scale indexes fit in RAM.*
+- [Johnson et al. (2019)](https://arxiv.org/abs/1702.08734) — *the FAISS engineering paper; §4 explains the IVF-PQ memory numbers.*
+- [Babenko &amp; Lempitsky (2015)](https://arxiv.org/abs/1510.07493) — *pooled CNN activations are strong retrieval descriptors with no retrieval-specific training.*
+- [Radford et al. (2021)](https://arxiv.org/abs/2103.00020) — *training image and text encoders to agree puts both in one space; multimodal retrieval is the same architecture, not a new one.*
+- [Jacob et al. (2018)](https://arxiv.org/abs/1712.05877) — *affine int8 quantization with per-channel scales; what `quantize_dynamic` implements and what Week 26 generalizes.*
+
+**Go deeper**
+
+- [Pinecone's "Faiss: The Missing Manual"](https://www.pinecone.io/learn/series/faiss/) — read the HNSW and IVF-PQ chapters for the clearest visual explanation of both algorithms anywhere, including what `M`, `efSearch` and `nprobe` do to the search geometry.
+- [ONNX operator schemas](https://github.com/onnx/onnx/blob/main/docs/Operators.md) — read this when an export fails. Knowing which opset introduced an operator turns "unsupported operator" from a dead end into a version bump.
+- Erik Bernhardsson, ["ANN benchmarks"](https://ann-benchmarks.com/) — read this for the recall/QPS Pareto frontier across a dozen libraries on standard datasets. It is the right way to *think* about the choice, and a reminder that your own data may rank them differently.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-22/p3-w22-m5">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

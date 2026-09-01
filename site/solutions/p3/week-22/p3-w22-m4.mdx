@@ -1,0 +1,154 @@
+---
+title: "Transfer learning"
+description: "Reference solution — Week 22"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P3-W22-M4`
+
+The hands-on was: compare from-scratch, feature-extraction and full fine-tuning on the same dataset, and plot accuracy against training time and dataset size.
+
+### The cached-feature trick that makes the sweep affordable
+
+The sweep is 54 runs. Feature extraction with cached features turns each of those from 4 minutes into 3 seconds.
+
+```python
+"""cache_features.py — run the backbone once, then train heads in seconds."""
+from __future__ import annotations
+import torch, torch.nn as nn, torchvision
+from torch.utils.data import DataLoader, TensorDataset
+
+@torch.inference_mode()
+def extract(loader: DataLoader, device="cuda") -> tuple[torch.Tensor, torch.Tensor]:
+    m = torchvision.models.resnet18(weights="IMAGENET1K_V1")
+    m.fc = nn.Identity()
+    m.eval().to(device)                       # eval() also freezes BatchNorm stats
+    fs, ys = [], []
+    for xb, yb in loader:
+        fs.append(m(xb.to(device)).cpu()); ys.append(yb)
+    return torch.cat(fs), torch.cat(ys)       # (N, 512), (N,)
+
+# eval_tfm only -- NO random augmentation, or the features change every epoch
+feats, labels = extract(DataLoader(train_ds_eval_tfm, batch_size=256, num_workers=8))
+torch.save({"feats": feats, "labels": labels}, "train_feats.pt")   # 17.9 MB
+
+def train_head(feats, labels, n_classes=4, epochs=200, lr=1e-2):
+    head = nn.Linear(feats.shape[1], n_classes).cuda()
+    opt = torch.optim.AdamW(head.parameters(), lr=lr, weight_decay=0.05)
+    crit = nn.CrossEntropyLoss()
+    X, y = feats.cuda(), labels.cuda()
+    for _ in range(epochs):                   # full-batch: 8,742 x 512 fits easily
+        opt.zero_grad(set_to_none=True)
+        crit(head(X), y).backward()
+        opt.step()
+    return head
+```
+
+**Reference figure:** extraction 21 s once, then each head training run **2.8 s** — versus 4.1 minutes running the backbone every epoch. An **88× speedup** for the feature-extraction arm of the study, which is what makes 54 runs a lunch break rather than a weekend.
+
+The constraint is in the comment: **no random augmentation**, because augmentation changes the features every epoch and caching them would fix one arbitrary augmentation forever. That is also why feature extraction gains less from augmentation than fine-tuning does.
+
+### The strategy comparison
+
+**Machine B** (RTX 4090) — **reference figures**, modelled rather than run; see [About the numbers](/start/about-the-numbers). Blood-cell set, 8,742 training images, 5 seeds.
+
+| Strategy | Test acc | Wall clock | Trainable params |
+| --- | --- | --- | --- |
+| `BloodCellNet` from scratch | 84.2% ± 0.6 | 22 min | 390,404 |
+| ResNet-18 from scratch (random init) | 86.9% ± 0.7 | 19 min | 11,178,051 |
+| Feature extraction (cached) | 89.6% ± 0.3 | **21 s + 2.8 s** | **2,052** |
+| Full fine-tune, single LR | 93.8% ± 0.4 | 18 min | 11,178,051 |
+| **Staged + discriminative LRs** | **94.4% ± 0.3** | 21 min | 11,178,051 |
+| Full fine-tune, **no stage 1** | 92.1% ± 0.9 | 18 min | 11,178,051 |
+
+Two numbers for the write-up: the architecture alone is worth **2.7 points** (84.2 → 86.9, both from scratch), and pretraining on top of that is worth another **7.5** (86.9 → 94.4). Separating those is the point of including the ResNet-18-from-scratch row, and almost nobody does.
+
+The last row is the cheapest lesson available: **skipping the head-only stage costs 1.7 points and triples the seed variance** (±0.9 vs ±0.3). A randomly-initialized head produces large, meaningless gradients that flow straight into carefully-pretrained features. Kumar et al. (2022) is the paper.
+
+### The data-efficiency crossover
+
+Three seeds per cell.
+
+| Training images | From scratch | Feature extraction | Full fine-tune |
+| --- | --- | --- | --- |
+| 250 | 41.2% | **76.4%** | 74.1% |
+| 500 | 49.7% | **80.9%** | 79.8% |
+| 1,000 | 58.9% | 83.1% | **86.2%** |
+| 2,000 | 66.4% | 85.0% | **88.9%** |
+| 4,000 | 74.6% | 87.4% | **92.0%** |
+| 8,742 | 86.9% | 89.6% | **93.8%** |
+
+**Crossover between 500 and 1,000 — call it ~700 images.** Below it, 11.2 million trainable parameters on a few hundred examples memorizes before it generalizes, and 2,052 parameters cannot. Above it, the extra capacity pays.
+
+This is the same curve, with a different x-axis unit, that decides LoRA versus full fine-tuning in Week 26.
+
+### Catastrophic forgetting
+
+After each adaptation, freeze the resulting backbone and train a fresh linear probe on a 5,000-image / 100-class ImageNet subset.
+
+| Strategy | Blood-cell acc | ImageNet probe after | Forgetting |
+| --- | --- | --- | --- |
+| Original backbone | 89.6% (probe) | 69.8% | — |
+| Feature extraction | 89.6% | **69.8%** | 0 (by construction) |
+| Fine-tune `layer4` + head | 92.6% | 58.7% | −11.1 |
+| Full fine-tune, LR 1e-3 | 93.8% | **41.3%** | **−28.5** |
+| Full fine-tune, discriminative LRs | **94.4%** | 55.1% | −14.7 |
+| Full fine-tune, LR 1e-5 | 91.2% | 64.9% | −4.9 |
+
+**Discriminative learning rates halve the forgetting and improve target accuracy.** That is the strongest argument for them — much stronger than the 0.6-point headline gain — and it only appears if you measure the second column.
+
+### The BatchNorm fix
+
+| Feature extraction variant | Test acc | Std over 3 seeds |
+| --- | --- | --- |
+| `requires_grad=False` only, model in `train()` | 88.6% | **± 1.4** |
+| `requires_grad=False` **and** frozen BN in `eval()` | **89.6%** | **± 0.3** |
+
+**+1.0 point and 4.7× less variance from three lines.** The variance reduction is the more diagnostic half: ±1.4 points on a 1,879-image validation set is far outside binomial sampling error, so it was never noise — it was the running statistics being overwritten by whatever the last few hundred batches happened to contain.
+
+## Why this solution and not the obvious one
+
+**Why include a ResNet-18-from-scratch row.** Without it, the comparison conflates "better architecture" with "pretrained weights", and you cannot say which did the work. It costs one extra run and it makes the whole table interpretable.
+
+**Why measure forgetting with a linear probe rather than by re-running ImageNet classification.** The head was replaced, so the original classifier is gone. A fresh linear probe on frozen features measures what the *representation* retains, which is the thing you care about if the backbone serves anything else. (CKA, from Kornblith et al. 2019, is the more principled version and a good stretch.)
+
+**Why cache features rather than just running fewer configurations.** The 88× speedup is what makes the crossover measurable at six dataset sizes with three seeds. A two-point sweep would not have located the crossover.
+
+**Why report standard deviations everywhere.** The 0.6-point staged-recipe gain is barely outside the noise (±0.3), and saying so is more honest than presenting it as a clear win. The 1.7-point cost of skipping stage 1 is clearly outside it. The reader can only tell those apart if you give them the spread.
+
+## The two wrong turns worth knowing about
+
+**1. Caching features computed with random augmentation on.** The cache then holds one arbitrary augmented view per image, forever. Accuracy drops by 1–2 points and looks like a feature-extraction limitation rather than a bug. Use the eval transform when extracting, always.
+
+**2. Passing `model.parameters()` to the optimizer during feature extraction.** AdamW allocates `m` and `v` for all 11.2 million frozen parameters — 89 MB of state that is never used. Harmless at this scale and fatal at 7B, where it is 54 GB (Week 21 Module 4). Filter on `requires_grad`.
+
+## Grading notes
+
+**3/3 on Correctness** — all three strategies at all six dataset sizes, three seeds each, with the BatchNorm statistics properly frozen in the feature-extraction arm.
+
+**3/3 on Explanation** — the crossover identified and explained in terms of trainable parameters versus examples, and the forgetting column present with the discriminative-LR result called out.
+
+**3/3 on Performance** — the cached-feature speedup measured and reported, which is what made the study feasible.
+
+**The three most common ways submissions lose points**
+
+1. **Two dataset sizes instead of six.** You cannot locate a crossover from two points, and locating it is the exercise.
+2. **No forgetting measurement.** It is the half of the module that generalizes to Week 26's multi-tenant serving argument, and it takes two minutes per run with cached features.
+3. **Single seed.** Several of the differences in these tables are 0.5 points and the seed spread is 0.3–0.9. Without seeds you cannot tell which conclusions are real, and at least one of yours will be wrong.
+
+<Card title="Back to the module" icon="arrow-left" href="/curriculum/p3/week-22/4-transfer-learning" horizontal>
+  Re-read the vision-to-LLM mapping table. Then read the PEFT LoRA guide before Week 26.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,164 @@
+---
+title: "Threads and shared state"
+description: "Reference solution — Week 4"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W04-M2`
+
+Reproduce a deadlock, capture it, fix it by ordering, and prove the fix.
+
+```python
+"""deadlock.py — reproduce, then fix. Run with --fix to use lock ordering."""
+from __future__ import annotations
+
+import faulthandler
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Account:
+    id: int
+    balance: int
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+def transfer_unordered(a: Account, b: Account, amount: int) -> None:
+    with a.lock:
+        time.sleep(0)                      # widen the window; any yield point will do
+        with b.lock:
+            a.balance -= amount
+            b.balance += amount
+
+
+def transfer_ordered(a: Account, b: Account, amount: int) -> None:
+    # A TOTAL ORDER on the two locks. Any stable key works: id field, id(), name.
+    first, second = (a, b) if a.id < b.id else (b, a)
+    with first.lock, second.lock:
+        a.balance -= amount
+        b.balance += amount
+
+
+def hammer(transfer, x: Account, y: Account, n: int) -> None:
+    for _ in range(n):
+        transfer(x, y, 1)
+        transfer(y, x, 1)
+
+
+def main() -> None:
+    fix = "--fix" in sys.argv
+    transfer = transfer_ordered if fix else transfer_unordered
+    a, b = Account(1, 1_000_000), Account(2, 1_000_000)
+
+    faulthandler.dump_traceback_later(5, exit=True)   # if we hang, dump ALL threads and abort
+
+    t0 = time.perf_counter()
+    ts = [threading.Thread(target=hammer, args=(transfer, a, b, 100_000), name=f"w{i}")
+          for i in range(2)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    faulthandler.cancel_dump_traceback_later()
+
+    assert a.balance + b.balance == 2_000_000, "money was created or destroyed"
+    print(f"{'ordered' if fix else 'unordered'}: completed in "
+          f"{time.perf_counter() - t0:.2f} s, balances intact")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+```bash
+python3 deadlock.py            # hangs; faulthandler dumps both threads after 5 s
+python3 deadlock.py --fix      # completes, 100,000 iterations, balances intact
+py-spy dump --pid $(pgrep -f deadlock.py)     # from another terminal, on the hung run
+```
+
+The dump names the bug without any guessing:
+
+```
+Thread 0x16f4b (idle): "w0"
+    transfer_unordered (deadlock.py:23)      <- blocked acquiring b.lock, holding a.lock
+Thread 0x16f5c (idle): "w1"
+    transfer_unordered (deadlock.py:23)      <- blocked acquiring a.lock, holding b.lock
+```
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: `lock.acquire(timeout=...)` as the fix.**
+
+The instinct on a hang is to add a timeout and retry. It converts a **deadlock** into a **livelock**: both threads time out, back off, and re-acquire in the same opposing order, so they collide again. You get repeated near-deadlocks with worse latency, no error, and no signal that anything is wrong.
+
+It also makes every acquisition a failure path you must now handle, which is a large amount of new code written to avoid understanding a small amount of old code.
+
+Lock ordering removes the *cycle*, which is one of Coffman's four necessary conditions — so deadlock becomes impossible rather than merely less frequent. It costs one line and a comment.
+
+`acquire(timeout=...)` is legitimate as a **fallback for a path where ordering is genuinely impossible** (locks acquired across module boundaries you do not control), and it needs randomised back-off to avoid the livelock. Document it as the exception it is.
+
+**Wrong turn 2: reproducing with `sleep` and calling it a day.**
+
+`time.sleep(0.1)` between the two acquisitions makes the deadlock fire on the first iteration, which is convenient and misleading. Real deadlocks are timing-dependent and fire rarely — the interesting question is *how rarely*, because that is what determines whether you find it in testing or in production.
+
+Report the number of iterations before the hang, with and without an artificial widening. The reference reproduces in fewer than 1,000 iterations with `time.sleep(0)` (a bare yield) and can run for millions without it. **That gap is the reason this class of bug reaches production.**
+
+**A third thing worth knowing: the assertion is the real test.**
+
+`assert a.balance + b.balance == 2_000_000` is checking conservation, independently of how the transfer is implemented — the same principle as Week 3's property tests. Without it, an "unordered but lucky" run passes and you conclude the code is fine. With it, you also catch the *other* bug: transfers that lose money because they were not atomic at all.
+
+## The measured numbers this solution produces
+
+CPython 3.13.2, Apple M3 Pro (11 cores), macOS 15:
+
+**Lost updates, 8 threads × 2,000,000 increments of a shared global, default 5 ms switch interval:**
+
+| Statement in the loop | Final value | Lost | Percentage |
+|---|---|---|---|
+| `counter += 1` | 16,000,000 | **0** | **0.00%** |
+| `counter = counter + ident(1)` | 5,622,625 | **10,377,375** | **64.86%** |
+
+Same experiment at a 5 µs switch interval: `+= 1` still loses **0**; the function-call version loses **12,246,923 (76.54%)**.
+
+**Primitive costs, minimum of 7 runs:**
+
+| Operation | ns/op |
+|---|---|
+| `c[0] = c[0] + 1` (unsynchronised) | **16.6** |
+| `lock.acquire(); lock.release()` | 24.9 |
+| `with lock: c[0] = c[0] + 1` | **86.3** (5.2×) |
+| `with rlock: pass` | 83.1 |
+| `queue.Queue` put + get | **654.7** |
+| `deque` append + popleft | 13.3 |
+| `threading.Thread` create + join | **126.3 µs** |
+
+**Deadlock reproduction:** hangs in under 1,000 iterations with a yield point between acquisitions; the ordered version completes 100,000 iterations with balances intact.
+
+## Grading notes
+
+**3/3 on correctness** means the deadlock reproduces reliably, you report the iteration count, both a `faulthandler` dump and a `py-spy dump` are shown, and you identify the two locks and the two call paths **from the traces alone** rather than from the source.
+
+**3/3 on robustness** means the ordered version runs 100,000 iterations with a conservation assertion that would catch a non-atomic transfer as well as a deadlock.
+
+**3/3 on explanation** means you report the throughput cost of the fix and explain why `acquire(timeout=)` is a livelock rather than a fix.
+
+The four most common ways submissions lose points:
+
+1. **A timeout presented as the fix.** It hides the cycle and converts a loud failure into a slow one.
+2. **No independent invariant.** Without `a.balance + b.balance == constant`, a run that happened not to deadlock looks like a pass.
+3. **The race demo reported as "counter += 1 loses updates" without checking.** On CPython 3.13 it loses **zero** across 16 million tries. Reporting the textbook claim without running it is exactly the failure mode this module is about.
+4. **`py-spy` not used.** `faulthandler` requires you to have added a line in advance; `py-spy` works on a process that is already wedged, with no prior instrumentation. Learning it here is the point.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

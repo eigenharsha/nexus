@@ -1,0 +1,824 @@
+---
+title: "Designing an application protocol"
+description: "Week 10 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 10 · Module 4 · `P2-W10-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** `P2-W10-M2` (TCP is a byte stream), `P2-W10-M3` (framing, back-pressure, the three
+  concurrency models).
+- **Unlocks:** the Week 10 lab (`PROTOCOL.md` is the main deliverable), Week 15 (data pipeline
+  message formats), and Week 29 — MCP's transports are exactly this module's decisions, made by
+  someone else.
+- **One-line:** after this you can design a wire protocol that survives its second version, and
+  justify your serialisation format with bytes and microseconds.
+
+## What you'll be able to do
+
+1. Choose between text and binary framing with a reason that is not aesthetic.
+2. Design messages that can be extended without breaking existing peers.
+3. Pick request/response, streaming or pub-sub deliberately, and say what each costs.
+4. Implement heartbeats, reconnection with backoff and jitter, and back-pressure.
+5. Benchmark JSON, MsgPack and Protobuf on your own data and defend the choice with numbers.
+
+## Why you should care
+
+**Aarav (student).** A `PROTOCOL.md` is the artefact that makes a chat-server project look
+professional rather than academic. It is also the thing an interviewer will actually read, because it
+shows design thinking rather than the ability to follow a tutorial.
+
+**Meera (working professional).** Every internal service you have ever integrated with had a
+protocol, and the pain you felt came from a decision made in its first week. Versioning, optional
+fields, and what happens when the connection drops mid-request: these three decide whether the
+protocol is a pleasure or a five-year tax. This module gives you the checklist and the numbers.
+
+## The mental model
+
+A protocol is a contract with three separable parts, and confusing them is the source of most bad
+protocols:
+
+1. **Framing** — where does one message end and the next begin? (Module 3 answered this: a length
+   prefix.)
+2. **Encoding** — how are the fields of a message turned into bytes? (JSON, MsgPack, Protobuf.)
+3. **Semantics** — what messages exist, who may send which, when, and what must the peer do?
+
+Keep them separate and you can change one without the others. Mix them — as HTTP/1.1 does, where
+framing depends on parsing headers which are part of the semantics — and every change is a breaking
+change.
+
+The second idea, and the one that separates a protocol that lasts from one that does not:
+**you will never deploy both ends at the same time.** Design for a world where an old client talks
+to a new server and vice versa, permanently.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p2-w10-m4.svg" alt="Hand-drawn sketch: designing an application protocol" className="block dark:hidden" />
+  <img src="/assets/diagrams/p2-w10-m4-dark.svg" alt="Hand-drawn sketch: designing an application protocol" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p2-w10-m4
+tier: T2
+one-sentence-goal: A protocol is three separable layers, and the one that decides its lifespan is how it handles a peer that has not been upgraded.
+elements:
+  - left: three stacked bands labelled FRAMING / ENCODING / SEMANTICS, each with a one-line note - "where does a message end", "how do fields become bytes", "who may say what, when" - with a red line drawn between them and "keep these separate" in amber
+  - centre: one message drawn three ways, side by side, to scale by width - JSON (114 B), MsgPack (81 B), Protobuf (48 B) - each drawn as a little ribbon of the right relative length with the bytes/msg hand-written under it
+  - beside them, decode time bars: JSON 4.44 us, MsgPack 1.19 us, Protobuf 1.84 us - with amber note "msgpack decodes FASTER than protobuf in Python. Measure, do not assume."
+  - right: two stick figures labelled "old client v1" and "new server v2" with a message passing between them; the v2 message has an extra field drawn in green being silently ignored by v1; below it a red crossed-out version where v2 renamed a field and v1 breaks
+  - bottom strip: a reconnect timeline - disconnect, then retry marks at 1s, 2s, 4s, 8s with a wobbly "+ jitter" scribble, and a red cross-out over evenly spaced retries labelled "thundering herd"
+  - circle the word "jitter"
+  - dangling arrow: "...and how do you know the peer is still there? -> heartbeats"
+numbers-to-write-in: JSON 113.8 B / MsgPack 81.1 B / Protobuf 47.8 B per message; decode 4.44 / 1.19 / 1.84 us; gzip on a single 114-byte message makes it BIGGER (115.9 B)
+alt: A whiteboard sketch dividing a protocol into framing, encoding and semantics bands, showing one message drawn to scale in JSON, MsgPack and Protobuf with measured sizes and decode times beneath each, a compatibility panel where an old client silently ignores a new field but breaks on a renamed one, and a reconnect timeline with exponential backoff and jitter contrasted against evenly spaced retries.
+*/}
+
+<Tabs>
+
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The words, defined
+
+- **Wire protocol** — the exact bytes two programs agree to exchange, and the rules for exchanging
+  them.
+- **Serialisation** — turning an in-memory object into bytes. **Deserialisation** is the reverse.
+- **Schema** — a declaration of what fields a message has and what type each is.
+- **Heartbeat** — a small periodic message whose only purpose is to prove the connection is alive.
+- **Back-pressure** — a mechanism for a slow receiver to make a fast sender slow down.
+- **Backoff** — waiting longer between each successive retry.
+- **Jitter** — adding randomness to a delay so that many clients do not retry in lockstep.
+
+### Designing a chat protocol on paper
+
+Before writing any code, write the message list. Five commands is enough for a real chat system:
+
+| Command | Direction | Payload | Meaning |
+|---|---|---|---|
+| `HELLO` | client → server | `nick`, `version` | join, announce identity |
+| `JOIN` | client → server | `room` | enter a room |
+| `MSG` | both ways | `room`, `text`, (server adds `from`, `ts`) | say something |
+| `LEAVE` | client → server | `room` | leave a room |
+| `PING` / `PONG` | both ways | `nonce` | heartbeat |
+
+And the server's replies:
+
+| Reply | Payload | When |
+|---|---|---|
+| `WELCOME` | `session_id`, `server_version` | after a valid `HELLO` |
+| `ERROR` | `code`, `message` | any rejected command |
+| `JOINED` / `LEFT` | `room`, `nick` | broadcast to a room |
+
+Writing this table first is the whole exercise. It forces four questions that code does not:
+
+1. **Which side may send each message?** If both sides can send `MSG`, they are structurally
+   different messages (the server's version has `from` and `ts`) and should be named differently or
+   have those fields clearly marked as server-set.
+2. **What is the reply to each request, and is there always one?** `MSG` is fire-and-forget;
+   `HELLO` demands `WELCOME` or `ERROR`. Mixing the two styles without saying so is how clients end
+   up waiting forever.
+3. **What is the error case for each?** Every command needs one. "It cannot fail" is never true.
+4. **What must happen first?** `JOIN` before `HELLO` is invalid. That ordering *is* the state machine.
+
+### The smallest working protocol
+
+Framing from Module 3, JSON inside it. This is a complete, runnable protocol layer.
+
+```python
+# protocol.py — length-prefixed JSON messages.
+import json, struct
+
+HEADER = struct.Struct("!I")             # 4-byte big-endian length
+MAX_MESSAGE = 1 << 20                    # 1 MiB — bound it, always
+
+def recv_exactly(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return bytes(buf)
+
+def send_msg(sock, obj: dict):
+    body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+    if len(body) > MAX_MESSAGE:
+        raise ValueError(f"message too large: {len(body)}")
+    sock.sendall(HEADER.pack(len(body)) + body)      # one write, not two
+
+def recv_msg(sock):
+    header = recv_exactly(sock, 4)
+    if header is None:
+        return None                                   # peer closed
+    (n,) = HEADER.unpack(header)
+    if n > MAX_MESSAGE:
+        raise ValueError(f"declared length {n} exceeds limit")
+    body = recv_exactly(sock, n)
+    if body is None:
+        raise ConnectionError("peer closed mid-message")
+    return json.loads(body)
+```
+
+Using it, the whole `HELLO` exchange is four lines:
+
+```python
+send_msg(sock, {"t": "HELLO", "v": 1, "nick": "aarav"})
+reply = recv_msg(sock)
+if reply["t"] != "WELCOME":
+    raise RuntimeError(reply.get("message", "rejected"))
+session = reply["session_id"]
+```
+
+### Line-by-line
+
+- **`"t"` for type, first field.** Every message carries a type tag. Without it the receiver must
+  guess from the shape of the object, which breaks the moment two messages have similar shapes.
+- **`separators=(",", ":")`** removes the spaces Python's `json.dumps` inserts by default. Measured
+  below: it saves 13 bytes per message on this data, about 11%. Free.
+- **`MAX_MESSAGE` checked before allocating.** The length came from the network. Checking it after
+  reading defeats the purpose.
+- **`recv_msg` distinguishes three outcomes** — a clean close (returns `None`), a truncated message
+  (raises), and a valid message. Collapsing the first two into one is how you end up logging
+  "connection error" every time a user closes their laptop lid.
+
+### Heartbeats and why you need them
+
+TCP does not tell you when the peer goes away silently. If a laptop's Wi-Fi drops, no FIN and no RST
+are sent — the connection simply stops carrying data. Your server holds the socket open. By default,
+Linux's TCP keep-alive does not even start probing for **two hours**.
+
+So the application sends its own heartbeat:
+
+```python
+HEARTBEAT_INTERVAL = 15      # seconds between PINGs
+HEARTBEAT_TIMEOUT  = 45      # 3 missed PINGs -> declare dead
+```
+
+The rule of thumb — **timeout at 2–3× the interval** — exists because a single lost packet plus a
+retransmission can easily eat one interval, and disconnecting a healthy user because one packet was
+lost is worse than detecting a dead one 30 seconds late.
+
+Note that a heartbeat does two jobs at once: it detects dead peers, and it keeps NAT mappings alive
+(from Module 1: UDP mappings expire in 30–120 seconds, TCP mappings in minutes). A 15-second
+interval is comfortably inside both.
+
+### Reconnecting properly
+
+When the connection drops, the client must reconnect. The naive version is a disaster:
+
+```python
+# WRONG — retries immediately, forever.
+while True:
+    try:
+        sock = socket.create_connection((host, port))
+        break
+    except OSError:
+        continue
+```
+
+If the server is down and 10,000 clients do this, the server gets 10,000 connection attempts per
+client per second the moment it comes back — and falls over again. This is a **thundering herd**, and
+it is how a five-minute outage becomes a two-hour one.
+
+The correct version is exponential backoff **with jitter**:
+
+```python
+import random, time, socket
+
+def connect_with_backoff(host, port, base=1.0, cap=60.0, max_attempts=None):
+    attempt = 0
+    while max_attempts is None or attempt < max_attempts:
+        try:
+            return socket.create_connection((host, port), timeout=10)
+        except OSError as e:
+            attempt += 1
+            backoff = min(cap, base * (2 ** (attempt - 1)))
+            delay = random.uniform(0, backoff)      # "full jitter"
+            print(f"attempt {attempt} failed ({e}); retrying in {delay:.1f}s")
+            time.sleep(delay)
+    raise ConnectionError(f"gave up after {attempt} attempts")
+```
+
+The delays go 0–1 s, 0–2 s, 0–4 s, 0–8 s, up to a 60-second cap. The `random.uniform(0, backoff)`
+is the important part: without it, all clients that disconnected at the same instant retry at the
+same instants forever, and the herd never disperses. AWS's engineering blog calls this "full jitter"
+and their simulations found it both reduces server load and *finishes faster* than the un-jittered
+version — which is the counterintuitive part worth remembering.
+
+### Guided practice
+
+Add versioning to the `HELLO` exchange so an old client and a new server can still talk.
+
+```python
+SERVER_VERSION = 2
+SUPPORTED = {1, 2}
+
+def handle_hello(msg):
+    client_v = msg.get("v", 1)          # missing == oldest version
+    if client_v not in SUPPORTED:
+        return {"t": "ERROR", "code": "UNSUPPORTED_VERSION",
+                "message": f"server supports {sorted(SUPPORTED)}"}
+    negotiated = ____                    # TODO: what version do we actually speak?
+    return {"t": "WELCOME", "v": negotiated, "session_id": new_session()}
+```
+
+<Accordion title="Answer">
+
+```python
+    negotiated = min(client_v, SERVER_VERSION)
+```
+
+Both sides then speak the lower of the two versions. This is the standard negotiation and it has
+three properties worth naming:
+
+1. **The server must keep supporting old versions** for as long as old clients exist. Write that
+   down with a date, or you will support v1 forever.
+2. **`msg.get("v", 1)`** — a missing field means the oldest version, because clients written before
+   versioning existed do not send one. Defaulting to the *newest* version is a common and painful bug.
+3. The negotiated version must be echoed in `WELCOME` so the client knows what the server will speak.
+   Negotiation where only one side knows the result is not negotiation.
+
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+<Accordion title="1. Why does every message need a type field?">
+Otherwise the receiver must infer the message kind from its shape, which breaks as soon as two
+messages have overlapping fields, and makes adding a message a breaking change.
+</Accordion>
+<Accordion title="2. Why is the length limit checked before reading the body?">
+The length is attacker-controlled. Checking after reading means you have already allocated whatever
+was claimed.
+</Accordion>
+<Accordion title="3. Why does a heartbeat timeout have to be larger than the interval?">
+A single lost packet plus retransmission can consume an interval. Timing out at 2–3× the interval
+tolerates transient loss without disconnecting healthy peers.
+</Accordion>
+<Accordion title="4. What is a thundering herd and what prevents it?">
+Many clients retrying in lockstep, re-overloading a recovering server. Exponential backoff with
+random jitter disperses them.
+</Accordion>
+<Accordion title="5. An old client omits the version field. What version should you assume?">
+The oldest one. Clients written before versioning existed cannot send a version, and assuming the
+newest breaks exactly the peers versioning was meant to protect.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### Measured: JSON vs MsgPack vs Protobuf
+
+The benchmark uses 100,000 realistic event messages — an integer id, two short strings, a float
+timestamp, a small integer status, and a list of three tags:
+
+```protobuf
+// event.proto
+syntax = "proto3";
+package nexus;
+message Event {
+  uint64 id        = 1;
+  string user      = 2;
+  string action    = 3;
+  double timestamp = 4;
+  uint32 status    = 5;
+  repeated string tags = 6;
+}
+```
+
+Measured on Python 3.13.2, macOS 26.2, Apple M3 Pro. Versions: `msgpack` 1.2.2, `protobuf` 7.36.0
+(upb C backend), stdlib `json`.
+
+| Format | Bytes/msg | Total (100k) | Encode | Decode | Decode + field access |
+|---|---|---|---|---|---|
+| JSON (default separators) | 126.8 | 12.68 MB | 4.23 µs | 3.17 µs | — |
+| JSON (compact separators) | **113.8** | 11.38 MB | 4.27 µs | 3.57 µs | **4.44 µs** |
+| MsgPack | **81.1** | 8.11 MB | 2.21 µs | 2.01 µs | **1.19 µs** |
+| Protobuf | **47.8** | 4.78 MB | 1.79 µs | 0.47 µs | **1.84 µs** |
+| JSON + gzip (per message) | 115.9 | — | — | — | — |
+
+Five findings, three of which are not what people expect:
+
+1. **Protobuf is 2.4× smaller than compact JSON** (47.8 vs 113.8 bytes). The saving comes from field
+   *numbers* instead of names, varint integers, and no punctuation. On 100,000 messages that is
+   6.6 MB less on the wire.
+2. **MsgPack decodes faster than Protobuf in Python** (1.19 vs 1.84 µs with field access). MsgPack
+   produces a plain `dict`, which Python accesses natively; Protobuf produces a message object whose
+   attribute access crosses into the C extension. Protobuf's bare `ParseFromString` measures 0.47 µs
+   because upb parses lazily — **the 0.47 µs number is real and misleading**, and if you benchmark
+   without touching a field you will report it and be wrong.
+3. **Compact JSON separators save 10% for free.** `json.dumps(obj)` inserts `", "` and `": "`.
+   `separators=(",", ":")` removes them. One argument, 13 bytes per message.
+4. **Gzipping individual small messages makes them bigger** — 115.9 bytes versus 113.8 raw, because
+   the gzip header and trailer alone are about 20 bytes. Compression needs either large messages or
+   a shared stream-level dictionary; per-message compression of small payloads is a pure loss.
+5. **Encode is slower than decode for all three.** If your service is write-heavy (a producer),
+   optimise encoding; if it is read-heavy (a consumer), optimise decoding. They are not the same
+   choice.
+
+Reproduce it:
+
+```python
+# bench_ser.py — run it on YOUR data before choosing.
+import json, time, random, msgpack, event_pb2
+
+random.seed(7)
+def mk(i):
+    return {"id": i, "user": "u" + str(random.randint(1, 100000)),
+            "action": random.choice(["view","click","purchase","scroll","hover"]),
+            "timestamp": 1756684800.0 + i * 0.001,
+            "status": random.choice([200, 200, 200, 404, 500]),
+            "tags": random.sample(["web","ios","android","eu","us","beta"], 3)}
+
+N = 100_000
+msgs = [mk(i) for i in range(N)]
+
+def bench(name, enc, dec):
+    t0 = time.perf_counter(); blobs = [enc(m) for m in msgs]
+    t1 = time.perf_counter()
+    for b in blobs: dec(b)
+    t2 = time.perf_counter()
+    total = sum(len(b) for b in blobs)
+    print(f"{name:22s} {total/N:6.1f} B/msg  encode {(t1-t0)/N*1e6:5.2f} us  "
+          f"decode {(t2-t1)/N*1e6:5.2f} us")
+
+bench("JSON compact", lambda m: json.dumps(m, separators=(",",":")).encode(),
+                      lambda b: json.loads(b))
+bench("MsgPack", msgpack.packb, msgpack.unpackb)
+bench("Protobuf",
+      lambda m: event_pb2.Event(**m).SerializeToString(),
+      lambda b: event_pb2.Event.FromString(b))
+```
+
+### Schema evolution: the rules that decide the protocol's lifespan
+
+**Protobuf's compatibility rules** are the model to copy even if you use JSON:
+
+| Change | Safe? | Why |
+|---|---|---|
+| Add a new optional field with a new number | ✅ | Old readers skip unknown field numbers |
+| Remove a field | ⚠️ | Safe only if you `reserved` the number so it is never reused |
+| Rename a field | ✅ on the wire, ❌ in code | The wire uses numbers, not names — but every codebase referencing the name breaks |
+| Change a field's number | ❌ | Old readers will misinterpret the data as a different field |
+| Change a field's type | ❌ mostly | Some pairs are compatible (`int32`/`int64`/`uint32`/`bool` share varint encoding); most are not |
+| Change `optional` to `repeated` | ⚠️ | Wire-compatible for length-delimited types, not for others |
+| Add a value to an enum | ⚠️ | Old readers see an unknown value; they must have a default branch |
+
+For JSON, the equivalent rules, which you must enforce yourself because nothing does it for you:
+
+- **Never remove or repurpose a field name.** Add new ones; deprecate old ones in documentation and
+  keep writing them until every reader is upgraded.
+- **Always ignore unknown fields on read.** Strict schema validation that rejects unknown keys makes
+  every additive change breaking. Pydantic's default (`model_config = ConfigDict(extra="ignore")`)
+  is the right one for a protocol; `extra="forbid"` is right for a config file and wrong here.
+- **Never change the type of an existing field**, including `"5"` → `5`. This bites JavaScript
+  clients hardest, and integers larger than 2⁵³ are silently corrupted by JS `JSON.parse` — send
+  large IDs as strings from day one.
+
+### Interaction styles
+
+| Style | Shape | Use when | Cost |
+|---|---|---|---|
+| **Request/response** | one message in, one out, correlated | Queries, commands with a result | The client must handle timeouts; needs a correlation id if pipelined |
+| **Streaming** | one request, many responses over time | Tailing logs, model token streaming, subscriptions | Needs back-pressure and an explicit end-of-stream marker |
+| **Pub-sub** | publish to a topic, N subscribers receive | Fan-out, events, chat rooms | Delivery semantics must be stated: at-most-once, at-least-once, exactly-once |
+| **Fire-and-forget** | send, no reply | Metrics, telemetry where loss is acceptable | You will not know it failed. State that this is intentional |
+
+**Correlation ids** are the detail that makes request/response work over a multiplexed connection.
+Without one, replies must arrive in request order, which forces serialisation. With one, the client
+sends `{"t":"GET","id":"7",...}` and matches the reply by `id`, so ten requests can be in flight.
+Every mature protocol has this: HTTP/2 stream ids, JSON-RPC `id`, AMQP correlation-id, and MCP's
+JSON-RPC request ids.
+
+### Back-pressure at the protocol level
+
+Module 3 covered kernel-level back-pressure (`await writer.drain()`). Protocol-level back-pressure is
+different and you need both: it lets a slow *application* tell a fast producer to stop, even when the
+kernel buffers are not full.
+
+Two standard mechanisms:
+
+- **Credit-based flow control.** The receiver grants the sender N messages of credit; the sender may
+  send N and then must wait for more. HTTP/2 and gRPC do this with `WINDOW_UPDATE` frames.
+- **Explicit pause/resume.** The receiver sends `PAUSE` and later `RESUME`. Simpler, but there is a
+  window in flight between the pause being sent and being honoured, so you still need a bounded
+  buffer.
+
+The rule: **an unbounded queue anywhere in your system is a latent OOM.** If you cannot apply
+back-pressure, you must drop, and you must decide *which* messages to drop and log it. "It never
+gets that far behind" is a prediction, not a design.
+
+### Trade-offs
+
+| Decision | Choose this when… | Choose the other when… | The number |
+|---|---|---|---|
+| **JSON** | Debuggability matters; heterogeneous clients; low volume | Bandwidth or CPU matters at volume | 113.8 B/msg and 4.44 µs to decode versus Protobuf's 47.8 B and 1.84 µs |
+| **MsgPack** | You want JSON's schemalessness with less size and faster decode | You want a schema, generated types, and a contract | 81.1 B/msg, 1.19 µs decode — the fastest decode measured here |
+| **Protobuf** | Cross-language contracts, evolution rules, high volume | Human debuggability; rapidly changing shapes; small scale | 47.8 B/msg — 2.4× smaller than JSON, at the cost of a build step |
+| **Text framing (newline)** | You want `nc` and `telnet` to work; payloads never contain newlines | Binary payloads, or large messages | Newline framing forces escaping and makes every read a scan |
+| **Length-prefix framing** | Almost always | You need a human to type the protocol by hand | 4 bytes per message; O(1) to find the boundary |
+
+### What breaks in the real world
+
+An internal event pipeline used JSON over a length-prefixed socket protocol, with a Pydantic model
+validating incoming messages using `extra="forbid"` — a habit carried over from configuration
+parsing, where it is correct.
+
+A producer team added an optional `trace_id` field to help with debugging. They tested against
+staging, where the consumer had already been updated. In production, the consumer was one deploy
+behind. Every message with a `trace_id` was rejected with a validation error, the consumer's error
+handler logged and skipped, and **1.4 million events were dropped over 40 minutes** before anyone
+noticed — the consumer was healthy, its dashboards were green, and the drop showed up only as a
+volume dip on a downstream chart.
+
+Three fixes, in order of importance: `extra="ignore"` on every message model that comes from the
+network; alerting on validation-failure rate, not just on process health; and a rule that additive
+schema changes deploy consumers first, producers second. That deployment ordering is the thing
+people forget, and it is the reason Protobuf's "unknown fields are preserved" behaviour is worth the
+build step.
+
+### Design checkpoint
+
+<Accordion title="Design the versioning strategy for a protocol used by a mobile app you cannot force-upgrade. Old clients may be around for years.">
+
+The constraint is the whole answer: **you cannot deprecate anything on a schedule you control**, so
+design for indefinite coexistence rather than for migration.
+
+**1. Version at the connection, not the message.** Negotiate once in `HELLO` (`min(client, server)`)
+and store the negotiated version in the session. Per-message version tags cost bytes on every message
+and let a client change version mid-stream, which nothing needs.
+
+**2. Additive-only changes, enforced in CI.** New fields get new numbers/names; nothing is removed or
+retyped. A CI check that diffs the schema against the previous release and fails on removal or type
+change turns a discipline into a guarantee. Protobuf gives you `reserved` for exactly this; for JSON
+you write the check yourself.
+
+**3. Capability flags, not version numbers, for features.** Instead of "v3 clients support
+attachments", send `{"caps": ["attachments", "reactions"]}` in `HELLO`. Then a client that supports
+attachments but not reactions is expressible, and you are not forced to release features in a total
+order. This matters enormously once you have more than one client platform shipping on different
+cycles.
+
+**4. Measure who is out there before you remove anything.** Log the negotiated version per session
+and put it on a dashboard. "We can drop v1 when it is under 0.1% of sessions for 30 days" is a
+decision rule; "v1 is old" is not.
+
+**5. Plan the forced-upgrade escape hatch on day one.** Add a `MUST_UPGRADE` error code and a minimum
+supported version in config, even though you will not use it for years. Retrofitting a way to
+politely refuse an ancient client, when the ancient client's error handling is whatever it shipped
+with, is much harder than including it at the start.
+
+The number that makes this concrete: if your app's long tail is 2% of users on a build older than 18
+months — which is typical for consumer mobile — then "we removed the v1 code path" means a 2% outage,
+and you will find out from app-store reviews.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim carries a measured or cited number. Serialisation figures are from the benchmark above:
+Python 3.13.2, msgpack 1.2.2, protobuf 7.36.0 (upb backend), 100,000 messages, Apple M3 Pro.
+</Warning>
+
+### How Protobuf actually encodes
+
+Every field is a **tag-length-value** or **tag-value** pair. The tag is a varint combining the field
+number and a 3-bit wire type:
+
+```
+tag = (field_number << 3) | wire_type
+```
+
+| Wire type | Meaning | Used by |
+|---|---|---|
+| 0 | Varint | int32, int64, uint32, uint64, bool, enum |
+| 1 | 64-bit fixed | double, fixed64 |
+| 2 | Length-delimited | string, bytes, embedded messages, packed repeated |
+| 5 | 32-bit fixed | float, fixed32 |
+
+**Varint** encoding uses 7 bits of payload per byte with the top bit as a continuation flag. So
+values 0–127 take one byte, 128–16383 take two, and so on. This is why `status: 200` costs 2 bytes in
+Protobuf (1 tag + 1 varint) and 14 bytes in JSON (`"status":200,`).
+
+Two consequences that decide schema design:
+
+- **Field numbers 1–15 encode their tag in one byte; 16–2047 take two.** Reserve 1–15 for your
+  highest-frequency fields. On a message sent a billion times a day, that single byte is a gigabyte.
+- **Negative `int32` values encode as 10 bytes** because varint treats them as very large unsigned
+  numbers. Use `sint32`/`sint64`, which zigzag-encode so that −1 is 1 byte. This is the most common
+  Protobuf performance bug and it is invisible until you look at message sizes.
+
+The reason unknown fields are safe: a reader that meets an unrecognised field number knows its wire
+type from the tag, so it knows exactly how many bytes to skip. **The encoding is self-describing
+enough to skip, without being self-describing enough to interpret.** That is the whole design.
+
+### Framing at scale: how HTTP/2 and gRPC actually do it
+
+gRPC does not invent a transport. It is:
+
+```
+HTTP/2 frame  ->  gRPC length-prefixed message  ->  Protobuf bytes
+```
+
+Each gRPC message on the wire is a 1-byte compression flag plus a 4-byte big-endian length, followed
+by the Protobuf payload — **structurally identical to the framing you built in Module 3**, layered
+inside HTTP/2's own framing. HTTP/2 adds stream multiplexing (many logical streams on one
+connection), `HEADERS` frames with HPACK compression, and `WINDOW_UPDATE` frames for credit-based
+flow control.
+
+The layering is worth internalising because it explains a class of bugs: HTTP/2's flow control
+window (default 65,535 bytes per stream) is separate from TCP's window, which is separate from your
+application's queue. A stall can occur at any of the three, and diagnosing "why did the stream stop"
+means checking all three. gRPC's default 4 MB max message size is a fourth limit, and the
+`RESOURCE_EXHAUSTED` error it produces is the most commonly hit gRPC error in practice.
+
+### WebSockets vs SSE vs long-polling vs gRPC streaming
+
+| | Direction | Framing | Reconnect | Through proxies | Cost |
+|---|---|---|---|---|---|
+| **SSE** (`text/event-stream`) | server → client only | newline-delimited text | built into the browser API, with `Last-Event-ID` | excellent — it is just HTTP | text only; ~6 connection limit per host on HTTP/1.1 |
+| **WebSocket** | bidirectional | binary frames, RFC 6455 | you implement it | needs `Upgrade` support; some proxies interfere | full duplex; no automatic reconnect |
+| **Long polling** | server → client, emulated | one HTTP response per message | inherent | works everywhere | one request per message; high overhead |
+| **gRPC streaming** | either or both | HTTP/2 frames | you implement it | needs HTTP/2 end to end; browsers need grpc-web | strongly typed; not natively browser-reachable |
+
+The under-appreciated point: **SSE is often the right answer for server-push.** Token streaming from
+an LLM, live dashboards, progress updates — all are unidirectional, and SSE gives you automatic
+reconnection with resume-from-last-id for free, over ordinary HTTP that every proxy understands.
+Reaching for WebSockets when you only push one way means implementing reconnection, heartbeats and
+resume yourself. That is precisely why the streamable-HTTP transport in MCP (Week 29) uses SSE for
+the server-to-client direction rather than a WebSocket.
+
+### At scale: what serialisation costs a real system
+
+Take a service handling 50,000 messages/second, using the measured numbers:
+
+| | JSON compact | MsgPack | Protobuf |
+|---|---|---|---|
+| Bandwidth | 113.8 B × 50k = **5.69 MB/s** (45.5 Mbit/s) | 4.06 MB/s (32.4 Mbit/s) | **2.39 MB/s** (19.1 Mbit/s) |
+| Decode CPU | 4.44 µs × 50k = **0.22 cores** | **0.06 cores** | 0.09 cores |
+| Encode CPU | 4.27 µs × 50k = 0.21 cores | 0.11 cores | 0.09 cores |
+| Egress cost at $0.09/GB (cross-region) | **$1,330/month** | $950/month | **$558/month** |
+
+The egress number is the one that decides real architecture arguments. Switching from JSON to
+Protobuf on this workload saves about **$770/month in cross-region transfer alone**, plus roughly
+0.25 of a core. Whether that is worth a build step and a loss of `curl`-ability depends entirely on
+your scale — at 500 messages/second it is $13/month and the answer is obviously no.
+
+**Do this arithmetic before the debate, not during it.** The format argument is one of the most
+reliably unproductive discussions in engineering, and it becomes a five-minute decision as soon as
+someone puts message rate, message size and egress price on the board.
+
+### Production failure modes
+
+| Failure | Signature | Detection |
+|---|---|---|
+| **Strict validation rejects new fields** | Consumer healthy, throughput drops, downstream volume dips | `extra="ignore"`; alert on validation-failure rate; deploy consumers before producers |
+| **Large integers corrupted in JS clients** | IDs off by small amounts above 9,007,199,254,740,991 | JS numbers are doubles; send IDs above 2⁵³ as strings |
+| **Negative ints cost 10 bytes in Protobuf** | Message sizes far above your estimate | Use `sint32`/`sint64` for values that can be negative |
+| **Field number reused after removal** | Data silently misinterpreted as the wrong field | `reserved 7;` / `reserved "old_name";` in the `.proto`, enforced by the compiler |
+| **Reconnect storm after an outage** | The service recovers, then immediately falls over again | Full jitter on backoff; also add a cap and a maximum concurrent-reconnect limit |
+| **Heartbeat interval longer than a NAT timeout** | Long-lived connections die after exactly 30/60/120 s of idle | Interval below the shortest NAT timeout on any path — 15 s is a safe default |
+| **Unbounded protocol queue** | Memory grows with one slow consumer attached | Credit-based flow control or explicit pause; bound the queue and decide the drop policy |
+| **gRPC `RESOURCE_EXHAUSTED`** | Large messages fail while small ones work | The 4 MB default max message size. Raise it deliberately, or paginate — usually paginate |
+
+### Frontier and further pointers
+
+- **Google, "Protocol Buffers" language guide (proto3) and encoding reference.** Takeaway: the
+  tag-length-value encoding with numeric field tags is what makes unknown fields skippable, which is
+  the entire basis of forward compatibility — read the encoding page, not just the language guide.
+- **RFC 6455 (WebSocket), WHATWG HTML "Server-sent events", RFC 9113 (HTTP/2).** Takeaway: HTTP/2's
+  per-stream flow-control window is independent of TCP's, which is why a gRPC stream can stall while
+  the TCP connection is idle — and why you must check both.
+- **M. Brooker, "Exponential Backoff and Jitter," AWS Architecture Blog (2015).** Takeaway:
+  simulations show full jitter (`sleep(random(0, backoff))`) both reduces peak server load and
+  completes the retry set *sooner* than un-jittered exponential backoff — the counterintuitive result
+  that makes jitter non-optional.
+- **M. Kleppmann, *Designing Data-Intensive Applications*, Chapter 4 ("Encoding and Evolution").**
+  Takeaway: forward and backward compatibility are separate properties with separate costs, and the
+  encoding you choose determines which of them you get for free.
+
+### Stretch challenge
+
+Design and implement **protocol version negotiation with capability flags**, then prove it works
+against a peer you cannot change.
+
+1. Implement `HELLO`/`WELCOME` with both a version number and a capability set. The server must
+   correctly serve: a v1 client with no capabilities, a v2 client with a capability the server does
+   not have, and a v2 client with a capability the server has but the *client* does not advertise
+   using.
+2. Write a conformance test suite that runs your current server against **recorded byte streams** from
+   an older version of your own client. Record them once, commit them, and run them in CI forever.
+   This is how real protocol teams prevent regressions, and it is much cheaper than keeping old
+   clients running.
+3. Now break it deliberately: change a field's type, remove a field, reuse a field number. Confirm
+   your CI catches all three. If it catches fewer than three, your compatibility check is decorative.
+4. Finally, measure the cost. What does negotiation add to connection setup in bytes and
+   milliseconds? Is per-message versioning ever worth it? (Compute the crossover: at what message
+   rate does a 2-byte per-message version tag cost more than the once-per-connection alternative
+   saves in complexity?)
+
+There is no single right answer to (4) — the interesting output is the crossover point for your own
+traffic pattern.
+
+</Tab>
+
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Benchmark JSON, MsgPack and Protobuf on 100,000 messages *of your own shape*: bytes on the wire,
+encode time, and decode time **including field access**. Then compute the monthly bandwidth and CPU
+cost at your target message rate.
+</Card>
+
+Reference numbers: 113.8 / 81.1 / 47.8 bytes per message, and 4.44 / 1.19 / 1.84 µs to decode with
+field access. If your Protobuf decode looks like 0.47 µs, you are measuring lazy parsing — touch a
+field.
+
+Then write `PROTOCOL.md` for your chat server: the message table, the state machine, the framing
+spec with byte offsets, the versioning rule, the heartbeat parameters, and the error codes.
+
+## The whiteboard
+
+<Tip>
+**Draw it yourself.** Draw the three bands (framing / encoding / semantics), then the same message
+drawn to scale in three formats with your measured sizes, then the old-client/new-server
+compatibility panel, then the backoff timeline with jitter.
+[Blank version](/assets/diagrams/p2-w10-m4-blank.svg) · [Editable source](/assets/diagrams/p2-w10-m4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Designed and documented a versioned wire protocol (`PROTOCOL.md`) with
+length-prefixed framing, capability negotiation, heartbeats and reconnect-with-jitter; benchmarked
+three serialisation formats on 100k messages (JSON 113.8 B / 4.44 µs, MsgPack 81.1 B / 1.19 µs,
+Protobuf 47.8 B / 1.84 µs) and justified the choice with bandwidth and CPU cost at target load."
+
+**The `PROTOCOL.md` is the differentiator.** Almost nobody writes one for a side project. It is one
+page, it takes an hour, and it demonstrates the thing employers cannot test for in a coding round:
+whether you think about the second version.
+
+**Interview:** the question is always "how would you add a field without breaking existing clients?"
+Answer with unknown-field skipping, additive-only rules, and the deployment ordering (consumers
+before producers). The deployment-ordering detail is what shows you have actually shipped one.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Check the `extra` policy on every model that parses network input.** If you use Pydantic,
+`extra="forbid"` on a message model is a production incident waiting for its trigger. It belongs on
+config, not on wire messages.
+
+**2. Do the egress arithmetic once for your busiest topic.** Message rate × bytes × 86,400 × 30 ×
+your egress price. If the answer is under $50/month, close the format debate. If it is over $1,000,
+you have a real decision and now you have the number for the ticket.
+
+**3. Audit your retry code for jitter.** Search for `sleep(2 ** attempt)` or a fixed retry interval.
+Un-jittered backoff is the single most common cause of a recovering service being knocked over again,
+and adding `random.uniform(0, backoff)` is a one-line change.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Consumers reject messages after a producer deploy | Strict schema validation on network input | Ignore unknown fields; deploy consumers first |
+| IDs subtly wrong in a JS client | Integers above 2⁵³ lose precision in `JSON.parse` | Serialise large IDs as strings |
+| Protobuf messages far larger than expected | Negative values in `int32`/`int64` fields encode as 10 bytes | Use `sint32`/`sint64` |
+| Service falls over again right after recovering | Un-jittered retry storm | Full jitter: `sleep(random.uniform(0, min(cap, base * 2**n)))` |
+| Long-lived connections die after exactly 60 s idle | Heartbeat interval exceeds a NAT mapping timeout | Interval ≤ 15 s; timeout at 2–3× the interval |
+| Memory grows with one slow consumer | No protocol-level back-pressure | Credit-based flow control or pause/resume, plus a bounded queue and an explicit drop policy |
+| A field's meaning silently changed | A removed field's number was later reused | `reserved` the number and the name; enforce in CI |
+| Compressing each small message makes traffic larger | Per-message gzip header/trailer overhead | Compress at the stream level, or only above a size threshold (measured: 114 B → 116 B) |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="Concept questions (8)">
+1. Name the three separable parts of a protocol. *(Framing, encoding, semantics.)*
+2. Why can a Protobuf reader skip a field it does not know? *(The tag encodes the wire type, so the reader knows how many bytes the field occupies without understanding it.)*
+3. Which is smaller and which decodes fastest, in the measured benchmark? *(Protobuf is smallest at 47.8 B/msg; MsgPack decodes fastest in Python at 1.19 µs with field access.)*
+4. Why is per-message gzip a loss on small messages? *(The header and trailer are ~20 bytes; measured 113.8 B became 115.9 B.)*
+5. What is full jitter and why does it finish faster? *(Sleeping a uniform random time in `[0, backoff]`; it disperses the herd so the server is not repeatedly overloaded, which lets the whole retry set complete sooner.)*
+6. Why negotiate version at the connection rather than per message? *(One negotiation instead of per-message overhead, and the session's version becomes a single well-defined piece of state.)*
+7. What should a missing version field mean? *(The oldest supported version — clients predating versioning cannot send one.)*
+8. Why does SSE often beat WebSockets for server push? *(It is ordinary HTTP so proxies handle it; the browser provides automatic reconnection with `Last-Event-ID` resume; and you only need one direction.)*
+</Accordion>
+<Accordion title="Coding challenge">
+Implement the chat protocol with version negotiation, capability flags, heartbeats and
+reconnect-with-jitter. Hidden tests: a v1 client must work against a v2 server and vice versa; an
+unknown message type must produce `ERROR` rather than a disconnect; a client that stops responding to
+`PING` must be disconnected within 3× the heartbeat interval; a declared message length above the
+limit must be rejected before allocation; and 100 simultaneous reconnects must show a spread of at
+least 2 seconds in their retry times.
+</Accordion>
+<Accordion title="Interview questions">
+- **Junior:** "How do you send structured messages over TCP?" *(Length-prefix framing plus a serialisation format, with a type tag in every message and a bounded maximum length.)*
+- **Mid:** "How do you add a field to a message format used by clients you cannot upgrade?" *(Additive-only with a new field number/name, readers ignore unknown fields, deploy consumers before producers, never reuse a removed number.)*
+- **Senior:** "Choose a serialisation format for a 50k msg/s cross-region pipeline. Defend it." *(Do the arithmetic: bandwidth, CPU and egress cost for each. Protobuf saves ~$770/month and 0.25 cores at this rate versus JSON — then weigh the build step, the loss of `curl`-ability, and whether the schema is stable enough to be worth a contract.)*
+</Accordion>
+<Accordion title="Draw it from memory">
+Draw the three protocol bands, the three-format size comparison to scale with your numbers, and the
+backoff-with-jitter timeline. Five minutes.
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+
+- [Protocol Buffers documentation: the proto3 language guide and the *Encoding* reference.](https://protobuf.dev/)
+  **Read this for:** varint and zigzag encoding, wire types, why field numbers 1–15 are cheaper, and
+  the exact list of compatible type changes.
+- [RFC 6455 (WebSocket Protocol), WHATWG HTML Living Standard §server-sent events, RFC 9113 (HTTP/2).](https://www.rfc-editor.org/rfc/rfc6455)
+  **Read this for:** frame layouts, the `Last-Event-ID` resume mechanism, and HTTP/2's per-stream
+  flow-control window, which is independent of TCP's.
+- [gRPC documentation on wire format and `max_receive_message_length`.](https://grpc.io/docs/) **Read this for:** the 5-byte
+  gRPC message prefix (compression flag plus 4-byte length) and the 4 MB default that causes most
+  `RESOURCE_EXHAUSTED` errors.
+
+**Papers**
+
+- [M. Brooker, "Exponential Backoff and Jitter," AWS Architecture Blog, 2015.](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/) **Takeaway:** full
+  jitter both lowers peak server load and reduces total time to complete a set of retries, compared
+  with plain exponential backoff — jitter is not a politeness feature, it is faster.
+- [S. Melnik et al., "Dremel: Interactive Analysis of Web-Scale Datasets," VLDB 2010.](https://doi.org/10.14778/1920841.1920886) **Takeaway:**
+  the repetition/definition-level encoding for nested records is why columnar formats can round-trip
+  Protobuf-shaped data losslessly — the bridge from this module to Parquet in Week 15.
+- [L. Lamport, "Time, Clocks, and the Ordering of Events in a Distributed System," CACM 1978.](https://doi.org/10.1145/359545.359563)
+  **Takeaway:** without a shared clock, ordering must be carried explicitly in messages — the reason
+  every serious protocol has sequence numbers or correlation ids rather than relying on arrival order.
+
+**Go deeper**
+
+- [M. Kleppmann, *Designing Data-Intensive Applications* (2017), Chapter 4, "Encoding and Evolution".](https://dataintensive.net/)
+  **Why:** the clearest treatment anywhere of forward versus backward compatibility, with worked
+  examples in JSON, Thrift, Protobuf and Avro, and the deployment-ordering rule that the war story
+  above violated.
+- [The Redis serialisation protocol (RESP) specification.](https://redis.io/docs/latest/develop/reference/protocol-spec/) **Why:** a complete, elegant, human-readable
+  protocol you can read in twenty minutes and implement in an afternoon — the best available example
+  of a real protocol that chose text framing deliberately and documented why.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p2/week-10/p2-w10-m4">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

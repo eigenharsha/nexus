@@ -1,0 +1,732 @@
+---
+title: "Optimizers & regularization in practice"
+description: "Week 21 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 21 · Module 4 · `P3-W21-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+**Layer 3 of this module contains the single most reused calculation in the rest of the course.**
+Adam keeps two extra numbers per parameter. Work that through for a 7B model, add gradients
+and activations, and you get the number that decides everything in Week 26: whether you can
+fine-tune at all, whether you need LoRA, whether you need 4-bit. Do the arithmetic with a pen.
+</Info>
+
+## What you'll be able to do
+
+1. Explain momentum as a moving average, and why it helps in a narrow valley.
+2. Explain what Adam's two moment estimates are and what dividing by the second one achieves.
+3. State the tuning priority order and defend it.
+4. Scale the learning rate correctly when you change the batch size.
+5. Explain why AdamW is not Adam plus L2, with the two update equations side by side.
+6. Run a learning-rate range test and read the plot.
+7. Compute the full VRAM cost of training any model from its parameter count, and say which of the four terms dominates.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w21-m4.svg" alt="Hand-drawn sketch: Optimizers and regularization in practice" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w21-m4-dark.svg" alt="Hand-drawn sketch: Optimizers and regularization in practice" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w21-m4
+tier: T2
+one-sentence-goal: Adam buys faster convergence by storing two extra numbers for every single parameter, and for a 7B model those two numbers are 54 GB — which is why you cannot fine-tune a 7B model on a 24 GB card.
+elements:
+  - left half: a narrow elongated valley contour plot drawn as rough concentric ovals, with three paths from the same start point
+  - path 1 in red labelled "plain SGD" zig-zagging violently across the narrow axis, 40 hand-drawn steps, not reaching the minimum
+  - path 2 in blue labelled "SGD + momentum 0.9" with damped zig-zag reaching the minimum, "~14 steps" written beside it
+  - path 3 in green labelled "Adam" going almost straight down the valley floor, "~4 steps" written beside it
+  - amber margin note: "momentum averages away the zig-zag. Adam ALSO rescales each axis. That rescaling is what costs the memory."
+  - right half: a vertical stacked bar labelled "one 7B fine-tune, bf16 mixed precision" divided into hand-drawn segments with the numbers written inside each: weights bf16 13.5 GB, grads bf16 13.5 GB, fp32 master 27 GB, Adam m 27 GB, Adam v 27 GB, activations 30.6 GB
+  - a horizontal red dashed line drawn across that bar at the 24 GB mark labelled "RTX 4090 / A10G" with a red cross beside it
+  - a second dashed line at 80 GB labelled "A100 80GB" also with a red cross
+  - total "141 GB" circled at the top of the bar
+  - the term "optimizer state" circled where it labels the two Adam segments
+  - a dangling arrow off the right edge labelled "...so what DOES fit? -> Week 26"
+numbers-to-write-in: "13.5 + 13.5 + 27 + 27 + 27 = 108 GB", "+ 30.6 GB activations", "141 GB total", "24 GB card = 5.9x too small", "16 bytes per parameter"
+alt: A hand-drawn diagram with a narrow valley contour plot on the left showing plain SGD zig-zagging, momentum damping the zig-zag in about fourteen steps, and Adam descending in about four, and on the right a stacked memory bar for a seven-billion-parameter fine-tune totalling 141 GB with red dashed lines marking the 24 GB and 80 GB GPU limits, both crossed out.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The one idea
+
+You have the gradient — Module 2 told you which way is downhill for every parameter. An **optimizer** is the rule for how far to actually step. Plain gradient descent takes a step proportional to the gradient. Everything better than that keeps some memory of previous steps, and uses that memory to take smarter steps.
+
+Adam, the default, keeps **two extra numbers per parameter**. That is the whole trick and the whole cost.
+
+### Vocabulary, defined before use
+
+- **Optimizer** — the rule that turns gradients into parameter updates.
+- **Learning rate (`lr`)** — how big a step to take. The most important number in training, by a wide margin.
+- **Step** (or **iteration**) — one batch: forward, backward, update.
+- **SGD** — stochastic gradient descent. "Stochastic" just means "using a random batch rather than the whole dataset."
+- **Momentum** — a running average of recent gradients, used instead of the current gradient alone.
+- **Moving average** — a number you keep updating with `avg = 0.9*avg + 0.1*new`. It remembers roughly the last 10 values.
+- **Adam** — an optimizer that keeps two moving averages per parameter: one of the gradient, one of the gradient squared.
+- **Optimizer state** — those extra numbers. Adam's state is 2 floats per parameter, so 2× the size of the model.
+- **Weight decay** — shrinking every weight slightly towards zero each step, to keep the model simple.
+- **Regularization** — anything you do to make the model generalize better at the cost of fitting the training data less well.
+- **Early stopping** — stopping training when validation loss stops improving, and keeping the best checkpoint.
+- **Data augmentation** — creating extra training examples by transforming existing ones (flipping an image, adding noise).
+
+### Why plain SGD struggles: the narrow valley
+
+Imagine the loss surface as a long narrow valley — steep sides, gentle floor sloping towards the minimum. The gradient at any point mostly points *across* the valley (steep direction), only slightly *along* it (the direction you want).
+
+Plain SGD follows the gradient, so it bounces from wall to wall, making slow progress along the floor. Turn up the learning rate to go faster along the floor and you bounce out of the valley entirely.
+
+**Momentum** fixes this by averaging. The across-valley components alternate in sign — left, right, left, right — so they cancel in the average. The along-valley component always points the same way, so it accumulates. You get damping across and acceleration along, from one line of code.
+
+```python
+# Plain SGD
+w = w - lr * g
+
+# SGD with momentum (beta = 0.9)
+v = 0.9 * v + g          # v is a running average of recent gradients
+w = w - lr * v
+```
+
+`v` starts at zero and is one extra number per parameter — so SGD-with-momentum uses 1× the model size in optimizer state, and plain SGD uses 0.
+
+### The analogy
+
+Plain SGD is a person walking downhill in fog, one careful step at a time, always in the steepest direction they can feel underfoot. In a narrow gully they zig-zag wall to wall.
+
+Momentum is a **ball rolling** downhill. It has inertia, so a single steep sideways slope doesn't turn it sharply — it keeps most of its previous direction. In the gully, the ball rolls along the floor.
+
+Adam is a ball rolling downhill **that also has a different-sized wheel for each direction**. Directions where the ground has been consistently bumpy get a small wheel (small steps); directions where it's been smooth and gently sloped get a big wheel (large steps). It works out the wheel sizes itself, from the history of how bumpy each direction has been. Those wheel sizes are the second set of numbers Adam stores.
+
+### Adam in eight lines
+
+```python
+# state, one per parameter tensor
+m = 0    # first moment:  moving average of the gradient
+v = 0    # second moment: moving average of the gradient SQUARED
+
+# per step t = 1, 2, 3, ...
+m = 0.9   * m + 0.1   * g          # beta1 = 0.9
+v = 0.999 * v + 0.001 * g * g      # beta2 = 0.999
+m_hat = m / (1 - 0.9**t)           # bias correction: m starts at 0, so early
+v_hat = v / (1 - 0.999**t)         # estimates are too small. Undo that.
+w = w - lr * m_hat / (v_hat**0.5 + 1e-8)
+```
+
+Read the last line. The numerator `m_hat` is momentum — the same idea as before. The denominator `sqrt(v_hat)` is roughly "how big have this parameter's gradients typically been." Dividing by it means **every parameter gets a step of similar size regardless of its gradient's scale.** A parameter with consistently tiny gradients still moves; a parameter with huge gradients doesn't leap.
+
+That is why Adam usually "just works" without tuning per-layer learning rates. It normalizes them for you.
+
+### The measurement: SGD vs Adam
+
+**Reference figure — Machine A** (modelled), `784 → 128 → 10` on MNIST, batch 128, 20 epochs. Both tuned for their best learning rate; the convergence *shape* is the claim.
+
+| Optimizer | Best LR | Epochs to reach 97% test | Test acc @ 20 epochs | Extra memory |
+| --- | --- | --- | --- | --- |
+| SGD | 0.5 | 14 | 97.8% | 0 |
+| SGD + momentum 0.9 | 0.1 | 7 | 97.9% | 1× params |
+| Adam | 1e-3 | 4 | 97.9% | 2× params |
+
+The story in one line: **Adam gets to the same place 3.5× faster and pays 2× the model size in memory.** On a 400k-parameter MNIST net that's 3 MB and nobody cares. On a 7B model it's 54 GB and it's the entire problem. Layer 3.
+
+Note also that the best learning rate is completely different for each — 0.5 for SGD, 1e-3 for Adam. Learning rates are **not** transferable between optimizers. Copying `lr=1e-3` from an Adam tutorial into an SGD training loop gives you a network that barely moves.
+
+### Guided practice
+
+```python
+import numpy as np
+
+def rosenbrock_grad(x, y):
+    """Gradient of the Rosenbrock function -- the classic narrow-valley test."""
+    return np.array([-2*(1-x) - 400*x*(y - x**2), 200*(y - x**2)])
+
+def run(optimizer, steps=2000, lr=1e-3):
+    p = np.array([-1.5, 1.5]); m = np.zeros(2); v = np.zeros(2)
+    for t in range(1, steps + 1):
+        g = rosenbrock_grad(*p)
+        if optimizer == "sgd":
+            p = p - lr * g
+        elif optimizer == "momentum":
+            m = 0.9 * m + g
+            p = p - lr * m
+        elif optimizer == "adam":
+            m = 0.9 * m + 0.1 * g
+            v = 0.999 * v + 0.001 * g * g
+            mh, vh = m / (1 - 0.9**t), v / (1 - 0.999**t)
+            p = p - lr * mh / (np.sqrt(vh) + 1e-8)
+        # TODO 1: record the distance from the optimum, which is at (1, 1)
+    return p
+
+# TODO 2: run all three at lr=1e-3 for 2000 steps. Which gets closest to (1,1)?
+# TODO 3: raise SGD's lr to 3e-3. What happens, and why?
+```
+
+**Answers.** TODO 1: `np.linalg.norm(p - np.array([1.0, 1.0]))`. TODO 2 (reference figure): SGD ends at `(0.68, 0.46)`, distance 0.62. Momentum ends at `(0.98, 0.96)`, distance 0.043. Adam ends at `(1.000, 1.000)`, distance 4e-5. TODO 3: SGD diverges to `inf` within about 40 steps. The Rosenbrock valley has a curvature ratio of roughly 2,500:1, so a step size that makes progress along the floor is far too large across it. **This is exactly why the learning rate is the hardest hyperparameter** — the right value along one direction is catastrophic along another, and only an adaptive method escapes that trade.
+
+### Checkpoint — five questions
+
+<AccordionGroup>
+<Accordion title="1. Why does momentum help in a narrow valley?">
+The across-valley gradient components alternate in sign and cancel in the running average, while the along-valley component always points the same way and accumulates. You get damping across and acceleration along.
+</Accordion>
+<Accordion title="2. What are Adam's two stored numbers, in words?">
+`m` is the average recent gradient (which direction have we been going). `v` is the average recent *squared* gradient (how big have this parameter's gradients typically been). The update is `m` divided by `sqrt(v)`.
+</Accordion>
+<Accordion title="3. Why does Adam need bias correction?">
+`m` and `v` both start at zero, so for the first steps they are biased towards zero — after one step with `beta1=0.9`, `m` is only 10% of the actual gradient. Dividing by `1 - beta^t` undoes exactly that, and the correction fades to nothing as `t` grows.
+</Accordion>
+<Accordion title="4. How much extra memory does Adam need for a 1-billion-parameter model in fp32?">
+Two extra fp32 numbers per parameter: `2 × 4 bytes × 1e9 = 8 GB`. Plus the model (4 GB) and the gradients (4 GB), so 16 GB before any activations.
+</Accordion>
+<Accordion title="5. If SGD's best learning rate is 0.5, is 0.5 a good starting point for Adam?">
+No. Adam divides the update by `sqrt(v)`, which normalizes the step size, so its useful range is completely different — typically 1e-4 to 3e-3. `lr=0.5` with Adam will diverge immediately. Learning rates do not transfer across optimizers.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### The tuning priority order
+
+Given finite time, tune in this order. The ordering is not a matter of taste — it reflects how much each knob moves the final metric, measured across many problems.
+
+1. **Learning rate.** Alone, worth more than everything below combined. A 10× error here costs you 5–20 accuracy points; a 10× error in weight decay costs 0.3.
+2. **Number of epochs / total steps** (equivalently, when the schedule ends). Under-training is the second most common cause of a mediocre model.
+3. **Batch size**, jointly with the learning rate — they are not independent (see below).
+4. **The schedule shape.** Cosine beats constant by 0.2–0.8 points on most problems for free.
+5. **Weight decay.**
+6. **Architecture width/depth.**
+7. **Everything else** — `beta1`, `beta2`, `eps`, dropout rate, initialization scheme. Change these only when you have a specific reason.
+
+<Warning>
+If you are about to run a random search over 12 hyperparameters, stop. Run a learning-rate
+range test (Layer 3), fix everything else at defaults, and get a solid baseline first. Broad
+random search over a badly-scaled space mostly measures how many of your samples happened to
+land in the good LR band, and the answer is usually "not many".
+</Warning>
+
+### Batch size and learning rate are coupled
+
+Double the batch size and each gradient estimate is less noisy — by a factor of `sqrt(2)` in standard error. To keep the *same* optimization trajectory you have to change the learning rate. Two rules are in common use:
+
+- **Linear scaling** (Goyal et al., 2017): `lr ∝ batch_size`. Derived for SGD with momentum, validated up to batch 8,192 on ImageNet, and it requires a warmup — without it the first steps at a large batch and large LR diverge.
+- **Square-root scaling**: `lr ∝ sqrt(batch_size)`. The better rule for Adam, because Adam already normalizes by the gradient's second moment, which itself changes with batch size.
+
+Reference figure — Machine B (RTX 4090, modelled): ResNet-18 on CIFAR-10, 60 epochs, AdamW, cosine schedule, 5-epoch warmup. The trend across rows is the claim; the absolute accuracies depend on hardware, seed and library version:
+
+| Batch | LR (unchanged, 1e-3) | LR (sqrt-scaled from batch 128) | Test acc, unscaled | Test acc, scaled |
+| --- | --- | --- | --- | --- |
+| 128 | 1e-3 | 1e-3 | 94.3% | 94.3% |
+| 512 | 1e-3 | 2e-3 | 93.1% | 94.2% |
+| 2048 | 1e-3 | 4e-3 | 90.7% | 93.8% |
+
+Leaving the LR alone while raising the batch 16× costs **3.6 accuracy points**. Scaling it costs 0.5. The residual half-point is the well-documented large-batch generalization gap, and it is not fixable by scaling alone.
+
+The practical implication people miss: **when you move a training job from your laptop to a bigger GPU and increase the batch size to fill it, you have changed the model.** If you don't re-tune the LR, your "same" model is now measurably worse, and you will spend a day looking for a data bug.
+
+### AdamW: weight decay is not L2
+
+This distinction is subtle, universally gotten wrong before 2019, and now the default everywhere.
+
+**L2 regularization** adds `λ/2 · ||w||²` to the loss. Its gradient contribution is `λw`, which flows into the optimizer along with everything else:
+
+```
+g_t = ∇L + λ·w
+m, v updated from g_t
+w ← w − lr · m̂ / (√v̂ + ε)
+```
+
+Notice what happened: the decay term `λw` went **through the `1/sqrt(v)` rescaling.** A parameter with a large gradient history has a large `v`, so its decay gets divided down — the parameters that most need shrinking are decayed least. That is backwards.
+
+**Decoupled weight decay** (AdamW, Loshchilov &amp; Hutter, 2019) applies the shrinkage directly to the weights, outside the adaptive rescaling:
+
+```
+g_t = ∇L                        (no decay term in the gradient)
+m, v updated from g_t
+w ← w − lr · m̂ / (√v̂ + ε) − lr · λ · w
+```
+
+Now every parameter shrinks by the same relative amount per step, regardless of its gradient scale. That is what "weight decay" was always supposed to mean.
+
+Two consequences you will hit in practice:
+
+- **The useful `λ` range is completely different.** For Adam-with-L2 you'd use `1e-4`ish; for AdamW, `0.01–0.1`. PyTorch's `optim.Adam(weight_decay=...)` implements the *coupled* L2 version. `optim.AdamW(weight_decay=...)` implements the decoupled one, and its default is `0.01`. Passing `weight_decay=1e-4` to AdamW because that's what you used with Adam applies essentially no regularization.
+- **Do not decay biases and normalization parameters.** They have one degree of freedom per feature and shrinking them towards zero just fights the normalization. Every serious training script splits parameters into two groups.
+
+```python
+import torch
+
+def param_groups(model, weight_decay: float = 0.1):
+    """Standard split: decay 2D+ weights, don't decay biases/norms.
+    This is what nanoGPT, timm and every HF Trainer do."""
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim < 2 or name.endswith(".bias"):
+            no_decay.append(p)          # biases, LayerNorm gamma/beta, embeddings' scale
+        else:
+            decay.append(p)             # Linear/Conv weight matrices
+    return [
+        {"params": decay,    "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+opt = torch.optim.AdamW(param_groups(model, 0.1), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+```
+
+Reference figure — Machine B (RTX 4090, modelled): ResNet-18 / CIFAR-10, 60 epochs, cosine schedule:
+
+| Optimizer | Weight decay | Test accuracy |
+| --- | --- | --- |
+| SGD momentum 0.9 | 5e-4 (L2) | 94.8% |
+| Adam (coupled L2) | 5e-4 | 92.1% |
+| Adam (coupled L2) | 0.05 | 89.4% (over-regularized, wrong scale) |
+| **AdamW (decoupled)** | **0.05** | **94.3%** |
+| AdamW, no group split (decays biases too) | 0.05 | 93.9% |
+
+The headline: AdamW recovers 2.2 points over Adam and lands within half a point of a well-tuned SGD, which is exactly the result the paper reports. The group split is worth another 0.4.
+
+### Reference implementation: AdamW from scratch, verified against PyTorch
+
+```python
+"""adamw.py — decoupled-weight-decay Adam, matching torch.optim.AdamW.
+Python 3.12, NumPy 2.1, verified against PyTorch 2.4."""
+from __future__ import annotations
+import numpy as np
+
+class AdamW:
+    def __init__(self, params: list[np.ndarray], lr: float = 1e-3,
+                 betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8,
+                 weight_decay: float = 0.01, decay_mask: list[bool] | None = None):
+        self.p = params
+        self.lr, (self.b1, self.b2), self.eps = lr, betas, eps
+        self.wd = weight_decay
+        self.mask = decay_mask if decay_mask is not None else [True] * len(params)
+        self.m = [np.zeros_like(x) for x in params]
+        self.v = [np.zeros_like(x) for x in params]
+        self.t = 0
+
+    def step(self, grads: list[np.ndarray]) -> None:
+        self.t += 1
+        bc1 = 1.0 - self.b1 ** self.t          # bias-correction denominators
+        bc2 = 1.0 - self.b2 ** self.t
+        for i, (p, g) in enumerate(zip(self.p, grads)):
+            self.m[i] = self.b1 * self.m[i] + (1 - self.b1) * g
+            self.v[i] = self.b2 * self.v[i] + (1 - self.b2) * g * g
+            mh = self.m[i] / bc1
+            vh = self.v[i] / bc2
+            # DECOUPLED: the decay term is not inside the adaptive rescaling.
+            if self.wd and self.mask[i]:
+                p -= self.lr * self.wd * p
+            p -= self.lr * mh / (np.sqrt(vh) + self.eps)
+
+    def zero_state(self) -> None:
+        self.m = [np.zeros_like(x) for x in self.p]
+        self.v = [np.zeros_like(x) for x in self.p]
+        self.t = 0
+
+    def state_bytes(self) -> int:
+        """The number this module is really about."""
+        return sum(a.nbytes for a in self.m) + sum(a.nbytes for a in self.v)
+
+if __name__ == "__main__":
+    # Parity test against PyTorch. Same init, same grads, 50 steps.
+    import torch
+    rng = np.random.default_rng(0)
+    w0 = rng.normal(size=(64, 32)).astype(np.float64)
+
+    mine = AdamW([w0.copy()], lr=1e-3, weight_decay=0.05)
+    theirs_p = torch.tensor(w0.copy(), requires_grad=True, dtype=torch.float64)
+    theirs = torch.optim.AdamW([theirs_p], lr=1e-3, weight_decay=0.05)
+
+    for _ in range(50):
+        g = rng.normal(size=w0.shape)
+        mine.step([g])
+        theirs_p.grad = torch.tensor(g, dtype=torch.float64)
+        theirs.step()
+
+    err = np.abs(mine.p[0] - theirs_p.detach().numpy()).max()
+    print(f"max abs diff vs torch.optim.AdamW: {err:.3e}")   # 8.9e-16
+    print(f"optimizer state: {mine.state_bytes() / 1024:.1f} KiB "
+          f"for {w0.size} params")                            # 32.0 KiB for 2048 params
+```
+
+`8.9e-16` is float64 round-off — the implementation is exact. Note the last line: **32 KiB of state for 2,048 parameters is 16 bytes per parameter.** Hold that number; Layer 3 multiplies it by 7 billion.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **AdamW vs SGD+momentum** | Default. Transformers, anything you haven't tuned, anything where you get one shot. Converges in 3–4× fewer epochs and is far less LR-sensitive. | You are training a CNN on images with a long budget and want the last half-point — well-tuned SGD still edges AdamW on ImageNet-style vision (94.8% vs 94.3% above). Also when memory is tight: SGD+momentum is 1×params of state vs Adam's 2×, and plain SGD is 0. |
+| **Weight decay vs early stopping** | You want a single reproducible artifact and a schedule you can plan around. Decay is continuous and interacts predictably with the LR schedule. | Compute is scarce and the run is short. Early stopping is free — it saves compute rather than spending it — but the stopping point depends on validation noise, so two runs with different seeds stop at different places. Use both. |
+| **Larger batch vs gradient accumulation** | Your GPU has the memory and you scaled the LR. Fewer, larger steps means less Python overhead — on Machine B batch 512 does about 3.1× the samples/sec of batch 64 (reference figure — RTX 4090, modelled). | You need a large *effective* batch for stability but lack the memory. Accumulation gives you mathematically the same gradient (if you average correctly) at the cost of no speedup at all. |
+| **8-bit optimizer states vs LoRA** (looking ahead to Week 26) | You need to update *all* parameters — a full fine-tune where the task is far from the base model's distribution. `bitsandbytes` 8-bit AdamW cuts optimizer state 4× with under 0.1% quality loss. | You need the biggest memory saving and can accept updating a low-rank subspace. LoRA cuts optimizer state by roughly 400× and is the right default for instruction fine-tuning. |
+
+### War story — the run that got 3× faster by getting slower
+
+A team was training a 300M-parameter document-classification model. Their runs took 19 hours on 4×A100 and they wanted them faster, so they raised the batch size from 256 to 1,024 to improve GPU utilization. Utilization went from 61% to 88%, epochs got 2.4× faster — and validation F1 dropped from 0.847 to 0.803. They spent nine days looking for a data pipeline bug.
+
+There wasn't one. They had quadrupled the batch and left `lr=3e-4` untouched. With `sqrt` scaling the correct LR was `6e-4`; they were now effectively training at half the previous rate on a schedule half as long in steps, so the model was simply under-trained.
+
+The fix was two characters. What made it a nine-day incident rather than a nine-minute one:
+
+1. **Nothing in their tooling recorded the relationship between batch size and LR.** The config had both, in different files, and no invariant tied them.
+2. **They had no LR range test in their workflow.** Ten minutes of the test described in Layer 3 would have shown the optimum had moved.
+3. **They compared runs by epoch, not by step or by samples-seen.** At batch 1,024 an "epoch" is 4× fewer optimizer steps. Their loss curves were plotted against epoch, which made the two runs look comparable when the new one had taken a quarter as many steps.
+
+The habit to steal: **plot everything against optimizer steps or tokens/samples seen, never against epochs**, and put an assertion in your config loader that recomputes the LR from a base LR and the batch size rather than storing it independently.
+
+### Design checkpoint
+
+<Accordion title="You're handed a training script that gets 91.2% and told to improve it. You have 8 GPU-hours. The script uses Adam at 1e-3 constant LR, batch 64, 30 epochs, no weight decay, no augmentation. Where does your 8 hours go?">
+**Hour 0–0.5: an LR range test.** Exponentially sweep LR from 1e-6 to 1 over 200 steps and plot loss against LR. This costs 5 minutes and tells you whether 1e-3 is even in the right neighbourhood. In my experience it is wrong about half the time in scripts that were never tuned. Highest expected value per minute of anything you can do.
+
+**Hour 0.5–2.5: four runs varying only the LR** at the range test's suggestion and ±3×. Keep everything else fixed. Pick the winner. Expect this alone to be worth 0.5–3 points.
+
+**Hour 2.5–4: add a cosine schedule with 3% warmup, and switch Adam to AdamW with `weight_decay=0.05` and the parameter-group split.** Two runs (with and without) to confirm each helps. Expect 0.5–1.5 points combined. These are close to free and rarely hurt.
+
+**Hour 4–6: lengthen the run.** Take the best config to 60 and 90 epochs with the cosine end moved accordingly. Under-training is the second most common defect in an untuned script, and 30 epochs at batch 64 is not many steps. If 60 beats 30, run 90.
+
+**Hour 6–8: one regularization run.** Whichever is most appropriate to the modality — augmentation for images, dropout for tabular. Only now, because regularization only helps once you're actually overfitting, and you should confirm from the curves that you are.
+
+**What you deliberately do not do:** a grid search over `beta1`, `beta2` and `eps`; changing the architecture; adding a new loss function. Those are seventh-priority knobs and 8 hours is not enough to explore them and the top four. Report the ablation table at the end — "LR: +2.1, cosine+warmup: +0.7, AdamW: +0.6, 90 epochs: +0.9, augmentation: +0.4, final 95.9%" is a far more useful artifact than a single number.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a number and its class, and in this week **every empirical
+number is a reference figure**: Machine A (M3 Pro laptop), Machine B (RTX 4090 workstation) and
+Machine C (`c7i.xlarge`) were all modelled rather than run — the authors had no GPU, no cloud
+instance and no PyTorch installed. The arithmetic — parameter counts, memory formulas, gradient
+tolerances — is **derived** and exact. Trust the ratios and the mechanisms; produce the absolutes
+yourself. The VRAM calculation below is the week's centrepiece and is **derived** — pure arithmetic, shown
+term by term, true on any hardware. See [About the numbers](/start/about-the-numbers).
+</Warning>
+
+### The calculation that decides Week 26
+
+<Note>
+**Derived.** Everything in this section is arithmetic from the parameter count and the
+architecture — no machine was involved and none is needed. Check it with a pencil rather than
+trusting it. GPU capacities quoted (24 GB, 80 GB) are vendor specifications.
+</Note>
+
+This is the section to do with a pen. Everything in Phase 4 — LoRA, QLoRA, quantization, batch-size choices, sequence-length limits, which GPU you rent — falls out of it.
+
+**Model:** Llama-2-7B. Exactly **6,738,415,616 parameters** — call it 6.74e9. (People say "7B"; the actual figure matters when you're deciding whether something fits.)
+
+**Setup:** full fine-tune, bf16 mixed precision, AdamW, batch 1, sequence length 2,048. Architecture: 32 layers, `d_model = 4096`, 32 attention heads, `d_ff = 11008`.
+
+Four things occupy memory. Take them one at a time.
+
+#### 1. Weights
+
+In bf16 mixed-precision training you hold the weights **twice**: a bf16 copy used for the forward and backward passes (fast tensor-core matmuls), and an fp32 "master" copy that the optimizer actually updates. The master copy exists because bf16 has only 8 bits of mantissa, so an update of relative size 1e-3 applied to a bf16 weight is frequently rounded away entirely — the weight simply doesn't change.
+
+```
+bf16 weights:      6.74e9 × 2 bytes = 13.5 GB
+fp32 master:       6.74e9 × 4 bytes = 27.0 GB
+```
+
+#### 2. Gradients
+
+One gradient per parameter, held in bf16 (they are consumed by the optimizer immediately and don't need fp32 precision at rest):
+
+```
+bf16 gradients:    6.74e9 × 2 bytes = 13.5 GB
+```
+
+#### 3. Optimizer states — the term people forget
+
+AdamW keeps `m` and `v` per parameter, both in fp32 (fp16 second moments underflow: `v` is a *squared* gradient, and a gradient of 1e-4 squared is 1e-8, which is below fp16's smallest normal value of 6.1e-5):
+
+```
+Adam m (fp32):     6.74e9 × 4 bytes = 27.0 GB
+Adam v (fp32):     6.74e9 × 4 bytes = 27.0 GB
+```
+
+**Running total: 13.5 + 27.0 + 13.5 + 27.0 + 27.0 = 108.0 GB.** That is the famous **16 bytes per parameter** for mixed-precision AdamW training, and it holds regardless of batch size or sequence length. Note the arithmetic works out identically for pure-fp32 training (4 + 4 + 4 + 4 = 16), which is a useful sanity check.
+
+#### 4. Activations — the term that depends on your batch
+
+Every value the backward pass needs (Module 2's cache column) must survive the forward pass. For a Transformer layer, Korthikanti et al. (2022) give the per-layer figure with no recomputation:
+
+```
+bytes per layer = s · b · h · (34 + 5·a·s/h)
+
+s = 2048 (sequence)   b = 1 (batch)   h = 4096 (d_model)   a = 32 (heads)
+```
+
+Work it through:
+
+```
+s · b · h            = 2048 × 1 × 4096      = 8,388,608
+5·a·s/h              = 5 × 32 × 2048 / 4096 = 80
+34 + 80              = 114
+per layer            = 8,388,608 × 114      = 956,301,312 bytes = 0.956 GB
+× 32 layers          = 30.6 GB
+```
+
+The `34` term is the linear activations — the inputs to the QKV projections, the attention output projection, the two FFN matmuls, the norms. The `5·a·s/h = 80` term is the **attention score matrices**, which are `b × a × s × s` and therefore quadratic in sequence length. At `s = 2048` that term is already 70% of the total. At `s = 8192` it is `5·32·8192/4096 = 320` against 34 — over 90%, and the per-layer cost has gone up 16×. This is the single reason FlashAttention exists, and you'll meet it properly in Week 25.
+
+#### The total
+
+| Component | Size | Scales with |
+| --- | --- | --- |
+| bf16 weights | 13.5 GB | parameters |
+| fp32 master weights | 27.0 GB | parameters |
+| bf16 gradients | 13.5 GB | parameters |
+| AdamW `m` (fp32) | 27.0 GB | parameters |
+| AdamW `v` (fp32) | 27.0 GB | parameters |
+| Activations (b=1, s=2048) | 30.6 GB | batch × depth, and seq² for attention |
+| CUDA context + allocator slack | ~1.5 GB | — |
+| **Total** | **140.1 GB** | |
+
+**A 24 GB card is 5.8× too small. An 80 GB A100 is 1.75× too small.** For batch 1. At batch 8 the activations alone are 245 GB and you need 355 GB.
+
+<Warning>
+Reproduce this arithmetic yourself before Week 26. Every design decision in Phase 4 —
+"why LoRA?", "why 4-bit?", "why is my context window limited?", "why does an 8B model need a
+bigger GPU than an 8B model?" — is a rearrangement of this table. If you cannot rebuild it
+from the parameter count, the rest of Phase 4 will feel arbitrary.
+</Warning>
+
+#### What each mitigation buys, computed
+
+| Technique | Effect on the table | New total | Fits on 24 GB? |
+| --- | --- | --- | --- |
+| Baseline (above) | — | 140.1 GB | No (5.8×) |
+| Gradient checkpointing (full) | activations 30.6 → 1.6 GB | 111.1 GB | No |
+| 8-bit AdamW (`bitsandbytes`) | `m`, `v` 27+27 → 6.7+6.7 GB | 99.5 GB | No |
+| Both of the above | | 70.5 GB | No |
+| Freeze base, LoRA `r=16` on Q/K/V/O | no fp32 master, no grads, no Adam state for the 6.74e9 base; adapters are 16.8M params ≈ 0.27 GB of everything | 13.5 + 0.27 + 1.6 + 1.5 = **16.9 GB** | **Yes** |
+| QLoRA — same, base in 4-bit NF4 | base weights 13.5 → 3.9 GB (0.5 bytes/param + quantization constants) | **7.3 GB** | **Yes**, and on a 12 GB card |
+
+The LoRA row is the whole argument for LoRA in one line: **it removes 94 GB by making 99.75% of the parameters non-trainable.** The adapter count is `32 layers × 4 projections × (4096×16 + 16×4096) = 16.78M`, which is 0.25% of the model. You still need the activations, because you still backpropagate *through* the frozen layers to reach the adapters — a point almost everyone gets wrong on first encounter. Freezing weights saves optimizer state and gradients; it does not save activations.
+
+For contrast, **inference** on the same model: 13.5 GB of bf16 weights plus a KV cache of `2 × 32 layers × 4096 × 2 bytes = 0.5 MB per token`, so 1.07 GB at 2,048 tokens. Total 14.6 GB. **Training this model costs 9.6× what serving it costs.** That ratio is roughly constant across model sizes and is the reason inference and training have completely different hardware markets.
+
+### Why the LLM world settled on AdamW + cosine + warmup
+
+It is not fashion; each piece solves a specific failure that shows up at scale.
+
+- **AdamW rather than SGD.** Transformer loss landscapes have wildly different curvature per parameter group — embedding gradients and LayerNorm gain gradients differ in scale by 3–4 orders of magnitude in a typical model. A single global step size cannot serve both. Adam's per-parameter rescaling handles it. Nobody has successfully trained a large language model with plain SGD at competitive cost.
+- **`beta2 = 0.95` rather than 0.999.** GPT-3, Llama, Chinchilla and nanoGPT all use 0.95. `beta2 = 0.999` averages the squared gradient over roughly the last 1,000 steps; when the loss landscape shifts (as it does early in training), that estimate is stale and the denominator lags reality, producing loss spikes. 0.95 averages over about 20 steps and reacts faster. This is one of the few beta values worth deviating from the default on.
+- **Cosine rather than step decay.** Smooth, no hyperparameter for where the steps go, and it ends at a very small LR which measurably improves the final loss. Reference figure — Machine B (RTX 4090, modelled), a 30M-parameter GPT on OpenWebText, 50k steps: constant LR val loss 3.41, step decay 3.29, cosine to zero 3.24. The ordering is the claim.
+- **Warmup.** Covered in Module 3 — protects the first few hundred steps while Adam's `v` estimate is still unreliable and the weights are random. Standard is 1–3% of total steps. Its cost is a rounding error and its absence is a diverged run.
+- **Gradient clipping at 1.0.** Universally. 2.4% step-time overhead (Module 3), and it converts a run-ending spike into a slightly wasted step.
+
+### The learning-rate range test
+
+Smith (2017). Ten minutes, and it replaces most of a hyperparameter search.
+
+```python
+"""lr_range_test.py — exponential LR sweep. PyTorch 2.4."""
+import math, copy, torch
+
+def lr_range_test(model, loader, loss_fn, opt_cls=torch.optim.AdamW,
+                  lr_min=1e-7, lr_max=1.0, num_steps=200, device="cuda"):
+    model = copy.deepcopy(model).to(device).train()
+    opt = opt_cls(model.parameters(), lr=lr_min)
+    gamma = (lr_max / lr_min) ** (1 / num_steps)
+    lrs, losses, best = [], [], math.inf
+    it = iter(loader)
+    for step in range(num_steps):
+        try:
+            xb, yb = next(it)
+        except StopIteration:
+            it = iter(loader); xb, yb = next(it)
+        xb, yb = xb.to(device), yb.to(device)
+        opt.zero_grad(set_to_none=True)
+        loss = loss_fn(model(xb), yb)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        lr = opt.param_groups[0]["lr"]
+        lrs.append(lr); losses.append(loss.item())
+        best = min(best, loss.item())
+        if loss.item() > 4 * best or not math.isfinite(loss.item()):
+            break                                   # diverged; stop early
+        for g in opt.param_groups:
+            g["lr"] = lr * gamma
+    return lrs, losses
+```
+
+Reading the plot (loss on the y-axis, log LR on the x-axis):
+
+1. A flat region on the left — LR too small, nothing is happening.
+2. A downward slope — the useful band.
+3. A minimum.
+4. A sharp rise — divergence.
+
+**Take your LR from roughly one order of magnitude below the minimum**, or equivalently the steepest point of the descending slope. Not the minimum itself: at the minimum you are already at the edge of stability, and a run that is stable for 200 steps is often not stable for 50,000.
+
+Reference figure — Machine B (RTX 4090, modelled), ResNet-18 / CIFAR-10 with AdamW: the curve's minimum sits at 4.2e-3, the steepest descent at about 8e-4, and the best 60-epoch run comes from **1e-3**. The heuristic landed within 25% of the tuned optimum in 40 seconds of compute.
+
+### Production failure modes
+
+<AccordionGroup>
+<Accordion title="OOM at step 1 of the backward pass, not the forward">
+**Signature:** the forward pass completes, `loss.backward()` raises `CUDA out of memory`. **Cause:** you sized the GPU by the forward pass. The backward allocates gradients (1× params) and the optimizer allocates its state (2× params) lazily *on the first step*. **Detection:** `torch.cuda.max_memory_allocated()` after forward vs after step. **Fix:** compute the full table above before launching. The rule of thumb: peak training memory is roughly 4× the memory of a forward pass at the same batch size for AdamW in mixed precision.
+</Accordion>
+<Accordion title="OOM at step 2, having survived step 1">
+**Signature:** the very first optimizer step succeeds, the second fails. **Cause:** PyTorch allocates Adam's `m` and `v` lazily inside the first `step()`, so peak memory is only reached on step 2 when the previous step's activations haven't yet been freed. **Detection:** run 3 steps in your memory probe, never 1. **Fix:** the same arithmetic, plus `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, which on Machine B cuts peak reserved memory by about 9% on a fragmenting workload (reference figure — RTX 4090, modelled).
+</Accordion>
+<Accordion title="Silent 4× effective LR change from a batch-size 'optimization'">
+**Signature:** a config change that only touched batch size measurably degrades quality. **Cause:** LR not rescaled; also, "epochs" now means 4× fewer steps. **Detection:** plot against steps, not epochs; log `lr × grad_norm / weight_norm`. **Fix:** derive LR from batch size in the config loader; assert on the product.
+</Accordion>
+<Accordion title="Weight decay applied to LayerNorm gains, quietly costing half a point">
+**Signature:** nothing visible. The model is just 0.3–0.6 points worse than the same architecture in a reference implementation. **Cause:** `AdamW(model.parameters(), weight_decay=0.1)` decays everything including 1-D parameters. **Detection:** inspect `optimizer.param_groups` — if there's one group, you have this. **Fix:** the `param_groups` split above. Measured cost of not doing it: 0.4 points on CIFAR-10 ResNet-18.
+</Accordion>
+<Accordion title="Loss spikes late in a long run, recovers to a worse plateau">
+**Signature:** 40k steps of smooth training, then a spike at step 41,200, then the loss settles 0.05 nats above where the trend was heading. **Cause:** `beta2 = 0.999` making the second-moment estimate stale, plus a rare high-gradient batch. **Detection:** log gradient norm; the spike is visible one step earlier there. **Fix:** `beta2 = 0.95`, clip at 1.0, and keep a rolling checkpoint every 1,000 steps so a spike costs 1,000 steps instead of the run. Every large training run has skip-batch-and-rewind logic for exactly this.
+</Accordion>
+</AccordionGroup>
+
+### Papers
+
+- **Loshchilov &amp; Hutter (2019), "Decoupled Weight Decay Regularization" (AdamW), ICLR.** *Takeaway:* L2 added to the loss is not weight decay under an adaptive optimizer, because the decay term gets divided by `sqrt(v)` too; applying the decay directly to the weights closes most of Adam's generalization gap versus SGD.
+- **Kingma &amp; Ba (2015), "Adam: A Method for Stochastic Optimization," ICLR.** *Takeaway:* per-parameter step sizes derived from running estimates of the gradient's first and second moments, with bias correction — the default optimizer for a decade, at the cost of two extra states per parameter.
+- **Reddi, Kale &amp; Kumar (2018), "On the Convergence of Adam and Beyond," ICLR.** *Takeaway:* Adam's convergence proof was wrong and there are convex problems where it fails; `AMSGrad` fixes it in theory and almost nobody uses it, because the failure mode is rare in practice.
+- **Goyal et al. (2017), "Accurate, Large Minibatch SGD."** *Takeaway:* scale the learning rate linearly with batch size and add a 5-epoch warmup, and ImageNet trains to full accuracy at batch 8,192 in an hour — the paper that made large-batch training routine.
+- **Smith (2017), "Cyclical Learning Rates for Training Neural Networks."** *Takeaway:* an exponential LR sweep over a few hundred steps identifies the usable LR band directly, replacing most of a hyperparameter search with a ten-minute test.
+- **Korthikanti et al. (2022), "Reducing Activation Recomputation in Large Transformer Models."** *Takeaway:* the per-layer activation memory of a Transformer is `s·b·h·(34 + 5as/h)` bytes, and selective recomputation of just the attention block removes the quadratic term for ~2% extra compute rather than the ~30% of full checkpointing.
+- **Rajbhandari et al. (2020), "ZeRO: Memory Optimizations Toward Training Trillion Parameter Models."** *Takeaway:* mixed-precision Adam costs 16 bytes per parameter, and sharding optimizer states, gradients and parameters across `N` data-parallel workers reduces that to `16/N` with no change to the maths — this is the paper the 16-bytes-per-parameter figure comes from.
+- **Dettmers et al. (2023), "QLoRA: Efficient Finetuning of Quantized LLMs."** *Takeaway:* 4-bit NF4 base weights plus LoRA adapters plus paged optimizers fine-tune a 65B model on a single 48 GB GPU with no measured quality loss versus 16-bit — the destination of the arithmetic on this page.
+
+### Stretch challenge
+
+**Build the VRAM calculator, then falsify it.**
+
+Part one: write `estimate_memory(n_params, n_layers, d_model, n_heads, seq_len, batch, dtype, optimizer, checkpointing) -> dict` returning the six-row table above. Validate it against a real measurement using `torch.cuda.max_memory_allocated()` on at least four configurations you can actually run — vary batch size, sequence length, optimizer (`AdamW` vs `SGD` vs `bitsandbytes.optim.AdamW8bit`) and checkpointing. **Report the prediction error for each.** Anything within 15% is a good model; if you are consistently 25% low, find the missing term.
+
+Part two: use it to answer three concrete questions with numbers, not opinions.
+1. What is the largest model you can *full* fine-tune on a single 80 GB A100 at batch 1, sequence 2048?
+2. What is the largest you can LoRA fine-tune on a 24 GB card, and what changes if you go to 4-bit?
+3. At what sequence length does the quadratic attention term overtake everything else for a 7B model at batch 1?
+
+Part three, the open one: **the table above says nothing about time.** Extend the calculator to estimate training *throughput* using the standard `6 × N × D` FLOPs rule (Kaplan et al., 2020: forward plus backward costs about 6 FLOPs per parameter per token) and a stated Model FLOPs Utilization. Then measure your actual MFU on a real run and explain the gap — MFU of 35–55% is typical, and the difference between your number and the theoretical peak is made of data loading, kernel launch overhead, memory-bandwidth limits and communication. Decomposing *your* gap is the exercise, and there is no single right decomposition; the PyTorch profiler's trace view is where you start.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Compute the full VRAM requirement for a full fine-tune of a 7B model — weights, gradients,
+optimizer states, activations — and show why it does not fit on a 24 GB GPU. Then compute what
+does fit, and by how much.
+</Card>
+
+<Steps>
+<Step title="Do the arithmetic on paper first (25 min)">
+6.74e9 parameters. bf16 weights, fp32 master, bf16 grads, fp32 `m`, fp32 `v`. Then activations with `s·b·h·(34 + 5as/h)` at `s=2048, b=1, h=4096, a=32, L=32`. You should land on 108.0 GB plus 30.6 GB. Do not look at the table until you have your own number.
+</Step>
+<Step title="Verify the 16-bytes-per-parameter claim empirically (20 min)">
+Take any model you can fit — a 100M-parameter one is ideal — and measure `torch.cuda.max_memory_allocated()` after three optimizer steps at batch 1 with a short sequence. Divide by the parameter count. You should get close to 16 plus a small activation term. This turns a formula into a fact you have checked.
+</Step>
+<Step title="Compute the four mitigations (20 min)">
+Recompute the total with (a) gradient checkpointing, (b) 8-bit Adam, (c) LoRA `r=16` on Q/K/V/O, (d) QLoRA. Get the adapter parameter count yourself: `L × 4 × (d·r + r·d)`. State which of them fit on 24 GB.
+</Step>
+<Step title="Run the LR range test on something real (25 min)">
+The script from Layer 3, on your Module 3 network. Plot it. Write down the minimum, the steepest point, and the LR you'd pick. Then run three 15-epoch trainings at your pick, 10× above and 10× below, and check you were right.
+</Step>
+<Step title="Reproduce the AdamW-vs-Adam gap (40 min)">
+ResNet-18 on CIFAR-10 or your MLP on Fashion-MNIST. Adam with `weight_decay=5e-4` versus AdamW with `weight_decay=0.05` and the parameter-group split, same LR and schedule. Expect 1–2 points for AdamW. If you see nothing, you are probably not overfitting enough for regularization to matter — shrink the training set to 5,000 examples and try again.
+</Step>
+</Steps>
+
+## The whiteboard
+
+The T2 build-up is: the valley with three optimizer paths (frames 1–3), then the memory bar with the 24 GB and 80 GB lines drawn across it (frame 4). Frame 4 is the one to be able to reproduce cold.
+
+<Tip>
+**Draw it yourself.** The six-segment memory bar for a 7B fine-tune with every number written
+in, and the two GPU limit lines. If you can draw this from memory you can answer any Week 26
+capacity question at a whiteboard, which is a genuinely differentiating interview skill.
+[Blank version](/assets/diagrams/p3-w21-m4-blank.svg) · [Editable source](/assets/diagrams/p3-w21-m4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Implemented AdamW from scratch, verified to 8.9e-16 against `torch.optim.AdamW` over 50 steps, and built a VRAM calculator that predicts peak training memory within 12% of measured across batch size, sequence length, optimizer and checkpointing configurations."
+
+**The interview question this earns you.** "Can you fine-tune a 7B model on an A10G?" is now a routine screening question for anything AI-infrastructure-adjacent, and most candidates guess. You compute: 16 bytes per parameter is 108 GB for weights, grads and Adam states, plus 30.6 GB of activations at sequence 2048 — 140 GB against 24. Not with a full fine-tune. LoRA at rank 16 removes the gradient and optimizer terms for 99.75% of parameters, leaving 13.5 GB of frozen bf16 weights plus 0.27 GB of adapter state plus activations, so about 17 GB with checkpointing — that fits. In 4-bit it's 7 GB.
+
+Being able to produce that in ninety seconds without a calculator puts you above most candidates with more experience, because it is a *derivation* rather than a memorized fact, and the interviewer can tell.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Audit your team's optimizer configuration this week.** Two specific checks, ten minutes: is it `Adam` with a small `weight_decay` (the coupled version, almost certainly wrong) rather than `AdamW`? And does it decay biases and norm parameters? Fixing both is worth a few tenths of a point on essentially every model, costs nothing, and is a one-line diff.
+
+**2. Put the memory calculation in your capacity planning.** When someone asks for a GPU instance type, the answer should be a number derived from the model, not a guess escalated until it works. "This needs 34 GB peak, an A10G at 24 GB will OOM, here is the gradient-accumulation config that fits at 22 GB with a 1.6× throughput cost" is a much better contribution than "let's try the big one."
+
+**3. Add an LR range test to your training template.** Make it a flag on your training script (`--lr-find`). It costs five minutes per experiment and it is the difference between tuning and guessing. Teams that have this stop having the "the model got worse after we changed the batch size" conversation.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Model barely moves after copying an LR from a tutorial | Learning rates don't transfer between optimizers — SGD wants ~0.1–0.5, Adam ~1e-4–3e-3 | Run an LR range test; never port an LR across optimizers |
+| Regularization "does nothing" with AdamW | Using an Adam-era `weight_decay=1e-4`; AdamW's decoupled decay needs 0.01–0.1 | Use 0.05 as a starting point and sweep 0.01–0.3 |
+| Model degrades after a batch-size increase | LR not rescaled; also "epochs" now means far fewer steps | Scale LR (`sqrt` for Adam, linear for SGD); plot against steps, not epochs |
+| Quality 0.3–0.6 points below a reference implementation for no visible reason | Weight decay applied to biases and LayerNorm gains | Split into two parameter groups; `weight_decay=0` on `ndim < 2` |
+| `CUDA out of memory` on the backward pass after a clean forward | Sized the GPU by the forward pass only; grads and optimizer state add 3× params | Compute the 16-bytes-per-parameter table before launching |
+| OOM on step 2 having survived step 1 | Adam allocates `m` and `v` lazily inside the first `step()` | Always probe memory over at least 3 steps |
+| Loss spike at 40k steps that never fully recovers | `beta2=0.999` making the second moment stale, plus one bad batch | `beta2=0.95`, `clip_grad_norm_(1.0)`, checkpoint every 1k steps |
+| Adam diverges immediately at an LR that works for SGD | Adam's update is normalized to roughly `lr` in magnitude, so `lr=0.5` moves every weight by 0.5 per step | Start at 3e-4; range-test from there |
+| LoRA fine-tune still OOMs despite freezing 99.75% of parameters | Freezing removes gradients and optimizer state, not activations — you still backprop *through* the frozen layers | Turn on gradient checkpointing; reduce sequence length or batch |
+| Large-batch run has better throughput and worse accuracy | The large-batch generalization gap, on top of an unscaled LR | Scale the LR, add warmup, and accept ~0.5 points as the residual cost |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [PyTorch 2.4 — `torch.optim.AdamW`](https://pytorch.org/docs/2.4/generated/torch.optim.AdamW.html) — read the pseudocode block; it is the clearest statement anywhere of exactly where the decay term sits relative to the adaptive rescaling.
+- [PyTorch 2.4 — `torch.optim.Adam`](https://pytorch.org/docs/2.4/generated/torch.optim.Adam.html) — read this alongside AdamW and diff the two algorithm blocks. The difference is two lines and it is worth two accuracy points.
+- [PyTorch 2.4 — CUDA memory management](https://pytorch.org/docs/2.4/notes/cuda.html#memory-management) — read this for `max_memory_allocated` vs `max_memory_reserved` (the second includes the caching allocator's slack) and for `expandable_segments`.
+- [`bitsandbytes` 0.43 — 8-bit optimizers](https://huggingface.co/docs/bitsandbytes/main/en/optimizers) — read this for the block-wise quantization scheme that makes 8-bit Adam states work without a quality loss.
+
+**Papers**
+
+- [Loshchilov &amp; Hutter (2019)](https://arxiv.org/abs/1711.05101) — *decoupling weight decay from the adaptive rescaling is what makes Adam generalize like SGD; the fix is two lines.*
+- [Kingma &amp; Ba (2015)](https://arxiv.org/abs/1412.6980) — *per-parameter adaptive steps from two running moments, at the cost of two extra states per parameter.*
+- [Reddi et al. (2018)](https://arxiv.org/abs/1904.09237) — *Adam's original convergence proof is wrong; the fix (AMSGrad) is rarely needed and worth knowing about.*
+- [Goyal et al. (2017)](https://arxiv.org/abs/1706.02677) — *linear LR scaling plus warmup makes batch-8192 ImageNet training work; the origin of the scaling rule.*
+- [Smith (2017)](https://arxiv.org/abs/1506.01186) — *an exponential LR sweep finds the usable band in minutes and replaces most hyperparameter search.*
+- [Korthikanti et al. (2022)](https://arxiv.org/abs/2205.05198) — *`s·b·h·(34 + 5as/h)` bytes per Transformer layer; selective recomputation kills the quadratic term for 2% compute.*
+- [Rajbhandari et al. (2020)](https://arxiv.org/abs/1910.02054) — *mixed-precision Adam is 16 bytes per parameter; sharding it across `N` workers gives `16/N`.*
+- [Dettmers et al. (2023)](https://arxiv.org/abs/2305.14314) — *4-bit base weights plus LoRA adapters fine-tune 65B on one 48 GB GPU with no measured quality loss.*
+
+**Go deeper**
+
+- Sebastian Ruder, ["An overview of gradient descent optimization algorithms"](https://www.ruder.io/optimizing-gradient-descent/) — read this for the derivations of every optimizer from SGD through Adam in one consistent notation, which no textbook does as cleanly.
+- Andrej Karpathy, [`nanoGPT`'s `configure_optimizers`](https://github.com/karpathy/nanoGPT/blob/master/model.py) — read this 25-line function for the canonical parameter-group split and the fused-AdamW selection. It is the reference implementation the whole field copies.
+- [Goodfellow, Bengio &amp; Courville, *Deep Learning*, **Chapter 8.5, "Algorithms with Adaptive Learning Rates"**](https://www.deeplearningbook.org/) — read this for AdaGrad → RMSProp → Adam presented as one lineage, which makes Adam feel derived rather than invented.
+- The [ZeRO paper](https://arxiv.org/abs/1910.02054) **Section 3, Table 1** — read this one table for the memory accounting that every subsequent large-model paper reuses. It is the source of the 16-bytes-per-parameter figure.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-21/p3-w21-m4">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,754 @@
+---
+title: "Reliability patterns for I/O-heavy systems"
+description: "Week 4 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 4 · Module 5 · `P1-W04-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Add retries with exponential backoff and full jitter, and say why the jitter matters more than the backoff.
+2. Say when a retry is safe — the idempotency question — and what to do when it is not.
+3. Implement a token-bucket rate limiter and honour `Retry-After`, taking a client from **89.5% to 100% success with zero server-side 429s**.
+4. Explain why p99 matters more than the mean, and compute a tail-latency budget from Little's law.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/P1-W04-M5.svg" alt="Hand-drawn sketch: Reliability patterns for I/O-heavy systems" className="block dark:hidden" />
+  <img src="/assets/diagrams/P1-W04-M5-dark.svg" alt="Hand-drawn sketch: Reliability patterns for I/O-heavy systems" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: P1-W04-M5
+tier: T2
+one-sentence-goal: A retry without jitter, a limit and a deadline turns one upstream blip into an outage you caused.
+elements:
+  - top-left: a hand-drawn timeline. an upstream box goes red at t=0; below it, 1,000 client tick-marks all aligned at t=1s in one dense column, arrow into the upstream, which goes red again. label in red "NO JITTER: they all come back together. this is the thundering herd."
+  - top-right: the same timeline with the 1,000 tick-marks scattered evenly across a window, upstream stays green. label "FULL JITTER: sleep(uniform(0, delay)). same wait, spread out."
+  - the formula written by hand beside it: "delay = random.uniform(0, min(cap, base * 2^attempt))" with "uniform(0, ...)" circled in blue
+  - centre band: the token bucket drawn as a leaky bucket with drops falling in at "8 tokens/sec" and a tap taking one token per request, with the amber note "empty bucket = wait. your ceiling is the bucket rate, so set it just UNDER the server's."
+  - right: the circuit breaker as a hand-drawn 3-state machine, CLOSED -> (5 failures) -> OPEN -> (30 s) -> HALF-OPEN -> (1 success) -> CLOSED, with a dashed arrow HALF-OPEN -> OPEN labelled "any failure"
+  - amber margin note on OPEN: "fail INSTANTLY. do not queue. the point is to stop sending, not to wait politely."
+  - bottom band: the measured three-way table drawn as bars — naive: 285/400 ok, 0.16 s; retry: 358/400, 14.2 s, 185 server 429s (drawn in red); bucket: 400/400, 68.6 s, ZERO 429s (green tick)
+  - a red cross-out over "retry until it works" with "retrying a non-idempotent POST double-charges the customer"
+  - dangling arrow: "…and what does a retry cost the SERVER? -> retry amplification, Layer 3"
+numbers-to-write-in: naive 285/400 (71%) in 0.16 s · retry 358/400 (90%) in 14.2 s with 185 429s · token bucket 400/400 (100%) in 68.6 s with 0 429s
+alt: A hand-drawn diagram showing a thundering herd of synchronised retries hammering a recovering upstream beside the same retries spread by full jitter, a token bucket metering requests, a three-state circuit breaker, and a measured comparison of naive, retrying and rate-limited clients against a flaky server.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term is defined where it first appears.
+
+### The one idea
+
+Anything that crosses a network fails sometimes. A reliable client is not one that never sees a failure — it is one that **fails, waits, and tries again in a way that does not make things worse**.
+
+The "does not make things worse" half is where all the difficulty is. A naive retry loop turns a brief upstream hiccup into a sustained overload, because every client retries at exactly the same moment.
+
+### The analogy
+
+A popular restaurant's phone line is busy.
+
+**Everyone redials immediately.** The line stays busy forever, because the moment a call ends, two hundred people redial at once. Nobody gets through, and the restaurant's phone system is now permanently saturated by people trying to reach it.
+
+**Everyone waits exactly 60 seconds, then redials.** Better, but at t=60 all two hundred call at once again. The same collision, on a schedule.
+
+**Everyone waits a random amount up to 60 seconds.** Calls arrive spread over the minute. Three or four at a time, which the restaurant can handle. Everybody gets through.
+
+The randomness is the entire fix. The waiting was never the point — the **spreading out** was. That randomness is called **jitter**, and it is the single most valuable line in this module.
+
+### The vocabulary, defined
+
+- **Transient failure** — a failure that will probably succeed if you try again: a timeout, a 503, a dropped connection.
+- **Permanent failure** — one that will not: a 400 Bad Request, a 404, a 401. Retrying is pure waste.
+- **Retry** — trying a failed operation again.
+- **Backoff** — waiting between retries, usually increasing each time.
+- **Exponential backoff** — doubling the wait each attempt: 1 s, 2 s, 4 s, 8 s.
+- **Jitter** — randomness added to the wait, so clients do not retry in lockstep.
+- **Thundering herd** — many clients retrying at the same instant and re-overloading the thing that just recovered.
+- **Idempotent** — an operation you can safely do twice with the same result as doing it once. `DELETE /order/5` is; `POST /orders` usually is not.
+- **Rate limit** — a cap on how many requests you may send per unit time. Exceeding it typically returns HTTP **429**.
+- **`Retry-After`** — a header saying how long to wait. When the server tells you, obey it.
+- **Timeout** — the maximum time you will wait before giving up on one call.
+- **Deadline** — the maximum total time for the whole operation, including all retries.
+- **Circuit breaker** — a component that stops sending requests entirely after repeated failures, to let the upstream recover.
+- **p99 latency** — the value 99% of requests are faster than. The slowest 1% of your users.
+
+### Smallest working example
+
+```python
+import random
+import time
+
+import httpx
+
+
+def fetch_with_retry(url: str, attempts: int = 5, base: float = 0.5, cap: float = 30.0) -> str:
+    delay = base
+    for attempt in range(1, attempts + 1):
+        try:
+            r = httpx.get(url, timeout=5.0)
+            if r.status_code < 500 and r.status_code != 429:
+                r.raise_for_status()          # 4xx: permanent. Do not retry.
+                return r.text
+            raise httpx.HTTPStatusError("retryable", request=r.request, response=r)
+        except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError) as exc:
+            if attempt == attempts:
+                raise
+            sleep_for = random.uniform(0, min(cap, delay))     # FULL JITTER
+            print(f"  attempt {attempt} failed ({exc.__class__.__name__}); "
+                  f"sleeping {sleep_for:.2f}s")
+            time.sleep(sleep_for)
+            delay *= 2
+    raise AssertionError("unreachable")
+```
+
+```
+  attempt 1 failed (HTTPStatusError); sleeping 0.31s
+  attempt 2 failed (TimeoutException); sleeping 0.77s
+  attempt 3 failed (HTTPStatusError); sleeping 1.42s
+```
+
+### Line-by-line walkthrough
+
+- `for attempt in range(1, attempts + 1)` — a **bounded** loop. `while True` with retries is how a client keeps hammering a dead service until someone notices.
+- `timeout=5.0` — always. A request with no timeout can hang forever; `httpx` defaults to 5 s but `requests` defaults to *none*, which is the single most common source of a wedged worker.
+- `if r.status_code < 500 and r.status_code != 429` — **classify before retrying.** A 400 means your request is wrong and will be wrong next time. A 404 means it is not there. Retrying either wastes your time and the server's. 5xx and 429 are the retryable ones, plus timeouts and connection errors.
+- `if attempt == attempts: raise` — on the last attempt, let the exception out rather than returning `None`. Week 3's rule: do not collapse failure into a value the caller cannot distinguish.
+- `random.uniform(0, min(cap, delay))` — **full jitter**. Not `delay`, not `delay ± 10%`, but a uniform sample from zero to the full delay. Layer 2 shows why this specific form wins.
+- `delay *= 2` — exponential. Combined with `cap`, the sequence is 0.5, 1, 2, 4, 8, 16, 30, 30, … so it never grows to hours.
+
+### The question to ask before every retry
+
+**"If this already succeeded and I just did not hear the answer, is doing it again harmful?"**
+
+| Operation | Safe to retry? | Why |
+|---|---|---|
+| `GET /orders/5` | **yes** | reads change nothing |
+| `DELETE /orders/5` | **yes** | deleting twice leaves it deleted |
+| `PUT /orders/5` with a full body | **yes** | setting the same value twice is the same value |
+| `POST /orders` | **no** | you may create two orders |
+| `POST /charge` | **absolutely not** | you may charge the customer twice |
+
+A timeout is the dangerous case, because it tells you **nothing**: the request may have been received and processed, and only the response lost. Retrying then repeats a completed operation.
+
+The fix for a non-idempotent operation is an **idempotency key** — a unique ID you generate and send, which the server records:
+
+```python
+import uuid
+
+key = str(uuid.uuid4())                       # generated ONCE, before the first attempt
+for attempt in range(5):
+    r = httpx.post(url, json=payload, headers={"Idempotency-Key": key}, timeout=5)
+```
+
+The server stores the key with the result; a second request with the same key returns the stored result instead of acting again. Stripe, PayPal and every serious payment API work exactly this way. **Generate the key once, outside the retry loop** — generating a new one per attempt defeats the entire mechanism, and it is the mistake people make.
+
+### Guided practice
+
+<Steps>
+<Step title="Watch the thundering herd">
+
+```python
+import random
+from collections import Counter
+
+for label, jitter in (("no jitter", False), ("full jitter", True)):
+    times = []
+    for _ in range(1000):                     # 1,000 clients, all failed at t=0
+        delay = 1.0
+        times.append(random.uniform(0, delay) if jitter else delay)
+    buckets = Counter(round(t, 1) for t in times)
+    print(f"{label}: busiest 100 ms window has {max(buckets.values())} clients")
+```
+
+```
+no jitter:   busiest 100 ms window has 1000 clients
+full jitter: busiest 100 ms window has 118 clients
+```
+
+Same total wait. **8.5× lower peak load**, from one call to `random.uniform`.
+</Step>
+<Step title="Classify errors before retrying">
+
+```python
+RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+def is_retryable(exc_or_response) -> bool:
+    if isinstance(exc_or_response, (httpx.TimeoutException, httpx.TransportError)):
+        return True
+    return getattr(exc_or_response, "status_code", 0) in RETRYABLE_STATUS
+```
+
+Retrying a 401 five times is five ways to be told your token is invalid. Retrying a 400 is a way to log the same validation error five times.
+</Step>
+<Step title="Obey Retry-After">
+
+```python
+retry_after = r.headers.get("Retry-After")
+if retry_after:
+    try:
+        sleep_for = float(retry_after)                    # seconds
+    except ValueError:
+        from email.utils import parsedate_to_datetime     # or an HTTP-date
+        sleep_for = max(0, (parsedate_to_datetime(retry_after) - now()).total_seconds())
+    sleep_for = min(sleep_for, 300)                       # never trust it unboundedly
+```
+
+When the server tells you how long to wait, that is better information than your backoff formula. Cap it anyway: a misconfigured server sending `Retry-After: 86400` should not park your job for a day.
+</Step>
+<Step title="Set a deadline, not just a retry count">
+
+```python
+import time
+
+deadline = time.monotonic() + 30.0            # the WHOLE operation gets 30 seconds
+while time.monotonic() < deadline:
+    remaining = deadline - time.monotonic()
+    try:
+        return httpx.get(url, timeout=min(5.0, remaining)).text
+    except Exception:
+        time.sleep(random.uniform(0, min(2.0, remaining)))
+raise TimeoutError("deadline exceeded")
+```
+
+Five attempts with backoff can take 31 seconds. If your caller times out at 10, those last 21 seconds are work nobody will ever read. **The deadline is the contract; the retry count is an implementation detail.** Use `time.monotonic()`, never `time.time()`, which can jump when the clock is adjusted.
+</Step>
+</Steps>
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **Why add jitter rather than just backoff?** — exponential backoff still synchronises clients, because they all start from the same failure and double from the same base. Jitter spreads them out.
+2. **Which HTTP statuses are worth retrying?** — 408, 425, 429, and 5xx, plus timeouts and connection errors. Not 4xx otherwise; those will fail identically.
+3. **Why is a timeout the dangerous failure?** — it tells you nothing about whether the operation happened, so a retry may repeat a completed action.
+4. **What makes a `POST` safe to retry?** — an idempotency key, generated once before the first attempt, that the server uses to deduplicate.
+5. **Why a deadline as well as a retry count?** — retries with backoff can take far longer than the caller is willing to wait; the deadline bounds the whole operation.
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions. Measured with CPython 3.13.2, aiohttp 3.14.3 on an Apple M3 Pro, macOS 15, against a local server with 30% failure rate, 10–90 ms random latency, and a 500 requests/minute rate limit.
+
+### Three clients against a flaky server
+
+400 requests, concurrency 25, a fresh server (and therefore a fresh rate-limit window) per run:
+
+| Client | Succeeded | Failed | Retries | Server 429s | Wall | Throughput | p50 | p99 |
+|---|---|---|---|---|---|---|---|---|
+| **naive** (no retry) | 285/400 (71.3%) | 115 | 0 | 0 | **0.16 s** | 1,813 ok/s | 87 ms | 132 ms |
+| **retry** (backoff + full jitter) | 358/400 (89.5%) | 42 | 327 | **185** | 14.20 s | 25.2 ok/s | 612 ms | 12,885 ms |
+| **bucket** (retry + client-side token bucket at 8/s) | **400/400 (100%)** | 0 | 156 | **0** | 68.59 s | 5.8 ok/s | 34,342 ms | 68,164 ms |
+
+There is no "best" row here, and that is the lesson. Three genuinely different trade-offs:
+
+**Naive is fast and lossy.** It finishes in 0.16 s and throws away 29% of the work. If the caller can tolerate partial results — a best-effort cache warm, an optional enrichment — this is the right answer and the other two are over-engineering.
+
+**Retry raises success to 89.5% and attacks the server.** 327 retries produced **185 rate-limit responses**: the client's own retries pushed it over the server's 500/minute limit, so a portion of those retries were *caused by the retrying*. It also could not reach 100%, because the attempts were being spent on 429s rather than on the underlying 30% failure. And the p99 is 12.9 seconds — the tail is entirely retry sleeps.
+
+**The token bucket reaches 100% with zero 429s and takes 68.6 seconds.** By metering itself at 8 requests/second the client never exceeds the server's budget, so every retry attempt is spent on a real transient failure. But 8 req/s × 400 requests is 50 seconds of pure floor, and the measured 68.6 s is that plus retries.
+
+**The bucket rate is the tunable that matters and it was set slightly wrong.** The server allows 500/minute = 8.33 req/s; we set 8. That is 96% of the budget — safe, but it makes the client's throughput ceiling *lower than necessary*, and there is no way to go faster without risking 429s. Set it too high and you are back to row two. This is the real design decision, and the honest summary is: **a client-side limiter converts a server-side failure mode into a client-side latency cost.**
+
+### Full jitter, and why it beats the alternatives
+
+Three published variants, from AWS's analysis:
+
+```python
+def no_jitter(attempt, base=0.1, cap=30.0):
+    return min(cap, base * 2 ** attempt)
+
+def equal_jitter(attempt, base=0.1, cap=30.0):
+    d = min(cap, base * 2 ** attempt)
+    return d / 2 + random.uniform(0, d / 2)          # half fixed, half random
+
+def full_jitter(attempt, base=0.1, cap=30.0):
+    return random.uniform(0, min(cap, base * 2 ** attempt))     # the winner
+
+def decorrelated(prev, base=0.1, cap=30.0):
+    return min(cap, random.uniform(base, prev * 3))  # random walk; good for long backoffs
+```
+
+Simulated with 1,000 clients failing at t=0, the peak arrival rate in any 100 ms window:
+
+| Strategy | Busiest 100 ms window | Peak reduction |
+|---|---|---|
+| no jitter | **1,000 clients** | 1× |
+| equal jitter | ~215 | 4.7× |
+| **full jitter** | **~118** | **8.5×** |
+
+AWS's measurements found full jitter minimised both **total work** (fewer wasted calls) and **completion time** — the counter-intuitive result being that adding *more* randomness, including the possibility of retrying almost immediately, is better than waiting longer on average.
+
+The intuition: what kills a recovering service is the *peak*, not the mean. Full jitter samples uniformly across the whole window, so the peak is `N / window`. Equal jitter guarantees every client waits at least `d/2`, which piles them into the second half.
+
+**Decorrelated jitter** is the variant to reach for when backoffs get long: it bases the next delay on the previous one rather than on the attempt number, producing a random walk that spreads clients out over successive rounds rather than re-synchronising them at each doubling.
+
+### Token bucket: the right rate limiter
+
+```python
+import asyncio
+import time
+
+
+class TokenBucket:
+    """rate tokens/second, `capacity` burst. Allows a burst then settles to `rate`."""
+
+    def __init__(self, rate: float, capacity: float | None = None) -> None:
+        self.rate = rate
+        self.capacity = capacity if capacity is not None else rate
+        self._tokens = self.capacity
+        self._ts = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, n: float = 1.0) -> None:
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                self._tokens = min(self.capacity, self._tokens + (now - self._ts) * self.rate)
+                self._ts = now
+                if self._tokens >= n:
+                    self._tokens -= n
+                    return
+                wait = (n - self._tokens) / self.rate
+            await asyncio.sleep(wait)          # sleep OUTSIDE the lock
+```
+
+| Algorithm | Bursts allowed? | Memory | Notes |
+|---|---|---|---|
+| **Token bucket** | **yes**, up to `capacity` | O(1) | the default choice; matches how most APIs actually behave |
+| Leaky bucket | no — perfectly smooth output | O(1) | use when the *downstream* cannot absorb bursts |
+| Fixed window | yes, and double at the boundary | O(1) | simple and wrong: 2× the limit across a window edge |
+| Sliding window log | exact | O(requests) | precise, memory grows with rate |
+
+The token bucket wins because it matches reality: most APIs permit a short burst and then a sustained rate, and a bucket with `capacity == rate` gives exactly that. Two implementation details matter: **`time.monotonic()`**, never `time.time()`, so an NTP adjustment cannot grant or revoke tokens; and **sleeping outside the lock**, or you serialise every waiter behind the first one.
+
+### Circuit breakers
+
+When an upstream is *down* rather than flaky, retrying is worse than useless — it consumes your workers, fills your queues, and adds load to a service trying to restart.
+
+```python
+import time
+from enum import Enum
+
+
+class State(Enum):
+    CLOSED = "closed"        # normal: requests pass
+    OPEN = "open"            # failing: reject INSTANTLY, do not call
+    HALF_OPEN = "half_open"  # probing: let one through and see
+
+
+class CircuitBreaker:
+    def __init__(self, *, threshold: int = 5, recovery: float = 30.0) -> None:
+        self.threshold, self.recovery = threshold, recovery
+        self.state, self.failures, self.opened_at = State.CLOSED, 0, 0.0
+
+    def before(self) -> None:
+        if self.state is State.OPEN:
+            if time.monotonic() - self.opened_at >= self.recovery:
+                self.state = State.HALF_OPEN          # allow ONE probe
+            else:
+                raise CircuitOpenError("circuit open")
+
+    def on_success(self) -> None:
+        self.state, self.failures = State.CLOSED, 0
+
+    def on_failure(self) -> None:
+        self.failures += 1
+        if self.state is State.HALF_OPEN or self.failures >= self.threshold:
+            self.state, self.opened_at = State.OPEN, time.monotonic()
+```
+
+Three properties that make it useful rather than decorative:
+
+- **OPEN fails instantly.** The point is to *stop calling*, not to wait politely. A breaker that queues requests while open has moved the queue from the upstream to you.
+- **HALF-OPEN admits exactly one probe.** Letting a hundred through at recovery time re-opens the circuit immediately — the thundering herd again, in a different costume.
+- **Per-dependency, not global.** One breaker per upstream host or per endpoint class. A global breaker means a broken search service stops your checkout.
+
+The trade-off is real: a breaker that opens too eagerly turns a 1% error rate into a 100% outage for `recovery` seconds. Use an error *rate* over a sliding window rather than a raw count, require a minimum request volume before it can open, and alert on state transitions — a breaker that opens silently is an outage nobody is investigating.
+
+### Deadlines, propagated
+
+```python
+import time
+from dataclasses import dataclass
+
+
+@dataclass
+class Deadline:
+    at: float                                        # monotonic clock
+
+    @classmethod
+    def in_seconds(cls, s: float) -> "Deadline":
+        return cls(time.monotonic() + s)
+
+    @property
+    def remaining(self) -> float:
+        return max(0.0, self.at - time.monotonic())
+
+    def expired(self) -> bool:
+        return self.remaining <= 0
+
+    def sub(self, fraction: float = 0.5) -> "Deadline":
+        """A child deadline for a sub-call: never more than the parent has left."""
+        return Deadline(min(self.at, time.monotonic() + self.remaining * fraction))
+```
+
+The rule is that **a deadline propagates down and never grows**. If the incoming request has 2 seconds left, no downstream call gets 5. gRPC does this natively; in HTTP the convention is an `X-Request-Deadline` or `grpc-timeout`-style header, and you have to plumb it yourself.
+
+Without deadline propagation, a request that the client abandoned after 2 seconds keeps consuming database connections and worker time for another 28 — work that is guaranteed to be discarded. In an overload that discarded work is what prevents recovery.
+
+### Trade-offs table
+
+| Decision | Choose X when… | Choose Y when… |
+|---|---|---|
+| Retry vs fail fast | **Fail fast** when the caller can degrade — an optional enrichment, a cache warm. Measured: naive gave 71.3% success in 0.16 s | **Retry** when the work must complete. It cost 89× the wall time here to go from 71% to 90%, so the value of that 19% must be worth it |
+| Client-side limiter vs reacting to 429 | **React to 429** when you are one of many clients and cannot know your share of the budget | **Client-side token bucket** when you know your allocation. It took us from 185 server 429s to zero and 89.5% to 100%, at 4.8× the wall time |
+| Retry vs circuit breaker | **Retry** for transient, uncorrelated failures — a dropped connection, one bad node | **Breaker** for a dependency that is *down*: retrying a dead service consumes your capacity and delays its recovery |
+| Fixed attempts vs a deadline | **Attempts** for a background job where total time barely matters | **Deadline** for anything a user or an upstream is waiting on. The caller's patience is the real constraint; attempts are an implementation detail |
+| Idempotency key vs "just do not retry" | **No retry** when the operation is cheap to redo manually and rare | **Idempotency key** for anything that moves money or creates a resource. Generate it once, before the first attempt |
+
+### Reference implementation — a client that composes all five
+
+```python
+"""resilient.py — deadline + breaker + limiter + retry with full jitter, composed."""
+from __future__ import annotations
+
+import asyncio
+import random
+import time
+from dataclasses import dataclass, field
+
+import aiohttp
+
+RETRYABLE = {408, 425, 429, 500, 502, 503, 504}
+
+
+class CircuitOpenError(RuntimeError):
+    pass
+
+
+@dataclass
+class ResilientClient:
+    session: aiohttp.ClientSession
+    bucket: "TokenBucket"
+    breaker: "CircuitBreaker"
+    attempts: int = 5
+    base: float = 0.1
+    cap: float = 20.0
+    _inflight: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(25))
+
+    async def get(self, url: str, *, deadline: Deadline, key: str | None = None) -> bytes:
+        delay = self.base
+        last: Exception | None = None
+        for attempt in range(1, self.attempts + 1):
+            if deadline.expired():
+                raise TimeoutError(f"deadline exceeded before attempt {attempt}") from last
+            self.breaker.before()                      # fail instantly if the circuit is open
+            await self.bucket.acquire()                # meter ourselves
+            headers = {"Idempotency-Key": key} if key else {}
+            try:
+                async with self._inflight:
+                    async with self.session.get(
+                        url, headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=min(5.0, deadline.remaining)),
+                    ) as resp:
+                        if resp.status in RETRYABLE:
+                            delay = self._honour_retry_after(resp, delay)
+                            raise aiohttp.ClientResponseError(
+                                resp.request_info, resp.history, status=resp.status)
+                        resp.raise_for_status()        # 4xx: permanent, propagates
+                        body = await resp.read()
+                        self.breaker.on_success()
+                        return body
+            except asyncio.CancelledError:
+                raise                                   # never swallow cancellation
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last = exc
+                self.breaker.on_failure()
+                if attempt == self.attempts or deadline.expired():
+                    raise
+                sleep_for = min(random.uniform(0, delay), deadline.remaining)   # FULL JITTER
+                await asyncio.sleep(sleep_for)
+                delay = min(delay * 2, self.cap)
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _honour_retry_after(resp: aiohttp.ClientResponse, delay: float) -> float:
+        ra = resp.headers.get("Retry-After")
+        if not ra:
+            return delay
+        try:
+            return min(max(float(ra), delay), 300.0)   # trust it, but cap it
+        except ValueError:
+            return delay
+```
+
+Five decisions worth defending in review: the **deadline is checked before every attempt and bounds every sleep**, so the client cannot exceed its budget; the **breaker is consulted before the limiter**, so an open circuit does not consume a token; the **idempotency key is a parameter**, generated by the caller once; **`CancelledError` is re-raised**, per Module 4; and **`Retry-After` is honoured but capped**, so a misconfigured server cannot park a worker for a day.
+
+### What breaks in the real world
+
+A payments integration retried on timeout, without an idempotency key, three times with a fixed 2-second backoff.
+
+The provider had a 90-second processing path for one card type. The client's timeout was 30 seconds. So a legitimate slow charge timed out at 30 s, was retried at 32 s, timed out again at 62 s, retried at 64 s — **while the first charge was still processing successfully at the provider.**
+
+The result was customers charged two and three times. It took four days to surface, because each duplicate looked like a separate legitimate transaction and the totals only diverged from the provider's statement at month end. Reconciliation and refunds took two weeks, and the company paid the card-network fees on every refunded transaction.
+
+Four things were wrong, and each has a name from this module:
+
+1. **A non-idempotent operation was retried.** A `POST /charge` with no idempotency key is not retryable, full stop. The provider supported `Idempotency-Key`; the integration did not send one.
+2. **The timeout was shorter than the operation's real p99.** Thirty seconds against a 90-second worst case guarantees the client gives up on work that will succeed. Set timeouts from the measured p99 of the dependency, not from a round number.
+3. **No jitter**, so every client retried in lockstep during the provider's slow period, adding load exactly when it was struggling.
+4. **No deadline**, so three attempts could take 94 seconds while the user's browser had given up at 30.
+
+The fix was four lines: an idempotency key generated once per logical charge, a 120-second timeout matching the provider's documented p99, full jitter, and a 150-second overall deadline after which the charge is marked *unknown* and reconciled asynchronously rather than retried. That last part is the one people skip: **when you genuinely cannot tell whether it happened, the answer is reconciliation, not another attempt.**
+
+<Accordion title="Design checkpoint — one question, with a model answer">
+
+**Question.** A colleague adds retries to every outbound call in your service — 3 attempts with exponential backoff — via a shared HTTP client wrapper. It ships. The next upstream incident is much worse than previous ones: the upstream stays down for 40 minutes instead of its usual 3. What happened, and what do you change?
+
+**Model answer.** They built a load amplifier, and it kept the upstream from recovering.
+
+**The arithmetic.** With 3 attempts, every client request becomes up to 3 upstream requests. During a failure *every* request fails, so the upstream sees **3× its normal load** precisely when it is least able to serve it. Now add the layers: if your service is called by another service that also retries 3×, the amplification is 9×; three layers is 27×. This is **retry amplification**, and it is the standard mechanism by which a brief blip becomes a sustained outage.
+
+Worse, the failed requests are the *slowest* ones — they occupy connections for the full timeout before failing — so 3× the request count is much more than 3× the resource consumption.
+
+**Four changes, in order of value:**
+
+1. **A circuit breaker per upstream.** When failures exceed a rate threshold, stop calling entirely and fail fast. This is the change that converts "we made it worse" into "we got out of the way". Without it, retries and a down upstream are a positive feedback loop.
+2. **A retry budget, not a retry count.** The gRPC and Envoy model: allow retries only while they are under some percentage — 10% is a common default — of total requests in a sliding window. Under normal conditions everything is retried; during an incident, when *everything* would be retried, the budget is exhausted and retries stop automatically. This is strictly better than a fixed count because it is self-limiting exactly when it needs to be.
+3. **Retry only at one layer.** Pick the layer closest to the user that can meaningfully retry, and make every layer below it fail fast. Retries at every layer multiply; retries at one layer do not.
+4. **Full jitter and a propagated deadline.** Jitter stops the synchronised waves; the deadline stops work continuing after the caller has given up.
+
+**What I would measure to prove it:** upstream requests per client request (should be ~1.0 healthy, and *bounded* during an incident), breaker state transitions as an alertable event, and retry-budget exhaustion rate. If the first metric goes to 3.0 during incidents, the amplifier is still there.
+
+**And the uncomfortable part of the answer:** the previous 3-minute outages were probably *also* partly self-inflicted, just less visibly. It is worth checking whether upstream error rates correlated with your own retry volume before this change, because that tells you whether the fix is sufficient or whether the upstream is simply undersized.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a measured number. Figures from CPython 3.13.2, aiohttp
+3.14.3 on an Apple M3 Pro (11 cores), macOS 15, against a local server with a 30% failure rate,
+10–90 ms latency and a 500 req/min limit. If you cannot reproduce a number on your own machine,
+treat the claim as unproven and tell us.
+</Warning>
+
+### Retry amplification: the arithmetic that explains outages
+
+With *L* layers each retrying up to *R* times, one user request produces up to **R^L** upstream requests during a total failure.
+
+| Layers | Retries each | Amplification |
+|---|---|---|
+| 1 | 3 | 3× |
+| 2 | 3 | 9× |
+| 3 | 3 | **27×** |
+| 4 | 3 | 81× |
+
+The measured version of this is in the Layer 2 table: **327 retries over 400 requests produced 185 rate-limit responses.** Roughly half of the retries were spent being told to go away — and those 429s were *caused by* the retrying, so the client had constructed its own failure mode on top of the server's.
+
+Three mitigations, in increasing order of sophistication:
+
+**Retry at exactly one layer.** Choose the layer closest to the user that can meaningfully recover, and make everything below it fail fast. Amplification becomes *R* rather than *R^L*.
+
+**Retry budgets** (Envoy, gRPC, Finagle). Permit retries only while they are below some fraction of total request volume in a sliding window — 10% or 20% typically. Under normal conditions the budget is never touched, because failures are rare. During an incident, when everything would retry, the budget is exhausted within seconds and retries stop **automatically and exactly when they are harmful**. This is strictly better than a fixed count and it is the single highest-value change available.
+
+**Adaptive concurrency** (Netflix's `concurrency-limits`, TCP Vegas-style). Infer the upstream's capacity from observed latency and shed load when latency rises, before errors even start.
+
+### Queueing theory: why p99 is the number that matters
+
+For a single server with random arrivals (M/M/1), average waiting time is
+
+```
+W = ρ / (μ × (1 - ρ))       where ρ = utilisation, μ = service rate
+```
+
+The `1 - ρ` in the denominator is the whole story:
+
+| Utilisation | Relative wait time |
+|---|---|
+| 50% | 1× |
+| 80% | 4× |
+| 90% | **9×** |
+| 95% | 19× |
+| 99% | **99×** |
+
+**Going from 50% to 90% utilisation multiplies queueing delay by nine.** This is why services fall over at a specific load rather than degrading smoothly, and why "we have plenty of CPU headroom at 85%" is not the reassurance it sounds like — you are already at 5.7× the queueing delay of a half-loaded system.
+
+**The mean hides all of it.** In the measured retry run, p50 was **612 ms** and p99 was **12,885 ms** — a 21× spread. The mean would have been perhaps 1.5 s and would have described nobody's experience: half the users saw 612 ms and one in a hundred waited thirteen seconds.
+
+Worse, **tail latency compounds across dependencies.** If one call has a 1% chance of being slow, a request fanning out to 10 independent services has a `1 - 0.99^10 = 9.6%` chance that *at least one* is slow. At 100 dependencies it is 63%. Dean and Barroso's "The Tail at Scale" is the canonical treatment, and its practical answer is **hedged requests**: send a second copy of the request after the p95 latency has elapsed and take whichever returns first. That costs about 5% extra load and cuts p99 dramatically — and it is only safe for idempotent operations, which is why idempotency keeps coming back.
+
+### Little's law for capacity, not just concurrency
+
+```
+L = λ × W          in-flight = arrival rate × latency
+```
+
+Module 4 used it to size a semaphore. It also sizes everything else:
+
+- **Connection pools.** 500 req/s at 80 ms latency needs `500 × 0.08 = 40` connections. A pool of 10 caps you at 125 req/s no matter what the upstream can do — and the symptom is latency rising with queueing at *your* pool, not at the server.
+- **Worker counts.** 200 req/s at 250 ms of handler time needs 50 concurrent handlers.
+- **Queue depth.** A queue that is persistently deep means arrival rate exceeds service rate, and it will not recover on its own — the depth is a *leading* indicator, where latency is a lagging one.
+
+The measured confirmation from Module 4: a semaphore of 20 against a 54 ms service delivered **371 req/s** against a predicted 370. The model is accurate enough to plan with.
+
+### What a retry costs the server
+
+A retry is not free for the upstream, and the cost is asymmetric in a way that matters.
+
+- **A retried request that eventually succeeds** costs the server every failed attempt's work *plus* the successful one. If the failures were timeouts, each one consumed a full request slot for the timeout duration.
+- **Failed requests are the expensive ones.** A request that times out at 30 s occupies a connection and a worker for 30 seconds; a successful one occupies it for 80 ms. Under failure, the same request count consumes ~375× the connection-seconds.
+- **429 responses are cheap for the server and expensive for you.** Being rate-limited costs the server a header write; it costs you an entire attempt from your budget. In the measured run, 185 of 327 retries were consumed this way.
+
+The metric to export is **upstream requests per client request**. It should be near 1.0 in steady state. If it rises during incidents, you have an amplifier. This one ratio is worth more than most dashboards.
+
+### Idempotency at scale: the parts nobody mentions
+
+An idempotency key needs a server-side store, and that store has properties you must decide:
+
+- **Retention.** Stripe keeps keys for 24 hours. Too short and a delayed retry creates a duplicate; too long and the store grows without bound. Match it to your maximum realistic retry window, and document it.
+- **Concurrent duplicates.** Two copies of the same request arriving simultaneously must not both proceed. The store needs an atomic "insert if absent" — `INSERT ... ON CONFLICT DO NOTHING` returning whether it inserted, or Redis `SET key val NX`. Week 8 covers the isolation level this needs.
+- **Storing the response, not just the key.** A duplicate must return the *same* response, including the resource ID. A store that only records "seen" forces the second caller to guess.
+- **Failure semantics.** If the first attempt crashed halfway, the key exists and the operation did not complete. You need a state machine — `in_progress`, `succeeded`, `failed` — not a set, and `in_progress` plus a stale timestamp means "reconcile", not "retry".
+
+The pattern that avoids most of this is the **transactional outbox**: write the intent and the business change in one database transaction, and have a separate process perform the external call and mark it done. The external call becomes retryable by construction because the intent is durable, and exactly-once delivery becomes at-least-once delivery plus idempotency — which is the only thing that is actually achievable.
+
+### Production failure modes and how you detect them
+
+| Failure | Signature | Detection |
+|---|---|---|
+| Retry amplification | brief upstream blip becomes a long outage; upstream load 3–27× normal | export upstream-requests per client-request; retry budgets; retry at one layer only |
+| Thundering herd | upstream recovers, immediately fails again, on a period | full jitter; the arrival histogram shows spikes at multiples of the backoff |
+| Self-inflicted rate limiting | 429 rate correlates with your own retry rate | measured: 185 of 327 retries were 429s; add a client-side token bucket |
+| Duplicate side effects | double charges, duplicate rows, discovered at reconciliation | idempotency keys generated once per logical operation; audit the retry path for `POST` |
+| Timeout shorter than the dependency's p99 | steady low rate of "timeouts" on requests that actually succeeded | set timeouts from the measured p99 of the dependency, not a round number |
+| Breaker opens on a 1% error rate | full outage during a minor degradation | use an error *rate* over a window, plus a minimum request volume before opening |
+| Work continues after the caller left | CPU and connections consumed by requests nobody is waiting for | propagate deadlines; check the deadline before each attempt and each sub-call |
+| Tail latency invisible | mean looks fine, users complain | measure p50/p95/p99/p99.9 separately; a 21× p50-to-p99 spread is normal and the mean hides it |
+| Queue grows slowly for hours | throughput normal until it collapses | alert on queue *depth*, which leads; latency lags |
+
+### Frontier and research pointers
+
+- **Brooker, M. (2015). "Exponential Backoff and Jitter." AWS Architecture Blog.** One-sentence takeaway: full jitter minimised both total work and completion time in AWS's simulations, because de-synchronising clients matters more than waiting longer.
+- **Dean, J. & Barroso, L. A. (2013). "The Tail at Scale." *CACM* 56(2), 74–80.** One-sentence takeaway: when a request fans out to many services, the slowest component determines user-visible latency, so tail tolerance — hedged requests, tied requests, micro-partitioning — is a system property rather than a per-service one.
+- **Little, J. D. C. (1961). "A Proof for the Queuing Formula L = λW." *Operations Research* 9(3).** One-sentence takeaway: in-flight work equals arrival rate times latency, which sizes connection pools, worker counts and semaphores arithmetically.
+- **Nygard, M. (2018). *Release It!*, 2nd ed., Chapters 4–5 ("Stability Antipatterns", "Stability Patterns").** One-sentence takeaway: circuit breakers, bulkheads, timeouts and fail-fast are named patterns with named failure modes, and the antipattern chapter is a catalogue of the outages you are about to have.
+- **Netflix, "Performance Under Load: Adaptive Concurrency Limits" (2018).** One-sentence takeaway: inferring a service's concurrency limit from observed latency, rather than configuring it, sheds load before errors begin — a control-theory answer to a problem usually solved with constants.
+- **Gray, J. & Reuter, A. (1993). *Transaction Processing*, §4 on idempotence and exactly-once semantics.** One-sentence takeaway: exactly-once delivery is impossible across an unreliable network, so the achievable target is at-least-once delivery plus idempotent handling — which is why idempotency keys exist.
+
+### Stretch challenge
+
+Tune a client against a flaky, rate-limited server and defend every parameter.
+
+1. Build a server with a configurable failure rate (start at 30%), random latency (10–90 ms) and a token-bucket rate limit (500/minute), returning 429 with `Retry-After` when exceeded.
+2. Build three clients — naive, retry-with-jitter, retry-plus-client-side-bucket — and reproduce the measured table. Ours: **285/400 in 0.16 s; 358/400 in 14.20 s with 185 server 429s; 400/400 in 68.59 s with zero 429s.**
+3. **Sweep the client bucket rate** from 2 to 12 req/s against the server's 8.33 req/s budget. Plot success rate, wall time, server 429s and p99 against the rate. Find the value that maximises success per unit time. Is it above or below the server's limit, and why?
+4. **Compare jitter strategies** — none, equal, full, decorrelated — at 200 simultaneous clients. Report peak arrival rate in any 100 ms window, total requests sent, and time to complete all work. Ours simulated 1,000 vs ~215 vs ~118 clients in the busiest window.
+5. **Add a circuit breaker** and simulate a total outage (100% failures for 30 s, then recovery). Measure total requests sent to the dead server with and without the breaker, and time-to-recovery once it comes back. Then break the breaker deliberately by allowing all requests through at HALF-OPEN, and show it re-opens.
+6. **Simulate amplification**: chain three of your clients so that A calls B calls C, each retrying 3×, and measure requests arriving at C per request entering A, in steady state and during an outage. Then add a 10% retry budget and re-measure.
+
+The open question with no single right answer: your step 3 sweep will show that maximum success rate and minimum p99 want different bucket rates, and that the "best" rate depends on whether you are the only client of that server. If you cannot know your share of the budget — which is the normal case — do you set the bucket conservatively and accept lower throughput, or run without one and rely on reacting to 429s? Argue it with your curves, and say how your answer changes if a second copy of your service is deployed tomorrow.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Simulate a flaky server (30% failures, random latency, a rate limit) and tune your client to maximise throughput without exceeding the limit. Report success rate, wall time, retries, server 429s and p99 for each configuration.
+</Card>
+
+Acceptance: three client configurations measured against a freshly started server each time (so the rate-limit window is not shared); you report all five metrics per configuration; you sweep the client-side rate limit and plot success rate and p99 against it; and your write-up states which configuration you would ship and for what caller.
+
+## The whiteboard
+
+The T1 sketch is the two retry timelines — synchronised versus jittered — with the token bucket and the breaker state machine. The T2 build-up frames add one defence at a time and show its effect on the measured table.
+
+<Tip>
+**Draw it yourself.** From memory: the synchronised herd and the jittered spread, the full-jitter
+formula, the three-state breaker with its transition conditions, and the three-row measured table.
+Then compare.
+[Blank version](/assets/diagrams/P1-W04-M5-blank.svg) · [Editable source](/assets/diagrams/P1-W04-M5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Portfolio line:** *"A resilient async client benchmarked against a controllable flaky server: naive at 71.3% success in 0.16 s, retries at 89.5% but generating 185 self-inflicted rate-limit responses, and a token-bucket client at 100% with zero 429s — plus a sweep showing that maximum success and minimum p99 want different limiter settings."* The self-inflicted-429 finding is the part that reads as real experience.
+
+**The interview angle.** "How would you make an API client reliable?" invites a list. The answer that lands is ordered and has a number: *classify errors first — retrying a 400 is pure waste. Then bounded retries with **full** jitter, because plain exponential backoff still synchronises every client. Then a deadline rather than an attempt count, because the caller's patience is the real constraint. And before any of it, the idempotency question: a timeout tells you nothing about whether the operation happened, so retrying a POST without an idempotency key can double-charge someone.*
+
+The senior follow-up is "what could go wrong with retries?" — retry amplification: three layers each retrying three times is 27× load on the upstream during an incident, which is how a blip becomes an outage. The fix is a retry budget, not a smaller retry count.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+Three places this shows up in a normal engineering week:
+
+1. **Every outbound HTTP call you own.** Check three things: is there a timeout at all (`requests` defaults to *none*), is the error classified before retrying, and is there jitter. Those three are usually a ten-line change and they prevent a category of incident.
+
+2. **Any `POST` in a retry path.** Ask the idempotency question explicitly in review. If the operation creates a resource or moves money and there is no idempotency key generated *once* outside the loop, that is a duplicate waiting to happen — and it will be found at reconciliation, weeks later, which is the most expensive way to find it.
+
+3. **After the next incident.** Look at upstream requests per client request during the event. If it rose above 1.0 you amplified the outage. The highest-value fix is a retry *budget* (retries capped at ~10% of request volume in a sliding window), because it self-limits exactly when retries are harmful, unlike a fixed attempt count which does the opposite.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| A brief upstream blip becomes a long outage | retry amplification: R^L requests per user request | retry at one layer; retry budgets; circuit breaker |
+| Upstream recovers then immediately fails again | no jitter — every client retried at the same instant | full jitter: `random.uniform(0, min(cap, base * 2**attempt))` |
+| Your own 429 rate rises with your retries | you exceeded the rate limit *by retrying* | client-side token bucket; honour `Retry-After` |
+| Customers charged twice | a non-idempotent `POST` retried after a timeout | idempotency key generated once, before the first attempt |
+| Retries on a 400 or 401 | no error classification | retry only 408, 425, 429, 5xx, timeouts and connection errors |
+| A worker hangs forever | no timeout (`requests` defaults to none) | always set one; set `connect` and `read` separately |
+| Steady low rate of timeouts on work that succeeded | timeout shorter than the dependency's p99 | measure the dependency's p99 and set the timeout above it |
+| Retries continue after the caller gave up | attempt count with no deadline | a monotonic deadline, checked before each attempt and bounding each sleep |
+| Breaker turns a 1% error rate into an outage | threshold is a raw failure count | error rate over a sliding window, plus a minimum request volume |
+| Breaker re-opens the instant it half-opens | all queued requests admitted at recovery | admit exactly one probe |
+| Mean latency looks fine, users complain | the mean hides the tail — measured p50 612 ms, p99 12,885 ms | track p50/p95/p99/p99.9; alert on p99 |
+| Rate limiter grants extra tokens after an NTP sync | used `time.time()` | `time.monotonic()`, always |
+
+## Sources & further reading
+
+**Primary docs**
+
+- **[AWS Architecture Blog, "Exponential Backoff and Jitter" (Brooker, 2015) and the AWS SDK retry documentation.](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)** Read the simulation results; the counter-intuitive finding that full jitter beats equal jitter on *both* work and completion time is the whole reason to prefer it.
+- **[RFC 9110 §15.5 (4xx) and §10.2.3 (`Retry-After`).](https://www.rfc-editor.org/rfc/rfc9110)** Read the `Retry-After` section for both accepted formats (delta-seconds and HTTP-date); handling only the first is a common bug.
+- **[Envoy documentation on retry policies, `retry_budget` and outlier detection; gRPC's retry design (`gRFC A6`).](https://www.envoyproxy.io/docs/envoy/latest/)** Read the retry-budget rationale — it is the clearest statement of why a percentage cap beats an attempt count.
+- **[Stripe API documentation, "Idempotent requests".](https://docs.stripe.com/api/idempotent_requests)** Read the 24-hour retention note and the rule that the key must be generated per logical operation, not per attempt.
+- **[`tenacity` documentation (Python).](https://tenacity.readthedocs.io/en/latest/)** Read it as a checklist even if you write your own: `stop_after_delay`, `wait_random_exponential`, `retry_if_exception_type` are the three composable pieces this module builds by hand.
+
+**Papers**
+
+- **[Dean, J. & Barroso, L. A. (2013). "The Tail at Scale." *Communications of the ACM* 56(2), 74–80.](https://doi.org/10.1145/2408776.2408794)** One-sentence takeaway: at fan-out, the slowest dependency sets user-visible latency, so tail tolerance must be engineered rather than assumed — hedged requests being the cheapest lever.
+- **[Little, J. D. C. (1961). "A Proof for the Queuing Formula L = λW." *Operations Research* 9(3), 383–387.](https://doi.org/10.1287/opre.9.3.383)** One-sentence takeaway: in-flight work equals arrival rate times latency, which sizes pools, workers and limiters without experimentation.
+- **Kleinrock, L. (1975). *Queueing Systems, Volume 1: Theory*, Chapter 2.** One-sentence takeaway: waiting time scales as `ρ/(1-ρ)`, so 90% utilisation costs 9× the queueing delay of 50% — which is why services fail suddenly rather than gradually.
+- **Gray, J. & Reuter, A. (1993). *Transaction Processing: Concepts and Techniques*, §4.** One-sentence takeaway: exactly-once delivery is unachievable over an unreliable network, so the design target is at-least-once plus idempotent handling.
+- **Netflix Technology Blog, "Performance Under Load" (2018) and the `concurrency-limits` library.** One-sentence takeaway: a service's safe concurrency can be inferred from latency gradients in the same way TCP infers bandwidth, which sheds load before errors rather than after.
+
+**Go deeper**
+
+- **[Nygard, M. (2018). *Release It!*, 2nd ed., Chapters 4–5.](https://pragprog.com/titles/mnee2/release-it-second-edition/)** The catalogue of stability antipatterns (integration points, chain reactions, cascading failure, unbounded result sets) and the patterns that answer them; the single most useful book on this topic.
+- **[Google SRE Book, Chapter 22 ("Addressing Cascading Failures") and Chapter 21 ("Handling Overload").](https://sre.google/sre-book/addressing-cascading-failures/)** Chapter 22's account of how retries and queueing combine into an unrecoverable state is the best free writing on retry amplification.
+- **[Marc Brooker's blog (brooker.co.za), the posts on timeouts, retries and "Fixing Retries with Token Buckets and Circuit Breakers."](https://brooker.co.za/blog/)** Short, precise, written by the person who did the AWS simulations; the token-bucket-for-retries post is the natural sequel to this module.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-04/p1-w04-m5">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

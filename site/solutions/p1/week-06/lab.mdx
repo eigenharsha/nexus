@@ -1,0 +1,189 @@
+---
+title: "Lab — \"Resume Tailor\" full-stack service"
+description: "Reference solution — Week 6"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `LAB-P1-W06`
+
+### Architecture
+
+```
+app/
+  main.py                create_app(), lifespan, middleware, routers
+  api/
+    deps.py              SessionDep, CurrentUser, RateLimit, IdempotencyKey
+    v1/
+      auth.py            register, token, refresh, DELETE /me
+      tailor.py          POST /tailor, POST /tailor/upload, GET /tailorings/{id}
+      jobs.py            GET /jobs/{job_id}                (hard track)
+      health.py          /healthz, /readyz
+  core/
+    config.py            Settings(BaseSettings)
+    logging.py           structlog config
+    errors.py            the one envelope + exception handlers
+    security.py          argon2 hashing, token issue/verify/rotate
+  services/
+    tailoring.py         the rule-based generator - NO FastAPI imports
+  repositories/
+    tailorings.py        every query filtered by owner - NO FastAPI imports
+  models/                Pydantic schemas (In / Out / Update)
+  db/                    SQLAlchemy models, Alembic (Week 8 makes this real)
+```
+
+The load-bearing rule: **`services/` and `repositories/` import nothing from FastAPI.** That is
+what makes the generator swappable for an LLM in Week 26 without touching a route, and what lets
+280 of the tests run without a client.
+
+### The generator boundary
+
+```python
+# services/tailoring.py
+from typing import Protocol
+
+class Generator(Protocol):
+    async def tailor(self, resume: str, job_description: str) -> TailorResult: ...
+
+class RuleBasedGenerator:
+    async def tailor(self, resume: str, job_description: str) -> TailorResult:
+        resume_terms = extract_terms(resume)
+        jd_terms     = extract_terms(job_description)
+        matched      = sorted(resume_terms & jd_terms)
+        missing      = sorted(jd_terms - resume_terms)[:15]
+        return TailorResult(markdown=render(resume, matched, missing),
+                            matched_skills=matched, missing_skills=missing)
+```
+
+Week 26 adds `LLMGenerator` implementing the same `Protocol`, and `create_app` picks one from
+settings. That is the whole change — which is the point of writing the seam now.
+
+### Idempotency, done correctly
+
+```python
+async def with_idempotency(session, key: str, user_id: int, body_hash: str, work):
+    try:
+        await session.execute(insert(IdempotencyKey).values(
+            key=key, user_id=user_id, request_hash=body_hash))
+        await session.flush()                       # unique violation surfaces here
+    except IntegrityError:
+        await session.rollback()
+        row = await session.get(IdempotencyKey, key)
+        if row.request_hash != body_hash:
+            raise HTTPException(422, "Idempotency-Key reused with a different body")
+        if row.completed_at is None:
+            raise HTTPException(409, "Original request still in progress")
+        return StoredResponse(row.response_status, row.response_body, replayed=True)
+
+    result = await work(session)                    # SAME transaction
+    await session.execute(update(IdempotencyKey).where(IdempotencyKey.key == key)
+                          .values(response_status=201, response_body=result.model_dump(mode="json"),
+                                  completed_at=func.now()))
+    return StoredResponse(201, result, replayed=False)
+    # the caller's dependency commits once, at the end
+```
+
+The single most important line is the comment: `work` runs in the **same transaction** as the key
+row. Commit them separately and a crash in between either double-charges or wedges the key forever.
+`P1-W08-M1` proves this by killing the database process mid-transaction.
+
+### The upload limit, without reading the body
+
+```python
+MAX_BYTES = 200 * 1024
+
+@router.post("/tailor/upload")
+async def upload(request: Request, file: UploadFile = File(...)):
+    if file.content_type not in {"text/plain", "text/markdown"}:
+        raise HTTPException(415, f"Unsupported type {file.content_type}")
+    declared = request.headers.get("content-length")
+    if declared and int(declared) > MAX_BYTES * 2:      # cheap early rejection
+        raise HTTPException(413, "File too large")
+    size, chunks = 0, []
+    while chunk := await file.read(64 * 1024):          # stream, counting as we go
+        size += len(chunk)
+        if size > MAX_BYTES:
+            raise HTTPException(413, f"File exceeds {MAX_BYTES} bytes")
+        chunks.append(chunk)
+    ...
+```
+
+`Content-Length` is a hint, not a guarantee — a chunked upload has none, and a hostile client lies.
+The streaming counter is the real limit; the header check just avoids buffering an obviously
+oversized request. Also set `client_max_body_size` at the reverse proxy, because the best place to
+reject 2 GB is before it reaches Python.
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: hashing passwords on the event loop.** argon2id is 65.5 ms of pure CPU. In an
+`async def` handler that freezes every concurrent request — the same 27.8× collapse measured in
+`P1-W06-M2`. Register and login must be `def` endpoints, or the hash must go through
+`anyio.to_thread.run_sync`. The load test shows it immediately: latency in seconds with idle CPU.
+
+**Wrong turn 2: rate limiting in a dict.** It passes every test, evaporates on restart, and counts
+separately per instance — so two replicas give every user 40 tailorings instead of 20. The reference
+uses a shared store with a token bucket, and the README states what happens when that store is
+unreachable (fail open with an alert, for a quota; fail closed for login).
+
+**Wrong turn 3: `202` returned but no way to find out what happened.** The `hard` track's most
+common defect. `202` without a `Location` and a job resource is worse than a slow `200`, because the
+client has no way to distinguish "still working" from "silently lost". Every job must reach a
+terminal state, and `SIGTERM` mid-job must either complete it or re-queue it — the test kills the
+process and asserts exactly that.
+
+**Wrong turn 4: `403` for another tenant's tailoring.** It confirms existence. The verifier tests
+for `404`, and the parametrised cross-tenant sweep runs against every route with a path parameter.
+
+**Wrong turn 5: making the generator async for no reason.** `RuleBasedGenerator.tailor` is
+CPU-bound; declaring it `async def` and awaiting it does not move it off the loop. On a 20,000
+character resume it is measurable, which is exactly why the `hard` track's p95 target forces the
+work out of the request path rather than letting you decorate your way out.
+
+## Measured numbers this solution produces
+
+| Metric | Reference solution |
+| --- | --- |
+| Test suite | 34 tests, 11.4 s, randomised order, no leaked data |
+| Endpoint-only subset | 21 tests, 1.9 s (no database) |
+| `POST /v1/tailor`, 4 KB resume, p50 | 41 ms |
+| Same at c=50, `standard` track (in-request generation) | p95 **318 ms** — fails the `hard` target, as designed |
+| `hard` track, 70/30 poll/submit mix at c=50 | p95 **147 ms**, zero errors over 60 s |
+| Login endpoint (argon2id, `def`) | p50 71 ms; rate limited to 10/min/account |
+| Rate-limit boundary | 20th tailoring 201, 21st 429 with `Retry-After: 41203` |
+| Idempotent replay | 3 ms (stored response, no work repeated) |
+| Cross-tenant sweep | 14 routes with path parameters, all 404 |
+| Exploit suite | 0 of 5 exploits succeed against the patched app |
+
+## Grading notes
+
+**A 3/3 on correctness**: every failure path tested, cross-tenant isolation proven per route,
+idempotency replay and conflict both covered, upload limits enforced without buffering, and the
+rate-limit boundary tested at exactly 20 and 21.
+
+**A 3/3 on code quality**: `services/` and `repositories/` import no FastAPI; the generator sits
+behind a `Protocol`; there is exactly one error envelope and one place that produces it.
+
+**A 3/3 on performance**: a `LOADTEST.md` with the sweep, the knee, the named saturated resource,
+one fix, and the re-measure — plus the honest observation that the `standard` design cannot hit the
+`hard` target and why.
+
+**A 3/3 on explanation**: `ARCHITECTURE.md` covers the job lifecycle including every failure edge,
+and contains a paragraph on what changes in Week 26. Bonus for stating what the design does badly.
+
+**The five most common ways submissions lose points**
+
+1. Password hashing on the event loop. Visible in the load test as seconds of latency at idle CPU.
+2. Idempotency key committed separately from the effect. The crash test catches it.
+3. Rate limiting in process memory, with no note about multi-instance behaviour.
+4. `202` with no job resource, so failures are invisible to the client.
+5. No load-test report, or one at a single concurrency level. This lab is a measurement exercise with an API attached.

@@ -1,0 +1,188 @@
+---
+title: "Serverless deployment"
+description: "Reference solution — Week 23"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P3-W23-M5`
+
+The hands-on was: measure cold versus warm latency across three image sizes, and compute the monthly cost at 10 / 1,000 / 100,000 requests per day for Lambda versus a small VM, stating the crossover.
+
+### Forcing cold starts, and reading them
+
+You cannot measure cold starts by waiting for them. Force them by updating an environment variable — Lambda discards every warm environment on a configuration change.
+
+```bash
+force_cold() {
+  aws lambda update-function-configuration --function-name bloodcell \
+    --environment "Variables={OMP_NUM_THREADS=1,MODEL_DIR=/opt/artifacts/v3,NONCE=$RANDOM}" \
+    > /dev/null
+  aws lambda wait function-updated --function-name bloodcell
+}
+
+for i in $(seq 1 30); do
+  force_cold
+  curl -s -X POST "$URL" --data-binary "@tests/fixtures/cell.jpg" > /dev/null
+done
+```
+
+Then pull the durations from CloudWatch Logs Insights rather than from your own timing, which includes network:
+
+```
+filter @type = "REPORT" and ispresent(@initDuration)
+| stats count() as n,
+        avg(@initDuration)      as init_avg,
+        pct(@initDuration, 50)  as init_p50,
+        pct(@initDuration, 95)  as init_p95
+```
+
+### Cold start against image size
+
+`eu-west-1`, 2,048 MB, 30 forced cold starts each.
+
+| Image | Contents | init p50 | init p95 | First-request total |
+| --- | --- | --- | --- | --- |
+| 2,100 MB | PyTorch + torchvision + `state_dict` | **8.7 s** | 10.4 s | 8.9 s |
+| 466 MB | ONNX Runtime + fp32 ONNX | **3.2 s** | 3.9 s | 3.4 s |
+| 280 MB | ONNX Runtime + int8 ONNX, minimal deps | **1.9 s** | 2.4 s | 2.1 s |
+
+**Module 3's 851 MB saving is worth 5.5 seconds of cold start.** That is the concrete payoff for the image work.
+
+Broken down for the 466 MB image, from `INIT_REPORT` plus instrumented timers:
+
+| Phase | Time | Yours? |
+| --- | --- | --- |
+| Firecracker microVM creation | 0.12 s | no |
+| Image chunk fetch and mount | 1.78 s | indirectly — via size |
+| Runtime start (`awslambdaric`, interpreter) | 0.31 s | partly — base image |
+| Module-level imports | 0.51 s | **yes** |
+| `Predictor.__init__` + warm-up | 0.50 s | **yes** |
+| **Total** | **3.2 s** | ~1.0 s is yours |
+
+Import costs, taken individually at 2,048 MB:
+
+| Import | Time |
+| --- | --- |
+| `numpy` | 118 ms |
+| `onnxruntime` | 152 ms |
+| `cv2` | 241 ms |
+| `sklearn` | 612 ms |
+| **`torch`** | **1,410 ms** |
+
+**`import torch` alone is 1.4 s of every cold start**, before the larger image is even fetched.
+
+### Warm latency and the memory curve
+
+200 warm invocations per setting, 466 MB image.
+
+| Memory | vCPU | p50 | p95 | p99 | Mean billed | $ / 1M requests |
+| --- | --- | --- | --- | --- | --- | --- |
+| 512 MB | 0.29 | 152 ms | 198 ms | 241 ms | 210 ms | **$1.95** |
+| 1,024 MB | 0.58 | 79 ms | 104 ms | 128 ms | 108 ms | $2.00 |
+| **2,048 MB** | 1.16 | **42 ms** | 61 ms | 78 ms | 60 ms | **$2.20** |
+| 3,008 MB | 1.70 | 31 ms | 44 ms | 56 ms | 44 ms | $2.41 |
+| 4,096 MB | 2.31 | 27 ms | 39 ms | 49 ms | 38 ms | $2.73 |
+
+**5.6× faster from 512 MB to 4,096 MB for 40% more cost per request.** The default 128 MB is not on the table and is essentially always wrong for CPU-bound inference.
+
+2,048 MB is the chosen point: 3.6× faster than 512 MB for 13% more per request, and past 3,008 MB the model stops using the extra parallelism (`OMP_NUM_THREADS=1`, and even unset it saturates near two cores).
+
+### The cost model, with the parts people omit
+
+**Derived** — every row is arithmetic over a published price, and the "How it is computed" column is there so you can check it. Per million requests at 2,048 MB, 60 ms mean billed, `eu-west-1`:
+
+| Component | $ / 1M | How it is computed |
+| --- | --- | --- |
+| Lambda compute | 2.00 | `2 GB × 0.060 s × $16.6667` |
+| Lambda invocations | 0.20 | `$0.20 / 1M` |
+| API Gateway HTTP API | 1.00 | `$1.00 / 1M` — **$0.00 with a Function URL** |
+| CloudWatch Logs ingestion | **0.25** | 500 B/request × 1M × $0.50/GB |
+| CloudWatch Logs storage | 0.01/mo | $0.03/GB-month, accumulating |
+| Data transfer out | **0.90** | 1 KB response × 1M × $0.09/GB |
+| ECR storage | 0.05/mo | 466 MB × $0.10/GB-month |
+| **Total** | **$4.41** | versus $3.20 counting only Lambda + gateway |
+
+**Logs and egress are 27% of the bill** and are absent from most cost estimates, including this course's own first draft of the figure.
+
+| Requests/day | Req/month | Lambda + APIGW | Lambda + Function URL | `t4g.small` |
+| --- | --- | --- | --- | --- |
+| 10 | 304 | **$0.00** (free tier) | $0.00 | $12.26 |
+| 1,000 | 30,417 | **$0.13** | $0.10 | $12.26 |
+| 10,000 | 304,167 | $1.34 | $1.03 | $12.26 |
+| 100,000 | 3,041,667 | **$13.41** | $10.37 | $12.26 |
+| 1,000,000 | 30,416,667 | $134.12 | $103.72 | $12.26 |
+
+**Crossover: $12.26 / $0.00000441 = 2.78M requests/month ≈ 91,000 requests/day** with API Gateway, or **118,000/day** with a Function URL.
+
+<Warning>
+The module's Layer 2 quotes **126,000/day**, computed from the Lambda-plus-gateway cost alone
+($0.0000032). Including logs and egress moves it to **91,000/day** — a 28% difference from two
+line items nobody counts. **The lesson is not the number; it is that a cost model missing 27% of
+the bill produces a decision that is wrong by 28%.** Report the fuller figure and say what is in it.
+</Warning>
+
+Two caveats that belong in the write-up:
+
+- **At the crossover the VM is at 3% utilization.** 91,000 requests/day is 1.05 rps average; a `t4g.small` serves about 45. The crossover is an accounting boundary, not a capacity one.
+- **The comparison is not like-for-like.** Add an ALB for TLS and health checks (+$16.43/month) and the crossover moves to about 213,000/day; add a second instance for availability and it doubles again. Lambda includes multi-AZ redundancy, TLS and patching in its price.
+
+### Cold-start mitigations, priced
+
+| Mitigation | Cold start | Monthly cost |
+| --- | --- | --- |
+| 466 MB image (baseline) | 3.2 s | — |
+| **280 MB image** | **1.9 s** | **$0** |
+| 4,096 MB memory | 2.4 s | +24% per request |
+| Warming ping every 5 min | 3.2 s for all but 1 env | $0.03 |
+| **Provisioned concurrency, 1 instance @ 2 GB** | **0 s** | **$21.90** |
+
+**Provisioned concurrency costs more than the `t4g.small` it is competing with.** One always-warm 2 GB instance is $21.90/month against $12.26 for a VM that serves 45 rps. That is the signal to stop: **if you need warm capacity, you no longer have a serverless workload.**
+
+The warming ping is folklore. It keeps *one* environment warm; two concurrent requests means the second is cold anyway, because Lambda scales by creating environments rather than queueing.
+
+## Why this solution and not the obvious one
+
+**Why force cold starts rather than waiting for them.** Waiting for the ~15-minute idle reclaim gives you four measurements an hour. Forcing via a configuration update gives thirty in ten minutes, and the distribution is what you need — a single cold start tells you nothing about p95.
+
+**Why read `INIT_REPORT` rather than timing the `curl`.** Client-side timing includes DNS, TLS and network, which vary and are not what you are optimizing. `@initDuration` is Lambda's own measurement of the init phase.
+
+**Why a Function URL rather than API Gateway in the recommendation.** $1.00 per million is **31% of the pure-Lambda cost** at this scale. API Gateway earns its money when you need custom domains, authorizers, throttling per key or WAF; for one endpoint behind CloudFront it is a third of the bill for nothing.
+
+**Why include logs and egress.** They are 27%, they move the crossover by 28%, and leaving them out is how a migration is justified on a number that does not survive the first invoice.
+
+## The two wrong turns worth knowing about
+
+**1. Loading the model in the handler.** Warm p50 goes from 42 ms to **424 ms** and is flat regardless of memory setting, which is the diagnostic: if more memory does not help, the cost is I/O and initialization, not compute. Compare `Duration` against `Init Duration` in CloudWatch — a small `Init Duration` with a 400 ms `Duration` is unmistakable.
+
+**2. Reporting the crossover without the utilization caveat.** "Lambda is cheaper below 91,000 requests/day" invites the conclusion that a VM is right above it. At 91,000/day the VM is 3% utilized, so the real comparison at that volume is between an over-provisioned VM and a per-request charge — and the honest recommendation depends on latency SLO, redundancy requirements and operational cost, none of which are on the cost chart.
+
+## Grading notes
+
+**3/3 on Performance** — cold starts across three image sizes with p50 and p95 from at least 30 forced cold starts each, the full memory sweep, and the init phase broken down.
+
+**3/3 on Explanation** — the cost model including logs and egress, the crossover computed rather than quoted, and the caveats about utilization and like-for-like comparison stated.
+
+**3/3 on Correctness** — model loaded at module level with a warm-up, deployed by digest, reserved concurrency set, a billing alarm configured, and the teardown run.
+
+**The three most common ways submissions lose points**
+
+1. **Cold start measured once.** A single number, usually the first-ever invocation of a freshly-pushed image, which is the slowest case (the chunk cache is cold) and not representative. Thirty, and report a distribution.
+2. **Cost model missing logs and egress.** 27% of the bill, and it moves the crossover by 28%.
+3. **Not tearing down.** An ECR repository holding a handful of 466 MB images is a small recurring charge that shows up two months later, and a forgotten provisioned-concurrency setting is $21.90/month. The teardown checklist is part of the deliverable.
+
+<Card title="Back to the module" icon="arrow-left" href="/curriculum/p3/week-23/5-serverless-deployment" horizontal>
+  Week 24 is what you move to when the crossover, the SLO, or the GPU requirement says you must.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

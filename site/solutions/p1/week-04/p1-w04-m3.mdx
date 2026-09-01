@@ -1,0 +1,163 @@
+---
+title: "Processes and true parallelism"
+description: "Reference solution — Week 4"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W04-M3`
+
+Find the crossover, and separate the two overheads that create it.
+
+```python
+"""crossover.py — where does a process pool start paying?"""
+from __future__ import annotations
+
+import os
+import pickle
+import time
+from concurrent.futures import ProcessPoolExecutor
+
+
+def work(n: int) -> float:                 # module level: picklable by reference
+    s = 0.0
+    for i in range(n):
+        s += i * 0.5
+    return s
+
+
+def bench(n: int, tasks: int = 64, workers: int = 8) -> tuple[float, float]:
+    t = time.perf_counter(); [work(n) for _ in range(tasks)]; seq = time.perf_counter() - t
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        t = time.perf_counter(); list(ex.map(work, [n] * tasks)); par = time.perf_counter() - t
+    return seq, par
+
+
+def pool_floor(workers: int = 8) -> float:
+    """Pool creation cost alone: create, run one trivial task, tear down."""
+    t = time.perf_counter()
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(work, [1]))
+    return time.perf_counter() - t
+
+
+def pickle_cost(obj) -> tuple[int, float, float]:
+    blob = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    t = time.perf_counter()
+    for _ in range(200): pickle.dumps(obj, protocol=5)
+    dump = (time.perf_counter() - t) / 200 * 1e6
+    t = time.perf_counter()
+    for _ in range(200): pickle.loads(blob)
+    load = (time.perf_counter() - t) / 200 * 1e6
+    return len(blob), dump, load
+
+
+def main() -> None:
+    print(f"cores={os.cpu_count()}  load={os.getloadavg()[0]:.1f}")
+    print(f"pool floor (create + 1 task + teardown): {pool_floor() * 1000:.1f} ms\n")
+    print(f"{'work/task':>12} {'sequential':>12} {'pool(8)':>12} {'speedup':>9}")
+    for n in (100, 1_000, 10_000, 100_000, 1_000_000, 5_000_000):
+        seq, par = bench(n)
+        print(f"{n:>12,} {seq*1000:>10.1f} ms {par*1000:>10.1f} ms {seq/par:>8.2f}x")
+    print()
+    for label, obj in [("int", 42), ("list 1k ints", list(range(1000))),
+                       ("list 100k ints", list(range(100_000))),
+                       ("dict 10k", {i: f"v{i}" for i in range(10_000)}),
+                       ("str 1 MB", "x" * 1_000_000)]:
+        size, dump, load = pickle_cost(obj)
+        print(f"{label:16s} {size:>9,} B  dumps {dump:8.1f} us  loads {load:8.1f} us")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: measuring the crossover without separating the two overheads.**
+
+A single speedup-versus-task-size curve tells you *that* small tasks lose. It does not tell you *why*, and the two causes have completely different fixes:
+
+- **Pool creation** is a one-off, measured here at **54.0 ms** with `spawn` and **3.8 ms** with `fork`. The fix is to create the pool once and reuse it, or to switch start method where it is safe.
+- **Pickling** is per task, measured at **659 µs to write and 1,313 µs to read** a 100,000-element list. The fix is to send less — a filename, an index range — or to use `chunksize` so one message carries many items.
+
+If your crossover is dominated by pool creation, `chunksize` will not help. If it is dominated by pickling, a longer-lived pool will not help. Measuring them separately takes ten extra lines and tells you which lever to pull.
+
+**Wrong turn 2: `ex.map(fn, million_items)` with the default `chunksize=1`.**
+
+`ProcessPoolExecutor.map` defaults to one item per message. For a million small items that is a million IPC round trips, and the *parent* becomes the bottleneck feeding all the workers one item at a time — so adding workers makes it worse.
+
+```python
+ex.map(fn, items, chunksize=max(1, len(items) // (workers * 4)))
+```
+
+Aim for roughly **four chunks per worker**: enough to balance the tail (one slow chunk does not leave every other worker idle) without paying per-message overhead for every item.
+
+Note that `multiprocessing.Pool.map` computes a chunksize automatically and `concurrent.futures` does not, which is a genuine asymmetry between two APIs that otherwise look identical.
+
+**A third thing worth knowing: the flat floor is the diagnosis.**
+
+Look at the pool column across the first three rows: 55.1, 50.5, 58.6 ms while the work grows 100×. **A flat pool time means you are measuring overhead, not work.** As soon as the pool column starts tracking the sequential column, you have crossed over. Recognising that shape in a plot is faster than any calculation.
+
+## The measured numbers this solution produces
+
+Apple M3 Pro (11 cores, 18 GB), macOS 15, CPython 3.13.2, 64 tasks, pool of 8, machine under load:
+
+| Work per task | Sequential | Process pool (8) | Speedup |
+|---|---|---|---|
+| 100 | 0.1 ms | **55.1 ms** | 0.00× |
+| 1,000 | 1.2 ms | 50.5 ms | 0.02× |
+| 10,000 | 13.2 ms | 58.6 ms | **0.22×** |
+| **100,000** | 130.1 ms | **83.9 ms** | **1.55×** |
+| 1,000,000 | 1,398.1 ms | 360.2 ms | 3.88× |
+| 5,000,000 | 6,553.9 ms | 1,674.7 ms | **3.91×** |
+
+**Crossover: between 10,000 and 100,000 iterations per task.**
+
+**Start methods** (pool of 4, create + one `map`):
+
+| Method | Time |
+|---|---|
+| `spawn` (default on macOS/Windows, Linux from 3.14) | **54.0 ms** |
+| `forkserver` | 43.2 ms |
+| `fork` | **3.8 ms** — 14.2× cheaper, unsafe with threads |
+
+**Pickling:**
+
+| Object | Size | `dumps` | `loads` |
+|---|---|---|---|
+| `int` | 5 B | 0.4 µs | 0.1 µs |
+| list of 1,000 ints | 2,760 B | 6.3 µs | 10.6 µs |
+| **list of 100,000 ints** | **368,931 B** | **658.9 µs** | **1,313.0 µs** |
+| dict of 10,000 | 108,679 B | 308.8 µs | 424.2 µs |
+| 1 MB string | 1,000,009 B | 14.4 µs | 47.9 µs |
+
+Note the last row: **bytes are nearly free** to pickle because there is nothing to construct, while containers cost per element. That asymmetry is the argument for NumPy arrays and `shared_memory` over Python lists across a process boundary.
+
+## Grading notes
+
+**3/3 on correctness** means the sweep spans at least five orders of magnitude, the crossover is marked explicitly, and pool creation and pickling are measured **independently**.
+
+**3/3 on performance** means every point reports speedup, worker count, efficiency and machine load, and you identify which of the two overheads dominates your crossover.
+
+**3/3 on explanation** means you explain the flat region in the pool column and state a `chunksize` rule you would actually use.
+
+The five most common ways submissions lose points:
+
+1. **A single curve with no overhead decomposition.** You know the crossover and not the reason, so you cannot choose the fix.
+2. **`chunksize` left at the default** for a large item count, then concluding that multiprocessing "does not scale".
+3. **The efficiency question dodged.** 3.91× on 8 workers is 49%; the write-up must say why (spawn startup, machine load, memory bandwidth) rather than presenting it as a clean 4×.
+4. **Oversubscription not tested.** Any NumPy in the task without `OMP_NUM_THREADS=1` in the pool `initializer` is the 11.3× penalty from the module's war story, and it looks like 100% CPU across all cores.
+5. **`fork` used to get better numbers, with no note about safety.** It is 14.2× cheaper and it deadlocks in a parent with threads. If you use it, say why it is safe here.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,619 @@
+---
+title: "SQL II: analytical SQL"
+description: "Week 7 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 7 · Module 4 · `P1-W07-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Solve "top N per group" with a window function instead of a correlated subquery, and know why that is a 900× difference.
+2. Use `ROWS` and `RANGE` frames deliberately, because they give different answers on tied values.
+3. Produce a monthly cohort-retention matrix in one query.
+4. Solve deduplication, gaps-and-islands and sessionization — the three patterns that cover most analytical work.
+5. Decide whether to aggregate in the database or in Pandas, from a measured crossover rather than a preference.
+
+## Where this sits
+
+| | |
+| --- | --- |
+| **Prereqs** | `P1-W07-M3` (joins, grouping, CTEs, reading a plan) |
+| **Unlocks** | `P1-W07-M5`, the Week 7 lab's analytics suite, Week 15 (the same logic incrementalised) |
+| **One-line** | After this you can answer analytical questions in SQL that most engineers export to a spreadsheet. |
+
+## Why you should care
+
+### For Aarav (student)
+
+- Window functions are the dividing line between "knows SQL" and "knows SQL". They appear in senior interviews and almost never in tutorials.
+- "Top 3 per category" and "monthly retention" are two of the most commonly asked live SQL problems, and both are one window function.
+- Measured here: the naive version of top-N-per-group ran for **5 minutes 7 seconds** before I cancelled it; the window version took **330 ms**. That is a number you can quote.
+
+### For Meera (working professional)
+
+- This shows up in your job as: "can you get me retention by signup month?" — a question that takes a week if you export to Python and twenty minutes if you know `FILTER` and `date_trunc`.
+- Deduplicating on "keep the latest row per key" is a weekly task. `ROW_NUMBER()` does it in four lines and is correct under ties if you order deterministically.
+- Aggregating in the database rather than pulling rows was measured at **9.6× faster than pure Python and 14.4× faster than Pandas** on 3 million rows. That is a decision you can defend with a number in any design review.
+
+## The mental model
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p1-w07-m4.svg" alt="Hand-drawn sketch: a window function computing per-row values within partitions" className="block dark:hidden" />
+  <img src="/assets/diagrams/p1-w07-m4-dark.svg" alt="Hand-drawn sketch: a window function computing per-row values within partitions" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p1-w07-m4
+tier: T2
+one-sentence-goal: Show that GROUP BY collapses rows away while a window function keeps every row and adds a column computed over a moving neighbourhood of that row.
+elements:
+  - left: a stack of 8 rows with a GROUP BY arrow collapsing them into 3 rows, labelled "rows are GONE"
+  - right: the same 8 rows kept intact, with an extra column drawn on, labelled "rows STAY, a new value is computed per row"
+  - on the right stack, a partition divider drawn as a dashed horizontal line between category groups, labelled "PARTITION BY"
+  - a sliding bracket drawn beside three consecutive rows, labelled "the FRAME - ROWS 2 PRECEDING", moving down with numbered positions
+  - underneath, two small columns of results side by side for the input 1,1,2,3,3,4 - one headed ROWS giving 1,2,3,5,6,7 and one headed RANGE giving 2,2,4,8,8,10 - with the differing cells circled in red and an amber note "RANGE groups TIED values together - this is where the bug is"
+  - circled key term "frame"
+  - dangling arrow labelled "...and what does this cost at 10 million rows?"
+numbers-to-write-in: top-3-per-category window 330 ms vs correlated subquery cancelled at 5 min 07 s; cohort matrix over 749,741 orders 2,328 ms; running total + 3-month MA 85.7 ms; dedup 9,997 -> 1,999 in 3.8 ms; SQL aggregate 127 ms vs pandas 1,826 ms (14.4x)
+alt: A hand-drawn comparison of GROUP BY collapsing eight rows into three against a window function keeping all eight rows and adding a computed column, with a partition divider, a sliding frame bracket, and a worked ROWS-versus-RANGE result table showing the differing values circled.
+*/}
+
+`GROUP BY` collapses rows and throws the detail away. A **window function** keeps every row and adds
+a column computed over a *window* of related rows — the ones in the same partition, within a frame
+relative to the current row. That one difference solves an entire class of problems that otherwise
+require self-joins or a trip to Python.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Plain English
+
+    Compare two queries over the same table.
+
+    ```sql
+    -- GROUP BY: 5 categories in, 5 rows out. Individual products are gone.
+    SELECT category, sum(units) FROM product_sales GROUP BY category;
+
+    -- Window: every product row survives, with its category total attached.
+    SELECT category, name, units,
+           sum(units) OVER (PARTITION BY category) AS category_units
+    FROM   product_sales;
+    ```
+
+    The `OVER (...)` clause is what makes it a window function. Inside it:
+
+    - **`PARTITION BY x`** — split the rows into independent groups. The function restarts for each.
+      It is `GROUP BY` for the window, without collapsing anything.
+    - **`ORDER BY y`** — order the rows *within* each partition. Required for anything positional:
+      ranking, running totals, previous or next row.
+    - **frame** (`ROWS BETWEEN ... AND ...`) — which rows around the current one to include. The
+      default depends on whether you wrote `ORDER BY`, which is a trap covered in Layer 2.
+
+    The functions you will actually use:
+
+    | Function | Returns |
+    | --- | --- |
+    | `row_number()` | 1, 2, 3, … — always distinct, ties broken arbitrarily unless you order deterministically |
+    | `rank()` | 1, 2, 2, 4 — ties share a rank and leave a gap |
+    | `dense_rank()` | 1, 2, 2, 3 — ties share a rank, no gap |
+    | `lag(x, 1)` | the value of `x` in the previous row |
+    | `lead(x, 1)` | the value of `x` in the next row |
+    | `sum/avg/count/min/max` | the aggregate over the frame |
+    | `first_value/last_value/nth_value` | positional values within the frame |
+
+    ### The analogy
+
+    A class ranked by exam score. `GROUP BY` gives you the class average and hands back one row —
+    the students are gone. A window function hands back every student, each with the class average,
+    their rank, and the score of the student just above them, written in extra columns. Nothing was
+    lost; something was added.
+
+    ### Smallest working example: top 3 per category
+
+    ```sql
+    WITH ranked AS (
+      SELECT p.category,
+             p.name,
+             sum(i.qty) AS units,
+             row_number() OVER (PARTITION BY p.category ORDER BY sum(i.qty) DESC) AS rn
+      FROM   products p
+      JOIN   order_items i ON i.product_id = p.id
+      GROUP  BY p.category, p.name
+    )
+    SELECT category, name, units
+    FROM   ranked
+    WHERE  rn <= 3
+    ORDER  BY category, rn;
+    ```
+
+    Real output on the seeded database (330 ms):
+
+    ```
+     category  |     name      | units
+    -----------+---------------+-------
+     audio     | Product 2900  |   600
+     audio     | Product 10720 |   600
+     audio     | Product 9840  |   600
+     cameras   | Product 1824  |   600
+     ...
+    (15 rows)
+    ```
+
+    ### Line by line
+
+    - `sum(i.qty)` inside `OVER (... ORDER BY sum(i.qty) DESC)` — a window function may take an
+      aggregate as its ordering expression, because **window functions run after `GROUP BY`**. That
+      execution order is the key fact: grouping happens, then windows are computed over the grouped
+      rows.
+    - `PARTITION BY p.category` — restart the numbering for each category.
+    - `ORDER BY sum(i.qty) DESC` — highest first, so `rn = 1` is the top seller.
+    - The CTE exists because **you cannot filter on a window function in `WHERE`**. `WHERE` runs
+      before windows are computed. Compute the rank in a CTE (or subquery) and filter in the outer
+      query. This is the single most common beginner error with window functions.
+
+    ### Guided practice
+
+    Three questions. Write them before reading the answers.
+
+    1. For each customer, their order total and the difference from their previous order.
+    2. A running total of daily revenue.
+    3. Each product's share of its category's total units.
+
+    <Accordion title="Answers">
+      ```sql
+      -- 1. lag() reaches back one row within the partition
+      SELECT customer_id, placed_at, total_cents,
+             total_cents - lag(total_cents) OVER (PARTITION BY customer_id ORDER BY placed_at)
+               AS change_from_previous
+      FROM   orders
+      WHERE  customer_id = 4242
+      ORDER  BY placed_at;
+
+      -- 2. running total: an ORDER BY in the window makes the frame cumulative
+      SELECT day, revenue,
+             sum(revenue) OVER (ORDER BY day ROWS UNBOUNDED PRECEDING) AS running_total
+      FROM (
+        SELECT placed_at::date AS day, sum(total_cents) AS revenue
+        FROM   orders WHERE status = 'paid' GROUP BY 1
+      ) d
+      ORDER BY day;
+
+      -- 3. a partition total attached to every row
+      SELECT category, name, units,
+             round(100.0 * units / sum(units) OVER (PARTITION BY category), 2) AS pct_of_category
+      FROM   product_sales;
+      ```
+
+      In query 1, the first order per customer has no previous row, so `lag` returns `NULL` and the
+      difference is `NULL`. That is correct, and `coalesce(..., 0)` would be a lie — a first order
+      has no change, it does not have a change of zero.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+      **1. What is the difference between `GROUP BY` and a window function?**
+      `GROUP BY` collapses rows into one per group; a window function keeps every row and adds a
+      computed column.
+
+      **2. Why can't you write `WHERE rn <= 3` in the same query that computes `rn`?**
+      `WHERE` runs before window functions are evaluated. Compute in a CTE, filter outside.
+
+      **3. `rank()` versus `dense_rank()` versus `row_number()`?**
+      With scores 10, 9, 9, 8: `row_number` gives 1,2,3,4; `rank` gives 1,2,2,4; `dense_rank` gives
+      1,2,2,3.
+
+      **4. What does `PARTITION BY` do?**
+      Splits rows into independent groups; the function restarts at each boundary.
+
+      **5. What does `lag()` return for the first row of a partition?**
+      `NULL` — there is no previous row. Supply a default as the third argument if you need one.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The real theory: frames, and the `ROWS`/`RANGE` trap
+
+    A **frame** is the subset of the partition the function sees for the current row. The defaults
+    are the trap:
+
+    - **No `ORDER BY` in the window** → the frame is the entire partition. `sum(x) OVER (PARTITION BY c)`
+      is the whole category total on every row.
+    - **`ORDER BY` present, no frame clause** → the default is
+      `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`. Note **`RANGE`**, not `ROWS`.
+
+    `ROWS` counts physical rows. `RANGE` groups by *value*: all rows tied on the `ORDER BY`
+    expression are treated as one unit and are all included at once. Verified on the input
+    `(1, 1, 2, 3, 3, 4)` with a frame of one preceding to current row:
+
+    ```sql
+    SELECT x,
+           sum(x) OVER (ORDER BY x ROWS  BETWEEN 1 PRECEDING AND CURRENT ROW) AS rows_frame,
+           sum(x) OVER (ORDER BY x RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS range_frame
+    FROM (VALUES (1),(1),(2),(3),(3),(4)) t(x) ORDER BY x;
+    ```
+
+    ```
+     x | rows_frame | range_frame
+    ---+------------+-------------
+     1 |          1 |           2
+     1 |          2 |           2
+     2 |          3 |           4
+     3 |          5 |           8
+     3 |          6 |           8
+     4 |          7 |          10
+    ```
+
+    Every value differs. `ROWS` gives each row its own answer; `RANGE` gives tied rows the same
+    answer, and `RANGE 1 PRECEDING` means "values within 1 of mine", not "one row back". For a
+    running total over a column with duplicate values — dates, especially — the default `RANGE`
+    frame silently includes every row sharing the current date, which is usually not what a running
+    total means. **Write `ROWS UNBOUNDED PRECEDING` explicitly** unless you specifically want value
+    grouping.
+
+    ### The production surface: the four patterns that cover most work
+
+    **1. Deduplication — keep one row per key.**
+
+    ```sql
+    WITH numbered AS (
+      SELECT *, row_number() OVER (PARTITION BY customer_id
+                                   ORDER BY placed_at DESC, id DESC) AS rn
+      FROM   orders
+    )
+    SELECT * FROM numbered WHERE rn = 1;
+    ```
+
+    Measured: 9,997 rows reduced to 1,999 in **3.8 ms**. The `, id DESC` tiebreaker is not optional —
+    without it, two rows with the same timestamp are ordered arbitrarily and the query returns a
+    different row on different runs, which is a non-deterministic bug that reproduces only sometimes.
+    PostgreSQL also offers `DISTINCT ON`, which is shorter and non-standard:
+
+    ```sql
+    SELECT DISTINCT ON (customer_id) *
+    FROM   orders ORDER BY customer_id, placed_at DESC, id DESC;
+    ```
+
+    **2. Cohort retention — one query.**
+
+    ```sql
+    WITH first_order AS (
+      SELECT customer_id, date_trunc('month', min(placed_at)) AS cohort
+      FROM   orders GROUP BY 1),
+    act AS (
+      SELECT f.cohort, o.customer_id,
+             (extract(year  FROM age(date_trunc('month', o.placed_at), f.cohort)) * 12
+            + extract(month FROM age(date_trunc('month', o.placed_at), f.cohort)))::int AS m
+      FROM   orders o JOIN first_order f USING (customer_id))
+    SELECT cohort::date,
+           count(DISTINCT customer_id) FILTER (WHERE m = 0) AS m0,
+           round(100.0 * count(DISTINCT customer_id) FILTER (WHERE m = 1)
+                       / count(DISTINCT customer_id) FILTER (WHERE m = 0), 1) AS m1_pct,
+           round(100.0 * count(DISTINCT customer_id) FILTER (WHERE m = 2)
+                       / count(DISTINCT customer_id) FILTER (WHERE m = 0), 1) AS m2_pct,
+           round(100.0 * count(DISTINCT customer_id) FILTER (WHERE m = 3)
+                       / count(DISTINCT customer_id) FILTER (WHERE m = 0), 1) AS m3_pct
+    FROM   act GROUP BY 1 ORDER BY 1;
+    ```
+
+    Real output on 749,741 orders from 150,000 customers, in **2,328 ms**:
+
+    ```
+       cohort   |  m0   | m1_pct | m2_pct | m3_pct
+    ------------+-------+--------+--------+--------
+     2024-01-01 | 15063 |   63.1 |   50.2 |   38.3
+     2024-02-01 | 14439 |   66.7 |   47.2 |   38.6
+     2024-03-01 | 15590 |   65.2 |   49.2 |   38.7
+     2024-04-01 | 14901 |   67.0 |   47.6 |   39.0
+    ```
+
+    `FILTER (WHERE ...)` is the SQL-standard conditional aggregate and it is far clearer than
+    `sum(CASE WHEN ... THEN 1 ELSE 0 END)`. Use it.
+
+    **3. Gaps and islands — consecutive runs.** The trick: subtract a row number from the value.
+    Consecutive values produce a constant difference, which becomes the group key.
+
+    ```sql
+    WITH d AS (SELECT DISTINCT customer_id, placed_at::date AS day FROM orders),
+    g AS (SELECT customer_id, day,
+                 day - (row_number() OVER (PARTITION BY customer_id ORDER BY day))::int AS grp
+          FROM d)
+    SELECT customer_id, min(day) AS streak_start, max(day) AS streak_end, count(*) AS days
+    FROM   g GROUP BY customer_id, grp HAVING count(*) > 1
+    ORDER  BY days DESC;
+    ```
+
+    **4. Sessionization — group events into sessions with a 30-minute gap rule.**
+
+    ```sql
+    WITH gapped AS (
+      SELECT user_id, event_at,
+             CASE WHEN event_at - lag(event_at) OVER (PARTITION BY user_id ORDER BY event_at)
+                       > interval '30 minutes'
+                  OR lag(event_at) OVER (PARTITION BY user_id ORDER BY event_at) IS NULL
+                  THEN 1 ELSE 0 END AS is_new_session
+      FROM   events),
+    sessioned AS (
+      SELECT *, sum(is_new_session) OVER (PARTITION BY user_id ORDER BY event_at
+                                          ROWS UNBOUNDED PRECEDING) AS session_num
+      FROM   gapped)
+    SELECT user_id, session_num, min(event_at) AS started, max(event_at) AS ended, count(*) AS events
+    FROM   sessioned GROUP BY 1, 2;
+    ```
+
+    Two window passes: one to mark session starts, one to turn those marks into a running session
+    number. That "running sum of a boolean flag" idiom is worth memorising — it converts any
+    "where does a new group begin" rule into a group key.
+
+    ### Trade-offs
+
+    | Decision | Choose the first when… | Choose the second when… |
+    | --- | --- | --- |
+    | **Window function vs correlated subquery** | Always, when both express the answer. Measured 330 ms versus a run cancelled at 5 min 07 s. | Never for this shape. The subquery runs once per outer row. |
+    | **`row_number()` vs `DISTINCT ON`** | Portable SQL, or you need ranks 2 and 3 as well. | PostgreSQL only and you want the shortest correct query — `DISTINCT ON` is one line. |
+    | **`ROWS` vs `RANGE`** | Almost always `ROWS` — it means "N rows back", which is what people intend. | You genuinely want value-based grouping: "all rows within 7 days of this one" is a `RANGE` over an interval, which `ROWS` cannot express. |
+    | **Aggregate in SQL vs pull into Pandas** | The result is much smaller than the input. Measured 127 ms in SQL versus 1,826 ms via Pandas on 3M rows — **14.4×**. | You need the raw rows anyway, or the operation is not expressible in SQL (a model fit, a bespoke library). |
+    | **Materialized view vs query on demand** | The same expensive aggregate is read far more often than the data changes; `REFRESH MATERIALIZED VIEW CONCURRENTLY` keeps it readable during refresh. | Freshness matters more than latency, or the query is already fast enough — a materialized view is a cache with all a cache's problems. |
+
+    ### What breaks in the real world
+
+    A growth team's retention chart showed month-1 retention of 112%. More customers "returned" in
+    month 1 than existed in the cohort.
+
+    The bug was in the cohort definition. They defined the cohort by `min(placed_at)` over
+    *non-cancelled* orders, and activity over *all* orders. A customer whose first order was
+    cancelled therefore had a cohort month later than their first activity month, so they appeared
+    in month 1 of a cohort they were not counted in for month 0. Roughly 12% of customers were in
+    that state.
+
+    Three lessons came out of the postmortem, and the second is the transferable one. First, the
+    fix: define the cohort and the activity from the same filtered set, always. Second, the check
+    that would have caught it on day one — **assert that `m0` equals the cohort size and that every
+    later month is less than or equal to it**, as a test on the query, not as something a human
+    notices on a chart. Retention is monotonically non-increasing by construction; if it is not,
+    the query is wrong. Third: they added the assertion to CI over a fixed fixture dataset, so the
+    invariant is checked on every change.
+
+    <Accordion title="Design checkpoint — model answer inside">
+      **Question.** An analyst asks for "the last known status of each order as of the end of each
+      month" from an `order_status_events` table. They propose exporting to Pandas. What do you
+      write?
+
+      **Model answer.** This is a classic as-of join and SQL does it well. Generate the month ends
+      with `generate_series`, then for each order and each month take the latest event at or before
+      that month end — either with `DISTINCT ON` inside a `LATERAL`, or by ranking events per
+      (order, month) with `row_number()` and keeping rank 1. Push it to the database, because the
+      output is one row per order per month while the input is every status event ever recorded: the
+      measured ratio for that shape was **127 ms in SQL against 1,826 ms via Pandas on 3 million
+      rows**, and the Pandas path also transfers all 3 million rows over the wire. Reach for Pandas
+      when the result is not much smaller than the input, or when the operation is not expressible
+      in SQL. Neither is true here. One caveat worth stating: if the analyst then wants to iterate
+      on the definition twenty times in an afternoon, giving them a materialized view of the
+      per-order-per-month result and letting them slice it in Pandas is the better *human* answer,
+      and that trade — machine time against analyst iteration speed — is the real decision.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    ### How a window function executes
+
+    PostgreSQL implements windows as a `WindowAgg` node fed by sorted input. For each distinct
+    window definition it needs the rows ordered by `PARTITION BY` columns then `ORDER BY` columns.
+    If no index provides that order, a `Sort` node appears beneath, and that sort is usually the
+    dominant cost.
+
+    Three consequences you can act on:
+
+    - **Reusing one window definition is free; adding a second is not.** Two window functions with
+      identical `OVER` clauses share one `WindowAgg` and one sort. Different clauses mean another
+      sort of the whole set. Name the window once with `WINDOW w AS (PARTITION BY ... ORDER BY ...)`
+      and reference `OVER w` — it is clearer and it makes the sharing obvious.
+    - **Sorts spill.** Measured elsewhere in this week: a sort over 1M rows for offset pagination
+      reported `Sort Method: external merge Disk: 11096kB`. Once a window's sort exceeds `work_mem`
+      it writes to disk and the query gets several times slower with no plan change to warn you.
+      `EXPLAIN (ANALYZE)` shows `Sort Method` — read it.
+    - **An index can remove the sort entirely.** An index on `(partition_col, order_col)` lets the
+      planner feed the `WindowAgg` in order. Measured in `P1-W08-M3`: an `ORDER BY placed_at` served
+      by a matching composite index produced **no `Sort` node at all** and ran in 0.139 ms, while the
+      unmatched ordering added `Sort Method: quicksort Memory: 25kB`.
+
+    ### At scale: where the work should happen
+
+    The recurring architectural question is whether to aggregate in the database or pull rows into
+    Python. Measured on 3,000,000 `order_items` producing 20,000 groups, best of three runs:
+
+    | Approach | Time | Rows over the wire |
+    | --- | --- | --- |
+    | `GROUP BY` in PostgreSQL | **127 ms** | 20,000 |
+    | Fetch all rows, aggregate in pure Python | 1,220 ms | 3,000,000 |
+    | Fetch all rows, aggregate in Pandas | 1,826 ms | 3,000,000 |
+    | `COPY TO STDOUT` → `pandas.read_csv` → `groupby` | 2,357 ms | 3,000,000 |
+
+    SQL is **9.6× faster than pure Python and 14.4× faster than Pandas** here, and the gap is
+    dominated by moving 3 million rows rather than by the aggregation itself. Two honest
+    qualifications. Pandas lost partly because building a DataFrame from a list of tuples is
+    expensive — with Arrow-native transfer (`adbc` or `psycopg`'s binary path into `pyarrow`) the
+    pull cost drops substantially. And the ranking inverts when the result is *not* smaller than the
+    input: if you need all 3 million rows in Python anyway, doing the aggregation there is free.
+
+    The rule that follows: **the crossover is the selectivity of the aggregation, not the row
+    count.** Push down anything that reduces rows by more than roughly 10×; pull when you need the
+    detail regardless, or when the operation is not expressible in SQL.
+
+    ### Correlated subqueries: the measured catastrophe
+
+    The same answer, two ways, on the same database:
+
+    | Formulation | Time |
+    | --- | --- |
+    | Window function (`row_number()` in a CTE) | **330 ms** |
+    | Correlated subquery counting how many rows beat each row | **cancelled at 5 min 07 s** |
+
+    The correlated version re-aggregates 3,000,000 order items once per candidate row. Its cost is
+    `outer_rows × inner_cost`, so it does not degrade gracefully — it degrades multiplicatively.
+    PostgreSQL can sometimes decorrelate a subquery into a join, but not when the subquery contains
+    its own aggregate over a different grouping, which is exactly this case.
+
+    Diagnosing it in a plan: look for a `SubPlan` node with a high `loops` count. `actual time` is
+    per loop, so a `SubPlan` at 3 ms with `loops=100000` is five minutes of work displayed as a
+    small number — which is why this bug survives casual plan reading.
+
+    ### `FILTER` versus `CASE`, and `DISTINCT` inside aggregates
+
+    `count(*) FILTER (WHERE cond)` and `count(CASE WHEN cond THEN 1 END)` produce the same result.
+    `FILTER` is clearer and the planner treats them equivalently. But `count(DISTINCT x)` is
+    genuinely expensive: it cannot use a hash aggregate combined with other aggregates in older
+    versions and forces a sort or a hash per group. The cohort query above uses **four**
+    `count(DISTINCT customer_id) FILTER (...)` calls and took 2,328 ms on 749,741 rows; replacing
+    them with a pre-deduplicated CTE (one row per customer per month) and plain `count(*)` is the
+    standard optimisation when that query moves from ad hoc to dashboard.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Retention above 100% | The chart shows m1 higher than m0 | Cohort and activity defined from differently filtered sets; assert monotonic non-increase in a test |
+    | Running total wrong on tied dates | Totals jump by a whole day's value at once | Default `RANGE` frame grouping tied values; write `ROWS UNBOUNDED PRECEDING` |
+    | Deduplication returns a different row each run | Downstream data changes with no input change | No deterministic tiebreaker in the window's `ORDER BY`; add the primary key |
+    | Query fine on staging, slow in production | 10× data, and the window's sort now exceeds `work_mem` | `Sort Method: external merge Disk:` in the plan |
+    | `WHERE rn = 1` is a syntax error | Filtering on a window function in the same query level | Compute in a CTE, filter outside |
+    | A `SubPlan` with a huge `loops` count | The query "looks fast" per node and takes minutes | Multiply `actual time` by `loops`; rewrite as a window function |
+    | Adding a second window doubles runtime | Two different `OVER` clauses mean two sorts | Share one `WINDOW w AS (...)` definition, or add a composite index |
+
+    ### Frontier and primary sources
+
+    - **SQL:2003 window functions (and SQL:2011 frame extensions).** *Takeaway:* windows are
+      standardised, so this knowledge transfers unchanged to Snowflake, BigQuery, DuckDB and Spark —
+      one of the highest-transfer skills in the course.
+    - **PostgreSQL 16 documentation, "Window Functions" and "Window Function Processing."**
+      *Takeaway:* windows are evaluated after `WHERE`, `GROUP BY` and `HAVING`, which explains every
+      "why can't I filter on it" question.
+    - **Celko, *SQL for Smarties*, gaps-and-islands chapters.** *Takeaway:* the row-number-difference
+      trick generalises to any "find consecutive runs" problem, including sessionization and
+      streak-counting.
+    - **DuckDB and vectorised execution.** *Takeaway:* the same SQL over columnar, vectorised
+      execution can be an order of magnitude faster for analytical scans, which is why the answer to
+      "should this run in the database" is increasingly "yes, but which database" — the theme of
+      Week 15.
+
+    ### Stretch challenge
+
+    Build the retention matrix three ways and compare them on correctness *and* cost: the
+    `count(DISTINCT ... ) FILTER` version above, a pre-deduplicated version using a
+    customer-month CTE with plain `count(*)`, and an incremental version that stores per-customer
+    first-order month in a table and updates it on write.
+
+    Measure all three at 750,000 orders and then at 10 million (the lab's seed script can generate
+    it). Report runtime, peak memory (`work_mem` spill or not), and how each behaves when you add a
+    filter for a single country. Then answer the question that actually decides the design: **which
+    version stays correct when an order is refunded three months later?** The incremental one
+    probably does not, and articulating exactly which events invalidate which stored value is the
+    same reasoning you will need for incremental pipelines in Week 15 and for cache invalidation in
+    `P1-W08-M5`.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Produce a monthly cohort-retention matrix in a single query against the seeded database. Then write
+the assertion that would have caught the 112% bug — that `m0` equals the cohort size and that every
+later month is less than or equal to it — and run it as a test.
+</Card>
+
+## The whiteboard
+
+T1 is the `GROUP BY`-versus-window sketch with the `ROWS`/`RANGE` result table. The T2 build-up
+frames: (1) the rows, (2) partitions drawn in, (3) the ordering within a partition, (4) the frame
+bracket sliding down with the computed value appearing per row.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p1-w07-m4-blank.svg) · [Editable source](/assets/diagrams/p1-w07-m4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    Put the cohort-retention query in your repo with its output as a formatted table, plus the
+    invariant test. It is the single most impressive query a junior candidate can show, because it
+    is what a growth or analytics team actually asks for on day one. The sentence that lands: "the
+    correlated-subquery version of top-N-per-group was still running after five minutes; the window
+    function returned in 330 ms."
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **One:** find any dashboard query with a correlated subquery in the `WHERE` clause and check its
+    plan for a `SubPlan` with a high `loops` count — that is minutes of work hiding behind a small
+    per-loop number. **Two:** grep for running totals without an explicit frame; the default `RANGE`
+    is wrong whenever the ordering column has ties. **Three:** find the biggest "export to CSV and
+    aggregate in Python" job in your team and measure both paths — the measured ratio here was 14.4×.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `WHERE rn = 1` fails to parse | Windows are computed after `WHERE` | Compute in a CTE, filter in the outer query |
+| Running total jumps by a whole day | Default `RANGE` frame groups tied values | `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` |
+| Dedup picks a different row each run | No deterministic tiebreaker | Add the primary key to the window's `ORDER BY` |
+| Retention exceeds 100% | Cohort and activity computed from differently filtered sets | Define both from one filtered set; assert monotonicity |
+| Query is fast per node but takes minutes | A `SubPlan` with a large `loops` count | Multiply time by loops; rewrite as a window function |
+| Adding a window doubles the runtime | A second, different `OVER` clause adds a second sort | Share one named `WINDOW`, or index `(partition, order)` |
+| Fine on staging, slow in production | The window's sort now spills to disk | Check `Sort Method`; raise `work_mem` for the session or reduce the sorted set |
+| `lag()` returns `NULL` and the report shows 0 | `coalesce` applied to a genuinely absent value | Leave it `NULL`; absent and zero are different facts |
+
+## Assessment
+
+**Concept questions**
+
+1. What does a window function do that `GROUP BY` cannot? *(Keeps every row and adds a value computed over related rows.)*
+2. Why can you not filter on a window function in `WHERE`? *(Windows are evaluated after `WHERE`, `GROUP BY` and `HAVING`.)*
+3. Give the `ROWS` and `RANGE` results for `sum(x)` over `(1,1,2,3,3,4)` with a 1-preceding frame. *(ROWS: 1,2,3,5,6,7. RANGE: 2,2,4,8,8,10.)*
+4. Why must a deduplication window have a deterministic tiebreaker? *(Otherwise tied rows are ordered arbitrarily and the query is non-deterministic.)*
+5. How do you turn "a new group starts here" into a group key? *(A running `sum()` of the boolean flag over `ROWS UNBOUNDED PRECEDING`.)*
+6. When should aggregation happen in Pandas rather than SQL? *(When the result is not much smaller than the input, or the operation is not expressible in SQL — measured 127 ms vs 1,826 ms when it is.)*
+7. What invariant must a retention matrix satisfy? *(Monotonic non-increase across months; `m0` equals the cohort size.)*
+8. Why is a correlated subquery in `WHERE` dangerous? *(Its cost multiplies by the outer row count — measured 330 ms versus a run cancelled at 5 min 07 s.)*
+
+**Coding challenge.** Produce, in single queries: the monthly cohort-retention matrix, a 7-day moving average of daily revenue, the top 3 products per category, per-customer purchase streaks, and 30-minute sessionization. Hidden tests check exact result sets plus the retention monotonicity invariant.
+
+**Interview questions**
+
+- *Junior:* "Find the top 3 products in each category."
+- *Mid:* "Deduplicate this table keeping the most recent row per key, and tell me what happens on ties."
+- *Senior:* "Design a retention query that stays correct when an order is refunded three months after it was placed."
+
+**Draw it from memory.** Draw the eight-row partition with the frame bracket, and write the `ROWS` and `RANGE` results side by side for the tied input.
+
+## Sources & further reading
+
+**Primary docs**
+
+- [PostgreSQL 16: Window Functions tutorial](https://www.postgresql.org/docs/16/tutorial-window.html) and [the reference](https://www.postgresql.org/docs/16/functions-window.html) — read the frame-clause section slowly; it is where the `ROWS`/`RANGE` bug lives.
+- [PostgreSQL 16: Aggregate Expressions](https://www.postgresql.org/docs/16/sql-expressions.html#SYNTAX-AGGREGATES) — read the `FILTER` clause section; it replaces most `CASE WHEN` aggregates.
+- [PostgreSQL 16: `DISTINCT ON`](https://www.postgresql.org/docs/16/sql-select.html#SQL-DISTINCT) — read the requirement that `ORDER BY` must start with the `DISTINCT ON` expressions.
+
+**Standards and their takeaways**
+
+- **SQL:2003 / SQL:2011 window functions.** *Takeaway:* the syntax is standard, so the skill transfers to every analytical engine you will meet later in the course.
+- **[PostgreSQL "Window Function Processing."](https://www.postgresql.org/docs/16/queries-table-expressions.html#QUERIES-WINDOW)** *Takeaway:* windows run after grouping over a sorted input, which explains both the filtering restriction and why an index can eliminate the sort.
+
+**Go deeper**
+
+- *SQL Cookbook*, Anthony Molinaro — read the chapters on ranking, running totals and reports. It is organised by problem rather than by feature, which is how these questions actually arrive.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-07/p1-w07-m4">
+  Attempt the lab first. Seriously.
+</Card>

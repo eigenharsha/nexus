@@ -1,0 +1,114 @@
+---
+title: "Text processing & pipelines"
+description: "Reference solution — Week 2"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W02-M2`
+
+Top-20 endpoints by p95 latency from a 1 GB nginx log (1,000,000,005 bytes, 8,954,064 lines), built both ways and timed.
+
+**Shape A — extract, sort, aggregate.**
+
+```bash
+time (awk '{print $7, $NF}' access.log \
+  | sort -k1,1 -k2,2g \
+  | awk '{c[$1]++; v[$1"|"c[$1]]=$2}
+         END{for(k in c){i=int(c[k]*0.95); if(i<1)i=1; printf "%s %s %d\n", k, v[k"|"i], c[k]}}' \
+  | sort -k2 -gr | head -20)
+```
+
+```
+( awk | sort | awk | sort | head )  67.65s user  58.72s system  93% cpu  2:15.39 total
+```
+
+**Shape B — single-pass histogram.**
+
+```bash
+time (LC_ALL=C awk '{ b = int($NF * 100); h[$7,b]++; n[$7]++ }
+  END { for (k in n) { t = 0; lim = n[k] * 0.95
+          for (i = 0; i <= 2500; i++) { c = h[k,i]
+            if (c) { t += c; if (t >= lim) { printf "%-28s p95=%.2fs  n=%d\n", k, i/100, n[k]; break } } } } }' \
+  access.log | sort -t= -k2 -gr | head -20)
+```
+
+```
+( LC_ALL=C awk | sort | head )  26.73s user  0.44s system  98% cpu  27.72 total
+```
+
+**135.4 s → 27.7 s. 4.9×.**
+
+The `LC_ALL=C` demonstration, on the extracted 203,741,964-byte pairs file:
+
+```
+LC_ALL=C sort -k1,1 pairs.txt   15.43s user  2.30s system   20.36s total
+         sort -k1,1 pairs.txt   58.88s user 17.80s system   1:26.18 total
+```
+
+**4.2× from one environment variable.**
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: believing you need a sort to compute a percentile.**
+
+This is the intuition that produces Shape A, and it is wrong in a specific and generalisable way. A percentile is a property of a *distribution*, not of an ordering. If you know how many samples fall in each 10 ms bucket, you can walk the buckets accumulating counts until you pass 95% of the total, and the bucket you stopped in is the p95 to within the bucket width.
+
+That reframing buys three things at once: one pass instead of O(n log n); bounded memory (12 endpoints × 2,500 buckets = 30,000 counters) instead of holding 8.9 M records; and — the property that matters at scale — **mergeability**. Two histograms add together elementwise. Two sorted lists do not combine without another merge pass. That is why this shape parallelises across hosts and Shape A does not, and it is precisely why Prometheus histograms, HdrHistogram and t-digest all exist.
+
+The system-time column is the evidence: **58.72 s in Shape A versus 0.44 s in Shape B.** That is `sort` spilling to temporary files — Week 1's external merge sort, running inside `sort(1)` because 203 MB of records exceeded its buffer.
+
+**Wrong turn 2: `grep`ing before `awk` "to make it faster".**
+
+The instinct to filter early is usually right, and here it is not. `grep` and `awk` both read every byte; adding `grep` adds a process, a pipe and a second full scan of the data that survives the filter. When the filter is not very selective — as it is not here, since every line has an endpoint — you have added work.
+
+Measured on this box, BSD `grep -c` over the 1 GB file takes **0.18–0.44 s** (page-cached), which is fast enough that grep is genuinely not the bottleneck. The bottleneck is `sort`, and the correct optimisation is to delete the sort rather than to speed up the filter.
+
+The rule: **`grep` first when it removes most of the data cheaply. Otherwise use awk's pattern-action form**, which does the filter and the extraction in one process:
+
+```bash
+awk '$9 == 500 { print $7 }' access.log     # one process, not grep | awk
+```
+
+**A third thing worth knowing: the bucket width is a decision, not a detail.**
+
+The reference uses `int($NF * 100)` — 10 ms buckets — which caps the p95 error at 10 ms. For a latency SLO stated in tens of milliseconds that is free accuracy. If your SLO is "p99 under 5 ms", 10 ms buckets are useless and you need `* 1000`. State the width and its error bound in the output; a percentile with an unstated approximation is a number people will over-trust.
+
+## The measured numbers this solution produces
+
+| Measurement | Value |
+|---|---|
+| Input | 1,000,000,005 bytes, 8,954,064 lines, 12 endpoints |
+| Shape A (sort-based) | **135.4 s** wall (67.65 user + 58.72 system) |
+| Shape B (single-pass histogram) | **27.7 s** wall (26.73 user + 0.44 system) |
+| Speedup | **4.9×** |
+| `LC_ALL=C sort` vs default locale | 20.4 s vs 86.2 s — **4.2×** |
+| BSD `grep -c` over 1 GB | 0.18–0.44 s (not the bottleneck) |
+| ReDoS `^(a+)+$` at n = 20 / 25 / 30 | 0.0371 s / 1.0759 s / **31.3158 s** |
+| ReDoS growth | roughly **2× per additional character** |
+
+## Grading notes
+
+**3/3 on correctness** means both shapes produce the same top-20 in the same order to bucket resolution, and you verified that rather than assuming it.
+
+**3/3 on performance** means wall, user **and system** time reported for both, with the system-time difference identified as `sort` spilling to disk. Reporting only wall time misses the whole mechanism.
+
+**3/3 on explanation** means the write-up states why a percentile does not require a sort, and notes that histograms merge while sorted lists do not.
+
+The three most common ways submissions lose points:
+
+1. **Only wall-clock time reported.** The 58.72 s of system time is the finding. Without it the 4.9× is a mystery rather than an explanation.
+2. **The two shapes give different answers and it is not investigated.** They should agree to the bucket width. If they do not, the percentile index arithmetic is off by one — test with n = 1, n = 2 and n = 20 where the exact answer is checkable by hand.
+3. **`LC_ALL=C` set globally with no measurement.** The criterion asks for a measured before-and-after on a sort stage. Setting it because a blog post said to is not the exercise.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

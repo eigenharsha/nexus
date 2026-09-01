@@ -1,0 +1,163 @@
+---
+title: "Pandas for real work"
+description: "Reference solution — Week 16"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P2-W16-M2`
+
+Take a large dataset to a working analysis on a laptop, documenting every memory decision.
+
+### The memory result
+
+5,000,000 rows, five columns:
+
+| Column | Before | MB | After | MB | Reduction |
+| --- | --- | --- | --- | --- | --- |
+| `id` | `int64` | 40.0 | `int32` | 20.0 | 2.0× |
+| `small_int` (0–99) | `int64` | 40.0 | `int8` | 5.0 | **8.0×** |
+| `amount` | `float64` | 40.0 | `float32` | 20.0 | 2.0× |
+| `category` (8 values) | `object` | **279.4** | `category` | **5.0** | **55.9×** |
+| `flag` | `bool` | 5.0 | `bool` | 5.0 | 1.0× |
+| **Total** | | **404.4 MB** | | **55.0 MB** | **7.35×** |
+
+**The `object` column is 69% of the frame and shrinks by 55.9×.** That one conversion does most of
+the work, and it is the first thing to look at in any memory audit.
+
+The mechanism: `object` stores 5 million 8-byte pointers (40 MB) **plus** the Python `str` objects
+they point at (~239 MB, because a short `str` carries ~49 bytes of header before its characters).
+`category` stores 5 million `int8` codes (5 MB) plus a table of 8 strings.
+
+<Warning>
+**`memory_usage()` without `deep=True` reports only the pointer array for an `object` column** — 8 MB
+where the truth is 62 MB. Every memory audit must pass `deep=True`, and a surprising amount of
+published advice does not.
+</Warning>
+
+### The `apply` result
+
+1,000,000 rows, `x * 1.2 + 5`:
+
+| Approach | Per row | vs vectorized |
+| --- | --- | --- |
+| `Series.apply` | 112 ns | **251×** |
+| `Series.map` | 103 ns | 232× |
+| `[x*1.2+5 for x in s.tolist()]` | **45 ns** | 100× |
+| `s * 1.2 + 5` | **0.4 ns** | 1× |
+
+**`apply` is slower than a plain Python list comprehension** — 112 ns against 45 ns. It does not
+vectorize anything; it is a Python loop *plus* per-element pandas overhead. **If you are going to
+write a loop, write the loop.**
+
+And row iteration, 200,000 rows:
+
+| Approach | Per row |
+| --- | --- |
+| `iterrows` | **9.33 µs** |
+| `itertuples` | **0.26 µs** (36×) |
+| `df["amount"].sum()` | ~0.0005 µs |
+
+`iterrows` constructs a whole `Series` per row — with an index and a dtype negotiation across the
+row's values — which is also why **it silently upcasts**: a row containing an `int64` and a
+`float64` becomes all-`float64`, turning integer IDs into floats.
+
+### The three cautions on the optimiser
+
+```python
+def optimise(df, category_threshold: float = 0.5):
+    for col in df.columns:
+        s = df[col]
+        if pd.api.types.is_integer_dtype(s):
+            df[col] = pd.to_numeric(s, downcast="signed")
+        elif pd.api.types.is_float_dtype(s):
+            df[col] = pd.to_numeric(s, downcast="float")
+        elif pd.api.types.is_object_dtype(s):
+            if s.nunique(dropna=False) / len(s) < category_threshold:
+                df[col] = s.astype("category")
+    return df
+```
+
+1. **`downcast="signed"` inspects the actual min and max**, so it is safe for the data you have and
+   **not** for data you will append. A column downcast to `int8` because today's values fit 0–99
+   overflows when tomorrow's batch contains 200. **Downcast at the end of a pipeline, not the start.**
+2. **`float32` has ~7 significant digits.** 12,345,678.91 does not round-trip. Money belongs in
+   `int64` cents or `Decimal`.
+3. **Categorising a high-cardinality column makes it larger** — you pay for the codes *and* a
+   dictionary as big as the original column. Hence the threshold. For high-cardinality text, use
+   `string[pyarrow]`: one contiguous byte buffer plus an offsets array, ~7 MB where `object` is 62.
+
+### The join validation
+
+```python
+bad  = orders.merge(customers, on="customer_id", how="left")
+good = orders.merge(customers, on="customer_id", how="left", validate="m:1")
+# MergeError: Merge keys are not unique in right dataset; not a many-to-one merge
+```
+
+With `customer_id` duplicated on the right, `len(bad)` is 4 where `len(orders)` is 3, and
+`bad.amount.sum()` is 700 where the truth is 600. **`merge` did nothing wrong** — a one-to-many join
+legitimately produces more rows — but you meant a lookup and got a multiplication, and there is no
+error anywhere.
+
+**Put `validate=` on every merge you write.** It costs one hash-uniqueness check and it converts the
+most expensive silent bug in analytics into an exception at the line that caused it. The belt-and-
+braces version adds `assert len(out) == len(left)` for a `m:1` left join — **one line that catches
+every fan-out**, whatever the cause.
+
+## Why this solution and not the obvious one
+
+**Why specify dtypes at read time, not after.** `pd.read_csv(path, usecols=[...], dtype={...})`.
+Converting afterwards means the `object` column existed, so you already paid the peak memory you were
+trying to avoid.
+
+**Why `transform` rather than `agg` plus a merge.** "Each row as a fraction of its group's total" is
+`groupby().transform("sum")` — one line, aligned to the original index, no join and therefore no
+fan-out risk. Doing it with `agg` and a merge is the most common unnecessary join in pandas code.
+
+**Why method chaining.** `assign` with a lambda sees the frame as it is at that point in the chain,
+so you can reference columns created earlier; there are no intermediate variables to go stale; and
+nothing is mutated, so `SettingWithCopyWarning` cannot arise. Insert `.pipe(peek, "label")` to debug.
+
+**Why `observed=True` on every categorical `groupby`.** Without it pandas produces a row for every
+*possible* category combination including empty ones — two categoricals of 100 levels gives 10,000
+rows where 40 exist. This becomes the default in pandas 3.0; set it explicitly until then.
+
+## Grading notes
+
+**3/3 on Correctness** — `validate=` on every merge with a test proving a duplicate key raises;
+`copy_on_write` enabled; `observed=True` on categorical groupbys.
+
+**3/3 on Performance** — memory measured with `deep=True` before and after, per column, with each
+factor attributed.
+
+**3/3 on Explanation** — where the `object` column's bytes went (pointers plus `str` headers), and
+the three cautions on downcasting.
+
+**The three most common ways submissions lose points:**
+
+1. **`memory_usage()` without `deep=True`.** Under-reports `object` columns by ~8× and makes the
+   whole audit wrong in the same direction.
+2. **No `validate=` on merges.** The single highest-value habit in the module.
+3. **`float32` for a money column.** Seven significant digits is not enough, and the error is
+   invisible until an audit.
+
+**A fourth:** downcasting to `int8` at the *start* of a pipeline that later appends data. It works,
+then silently wraps around. Downcast last.
+
+**On the stretch challenge (memory profiler study).** The interesting question is whether the saving
+**survives an operation**. A categorical column that is grouped, merged or concatenated can silently
+revert to `object`. Measuring memory only immediately after conversion reports a saving that a
+realistic pipeline gives straight back, and that is the finding worth having.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

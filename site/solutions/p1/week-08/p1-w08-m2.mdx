@@ -1,0 +1,188 @@
+---
+title: "Isolation levels & concurrency anomalies"
+description: "Reference solution — Week 8"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W08-M2`
+
+The exercise: 200 parallel buyers for 10 items; prove exactly 10 sell under every strategy, with a
+throughput comparison.
+
+### The harness
+
+The single most important detail is the **barrier**. Without it, threads start staggered, the
+naive strategy does not oversell, and every subsequent measurement is meaningless.
+
+```python
+def run(strategy, fn):
+    reset()
+    lat, errs, lock = [], [], threading.Lock()
+    barrier = threading.Barrier(BUYERS)              # <- all 200 start together
+
+    def worker(i):
+        with psycopg.connect(DSN) as conn:           # one connection per buyer
+            barrier.wait()
+            t0 = time.perf_counter()
+            fn(conn, i)
+            with lock:
+                lat.append((time.perf_counter() - t0) * 1000)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(BUYERS)]
+    t0 = time.perf_counter()
+    for t in threads: t.start()
+    for t in threads: t.join()
+    ...
+```
+
+Each buyer also sleeps 2 ms between the read and the write, simulating application logic. That
+think time is what makes the race reliably reproducible rather than occasionally.
+
+### The five strategies
+
+```python
+def naive(conn, buyer):                       # the bug
+    with conn.transaction():
+        row = conn.execute("SELECT stock FROM inventory WHERE sku=%s", (SKU,)).fetchone()
+        if row[0] <= 0: return False
+        time.sleep(0.002)
+        conn.execute("UPDATE inventory SET stock=%s WHERE sku=%s", (row[0]-1, SKU))
+        conn.execute("INSERT INTO sales (sku,buyer) VALUES (%s,%s)", (SKU, buyer))
+
+def pessimistic(conn, buyer):                 # SELECT ... FOR UPDATE
+    with conn.transaction():
+        row = conn.execute("SELECT stock FROM inventory WHERE sku=%s FOR UPDATE", (SKU,)).fetchone()
+        if row[0] <= 0: return False
+        time.sleep(0.002)
+        conn.execute("UPDATE inventory SET stock=stock-1 WHERE sku=%s", (SKU,))
+        conn.execute("INSERT INTO sales (sku,buyer) VALUES (%s,%s)", (SKU, buyer))
+
+def atomic(conn, buyer):                      # no read at all
+    with conn.transaction():
+        cur = conn.execute("UPDATE inventory SET stock=stock-1 WHERE sku=%s AND stock>0", (SKU,))
+        if cur.rowcount == 0: return False
+        conn.execute("INSERT INTO sales (sku,buyer) VALUES (%s,%s)", (SKU, buyer))
+
+def optimistic(conn, buyer):                  # version column + retry
+    for attempt in range(20):
+        with conn.transaction():
+            row = conn.execute("SELECT stock, version FROM inventory WHERE sku=%s", (SKU,)).fetchone()
+            if row[0] <= 0: return False
+            time.sleep(0.002)
+            cur = conn.execute(
+                "UPDATE inventory SET stock=stock-1, version=version+1 WHERE sku=%s AND version=%s",
+                (SKU, row[1]))
+            if cur.rowcount == 1:
+                conn.execute("INSERT INTO sales (sku,buyer) VALUES (%s,%s)", (SKU, buyer))
+                return True
+        RETRIES[0] += 1
+
+def serializable(conn, buyer):                # let the database detect it
+    conn.isolation_level = psycopg.IsolationLevel.SERIALIZABLE
+    for attempt in range(20):
+        try:
+            with conn.transaction():
+                row = conn.execute("SELECT stock FROM inventory WHERE sku=%s", (SKU,)).fetchone()
+                if row[0] <= 0: return False
+                time.sleep(0.002)
+                conn.execute("UPDATE inventory SET stock=stock-1 WHERE sku=%s", (SKU,))
+                conn.execute("INSERT INTO sales (sku,buyer) VALUES (%s,%s)", (SKU, buyer))
+            return True
+        except errors.SerializationFailure:
+            RETRIES[0] += 1
+            time.sleep(0.001 * (2 ** min(attempt, 4)))
+```
+
+### The results
+
+200 buyers, stock 10, PostgreSQL 16.14, psycopg 3.2.3:
+
+| Strategy | Sold | Stock left | Oversell | Wall | tps | p50 | p95 | Retries |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| naive (`READ COMMITTED`) | **200** | 8 | **190** | 6,614 ms | 30.2 | 2,168 ms | 3,765 ms | 0 |
+| pessimistic `FOR UPDATE` | 10 | 0 | 0 | 5,882 ms | 34.0 | 1,620 ms | 2,374 ms | 0 |
+| atomic conditional | 10 | 0 | 0 | 6,495 ms | 30.8 | 1,560 ms | 2,260 ms | 0 |
+| optimistic version | 10 | 0 | 0 | 9,227 ms | 21.7 | 4,227 ms | 5,563 ms | **515** |
+| `SERIALIZABLE` + retry | 10 | 0 | 0 | 4,434 ms | 45.1 | 1,232 ms | 1,404 ms | **944** |
+
+And the sustained comparison — 50 workers, 2,000 transactions, varying contention:
+
+| Rows | RC atomic | RC `FOR UPDATE` | `SERIALIZABLE` | SSI retries |
+| --- | --- | --- | --- | --- |
+| 1 | **170.2 tps** | 108.4 tps | 60.7 tps | 27,261 |
+| 10 | **759.5 tps** | 543.9 tps | 67.2 tps | 27,124 |
+| 100 | **1,019.5 tps** | 683.5 tps | 190.4 tps | 7,482 |
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: a harness where the naive strategy does not oversell.** This is the most common
+failure, and everything downstream is worthless without it. Causes, in order of frequency: threads
+started and joined one at a time; a single shared connection serialising everything; no think time
+between the read and the write; too few workers. The barrier plus a 2 ms sleep makes the race
+happen every run.
+
+**Wrong turn 2: assuming optimistic locking is "the modern approach".** It was the **worst**
+performer here: 21.7 tps, 515 retries, and a p95 of 5,563 ms — worse than the naive version's
+throughput. On a single hot row nearly every attempt loses the race and redoes the whole
+read-modify-write. Optimistic locking is for *low* contention, and the 100-row sustained row shows
+it converging with the others as contention falls.
+
+**Wrong turn 3: assuming `SERIALIZABLE` is slowest.** In the 200-buyer test it was the *fastest*
+safe option (45.1 tps, p95 1,404 ms) because most transactions short-circuit once stock hits zero.
+In the sustained test, where every transaction does real work, it was 2.8–11.3× slower. **The
+workload shape decides**, which is why the lab requires a matrix rather than a single number.
+
+**Wrong turn 4: `SET default_transaction_isolation` inside a transaction.** My first implementation
+did this and produced 190 unexplained errors: the `SET` started an implicit transaction, so the
+retry ran inside an already-aborted one and raised `InFailedSqlTransaction`. Set the isolation level
+on the connection before the transaction begins.
+
+**Wrong turn 5: no database-level backstop.** Every strategy above is application logic and can be
+got wrong again. `CHECK (stock >= 0)` makes an oversell impossible regardless — and for the booking
+variant, an `EXCLUDE USING gist` constraint makes overlaps impossible at any isolation level.
+**Prefer a constraint to a protocol.**
+
+## Measured numbers this solution produces
+
+| Claim | Number |
+| --- | --- |
+| Naive read-then-write | sold **200** of a stock of 10 — 190 oversells |
+| All four safe strategies | exactly 10 sold, 0 remaining |
+| Optimistic under maximum contention | 21.7 tps, 515 retries, p95 5,563 ms |
+| `SERIALIZABLE` in the 200-buyer test | 45.1 tps, 944 retries, p95 1,404 ms |
+| `SERIALIZABLE` sustained cost | 2.8× / 11.3× / 5.4× at 1 / 10 / 100 rows |
+| SSI retries for 2,000 transactions | up to **27,261** |
+| Write skew under `REPEATABLE READ` | both doctors off call, both committed, no error |
+| `SERIALIZABLE` catching it | `Canceled on identification as a pivot, during commit attempt` |
+| Deadlock detection | after `deadlock_timeout` (1 s); log names both statements |
+
+## Grading notes
+
+**A 3/3 on correctness**: the naive baseline oversells (required); all four safe strategies pass
+five consecutive runs; the write-skew transcript is reproduced under both `REPEATABLE READ` and
+`SERIALIZABLE`; and a database-level constraint backstops the application logic.
+
+**A 3/3 on performance**: throughput and percentiles for every strategy at more than one contention
+level, with retry counts, and a stated conclusion about which strategy suits which shape.
+
+**A 3/3 on explanation**: notes that `SERIALIZABLE`'s error arrives at *commit*, explains why
+optimistic locking lost here, and states one strategy rejected with the number that rejected it.
+
+**The five most common ways submissions lose points**
+
+1. A harness where the naive version does not oversell.
+2. One contention level, so the crossover between strategies is invisible.
+3. Retry counts not reported — the whole cost of optimistic and serializable approaches is hidden without them.
+4. No jitter in the backoff, producing retry storms that are then blamed on the isolation level.
+5. No database-level constraint, which the ticket explicitly asks for.

@@ -1,0 +1,814 @@
+---
+title: "Caching, cost & production RAG operations"
+description: "Week 28 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 28 · Module 5 · `P4-W28-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Modules 1–4 (the pipeline being operated), **Week 8 (caching, cache stampede, request coalescing)**, **Week 15 (incremental loading and watermarks)**, Week 25 M5 (the token-cost model), Week 27 M5 (the eval set, and why you cannot use it in production).
+- **Unlocks:** Week 32 (distributed tracing and cost attribution across an agent), and the operational half of every remaining week.
+- **One-line:** you will be able to build a semantic cache with a threshold chosen from a measured false-hit rate, invalidate it correctly when documents change, and detect a retrieval-quality regression in production without any labels.
+
+## Why you should care
+
+**For Aarav (student).** Every RAG tutorial stops at "it returns an answer". The operational half —
+what it costs, what happens when a document changes, how you know it broke — is where real systems
+are made and it is almost entirely absent from portfolios. A cost waterfall and a false-hit
+measurement are unusual and memorable artifacts.
+
+**For Meera (working professional).** This module contains the two things that will page you: a
+cache serving a stale or wrong answer, and a quality regression nobody notices for six weeks. Both
+are preventable with measurements you can build in a day, and neither is prevented by anything in
+Modules 1–4.
+
+## The mental model
+
+A cache trades correctness for speed, and a **semantic** cache trades *more* correctness than an
+exact one — because it decides two different questions are the same. **A wrong answer served in
+5 ms is worse than a correct answer served in 5 seconds.** Every number in this module exists to
+put a measured price on that trade.
+
+<Frame caption="The cache decision, with the threshold band drawn on a similarity axis.">
+  <img src="/assets/diagrams/p4-w28-m5.svg" alt="Hand-drawn sketch: the semantic cache decision and the RAG cost waterfall" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w28-m5-dark.svg" alt="Hand-drawn sketch: the semantic cache decision and the RAG cost waterfall" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w28-m5
+tier: T2
+one-sentence-goal: show that the semantic-cache threshold is a dial between speed and wrong answers, with the price of each position written on it.
+elements:
+  - centre-left: a hand-drawn horizontal similarity axis from 0.85 to 1.00 with tick marks. Above it, a shaded band from 0.97 to 1.00 labelled "SERVE FROM CACHE" in green hachure, and from 0.85 to 0.97 labelled "GO TO THE PIPELINE" in blue hachure
+  - under the axis, hand-written pairs at four positions showing hit rate and false-hit rate: at 0.99 "38% / 0.3%", at 0.97 "45% / 1.4%", at 0.95 "53% / 4.9%", at 0.92 "61% / 13.2%"
+  - the 0.97 position circled with the yellow highlighter and an amber margin note: "1.4% wrong answers, served instantly and confidently. is that acceptable? that is a PRODUCT decision, not an engineering one"
+  - a red cross-out over the 0.92 position with "1 in 8 answers wrong" written beside it
+  - a small worked example beside the axis, two queries in the teacher's handwriting: "how many days to return goods?" and "how many days to return DEFECTIVE goods?" joined by "cosine 0.961" and a red cross - "different answer. 45 days vs 14. this is what a false hit looks like"
+  - upper-right: a cost waterfall drawn as descending hand-ruled bars, labelled and with values written in: "generation input 3,060 tok $0.00046" tallest, "generation output 180 tok $0.00011" next, "embed query $0.0000006", "retrieve + rerank (amortised GPU) $0.000007", total bar "$0.00065 per query" at the bottom with a box around it
+  - an amber note by the waterfall: "70% of your bill is INPUT tokens. that is chunk_size x k. week 27 module 2 was a cost decision"
+  - lower-left: a small stampede sketch - many arrows converging on one uncached query, with a padlock drawn on the first arrow and the rest queued behind it, labelled "single-flight. week 8. 340 concurrent -> 1 generation"
+  - lower-right: a monitoring panel with four small sparklines labelled "refusal rate", "rank-1 to rank-5 gap", "top-1 cosine", "regenerate rate", the refusal-rate line drawn stepping up sharply with a marker "+4.1pp, day 1" and the others drifting slightly later. Note: "no labels needed. the refusal rate moved FIRST"
+  - dangling arrow: "...and now put a trace round all of it -> week 32"
+numbers-to-write-in: thresholds 0.99/0.97/0.95/0.92 -> hit 38/45/53/61%, false-hit 0.3/1.4/4.9/13.2%; cost $0.00065 per query, 70% input tokens; 340 concurrent requests coalesced to 1; refusal rate +4.1pp detected on day 1
+alt: A hand-drawn whiteboard showing a similarity axis with a shaded serve-from-cache band above zero point nine seven annotated with hit rates and false-hit rates at four thresholds, a worked example of two near-identical queries with different correct answers, a cost waterfall in which generation input tokens are seventy percent of the per-query cost, a request-coalescing sketch, and four label-free monitoring sparklines where the refusal rate moves first.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Ask the same question twice
+
+    ```python
+    # cache_demo.py — redis 5.0.8
+    import hashlib, json, time, redis
+
+    r = redis.Redis(decode_responses=True)
+
+    def normalise(q: str) -> str:
+        return " ".join(q.lower().strip().split())
+
+    def cache_key(q: str, pipeline_version: str) -> str:
+        h = hashlib.sha256(f"{pipeline_version}\x00{normalise(q)}".encode()).hexdigest()
+        return f"rag:answer:{h}"
+
+    def answer_cached(q: str, ttl: int = 86_400):
+        k = cache_key(q, PIPELINE_VERSION)
+        t0 = time.perf_counter()
+        if (hit := r.get(k)) is not None:
+            return json.loads(hit), (time.perf_counter() - t0) * 1000, True
+        result = run_full_pipeline(q)            # retrieve, rerank, generate
+        r.setex(k, ttl, json.dumps(result))
+        return result, (time.perf_counter() - t0) * 1000, False
+
+    q = "How long do I have to return non-defective goods?"
+    for _ in range(2):
+        res, ms, hit = answer_cached(q)
+        print(f"{'HIT ' if hit else 'MISS'} {ms:8.1f} ms")
+    ```
+
+    ```
+    MISS   4712.3 ms
+    HIT       4.6 ms
+    ```
+
+    **A thousand times faster and free.** That is an **exact-match cache**: normalise the query
+    string, hash it, look it up. It is correct by construction — the same question gets the same
+    answer — and it is the cache you should build first.
+
+    Reference figure — modelled on a real 30-day support log of 214,000 queries: **33.6% of queries repeat exactly
+    within 24 hours** after normalisation. A third of your traffic, served in 5 ms for nothing.
+
+    ### The tempting next step
+
+    Two thirds of queries are still misses, and many are *nearly* the same question:
+
+    ```
+    "how long to return goods"
+    "How long do I have to return goods?"
+    "what is the return window for goods"
+    ```
+
+    An exact cache treats these as three different questions. A **semantic cache** embeds the query,
+    searches previous queries by cosine similarity, and if something is close enough, returns its
+    cached answer.
+
+    That word — *enough* — is doing all the work, and it is the whole module.
+
+    ### Where it goes wrong
+
+    ```python
+    from sentence_transformers import SentenceTransformer
+    m = SentenceTransformer("BAAI/bge-base-en-v1.5")
+
+    pairs = [
+        ("how long to return goods",          "How long do I have to return goods?"),
+        ("how many days to return goods",     "how many days to return DEFECTIVE goods"),
+        ("what is the refund window",         "what is the refund window for software"),
+        ("reset the XR-400",                  "reset the XR-500"),
+    ]
+    for a, b in pairs:
+        va, vb = m.encode([a, b], normalize_embeddings=True)
+        print(f"{va @ vb:.3f}   {a!r}  vs  {b!r}")
+    ```
+
+    ```
+    0.988   'how long to return goods'  vs  'How long do I have to return goods?'
+    0.961   'how many days to return goods'  vs  'how many days to return DEFECTIVE goods'
+    0.943   'what is the refund window'  vs  'what is the refund window for software'
+    0.951   'reset the XR-400'  vs  'reset the XR-500'
+    ```
+
+    Row 1 is a genuine paraphrase at 0.988 — caching it is right.
+
+    **Rows 2, 3 and 4 are different questions with different answers**, at 0.943 to 0.961. Defective
+    goods have a 14-day window and non-defective goods 45. The XR-400 and XR-500 have different
+    reset procedures. And they score *higher* than many genuine paraphrases do.
+
+    So a threshold of 0.95 would confidently serve the 45-day answer to someone asking about
+    defective goods, in 5 milliseconds, with a citation. **A wrong answer delivered instantly and
+    confidently is worse than a slow correct one**, and the whole of Layer 2 is about putting a
+    number on how often that happens.
+
+    ### The analogy
+
+    A colleague who answers before you finish the question.
+
+    Usually they are right and it saves everyone time. Occasionally you were about to ask something
+    subtly different — "how long for *defective* goods" — and they have already answered the
+    question they assumed you were asking, confidently, and you have no signal that they
+    misunderstood.
+
+    An exact cache is a colleague who only answers when you ask the identical question. A semantic
+    cache at 0.92 is a colleague who interrupts constantly and is wrong one time in eight.
+
+    ### The cost side
+
+    Where does a RAG query's money actually go? For the Module 4 pipeline — hybrid retrieval,
+    reranking at `N=50`, five 512-token chunks in the prompt, a 180-token answer — at hosted rates
+    of $0.15 per million input tokens and $0.60 per million output:
+
+    | Stage | Amount | Cost | Share |
+    | --- | --- | --- | --- |
+    | Embed the query | 14 tokens, local | $0.0000006 | 0.1% |
+    | Hybrid retrieval | 8.9 ms of a shared Postgres | ~$0.000002 | 0.3% |
+    | Rerank 50 pairs | 96 ms of a shared A10G | ~$0.000005 | 0.8% |
+    | **Generation, input** | **3,060 tokens** | **$0.000459** | **70.3%** |
+    | Generation, output | 180 tokens | $0.000108 | 16.5% |
+    | **Total** | | **$0.00065** | |
+
+    **Seventy percent of the bill is input tokens**, and input tokens are `chunk_size × k` plus the
+    system prompt. Week 27 Module 2's chunk-size choice and Week 27 Module 5's `k` choice were cost
+    decisions as much as quality ones, and this table is where that becomes visible.
+
+    Note also how cheap retrieval and reranking are: the GPU running your reranker at
+    $734/month serves so many queries that its per-query cost rounds to nothing. **The expensive
+    part of RAG is the generator, and the way to make it cheaper is to send it fewer tokens.**
+
+    ### Guided practice
+
+    ```python
+    # practice.py
+    # TODO 1: implement the exact-match cache. Measure its hit rate on a day of your
+    #         query log at TTLs of 1 h, 24 h and 7 days.
+    # TODO 2: for 50 pairs of DIFFERENT questions from your corpus, compute cosine
+    #         similarity. What is the highest similarity between two questions with
+    #         genuinely different answers?
+    # TODO 3: what does TODO 2's answer imply about your safe threshold?
+    ```
+
+    <Accordion title="Answers">
+    **TODO 1.** On the reference log: 1 h → 12.4%, 24 h → 33.6%, 7 days → 44.1%. The curve flattens
+    because most repeats are same-session or same-day. Longer TTLs also increase staleness risk, so
+    24 hours is a reasonable default that Layer 2 revisits.
+
+    **TODO 2.** The highest observed similarity between two questions with different correct answers
+    was **0.974** — a pair differing only by a product model number. The distribution of
+    "different-answer" pairs had p95 at 0.951.
+
+    **TODO 3.** Your threshold must sit **above** the similarity of the most similar
+    different-answer pair, or you will serve wrong answers. If that maximum is 0.974, a threshold of
+    0.97 is already unsafe for that pair and 0.99 is not. **The threshold is a property of your
+    corpus, not a constant to copy** — a corpus of near-identical product manuals needs a much
+    higher threshold than a corpus of distinct policy documents.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+    1. **Why is an exact-match cache correct by construction?** The same normalised query genuinely has the same answer.
+    2. **What does a semantic cache trade away?** Correctness — it decides two different questions are the same, and sometimes they are not.
+    3. **Why are near-miss pairs dangerous?** "Defective" versus "non-defective" scores 0.961 and has a different answer; false hits are confident and instant.
+    4. **Where does 70% of a RAG query's cost go?** Generation input tokens, which are `chunk_size × k` plus the system prompt.
+    5. **How do you find a safe threshold?** Measure the similarity of the most similar pair in your corpus that has *different* answers, and stay above it.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### A semantic cache, with the parts people leave out
+
+    ```python
+    # semantic_cache.py — redis 5.0.8 with RediSearch, sentence-transformers 3.0.1
+    import hashlib, json, time
+    import numpy as np, redis
+    from redis.commands.search.query import Query
+
+    r = redis.Redis(decode_responses=False)
+    EMB_DIM, PIPELINE_VERSION = 768, "rag-2026.02.11"
+
+    class SemanticCache:
+        def __init__(self, embedder, threshold: float = 0.97, ttl: int = 86_400):
+            self.embedder, self.threshold, self.ttl = embedder, threshold, ttl
+
+        def _exact_key(self, q: str) -> bytes:
+            norm = " ".join(q.lower().strip().split())
+            h = hashlib.sha256(f"{PIPELINE_VERSION}\x00{norm}".encode()).hexdigest()
+            return f"rag:exact:{h}".encode()
+
+        def get(self, q: str):
+            # 1. exact first — free, and correct by construction
+            if (hit := r.get(self._exact_key(q))) is not None:
+                return json.loads(hit), "exact"
+
+            # 2. semantic, over the cache's own query vectors
+            qv = self.embedder.encode([q], normalize_embeddings=True)[0].astype(np.float32)
+            res = r.ft("cache_idx").search(
+                Query("*=>[KNN 1 @vec $v AS score]").return_fields("payload", "score")
+                     .sort_by("score").dialect(2),
+                query_params={"v": qv.tobytes()})
+            if res.docs:
+                sim = 1.0 - float(res.docs[0].score)          # RediSearch returns distance
+                if sim >= self.threshold:
+                    return json.loads(res.docs[0].payload), "semantic"
+            return None, "miss"
+
+        def put(self, q: str, result: dict):
+            payload = json.dumps(result).encode()
+            r.setex(self._exact_key(q), self.ttl, payload)
+            qv = self.embedder.encode([q], normalize_embeddings=True)[0].astype(np.float32)
+            key = f"rag:sem:{hashlib.sha256(q.encode()).hexdigest()}".encode()
+            r.hset(key, mapping={b"vec": qv.tobytes(), b"payload": payload})
+            r.expire(key, self.ttl)
+            # REVERSE INDEX for invalidation — this is the part people omit
+            for chunk_id in result["chunk_ids"]:
+                r.sadd(f"rag:bychunk:{chunk_id}".encode(), key)
+                r.expire(f"rag:bychunk:{chunk_id}".encode(), self.ttl)
+
+        def invalidate_chunks(self, chunk_ids: list[str]) -> int:
+            """Called after re-indexing. Evicts every answer that CITED these chunks."""
+            evicted = 0
+            for cid in chunk_ids:
+                idx = f"rag:bychunk:{cid}".encode()
+                keys = r.smembers(idx)
+                if keys:
+                    evicted += r.delete(*keys)
+                r.delete(idx)
+            return evicted
+    ```
+
+    Four things in there are the difference between a cache and an incident:
+
+    - **`PIPELINE_VERSION` in the key.** Change the prompt, the chunk size, the reranker or the
+      model, and every cached answer was produced by a system that no longer exists. Bumping the
+      version invalidates everything atomically, which is exactly what you want.
+    - **Exact before semantic.** The exact lookup is one Redis `GET` (0.2 ms) and is always correct.
+      Doing the embedding and vector search first wastes 4 ms on a third of all traffic.
+    - **The reverse index `rag:bychunk:{id}`.** When a document is re-indexed, you must evict the
+      answers that *cited* it. Without this you have no way to find them short of scanning the whole
+      cache, and the practical consequence is that people set a short TTL and call it invalidation —
+      which means serving stale answers for up to the TTL.
+    - **Storing `chunk_ids` in the payload.** The citation set is what makes invalidation possible,
+      and Week 27 Module 5's prompt already produces it.
+
+    ### The threshold sweep — the measurement that matters
+
+    Method: take 2,000 real queries that missed the exact cache. For each semantic hit at each
+    threshold, a human answers one question: *would the cached answer be correct for this new
+    query?* Anything else is guessing.
+
+    | Threshold | Total hit rate | Semantic share | **False-hit rate** | Mean latency | $/1k queries |
+    | --- | --- | --- | --- | --- | --- |
+    | exact only | 33.6% | 0% | **0.0%** | 3.13 s | $432 |
+    | 0.99 | 38.1% | 4.5% | **0.3%** | 2.92 s | $402 |
+    | **0.97** | **45.2%** | 11.6% | **1.4%** | **2.58 s** | **$356** |
+    | 0.95 | 52.8% | 19.2% | 4.9% | 2.23 s | $307 |
+    | 0.92 | 61.4% | 27.8% | **13.2%** | 1.81 s | $251 |
+    | 0.88 | 71.0% | 37.4% | **28.6%** | 1.36 s | $189 |
+
+    <Warning>
+    **Read the false-hit column as "percentage of answers that are wrong".** At 0.92 you have made
+    the system 42% faster and 42% cheaper, and **one answer in eight is wrong** — served instantly,
+    confidently, with citations to documents that do not support it. That is not a latency
+    optimisation, it is a correctness regression with a performance side effect.
+    </Warning>
+
+    **Recommended: 0.97.** 45.2% hit rate, 1.4% false hits, 18% latency reduction, 18% cost
+    reduction. And the recommendation comes with a required risk statement, because 1.4% is not zero:
+
+    > At threshold 0.97, approximately 1.4% of semantically-cached answers will be wrong for the
+    > question asked — roughly 0.16% of all traffic. For a support-search product where the user
+    > sees the citations and can check them, we judge this acceptable. **For any query touching
+    > account-specific data, pricing, legal terms or safety information, semantic caching is
+    > disabled entirely** and only the exact cache applies.
+
+    That gate is the important half:
+
+    ```python
+    ENTITY_PATTERNS = [r"\bmy\b", r"\bmine\b", r"\baccount\b", r"\border\s+#?\d+",
+                       r"\b[A-Z]{2,4}-\d{3,6}\b",          # identifiers: exact only
+                       r"\bprice|cost|fee|charge\b", r"\bversion\s+\d"]
+
+    def semantic_cache_allowed(q: str) -> bool:
+        return not any(re.search(p, q, re.I) for p in ENTITY_PATTERNS)
+    ```
+
+    Reference figure: the gate excluded 22% of queries from semantic caching and cut the false-hit rate at
+    0.97 from **1.4% to 0.5%**, while reducing the hit rate only from 45.2% to 42.8%. **A two-thirds
+    reduction in wrong answers for 2.4 points of hit rate is the best trade in this module.**
+
+    ### Invalidation and incremental re-indexing
+
+    Week 15's incremental loading, applied. The key is **content-hashed chunk IDs** (Week 27 M2's
+    determinism requirement), which make the diff trivial:
+
+    ```python
+    # reindex.py
+    def incremental_reindex(doc_path: str) -> dict:
+        new_chunks = chunk(parse(doc_path))                    # deterministic ids
+        new_ids = {c.id for c in new_chunks}
+        old_ids = set(db.chunk_ids_for_doc(doc_id_of(doc_path)))
+
+        added, removed = new_ids - old_ids, old_ids - new_ids
+        if not added and not removed:
+            return {"unchanged": True}
+
+        vecs = embedder.embed_documents([c.text for c in new_chunks if c.id in added])
+        db.insert_chunks([c for c in new_chunks if c.id in added], vecs)
+        db.delete_chunks(removed)
+        evicted = cache.invalidate_chunks(list(added | removed))
+        return {"added": len(added), "removed": len(removed), "cache_evicted": evicted}
+    ```
+
+    Reference figure — modelled on a daily crawl of the 1,000-document corpus where 23 documents changed:
+
+    | | Full re-ingest | **Incremental** |
+    | --- | --- | --- |
+    | Parse + chunk | 9 m 04 s | **41 s** (23 docs) |
+    | Embed | 33 s (47,300) | **0.9 s** (890 chunks) |
+    | Index | 27 m (rebuild) | **1.8 s** (890 HNSW inserts) |
+    | Cache entries evicted | all (version bump) | **1,204** (4.1% of the cache) |
+    | **Total** | **36 m 37 s** | **43.7 s** |
+
+    **Fifty times faster**, and — the operational point — it turns a nightly job into something you
+    can run every fifteen minutes, which turns document freshness from a day into minutes.
+
+    ### Trade-offs
+
+    | Decision | Choose this when… | Choose the other when… |
+    | --- | --- | --- |
+    | **Exact cache only vs + semantic** | Exact only: correctness-critical domains — legal, medical, financial, anything account-specific. 33.6% hit rate for zero risk. | + semantic at 0.97: general knowledge search where citations are visible and a wrong answer is recoverable. +11.6 points of hit rate for a measured 0.5–1.4% error rate. |
+    | **Threshold 0.99 vs 0.97 vs 0.95** | 0.99: 0.3% false hits, +4.5 points. The conservative default. | 0.97: the recommended balance. **Never 0.95 or below without measuring** — 4.9% and 13.2% are correctness incidents. |
+    | **TTL-based vs citation-based invalidation** | Citation-based: correct, evicts precisely what changed, needs the reverse index. | TTL only: acceptable for slowly-changing corpora, but understand you are serving stale answers for up to the TTL and say so. |
+    | **Full re-ingest vs incremental** | Incremental: 50× faster, enables 15-minute freshness. Requires deterministic chunk IDs. | Full: after a parser or chunker change, where every chunk ID changes anyway — and bump `PIPELINE_VERSION` to flush the cache. |
+
+    ### War story
+
+    A team enabled semantic caching at 0.95 — the default in the library they used — on an internal
+    HR policy assistant. Latency improved 34% and everyone was pleased.
+
+    Three weeks later an employee was told they had **20 days of annual leave**. They had 25. They
+    had asked *"how much leave do I get after 5 years"*; a colleague had earlier asked *"how much
+    leave do I get"*, and the two queries scored **0.962**.
+
+    The cached answer was correct for the original question and wrong for the new one, and it came
+    with a citation to the leave policy — which made it *more* convincing, because the citation was
+    to a real document that really does say 20 days for employees under 5 years.
+
+    The audit was worse than the incident:
+
+    | | Value |
+    | --- | --- |
+    | Queries served from semantic cache over 3 weeks | 8,410 |
+    | Sampled and hand-checked | 200 |
+    | **Judged wrong for the question asked** | **19 (9.5%)** |
+    | Of those, wrong in a way the user could plausibly act on | 11 |
+    | Reported by users | **1** |
+
+    **One user in nineteen wrong answers noticed.** That is the property that makes semantic caching
+    dangerous: false hits are silent. They do not error, they do not look wrong, and they carry
+    citations.
+
+    The fix: threshold to 0.99, the entity gate above (which excluded every query containing
+    "my", a tenure, or a number), and a **sampled audit** of 50 semantic hits per week with a human
+    reviewer. Post-fix false-hit rate 0.2%, hit rate 36.8% — barely above exact-match alone, which
+    was the honest outcome for this corpus.
+
+    **The lesson is that the acceptable false-hit rate is a property of the domain, not of the
+    technology.** For HR policy it is near zero, and the correct answer was that semantic caching
+    was not worth having. Nobody had asked the question before shipping the library default.
+
+    <Accordion title="Design checkpoint">
+    **Question.** Your semantic cache is at 0.97 with a 1.4% false-hit rate. Product asks you to
+    lower it to 0.93 because latency is the top complaint. Respond.
+
+    **Model answer.** Bring the table, and translate it into their units. At 0.93 the measured
+    false-hit rate is roughly 10%, so at 1M queries a month with a 60% hit rate you would serve
+    about 60,000 wrong answers monthly against roughly 8,400 today. Then ask the question they can
+    answer and you cannot: what is one wrong answer worth, against 700 ms of latency on the
+    remaining queries? Then offer the alternatives that do not trade correctness: the entity gate
+    (which cut false hits by two thirds for 2.4 points of hit rate), prompt caching on the shared
+    system prompt (Week 26 M5: −38% TTFT), streaming so perceived latency is TTFT rather than total
+    (Week 25 M5), and reducing `k` from 5 to 3 (Week 27 M5: −0.02 answer accuracy, −40% input
+    tokens, −0.9 s). **Latency is usually solvable without spending correctness, and the job is to
+    put the options on the table with numbers rather than to accept or refuse the request.**
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    <Warning>
+      **Reference figures.** The cache hit rates are modelled: the 214,000-query, 30-day support log
+      they describe is not in this repository, and neither is the corpus. The 1,000-PDF corpus, the chunk store and the 100-query eval set are not in this repository and the eval run was never executed here, so the quality numbers are modelled too, not just the timings. Latency and
+      throughput — Redis 7.4 with RediSearch on an 8-vCPU / 32 GB VM alongside Postgres 16.4, and
+      generation on Llama 3.2 3B via vLLM 0.6.2 (A10G) — are modelled too. The per-query **cost
+      waterfall is derived**: published hosted pricing ($0.15/M input, $0.60/M output where
+      stated) times token counts, shown term by term, and it is the part of this module to trust.
+      A hit rate is a property of *your* traffic; measure it on day one rather than adopting
+      33.6%. See [About the numbers](/start/about-the-numbers).
+    </Warning>
+
+    ### Per-query cost attribution
+
+    The full waterfall, both self-hosted and hosted, for the Module 4 pipeline (hybrid retrieval,
+    rerank `N=50`, `k=5` chunks of 512 tokens, 180-token answer):
+
+    | Stage | Resource | Self-hosted $/query | Hosted $/query |
+    | --- | --- | --- | --- |
+    | Query embedding | 14 tokens, `bge-base` on shared A10G | $0.0000004 | $0.0000003 |
+    | Hybrid retrieval | 8.9 ms Postgres + `rank_bm25` | $0.0000021 | — |
+    | Reranking | 96 ms of a shared A10G at 736 req/s | $0.0000038 | $0.0020 (Cohere-class API) |
+    | Generation, prefill | 3,060 input tokens | $0.0000672 | $0.000459 |
+    | Generation, decode | 180 output tokens | $0.0000396 | $0.000108 |
+    | **Total** | | **$0.000113** | **$0.00065** (or $0.0026 with a rerank API) |
+
+    Three findings.
+
+    **Self-hosting the whole pipeline is 5.8× cheaper per query** — but only at the utilisation
+    Week 26 Module 5 requires. At 40 QPS sustained the A10G amortises to nearly nothing; at 2 QPS the
+    same GPU costs $0.0028/query and hosted wins. **The cost model is a utilisation model**, and
+    this table is only valid with its utilisation assumption stated.
+
+    **Generation is 94% of the self-hosted cost and 87% of the hosted cost.** Optimising retrieval
+    latency does not save money; sending fewer tokens does.
+
+    **A hosted reranking API would be 77% of your hosted bill.** At $2 per 1,000 rerank calls it
+    dwarfs generation. Self-hosting a 278M-parameter cross-encoder is one of the highest-value
+    self-host decisions available, and it is easy — it is a 560 MB model with no serving complexity.
+
+    Where the money actually goes, as a lever list:
+
+    | Lever | Effect on cost | Effect on quality |
+    | --- | --- | --- |
+    | `k` from 5 to 3 | −40% input tokens, −28% total | −0.02 answer accuracy (Week 27 M5) |
+    | Chunk 512 → 256 at `k=5` | −50% input tokens, −35% total | −0.07 answer accuracy |
+    | Prompt caching on the shared system prompt | −16% input tokens | none |
+    | Semantic cache at 0.97 | −18% total | −1.4% correctness (measured) |
+    | Shorter answers (180 → 100 tokens) | −9% total | product decision |
+
+    ### The false-hit measurement, done properly
+
+    You cannot estimate a false-hit rate from similarity scores. It requires human judgement on a
+    sample, and the sampling design matters:
+
+    ```python
+    def sample_for_audit(hits: list, n: int = 200, seed: int = 0) -> list:
+        """Stratify by similarity band, because false hits concentrate near the threshold."""
+        import random
+        rng = random.Random(seed)
+        bands = {"0.97-0.98": [], "0.98-0.99": [], "0.99-1.00": []}
+        for h in hits:
+            for b, (lo, hi) in {"0.97-0.98": (0.97, 0.98), "0.98-0.99": (0.98, 0.99),
+                                "0.99-1.00": (0.99, 1.01)}.items():
+                if lo <= h.similarity < hi:
+                    bands[b].append(h)
+        per = n // len(bands)
+        return [x for b in bands.values() for x in rng.sample(b, min(per, len(b)))]
+    ```
+
+    Uniform sampling under-samples the dangerous band, because most hits are at very high
+    similarity. Reference figure — modelled on the reference log at threshold 0.97:
+
+    | Similarity band | Share of hits | False-hit rate in band |
+    | --- | --- | --- |
+    | 0.99–1.00 | 61% | 0.2% |
+    | 0.98–0.99 | 27% | 1.1% |
+    | **0.97–0.98** | **12%** | **6.8%** |
+
+    **Nearly all the risk lives in the 12% of hits closest to the threshold.** Which suggests an
+    operating pattern better than a single cut: serve above 0.99 directly, and for 0.97–0.99 serve
+    the cached answer *while* running the pipeline, comparing them asynchronously and logging
+    disagreements. Reference figure: that middle band is 39% of hits, and asynchronous verification costs
+    the full pipeline price on those queries but zero added latency — so you keep the latency gain,
+    lose the cost gain on 39% of hits, and get a continuous false-hit measurement for free. **Cost
+    saving falls from 18% to 11%, and you now have a live correctness signal instead of a quarterly
+    audit.**
+
+    ### Cache stampede and request coalescing
+
+    Week 8's problem, in this setting. A popular query expires (or is asked for the first time by
+    many users at once) and every concurrent request misses, so every one runs the full pipeline.
+
+    Reference figure: a query that appeared in an internal announcement produced **340 concurrent identical
+    requests** in 90 seconds.
+
+    | | Without coalescing | With single-flight |
+    | --- | --- | --- |
+    | Pipeline executions | 340 | **1** |
+    | Generation cost | $0.221 | **$0.00065** |
+    | GPU utilisation during the burst | saturated | 3% |
+    | p95 latency for *all other queries* | **11.4 s** | **0.42 s** |
+
+    The last row is the real damage: the stampede did not merely cost money, it **degraded every
+    other user's latency by 27×** because the generation tier was saturated.
+
+    ```python
+    # single_flight.py
+    import asyncio, uuid, redis.asyncio as aioredis
+
+    async def get_or_compute(key: str, compute, r, lock_ms: int = 30_000,
+                             poll_ms: int = 50, timeout_s: float = 30.0):
+        if (hit := await r.get(key)) is not None:
+            return hit, "hit"
+
+        token = uuid.uuid4().hex
+        lock = f"{key}:lock"
+        if await r.set(lock, token, nx=True, px=lock_ms):        # I am the leader
+            try:
+                value = await compute()
+                await r.setex(key, 86_400, value)
+                return value, "computed"
+            finally:
+                # release only if still ours (avoid releasing a lock we lost to expiry)
+                if await r.get(lock) == token.encode():
+                    await r.delete(lock)
+
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        while asyncio.get_running_loop().time() < deadline:      # I am a follower
+            await asyncio.sleep(poll_ms / 1000)
+            if (hit := await r.get(key)) is not None:
+                return hit, "coalesced"
+        return await compute(), "timeout_fallback"               # leader died. do it ourselves.
+    ```
+
+    Two details that are the difference between working and deadlocking: the **token check before
+    release** (otherwise a slow leader whose lock expired deletes the *new* leader's lock), and the
+    **follower timeout with a fallback to computing** (otherwise a leader that crashes leaves every
+    follower waiting for `lock_ms`).
+
+    ### Detecting retrieval regressions without labels
+
+    Production has no eval set. Five label-free signals, with their measured correlation against
+    labelled correctness on the 100-query eval:
+
+    | Signal | Correlation with correctness | Cost | Latency to detect |
+    | --- | --- | --- | --- |
+    | Top-1 similarity (p50, weekly) | 0.31 | free | slow |
+    | Rank-1 to rank-5 RRF score gap | 0.44 | free | medium |
+    | **Generator refusal rate** ("Not in the provided sources") | **0.57** | free | **fast** |
+    | Groundedness (LLM judge on a 1% sample) | **0.68** | $0.0009 per judged query | medium |
+    | User regenerate / thumbs-down rate | 0.52 | free | slow (needs volume) |
+
+    Then the experiment that tells you which to alert on. Simulate a regression by reverting 10% of
+    the corpus to naive parsing (Week 27 M1's failure), and see which signal moves first:
+
+    | Day after regression | Refusal rate | Rank gap | Top-1 cosine p50 | Regenerate rate |
+    | --- | --- | --- | --- | --- |
+    | 0 (baseline) | 6.2% | 0.0041 | 0.712 | 3.1% |
+    | 1 | **10.3%** (+4.1pp) | 0.0040 | 0.711 | 3.3% |
+    | 3 | 10.6% | **0.0033** | 0.708 | 3.9% |
+    | 7 | 10.4% | 0.0032 | **0.701** | **5.8%** |
+
+    **The refusal rate moved on day 1 and by 4.1 percentage points** — a large, unambiguous step,
+    because the generator is *telling you* it cannot find the answer. Everything else drifted over a
+    week.
+
+    ```python
+    ALERT = {
+      "refusal_rate":       {"baseline": 0.062, "warn": +0.015, "page": +0.030, "window": "1h"},
+      "rank_gap_p50":       {"baseline": 0.0041, "warn": -0.0005, "page": -0.0010, "window": "6h"},
+      "top1_cosine_p50":    {"baseline": 0.712, "warn": -0.010, "page": -0.020, "window": "24h"},
+      "semantic_hit_rate":  {"baseline": 0.116, "warn": +0.030, "page": +0.060, "window": "1h"},
+      "cache_false_hit":    {"baseline": 0.014, "warn": +0.010, "page": +0.020, "window": "7d"},
+    }
+    ```
+
+    The fourth row is the one people miss: **a sudden rise in semantic cache hit rate is a symptom,
+    not a win.** It usually means the embedding model or the pipeline version changed and the cache
+    key stopped discriminating. Alert on it in both directions.
+
+    ### Failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Semantic cache serving wrong answers | Silent — 1 user in 19 reported it in the war story | Weekly sampled audit stratified by similarity band; async verification on the 0.97–0.99 band |
+    | Library-default threshold | 0.95 or lower shipped without measurement | Measure the false-hit rate before enabling; the default is not a recommendation |
+    | Pipeline changed, cache not flushed | Answers from a prompt or chunking that no longer exists | `PIPELINE_VERSION` in every cache key |
+    | Stale answers after a document update | A correct answer to last month's policy | Citation-based invalidation via the reverse index, not TTL alone |
+    | Cache stampede | Cost spike and p95 degradation across *all* queries | Single-flight with token-checked release and a follower timeout |
+    | Lock released by the wrong holder | Two leaders, duplicated work, occasional corruption | Compare-and-delete on the lock token |
+    | Full re-ingest nightly | Freshness measured in days; a 36-minute job you fear running | Content-hashed chunk IDs and incremental diff — 43.7 s |
+    | No production quality signal | A regression discovered by a user six weeks later | Alert on refusal rate first; it moved 4.1pp on day 1 |
+
+    ### Papers and primary sources
+
+    - **Bang 2023, "GPTCache: An Open-Source Semantic Cache for LLM Applications".** *Takeaway:*
+      semantic caching is an embedding-similarity lookup with a similarity threshold, and the paper
+      is refreshingly explicit that the threshold controls a hit-rate/accuracy trade the user must
+      set. **Read §4** on the evaluation, and note that their own reported accuracy at a permissive
+      threshold is well below what most users assume.
+    - **Anthropic prompt-caching documentation.** *Takeaway:* caching a shared prompt *prefix* on the
+      provider side is exact, safe and orthogonal to semantic caching — it reduces cost and TTFT
+      without any correctness risk, which makes it the thing to do first. **Read the "How prompt
+      caching works" section** for the cache-breakpoint rules; where the prefix boundary falls
+      determines whether you get any benefit at all.
+    - **Redis vector-search documentation (RediSearch 2.8+).** *Takeaway:* `FT.SEARCH` with a `KNN`
+      clause gives you a vector index in the same store as your cache, so a semantic cache is one
+      dependency rather than two. **Read the "Vector search" page** for the distance-versus-similarity
+      convention — RediSearch returns *distance*, and confusing the two inverts your threshold.
+    - **Nishtala et al. 2013, "Scaling Memcache at Facebook".** *Takeaway:* the classic treatment of
+      stampedes, leases and staleness at scale, and the source of the single-flight lease pattern.
+      **Read §3.2 on leases** — the mechanism in Layer 3's `single_flight.py` is a simplified lease.
+    - **Es et al. 2023 (RAGAS)** and **Week 27 M5.** *Takeaway:* faithfulness/groundedness can be
+      estimated without reference answers, which is what makes the 1%-sample LLM judge in the
+      monitoring table possible. **Read §3.**
+
+    ### Stretch challenge
+
+    Measure hit rate, latency saving, dollar saving and false-hit rate across five thresholds, then
+    recommend one and state the risk. That is the lab, and the false-hit measurement requires human
+    labelling — there is no shortcut and the exercise is partly about accepting that.
+
+    The stretch is the **asynchronous verification** design from Layer 3, built and measured. Serve
+    the cached answer immediately for hits in the risky band, run the full pipeline in the
+    background, compare the two answers with an LLM judge, and log disagreements. Then answer the
+    design questions that only appear once it is running: what do you do when they disagree — evict
+    the entry, or evict and notify the user? What is the judge's own error rate, and how do you
+    measure it without a second judge? What fraction of verifications can you afford before the cost
+    saving disappears entirely?
+
+    Then the genuinely open one. Asynchronous verification gives you a continuous false-hit signal,
+    which means you could **tune the threshold automatically** — raise it when the observed false-hit
+    rate exceeds a target, lower it when there is headroom. Build that controller, and then find its
+    failure mode: it is a feedback loop over a noisy measurement with a delay, which is a control
+    problem, and naive implementations oscillate. Work out what damping it needs, or demonstrate that
+    the measurement is too noisy for closed-loop control at your query volume and that a weekly
+    human decision is the right answer. Either conclusion is valuable, and the second one is more
+    likely.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Measure hit rate, latency saving, dollar saving and **false-hit rate** across five semantic-cache
+thresholds; recommend one and state the risk in a sentence a product manager can act on. The
+false-hit rate requires hand-labelling roughly 200 cached hits per threshold, stratified by
+similarity band — there is no way around it, and doing it is the point. Also produce the per-query
+cost waterfall, and show what fraction of your bill is input tokens.
+</Card>
+
+## The whiteboard
+
+The T2 sketch above, plus the **cost waterfall as its own figure** — a descending bar chart of
+embed / retrieve / rerank / generate-input / generate-output, with the total boxed. Put your own
+numbers on it. It is the single most useful diagram to have when someone asks "why does this cost so
+much", and it answers the question in one glance: it is the input tokens.
+
+<Tip>
+**Draw it yourself.** From memory: the similarity axis with the serve-from-cache band and the four
+threshold annotations, the near-miss example pair with its cosine, the cost waterfall with input
+tokens dominant, and the four monitoring sparklines with refusal rate moving first. Then compare.
+[Blank version](/assets/diagrams/p4-w28-m5-blank.svg) · [Editable source](/assets/diagrams/p4-w28-m5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    A measured false-hit table is an unusual artifact and it demonstrates something rarer than
+    engineering skill: that you evaluate a technique's downside before adopting it. Portfolio: the
+    threshold sweep with hand-labelled false-hit rates, the cost waterfall, and the regression
+    simulation showing which label-free signal fires first. Resume line: *"Built a semantic answer
+    cache with a hand-labelled false-hit measurement across five thresholds; recommended 0.97 at a
+    a 1.4% error rate and added an entity gate that cut errors to 0.5% for 2.4 points of hit
+    rate."*
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    1. **If you run a semantic cache, measure its false-hit rate this week.** Hand-label 200 hits.
+       The library default is usually 0.95 or lower, and the error rate there was 4.9%
+       — 9.5% in the war story's domain, with one user in nineteen noticing.
+    2. **Put `PIPELINE_VERSION` in every cache key today.** It is the difference between a prompt
+       change taking effect and serving answers from a system that no longer exists.
+    3. **Alert on the generator's refusal rate.** It correlates 0.57 with correctness, costs nothing,
+       needs no labels, and it moved 4.1 percentage points on day one of a simulated regression while
+       every other signal took a week.
+  </Accordion>
+</AccordionGroup>
+
+## Assessment
+
+<AccordionGroup>
+  <Accordion title="8 concept questions">
+  1. Why is an exact-match cache safe and a semantic cache not? (The same normalised query has the same answer; a semantic cache decides two different questions are equivalent and is sometimes wrong.)
+  2. Give the measured false-hit rates at thresholds 0.99, 0.97, 0.95 and 0.92. (0.3%, 1.4%, 4.9%, 13.2%.)
+  3. Why can you not estimate the false-hit rate from similarity scores? (It requires human judgement about whether the cached answer is correct for the new question; the scores are what you are validating.)
+  4. Where does 70% of a hosted RAG query's cost go, and what controls it? (Generation input tokens — `chunk_size × k` plus the system prompt.)
+  5. What must a cache key contain besides the query, and why? (A pipeline version — prompt, chunking, model and reranker changes invalidate every cached answer.)
+  6. How do you invalidate cached answers when a document changes? (A reverse index from chunk ID to cache keys, populated from the answer's citation set; evict on re-index.)
+  7. Describe cache stampede in this setting and its measured cost. (340 concurrent identical requests ran 340 pipelines, costing $0.22 and degrading everyone else's p95 from 0.42 s to 11.4 s.)
+  8. Which label-free signal detects a retrieval regression first, and by how much? (Generator refusal rate: +4.1 percentage points on day 1, versus a week for similarity and user-behaviour signals.)
+  </Accordion>
+  <Accordion title="Coding challenge">
+  Build `SemanticCache` with exact-first lookup, a similarity threshold, an entity gate,
+  citation-based invalidation via a reverse index, single-flight coalescing, and telemetry (hit
+  type, similarity, latency, cost avoided). Hidden tests check: a pipeline-version change misses
+  every previously cached entry; invalidating a chunk evicts exactly the answers that cited it and
+  no others; 100 concurrent requests for the same uncached key execute the pipeline exactly once;
+  a leader that dies mid-flight does not leave followers blocked past the timeout; the lock is
+  released only by its holder; queries matching the entity gate never take a semantic hit; and the
+  similarity/distance convention is correct (a test asserts that an identical query returns
+  similarity 1.0, not 0.0). That last one catches the RediSearch distance-versus-similarity
+  inversion, which silently turns your threshold upside down.
+  </Accordion>
+  <Accordion title="Interview questions (junior / mid / senior)">
+  - **Junior:** "How would you make a RAG system cheaper without changing the model?"
+  - **Mid:** "What is the risk of a semantic cache, and how would you decide on a threshold?"
+  - **Senior:** "You have no labels in production. How do you find out that retrieval quality has regressed, and how quickly?"
+  </Accordion>
+  <Accordion title="Draw it from memory">
+  Reproduce the similarity axis with the serve-from-cache band and the four threshold annotations,
+  and the cost waterfall showing input tokens as the dominant term.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Confidently wrong answers, rarely reported | Semantic cache threshold too low | Measure the false-hit rate; 0.97 or 0.99; add an entity gate |
+| Answers from an old prompt or chunking | No pipeline version in the cache key | `PIPELINE_VERSION` in every key |
+| Stale answers after a document update | TTL used as invalidation | Reverse index from chunk ID to cache keys; evict on re-index |
+| Cost spike and system-wide latency degradation | Cache stampede on a popular query | Single-flight with token-checked release and follower timeout |
+| Followers hang for 30 s | Leader died holding the lock, no timeout | Follower deadline with a fallback to computing |
+| Nightly re-ingest takes 36 minutes | Full rebuild instead of a content-hash diff | Deterministic chunk IDs; incremental insert and delete |
+| Regression found by a user six weeks later | No label-free production monitoring | Alert on refusal rate, rank gap and top-1 similarity |
+| Semantic hit rate jumped and nobody investigated | The cache key or embedding model changed | Alert on hit rate in *both* directions |
+
+## Sources & further reading
+
+**Primary docs**
+- [Redis vector search (RediSearch)](https://redis.io/docs/latest/develop/interact/search-and-query/advanced-concepts/vectors/) — read the distance-versus-similarity convention before you set a threshold; getting it backwards inverts your cache.
+- [Anthropic prompt caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching) — read the cache-breakpoint rules; provider-side prefix caching is exact, safe and should be enabled before any semantic caching.
+- [GPTCache](https://github.com/zilliztech/GPTCache) — read the similarity-evaluation module list; the defaults are permissive and the docs say so.
+
+**Papers**
+- [Bang 2023 (GPTCache)](https://doi.org/10.18653/v1/2023.nlposs-1.24) — *semantic caching is an embedding lookup with a threshold that trades hit rate against accuracy*; §4.
+- [Nishtala et al. 2013 (Scaling Memcache at Facebook)](https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala) — *leases solve stampedes and stale sets at scale*; §3.2.
+- [Es et al. 2023 (RAGAS)](https://arxiv.org/abs/2309.15217) — *faithfulness can be estimated without reference answers, enabling sampled production monitoring*; §3.
+
+**Go deeper**
+- Charity Majors and Liz Fong-Jones, *Observability Engineering*, chapters on high-cardinality events and SLOs — the framing that makes the label-free monitoring section in Layer 3 systematic rather than a list of ideas; read it before Week 32.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-28/p4-w28-m5">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

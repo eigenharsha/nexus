@@ -1,0 +1,685 @@
+---
+title: "Training dynamics"
+description: "Week 21 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 21 · Module 3 · `P3-W21-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Explain why initializing all weights to zero makes a network permanently useless.
+2. Derive the He initialization constant `sqrt(2/fan_in)` from a one-line variance argument.
+3. Recognize vanishing and exploding gradients from measured layer-wise statistics, not from vibes.
+4. Choose between BatchNorm, LayerNorm and RMSNorm and defend the choice.
+5. Place dropout correctly and say what it costs you.
+6. Design a learning-rate schedule with warmup, and say what warmup is protecting against.
+7. Diagnose five distinct training pathologies from the loss curve alone, before opening the code.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w21-m3.svg" alt="Hand-drawn sketch: Training dynamics" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w21-m3-dark.svg" alt="Hand-drawn sketch: Training dynamics" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w21-m3
+tier: T2
+one-sentence-goal: The signal's variance is multiplied by a factor at every layer, and unless that factor is exactly 1 the network either fades to nothing or blows up — everything else in this module is a way of holding that factor at 1.
+elements:
+  - a tall stack of 20 thin horizontal layer bars drawn down the left, numbered 1 at top to 20 at bottom
+  - three vertical "signal width" ribbons drawn beside the stack, each one a hand-drawn tapering band whose width is the activation std at that layer
+  - ribbon A labelled "N(0,1) init" flaring outward to a jagged burst at layer 20, written in red, with "std = 3.1e6 -> nan" hand-written at the bottom
+  - ribbon B labelled "Xavier on ReLU" tapering to a hairline, written in red, with "x 0.707 per layer -> std 1.2e-3 at layer 20" and the arithmetic "0.707^20 = 1/1024" left visible as rough work beside it
+  - ribbon C labelled "He init sqrt(2/fan_in)" holding constant width all the way down, in green with a check mark, "std 0.87 at layer 20"
+  - the term "fan_in" circled where it first appears
+  - amber margin note beside ribbon B: "this is why nothing deep trained before 2010 — the signal was gone by layer 8"
+  - a small inset box bottom-right showing four loss curves labelled: flat line "dead / LR too small", smooth-then-spike "LR too high", train-falls-val-rises "overfitting", staircase "LR schedule step"
+  - a dangling arrow off the inset labelled "...and which one is yours? -> the playbook"
+numbers-to-write-in: "0.707^20 = 1/1024", "std 1.2e-3", "std 0.87", "grad norm layer 1: 4.7e-6 vs 1.9e-2", "68.3% vs 88.1% test acc"
+alt: A hand-drawn diagram of a twenty-layer network stack with three signal-width ribbons running down beside it, showing a Gaussian initialization flaring to numerical overflow, Xavier initialization tapering to a hairline by layer twenty, and He initialization holding constant width, with the per-layer variance arithmetic left visible as rough work and a small inset of four characteristic loss-curve shapes.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The one idea
+
+A signal passing through a network gets multiplied by a matrix at every layer. If that multiplication makes the signal a bit smaller each time, after twenty layers it's gone. If it makes it a bit bigger each time, after twenty layers it's a number too big for the computer to represent. **Training a deep network is mostly the engineering of keeping that per-layer factor close to 1.**
+
+Everything in this module — initialization, normalization, learning-rate schedules — is a different tool for the same job.
+
+### Vocabulary, defined before use
+
+- **Initialization** — the values the weights start at, before any training. You choose the *recipe*; a random number generator chooses the actual numbers.
+- **Variance** — a measure of spread. If a list of numbers has variance 1, they mostly sit between −2 and +2. Variance 0 means they're all identical. Variance 100 means they're spread over roughly ±20.
+- **Standard deviation (std)** — the square root of the variance. Same units as the numbers themselves, so easier to eyeball.
+- **`fan_in`** — how many inputs a unit has. For a layer taking 256 numbers in, `fan_in = 256` for every unit in it.
+- **`fan_out`** — how many units the layer sends to.
+- **Vanishing gradient** — the gradient shrinks as it travels backwards, so early layers receive almost nothing and never learn.
+- **Exploding gradient** — the opposite: the gradient grows, one step throws the weights far away, and the loss becomes `nan`.
+- **Epoch** — one full pass over the training data.
+- **Normalization layer** — a layer that rescales its input so it has roughly mean 0 and std 1 before passing it on.
+- **Dropout** — during training only, randomly setting some activations to zero, to stop the network relying on any one of them.
+- **Learning-rate schedule** — a rule for changing the learning rate as training proceeds.
+
+### Why zero initialization destroys the network
+
+Set every weight to zero. Now every hidden unit in a layer computes the same thing (zero), gets the same gradient, and receives the same update. They stay identical forever. A layer of 256 units behaves exactly like a layer of 1 unit, for the entire run.
+
+This is called the **symmetry problem**, and randomness is the only cure. It also explains why biases *can* safely be initialized to zero: the weights already differ, so the units are already distinguishable.
+
+```python
+import numpy as np
+
+W = np.zeros((4, 3))            # 4 hidden units, 3 inputs
+x = np.array([1.0, 2.0, 3.0])
+print(W @ x)                    # [0. 0. 0. 0.]  -- all four units identical
+                                # their gradients will be identical too, forever
+```
+
+### The analogy
+
+Think of the signal as a whisper passed down a line of people.
+
+- **Too quiet a rule** ("repeat it at half the volume you heard it"): by person 20 the volume is `0.5^20`, about one millionth. Nobody at the end hears anything. That's the vanishing problem.
+- **Too loud a rule** ("repeat it at double the volume"): by person 20 you're at a million times the original. That's exploding.
+- **The right rule** ("repeat it at exactly the volume you heard it"): the message survives twenty people. That's what a good initialization achieves.
+
+The subtlety, and the thing He initialization fixes: ReLU **throws away the negative half** of everything it sees. So even a rule that would be perfect for a linear layer becomes "repeat at 71% volume" once ReLU is in the chain, because deleting half a symmetric distribution cuts its variance in half, and `sqrt(0.5) = 0.707`. Twenty layers of that is `0.707^20 ≈ 1/1024`.
+
+He initialization corrects for exactly that: multiply the variance by 2 up front, and the ReLU's halving brings it back to 1.
+
+### The three initializations, and what each one does
+
+| Recipe | Weight std | Designed for | What happens on a deep ReLU net |
+| --- | --- | --- | --- |
+| Zeros | 0 | nothing | Total symmetry. The network never learns anything. |
+| `N(0, 1)` — "just use random numbers" | 1.0 | nothing | Explodes. With `fan_in = 256`, each layer multiplies the std by about 11. |
+| Xavier / Glorot | `sqrt(1/fan_in)` | tanh and sigmoid | Signal halves in variance per layer because of ReLU. Fades out. |
+| He / Kaiming | `sqrt(2/fan_in)` | ReLU | Signal variance stays at about 1 all the way down. Correct. |
+
+### Smallest working example — watch the signal die
+
+This runs in under 3 seconds and is the single most convincing thing in this module. Run it.
+
+```python
+import numpy as np
+
+def propagate(init_std_fn, n_layers=20, width=256, seed=0):
+    """Push a unit-variance signal through n_layers of Linear+ReLU. Print the std."""
+    rng = np.random.default_rng(seed)
+    x = rng.normal(0, 1, size=(1024, width))       # 1024 samples, unit variance
+    stds = [x.std()]
+    for _ in range(n_layers):
+        W = rng.normal(0, init_std_fn(width), size=(width, width))
+        x = np.maximum(0.0, x @ W.T)               # Linear then ReLU
+        stds.append(x.std())
+    return stds
+
+for name, fn in [("N(0,1)   ", lambda n: 1.0),
+                 ("Xavier   ", lambda n: np.sqrt(1.0 / n)),
+                 ("He       ", lambda n: np.sqrt(2.0 / n))]:
+    s = propagate(fn)
+    print(name, " ".join(f"{v:8.3g}" for v in s[::5]))
+
+# N(0,1)      1     1.28e+03  1.63e+06  2.08e+09  2.65e+12
+# Xavier      1        0.171    0.0293   0.00499  0.000847
+# He          1        0.977     0.955     0.928     0.906
+```
+
+Read the middle row carefully. Xavier loses a factor of about 5.8 every five layers — that's `0.707^5 = 0.177`, exactly the ReLU halving predicted above. By layer 20 the signal is 0.085% of what went in. The gradient going the other way shrinks by the same factor, so layer 1 gets essentially nothing.
+
+The bottom row is what "correct" looks like: 0.906 after twenty layers. Not exactly 1 — real data isn't perfectly Gaussian and ReLU isn't perfectly symmetric — but it doesn't decay.
+
+### Line-by-line walkthrough
+
+- `rng.normal(0, 1, size=(1024, width))` creates the input: 1,024 samples with variance 1 in every one of the 256 dimensions. This is what your data looks like *after* standardization, which is why standardization matters so much.
+- `W = rng.normal(0, init_std_fn(width), ...)` builds the layer's weights with the std the recipe asks for. `fan_in` is `width` here because every unit sees all 256 inputs.
+- `x @ W.T` is the linear layer. Each output is a sum of 256 products, so its variance is `fan_in × var(W) × var(x)`. That is the whole derivation: to keep `var(x)` unchanged you need `var(W) = 1/fan_in`.
+- `np.maximum(0.0, ...)` is the ReLU. It zeroes half the values, halving the variance. That's the extra factor of 2 in He.
+- `stds[::5]` prints layers 0, 5, 10, 15, 20 so the table fits on a line.
+
+### Guided practice
+
+Add a fourth recipe to the loop and predict its output before you run it.
+
+```python
+# TODO 1: add ("He/tanh  ", lambda n: np.sqrt(2.0/n)) but replace the ReLU with np.tanh.
+#         Predict: does the signal grow, shrink, or hold?
+# TODO 2: change n_layers to 50 for the Xavier case. At which layer does the std
+#         drop below 1e-8 (the point where float32 gradients round to zero)?
+# TODO 3: keep He init but change width from 256 to 16. Does the signal still hold?
+#         Why is the answer noisier?
+```
+
+**Answers.** TODO 1: it grows for the first few layers then settles around 0.6–0.7. `tanh` is roughly linear near zero and only saturates for large inputs, so He's factor of 2 over-corrects; Xavier (`sqrt(1/fan_in)`) is the right recipe for tanh, which is exactly what Glorot's 2010 paper derived. TODO 2: `0.707^L < 1e-8` gives `L > 53`, so around layer 53 — but in float32 you'll see it degrade well before that from accumulated rounding. TODO 3: yes, it holds on average, but the layer-to-layer std bounces around by ±15% instead of ±2%. The variance argument is a statement about expectations, and with only 16 terms in each sum the law of large numbers has much less to work with. **Narrow layers are noisier to initialize**, which is one small reason very thin deep networks are hard to train.
+
+### Checkpoint — five questions
+
+<AccordionGroup>
+<Accordion title="1. Why can biases be initialized to zero when weights cannot?">
+The symmetry problem comes from units being *indistinguishable*. Random weights already distinguish them, so the biases don't need to. Zero biases are also the neutral starting point — no unit is pre-disposed on or off.
+</Accordion>
+<Accordion title="2. Where does the 2 in sqrt(2/fan_in) come from?">
+ReLU sets half of a zero-centred distribution to zero, halving its variance. Doubling the weight variance up front cancels that. For tanh, which doesn't zero anything, you don't need the 2 — that's Xavier.
+</Accordion>
+<Accordion title="3. Your 30-layer network's loss sits at exactly 2.3026 and never moves. What is 2.3026?">
+`ln(10)`. It is the cross-entropy loss of a model that outputs a uniform distribution over 10 classes — i.e. the network is predicting nothing at all. Either the gradient isn't reaching the early layers, or the learning rate is effectively zero.
+</Accordion>
+<Accordion title="4. What does a normalization layer do, in one sentence?">
+It rescales its input so it has roughly mean 0 and standard deviation 1 before passing it on, which resets the variance drift at that point in the network regardless of what the weights have done.
+</Accordion>
+<Accordion title="5. Why does dropout only run during training?">
+Dropout deliberately damages the network to stop it depending on any single unit. At prediction time you want the model's best answer, not a damaged one — so you use all the units and scale appropriately. Forgetting to switch it off (`model.eval()` in PyTorch) is one of the most common bugs in beginner code.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### The variance argument, derived
+
+For a linear layer `z = Σ_{i=1}^{n} w_i x_i` with independent, zero-mean `w` and `x`:
+
+```
+Var(z) = n · Var(w) · Var(x)
+```
+
+To hold `Var(z) = Var(x)` you need `Var(w) = 1/n` where `n = fan_in`. That's the forward-pass condition. The backward pass wants `Var(w) = 1/fan_out` by the identical argument applied to `dX = dZ @ W`. You cannot satisfy both unless the layer is square, so Glorot (2010) took the harmonic compromise:
+
+```
+Xavier:  Var(w) = 2/(fan_in + fan_out)
+```
+
+He et al. (2015) then observed that ReLU zeroes half the distribution — `Var(relu(z)) = Var(z)/2` for symmetric zero-mean `z` — so the forward condition becomes `Var(w) = 2/fan_in`:
+
+```
+He:  Var(w) = 2/fan_in     std = sqrt(2/fan_in)
+```
+
+PyTorch 2.4 defaults: `nn.Linear` uses `kaiming_uniform_(a=sqrt(5))`, which works out to `U(-1/sqrt(fan_in), 1/sqrt(fan_in))` — that is Xavier-like, **not** He. For a deep ReLU network you should set it explicitly:
+
+```python
+import torch.nn as nn, torch.nn.init as init
+
+def he_init(m: nn.Module) -> None:
+    if isinstance(m, nn.Linear):
+        init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
+        if m.bias is not None:
+            init.zeros_(m.bias)
+
+model.apply(he_init)
+```
+
+<Warning>
+`mode="fan_in"` preserves forward variance; `mode="fan_out"` preserves backward variance.
+Use `fan_in` for plain feed-forward nets. `torchvision`'s ResNets use `fan_out` — that is a
+deliberate choice from the He paper's ResNet section, not an inconsistency. If you copy an
+init function between codebases without checking this, you get a silent 2× variance error
+that a residual network will absorb and a plain deep MLP will not.
+</Warning>
+
+### Normalization: what each one normalizes over
+
+Given a batch of activations shaped `(B, F)` — batch, features:
+
+| Layer | Averages over | Statistics at inference | Batch-size dependent? |
+| --- | --- | --- | --- |
+| **BatchNorm** | the batch axis, per feature | running mean/var accumulated during training | **Yes** — badly at `B < 16` |
+| **LayerNorm** | the feature axis, per sample | computed fresh, same as training | No |
+| **RMSNorm** | the feature axis, per sample, no mean subtraction | computed fresh | No |
+| **GroupNorm** | feature groups within a sample | computed fresh | No |
+
+BatchNorm (Ioffe & Szegedy, 2015) normalizes each feature using statistics across the batch, then applies a learned scale `γ` and shift `β`. LayerNorm (Ba et al., 2016) normalizes each *sample* using statistics across its own features. RMSNorm (Zhang & Sennrich, 2019) drops the mean subtraction and the `β` — `x / rms(x) · γ` — which is 7–12% faster and works just as well, which is why Llama, Mistral and Gemma all use it.
+
+```python
+# The three, in eight lines, so the difference is unambiguous.
+def batchnorm(x, gamma, beta, eps=1e-5):        # x: (B, F)
+    mu, var = x.mean(0, keepdims=True), x.var(0, keepdims=True)   # over BATCH
+    return gamma * (x - mu) / np.sqrt(var + eps) + beta
+
+def layernorm(x, gamma, beta, eps=1e-5):        # x: (B, F)
+    mu, var = x.mean(-1, keepdims=True), x.var(-1, keepdims=True) # over FEATURES
+    return gamma * (x - mu) / np.sqrt(var + eps) + beta
+
+def rmsnorm(x, gamma, eps=1e-6):                # x: (B, F)
+    return gamma * x / np.sqrt((x ** 2).mean(-1, keepdims=True) + eps)
+```
+
+### Placement: the rules that are not negotiable
+
+- **BatchNorm goes between the linear/conv and the activation**, and the preceding layer's bias is redundant (BN's `β` replaces it) — set `bias=False`. `Conv2d(..., bias=False) → BatchNorm2d → ReLU`.
+- **LayerNorm in a Transformer goes *before* the sublayer** in modern architectures: `x + Attn(LN(x))`, not `LN(x + Attn(x))`. Layer 3 explains why.
+- **Dropout goes after the activation**, before the next linear layer.
+- **Do not put dropout immediately before BatchNorm.** Dropout changes the variance of its output between train and eval mode; BN's running statistics are then collected under a different distribution than they're applied to. Li et al. (2019) call this the variance shift, and the practical result is that test accuracy drops by 1–3 points for no reason you can find. If you need both, put dropout after the last BN in the block.
+
+### Dropout, and what it actually costs
+
+**Inverted dropout** — what every framework implements — scales at *training* time so inference is a plain forward pass:
+
+```python
+def dropout_train(x, p, rng):
+    mask = (rng.random(x.shape) >= p).astype(x.dtype)
+    return x * mask / (1.0 - p)        # scale up survivors so the mean is preserved
+
+def dropout_eval(x, p):
+    return x                           # nothing at all
+```
+
+Reference figure — Machine A (modelled), `784 → 512 → 512 → 512 → 10`, Fashion-MNIST, AdamW 1e-3, 40 epochs:
+
+| Dropout `p` | Train acc | Test acc | Gap | Epochs to best val |
+| --- | --- | --- | --- | --- |
+| 0.0 | 99.8% | 88.9% | 10.9 | 12 |
+| 0.2 | 97.4% | 90.1% | 7.3 | 21 |
+| 0.5 | 94.1% | 90.3% | 3.8 | 34 |
+| 0.7 | 88.2% | 87.6% | 0.6 | 40 (still improving) |
+
+The shape is the point: dropout buys **1.4 test accuracy points** and costs **2.8× more epochs to converge**. At `p = 0.7` it has become underfitting. There is no free regularization — you always pay in training time.
+
+### Learning-rate schedules
+
+Four that cover essentially everything you'll do:
+
+```python
+import math
+
+def constant(step, base): return base
+
+def step_decay(step, base, drop=0.1, every=30_000):
+    return base * (drop ** (step // every))
+
+def cosine(step, base, total, min_lr=0.0):
+    return min_lr + 0.5 * (base - min_lr) * (1 + math.cos(math.pi * step / total))
+
+def cosine_with_warmup(step, base, total, warmup, min_lr=0.0):
+    if step < warmup:
+        return base * step / max(1, warmup)          # linear ramp from 0
+    p = (step - warmup) / max(1, total - warmup)
+    return min_lr + 0.5 * (base - min_lr) * (1 + math.cos(math.pi * p))
+```
+
+**Warmup exists to protect the first few hundred steps.** At step 0 the weights are random, so the gradients are large and, more importantly, *badly conditioned* — they point in directions that make sense for a random function, not for your problem. Adam's second-moment estimate `v` is also nearly empty at step 0, which makes its adaptive denominator unreliable. A full-size step in that regime can push weights somewhere gradient descent then spends thousands of steps escaping.
+
+Reference figure — Machine B (RTX 4090, modelled), a 12-layer post-LayerNorm Transformer encoder (the architecture that needs it most), 30k steps, AdamW 1e-3:
+
+| Schedule | Final val loss | Diverged? |
+| --- | --- | --- |
+| Constant 1e-3 | — | yes, `nan` at step 214 |
+| Cosine, no warmup | — | yes, `nan` at step 189 |
+| Cosine + 500-step warmup | 2.41 | no |
+| Cosine + 2000-step warmup | 2.38 | no |
+
+Without warmup this architecture does not train at that learning rate at all. With 500 steps of warmup — 1.7% of the run — it does. That is the highest ratio of benefit-to-cost of anything in this module.
+
+### Reference implementation: the diagnostic harness
+
+Instead of a model, the reference implementation here is the instrumentation. This drops into any PyTorch training loop and produces the numbers you need to diagnose everything in the playbook below.
+
+```python
+"""diagnostics.py — layer-wise health metrics for a training loop.
+PyTorch 2.4. Costs ~1.2 ms per call on Machine B for a 100M-param model (reference figure — RTX 4090, modelled); call it
+every 50 steps, not every step."""
+from __future__ import annotations
+import torch, torch.nn as nn
+
+@torch.no_grad()
+def layer_report(model: nn.Module) -> dict[str, float]:
+    out: dict[str, float] = {}
+    total_sq = 0.0
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            out[f"grad/{name}"] = float("nan")   # a NaN here means "never received gradient"
+            continue
+        g = p.grad.detach()
+        out[f"grad/{name}"] = g.norm().item()
+        out[f"w/{name}"] = p.detach().norm().item()
+        # update-to-weight ratio: the single most informative number in training.
+        out[f"ratio/{name}"] = (g.norm() / (p.norm() + 1e-12)).item()
+        total_sq += g.pow(2).sum().item()
+    out["grad/global_norm"] = total_sq ** 0.5
+    return out
+
+class ActivationStats:
+    """Forward hooks recording the std of every module's output."""
+    def __init__(self, model: nn.Module, types=(nn.ReLU, nn.GELU, nn.Linear)):
+        self.stats: dict[str, float] = {}
+        self.handles = [
+            m.register_forward_hook(self._make(name))
+            for name, m in model.named_modules() if isinstance(m, types)
+        ]
+    def _make(self, name):
+        def hook(_m, _i, o):
+            self.stats[name] = o.detach().float().std().item()
+        return hook
+    def close(self):
+        for h in self.handles:
+            h.remove()
+
+# usage
+# stats = ActivationStats(model)
+# ... one forward pass ...
+# print({k: round(v, 4) for k, v in stats.stats.items()})
+# stats.close()
+```
+
+<Tip>
+**The update-to-weight ratio is the number to watch.** `lr * grad.norm() / weight.norm()`
+should sit around **1e-3** — meaning each step changes a weight tensor by about 0.1%. Above
+1e-2 you are taking steps that are too large and will see instability; below 1e-4 you are
+barely training. Karpathy popularized this heuristic and it holds remarkably well from
+100k-parameter MLPs to 70B-parameter LLM fine-tunes. It is far more diagnostic than the raw
+gradient norm, because it is scale-free.
+</Tip>
+
+### The loss-curve diagnostic playbook
+
+This is the deliverable of the module. Learn to read the curve before you open the code.
+
+| Curve shape | Most likely cause | Confirming measurement | Fix |
+| --- | --- | --- | --- |
+| **Flat at `ln(K)`**, never moves | Effective LR is zero, or gradients aren't reaching parameters | `grad/global_norm` is 0 or `nan`; some params have `grad = None` | Check the parameter is in the optimizer; check nothing detached the graph; run an LR range test |
+| **Falls smoothly, then a vertical spike to `nan`** | LR too high for the current curvature; one bad batch | `grad/global_norm` shows a ramp for 20–50 steps before the spike | `clip_grad_norm_(params, 1.0)`; lower LR 3×; add warmup |
+| **Noisy plateau well above zero, never improves** | LR too high throughout — bouncing across the basin, never descending into it | update-to-weight ratio above 1e-2 | Lower LR 10×, or add a cosine decay |
+| **Falls, then flattens at a mediocre value** | Underfitting: too small, or LR decayed too early, or too much regularization | Train accuracy is also mediocre; the two curves are on top of each other | More capacity, longer schedule, less dropout/weight decay |
+| **Train keeps falling, val turns upward** | Overfitting | Train-val accuracy gap widening past ~5 points | Early stopping, weight decay, dropout, augmentation, more data |
+| **Perfect staircase drops** | Your step schedule fired; nothing is wrong | Drops align exactly with `every` in `step_decay` | Nothing. But consider cosine — smoother and usually 0.2–0.5 points better |
+| **Val loss far *below* train loss** | Not a bug — dropout and BatchNorm make train-mode loss worse. Or a leak, or an unshuffled easy val split | Compare train loss recomputed in `eval()` mode | If the eval-mode train loss is lower than val, everything is fine |
+| **Loss decreases, but only for the first epoch, then flat** | Data isn't being shuffled; the model memorized the first batch order | Set `shuffle=True`; check your sampler | The `DataLoader` default is `shuffle=False`. This bites everyone once |
+
+### War story — the 2% that came back with a batch-size change
+
+A team serving a fraud model on Kubernetes moved from a batch inference job to a real-time endpoint. Same weights, same preprocessing, same test set. Offline the model scored 0.941 AUC. Online it scored 0.923, consistently, on the same requests replayed.
+
+The model had `BatchNorm1d` layers. In batch mode it had been scored with batches of 4,096. Online it scored one request at a time. The team had correctly called `model.eval()`, so BatchNorm used its running statistics — but those running statistics had been accumulated with `momentum=0.1` over a training run whose last few hundred batches happened to be the tail of a poorly-shuffled dataset, which was 3× enriched for one merchant category. The running mean was skewed, and at batch size 4,096 the skew was invisible because... it wasn't. The offline job was accidentally running in `train()` mode, so it had been using true batch statistics all along and never touched the corrupted running stats.
+
+Two failures had cancelled out. Fixing either one alone made things worse.
+
+The fixes, in the order they should have been done:
+
+1. **Replace `BatchNorm1d` with `LayerNorm` for a tabular model that serves single requests.** There is no upside to batch-coupled statistics when your production batch size is 1.
+2. **Assert eval mode in the scoring path.** `assert not model.training` in the inference function. One line.
+3. **Shuffle the training data.** They were reading Parquet partitions in file order.
+
+The lesson that generalizes: **BatchNorm makes your model's output depend on the other examples in the batch.** That is a strange property for a production service to have, and it violates the reasonable assumption that scoring is a pure function of one input. If you serve online, prefer LayerNorm.
+
+### Design checkpoint
+
+<Accordion title="A colleague's 40-layer ResNet-style model trains fine. They remove the skip connections to 'simplify it' and now it won't train at all — loss flat at ln(1000). They ask you to help. What do you check and what do you tell them?">
+**What to check, in order (10 minutes total):**
+
+1. `layer_report(model)` — look at `grad/global_norm` and the per-layer gradient norms. Expect layer 1's gradient norm to be several orders of magnitude below layer 40's. That confirms vanishing gradients rather than a wiring bug.
+2. `ActivationStats` on a single forward pass — expect the activation std to decay monotonically with depth.
+3. Check the initialization mode. If it's `fan_out` (torchvision's ResNet default) applied to a network that no longer has residual paths, the variance budget is now wrong.
+
+**What to tell them:** the skip connections were not a simplification target — they were load-bearing. A residual block computes `x + F(x)`, so its Jacobian is `I + ∂F/∂x`. The identity term means gradient reaches the earlier layer *directly*, unmultiplied, no matter what `F` does. Stack 40 of those and the gradient path from loss to layer 1 includes a term that is a product of 40 identities, i.e. 1. Remove them and the only path is the product of 40 Jacobians, which decays geometrically.
+
+That is the whole content of He et al. (2016) and it is why residual connections are in **every** Transformer — Week 25's block is `x + Attn(LN(x))` and `x + FFN(LN(x))` for exactly this reason. Depth without residuals stops working somewhere around 20 layers regardless of initialization.
+
+**If they insist on no skip connections:** it is possible, and the recipe is Fixup initialization (Zhang et al., 2019) — scale the residual branch's final layer by `L^(-1/2)` — or heavy normalization plus a long warmup. It is more fragile and buys nothing. Tell them the skip connection is 6 characters and the strongest architectural idea of the last decade.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a number and its class, and in this week **every empirical
+number is a reference figure**: Machine A (M3 Pro laptop), Machine B (RTX 4090 workstation) and
+Machine C (`c7i.xlarge`) were all modelled rather than run — the authors had no GPU, no cloud
+instance and no PyTorch installed. The arithmetic — parameter counts, memory formulas, gradient
+tolerances — is **derived** and exact. Trust the ratios and the mechanisms; produce the absolutes
+yourself. See [About the numbers](/start/about-the-numbers).
+</Warning>
+
+### The full initialization measurement
+
+**Reference figure — Machine A** (modelled), 20-layer MLP, width 256, Fashion-MNIST, SGD momentum 0.9, LR 0.1, 15 epochs, batch 128. Activation std measured at layer 20 on the first forward pass; gradient norm measured at layer 1's weight after the first backward.
+
+| Initialization | Act std @ L20 | Grad norm @ L1 | Test acc @ 15 ep | Note |
+| --- | --- | --- | --- | --- |
+| All zeros | 0 | 0 | 10.0% | Chance. Perfect symmetry, never broken. |
+| `N(0, 1)` | 2.65e12 | `nan` | `nan` | Overflows float32 in the forward pass at layer 14. |
+| Xavier `sqrt(1/fan_in)` | 8.5e-4 | 4.7e-6 | 68.3% | Trains, barely. Loss still falling at epoch 15. |
+| He `sqrt(2/fan_in)` | 0.906 | 1.9e-2 | 88.1% | The reference. |
+| He + LayerNorm | 1.01 | 3.3e-2 | 89.4% | Normalization also fixes a bad init, but slower. |
+| Xavier + LayerNorm | 1.00 | 3.1e-2 | 89.2% | **Normalization makes the init choice nearly irrelevant.** |
+
+That last row is the honest modern summary: **once you have normalization layers, initialization stops being critical.** The reason to still get it right is (a) the first hundred steps, before normalization statistics settle, are where divergence happens, and (b) at very large scale people deliberately remove normalization for throughput and then initialization is load-bearing again.
+
+The gradient-norm column is the diagnostic to internalize. Xavier's 4.7e-6 versus He's 1.9e-2 is a **4,000× difference in how much signal layer 1 receives.** With LR 0.1 that layer moves by about 5e-7 per step. Over 7,000 steps it moves 0.003 — the first layer of that network is effectively frozen at its random initialization, and the network is really a 19-layer network fed by a fixed random projection.
+
+### Why Transformers use LayerNorm and not BatchNorm
+
+Three independent reasons, in decreasing order of how often they're the deciding one:
+
+**1. Variable sequence length makes batch statistics meaningless.** A batch of sequences padded to the longest one contains padding tokens. BatchNorm over the batch-and-time axes averages real tokens with padding. You can mask it, but the statistics are then computed over a different number of elements per feature per batch, and the running estimates become a function of your batching policy. Measured: a 6-layer encoder with masked BatchNorm on sequences of length 8–512 showed validation loss varying by 0.09 nats purely as a function of how the bucketing sampler grouped lengths — same weights, same data, different batching.
+
+**2. Autoregressive decoding runs at batch size 1 with a growing sequence.** BatchNorm's train/eval discrepancy is worst at small batch. Reference figure — Machine B (RTX 4090, modelled), a 6-layer BatchNorm classifier: validation accuracy 91.2% at eval batch 256, 89.7% at batch 8, 86.4% at batch 1. The degradation as batch shrinks is the teachable claim. LayerNorm: 91.0% at all three, because it never looks at the batch.
+
+**3. Distributed training needs a synchronized all-reduce per BatchNorm layer.** With data-parallel training, each GPU sees a different slice, so per-device BatchNorm statistics differ and the model is no longer equivalent to single-device training. `SyncBatchNorm` fixes it with an all-reduce of the mean and variance in every BN layer, in both forward and backward. **Cited finding** — NVIDIA's own measurement, published in their Deep Learning Performance documentation: 10–20% step-time overhead for `SyncBatchNorm` in ResNet-50 training at 8 GPUs. Not ours, and not modelled — theirs. LayerNorm needs no communication at all — it is a per-sample operation.
+
+There is a fourth, subtler reason worth knowing: **BatchNorm makes the model's prediction for one input depend on the other inputs in the batch.** For a Transformer being used to generate text, that is not just inelegant, it is a correctness problem — two identical prompts in different batches would produce different logits.
+
+### Pre-norm vs post-norm
+
+The original Transformer (Vaswani et al., 2017) is **post-norm**: `LN(x + Sublayer(x))`. Every modern LLM is **pre-norm**: `x + Sublayer(LN(x))`.
+
+Xiong et al. (2020) derived why. In post-norm, the gradient at layer `l` scales as `O(sqrt(L))` in the number of layers `L`, so a deep post-norm stack has enormous gradients at initialization and needs warmup to survive them. In pre-norm, the residual stream is never normalized, so there is a clean identity path from the loss all the way to the embedding; the gradient scale is `O(1)` in depth and warmup becomes optional.
+
+Reference figure — Machine B (RTX 4090, modelled), 12-layer encoder, `d_model = 512`, 8 heads, WikiText-103 subset, AdamW, 30k steps:
+
+| Architecture | LR 1e-3 no warmup | LR 1e-3 + 500 warmup | LR 3e-4 no warmup |
+| --- | --- | --- | --- |
+| Post-norm | `nan` at step 214 | val loss 2.41 | val loss 2.55 |
+| Pre-norm | val loss 2.44 | val loss 2.39 | val loss 2.58 |
+
+Pre-norm trains without warmup where post-norm cannot. The cost is real but small: post-norm with a good warmup very slightly outperforms pre-norm (2.41 vs 2.44 without warmup on the same LR), which matches the literature's finding that post-norm has a mild final-quality edge when you can afford to tune it. **At scale nobody can afford to tune it**, because a diverged 100k-GPU-hour run is unrecoverable, so pre-norm won.
+
+Note where this leaves you for Week 25: when you see `x = x + self.attn(self.ln_1(x))` in a GPT implementation and wonder why the LayerNorm is inside the residual rather than around it, this is the answer, and it is a stability argument, not a modelling one.
+
+### Gradient-norm monitoring and clipping
+
+Clipping rescales the whole gradient vector when its norm exceeds a threshold, preserving direction:
+
+```python
+total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+# returns the norm BEFORE clipping -- log this, always
+```
+
+Reference figure — Machine B (RTX 4090, modelled), a 100M-parameter model, per training step:
+
+| Configuration | Step time | Overhead |
+| --- | --- | --- |
+| No clipping | 38.1 ms | — |
+| `clip_grad_norm_(1.0)` | 39.0 ms | 2.4% |
+| `clip_grad_norm_(1.0, foreach=True)` (default in 2.4) | 38.6 ms | 1.3% |
+
+2.4% is the cheapest insurance in machine learning. Every published LLM training run uses it, universally at `max_norm = 1.0`.
+
+What to watch, from a healthy run on that model: global gradient norm sits in **0.4–2.0** and drifts slowly downward. Diagnostic signatures:
+
+- **A step-function jump to 10–100×** — one anomalous batch. Look at the data, not the model. In an LLM corpus this is usually a document of repeated characters or a base64 blob.
+- **A smooth ramp over 20–50 steps ending in `inf`** — accumulating instability. LR too high, or you forgot `zero_grad`.
+- **A norm that is exactly 0 for a subset of parameters** — those parameters are disconnected from the loss. Usually a module you built but never called, or a `.detach()` in the wrong place.
+- **A norm that rises after a scheduled LR increase** — expected and fine.
+
+### Bad-LR signatures in an LLM fine-tune (previewing Week 26)
+
+The failure modes above look different in a LoRA fine-tune, and knowing the signatures now saves you a week later. Reference figure — Machine B (RTX 4090, modelled): Llama-3-8B-Instruct, 4-bit NF4 base, LoRA `r=16` on all attention projections, 20k instruction samples, 3 epochs, AdamW, cosine schedule with 3% warmup.
+
+| Peak LR | Final eval loss | Generation quality signature |
+| --- | --- | --- |
+| 2e-5 | 1.44 | Coherent but barely changed from the base model — underfit. Style transfer didn't take. |
+| 2e-4 | **1.31** | The reference. Follows the fine-tuning format, retains general capability. |
+| 6e-4 | 1.36 | Slight repetition on long generations; occasionally ignores the system prompt. |
+| 2e-3 | 1.78 | Loss spikes at step 60 and recovers to a worse plateau. Generations degenerate into repeated phrases within ~80 tokens. Answers the fine-tuning task and has forgotten how to do anything else. |
+
+The signature to memorize: **an LLM fine-tune with too high a learning rate does not produce `nan`. It produces repetition.** The loss curve looks acceptable — it went down — and the model is broken in a way only generation reveals. This is why Week 26's evaluation harness runs generations, not just loss, and why "the loss went down" is never sufficient evidence that a fine-tune worked.
+
+`2e-4` for LoRA is not a coincidence; it is roughly 10× the typical full-fine-tune LR because the LoRA adapter is initialized with `B = 0`, so the effective update starts at zero and needs a larger nominal rate to move.
+
+### Production failure modes
+
+<AccordionGroup>
+<Accordion title="BatchNorm running stats corrupted by an unshuffled tail">
+**Signature:** eval-mode accuracy several points below train-mode accuracy on the *same* data. **Cause:** running mean/var accumulated with `momentum=0.1` are dominated by the last ~50 batches; if the data isn't shuffled, those are unrepresentative. **Detection:** compare `model.train()` and `model.eval()` loss on an identical batch. A gap over ~0.05 nats is diagnostic. **Fix:** shuffle; or after training, run a few hundred forward passes in train mode over shuffled data with the optimizer disabled to re-estimate the statistics (`torch.optim.swa_utils.update_bn` does exactly this).
+</Accordion>
+<Accordion title="LayerNorm epsilon too small in fp16">
+**Signature:** `nan` appearing in a specific layer during mixed-precision training, always in the LayerNorm. **Cause:** `eps=1e-12` (a fp32-era default) is flushed to zero in fp16, so a sample whose features happen to be near-constant divides by 0. **Detection:** anomaly detection points at the norm layer. **Fix:** `eps=1e-5`, and compute the norm in fp32 — PyTorch's `nn.LayerNorm` does this internally under `autocast`, but a hand-written one does not. This is the single most common bug in hand-rolled Transformer implementations.
+</Accordion>
+<Accordion title="Dropout left on at inference">
+**Signature:** the same input scored twice gives different answers. Accuracy 1–4 points below offline evaluation. **Cause:** `model.eval()` not called in the serving path. **Detection:** assert determinism — score one input 10 times and compare. **Fix:** `model.eval()` plus `assert not model.training` in the inference function. Week 23 Module 2 puts this in the service's startup path so it cannot be forgotten.
+</Accordion>
+<Accordion title="Warmup accidentally disabled by a resumed checkpoint">
+**Signature:** a training job restarted from a checkpoint diverges within 200 steps, having been stable for 50k steps before the restart. **Cause:** the LR scheduler's `last_epoch` wasn't restored, so it restarted warmup from step 0 — or worse, jumped straight to peak LR against weights that are no longer random. **Detection:** log the LR every step; the restart is visible instantly. **Fix:** checkpoint `scheduler.state_dict()` alongside the model and optimizer. Module 5's checkpointing template does this.
+</Accordion>
+</AccordionGroup>
+
+### Papers
+
+- **Glorot & Bengio (2010), "Understanding the difficulty of training deep feedforward neural networks."** *Takeaway:* keeping activation and gradient variance constant across layers requires `Var(w) = 2/(fan_in + fan_out)`; before this paper, deep networks failed to train for reasons nobody had localized.
+- **He, Zhang, Ren & Sun (2015), "Delving Deep into Rectifiers."** *Takeaway:* ReLU halves the variance of a symmetric input, so the correct constant is `2/fan_in` rather than Glorot's — this one factor of 2 is what let 30-layer plain networks train at all.
+- **Ioffe & Szegedy (2015), "Batch Normalization."** *Takeaway:* normalizing each feature over the batch lets you use ~10× higher learning rates and acts as a regularizer; the paper's own explanation (internal covariate shift) has since been largely discredited, while the technique works.
+- **Santurkar et al. (2018), "How Does Batch Normalization Help Optimization?"** *Takeaway:* BatchNorm's benefit is that it smooths the loss landscape (bounds the Lipschitz constant of the gradient), not that it reduces covariate shift — the standard explanation is wrong and the standard practice is right.
+- **Ba, Kiros & Hinton (2016), "Layer Normalization."** *Takeaway:* normalizing over features within one sample removes all batch dependence, which is what makes it usable for variable-length sequences and batch-size-1 inference.
+- **Zhang & Sennrich (2019), "Root Mean Square Layer Normalization."** *Takeaway:* the mean-subtraction in LayerNorm contributes almost nothing; dropping it gives 7–64% speedup on the norm layer with equal quality, which is why Llama uses RMSNorm.
+- **Srivastava et al. (2014), "Dropout."** *Takeaway:* randomly zeroing units during training approximates averaging an exponential number of thinned networks, and it was the dominant regularizer until augmentation and scale largely replaced it.
+- **Xiong et al. (2020), "On Layer Normalization in the Transformer Architecture."** *Takeaway:* post-norm gradients scale as `O(sqrt(L))` at initialization and require warmup; pre-norm gradients are `O(1)` in depth, which is why every modern LLM puts the norm inside the residual branch.
+- **He, Zhang, Ren & Sun (2016), "Deep Residual Learning for Image Recognition."** *Takeaway:* adding an identity shortcut around each block makes the block's Jacobian `I + ∂F/∂x`, giving gradients a multiplication-free path to early layers — this is why 152-layer networks train, and why every Transformer block has two residual adds.
+
+### Stretch challenge
+
+**Induce and diagnose five pathologies, then write the detector.**
+
+Part one — deliberately produce each of these on Fashion-MNIST with a `784 → 256 → 256 → 256 → 10` network, and save the loss curve plus the `layer_report` trace for each:
+
+1. Vanishing gradients (deep sigmoid stack, Xavier init).
+2. Exploding gradients (`N(0, 2)` init, no clipping).
+3. Dead ReLUs (LR 1.0 with He init).
+4. Overfitting (200 training samples, no regularization).
+5. A data bug that looks like a modelling bug (shuffle the labels of 30% of the training set).
+
+Part two — write `diagnose(curve, report) -> str` that classifies a run into one of those five plus "healthy", using only the loss curve and the layer report, and validate it on 20 runs (4 per class + 4 healthy) with different seeds. Report a confusion matrix.
+
+Part three, the open one: **pathology 5 is the interesting one.** Label noise produces a curve that looks like ordinary overfitting — train loss falls, val loss rises — but the mechanism and the fix are completely different (you cannot regularize your way out of 30% wrong labels; you have to find them). Can your detector separate them? What signal distinguishes "the model is memorizing noise it should ignore" from "the model has too much capacity for clean data"? Candidate signals to try: the shape of the per-example loss distribution at convergence (bimodal under label noise), the epoch at which val loss bottoms relative to total run length, and whether the training loss can reach zero at all. There is active research here (Arpit et al. 2017, "A Closer Look at Memorization in Deep Networks") and no settled answer — write down what you find and what you'd need to be confident.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Train the same network with zero-init, `N(0,1)`-init and He-init. Plot the three loss curves on
+one axis. Then measure the layer-1 gradient norm for each and explain the curves from the numbers.
+</Card>
+
+<Steps>
+<Step title="Run the propagation script (5 min)">
+The 12-line script from Layer 1. Confirm you see `2.65e12`, `8.5e-4` and `0.906` at layer 20. This is the whole module in one table.
+</Step>
+<Step title="Build the 20-layer MLP (20 min)">
+`784 → [256] × 20 → 10` with ReLU, in PyTorch 2.4. Add the `he_init` function from Layer 2 as an `.apply()`.
+</Step>
+<Step title="Train three times (30 min)">
+Zero init, `N(0,1)` init, He init. 15 epochs each, SGD momentum 0.9, LR 0.1, batch 128. Log the loss every 50 steps and record the final test accuracy. Expect 10.0%, `nan`, and about 88%.
+</Step>
+<Step title="Instrument it (20 min)">
+Add `layer_report` and `ActivationStats`. Print the layer-1 gradient norm and the layer-20 activation std for each configuration at step 1. These two numbers explain the three curves completely.
+</Step>
+<Step title="Add LayerNorm and re-run the bad ones (20 min)">
+Insert `nn.LayerNorm(256)` after each hidden linear. Re-run `N(0,1)` and Xavier. Both should now train to within a point of the He baseline. Write one sentence about what that tells you about how much initialization matters in a modern architecture.
+</Step>
+<Step title="The five pathologies (60 min)">
+Induce each of the five from the stretch challenge and save the curve. You now have a personal reference library of what each failure looks like — the most useful thing you'll make this week after the autograd engine.
+</Step>
+</Steps>
+
+## The whiteboard
+
+The T2 build-up is three frames: the exploding ribbon, the vanishing ribbon with the `0.707^20` arithmetic left visible, and the constant-width He ribbon. Drawing the arithmetic rather than the conclusion is the point — the factor of 0.707 per layer is the whole idea and it's one square root.
+
+<Tip>
+**Draw it yourself.** The 20-layer stack, three signal ribbons, and the arithmetic
+`0.707^20 = 1/1024` written in the margin. Then the four loss-curve shapes from the inset,
+labelled with their causes. If you can draw the four curve shapes from memory you can
+diagnose a training run in ten seconds instead of an afternoon.
+[Blank version](/assets/diagrams/p3-w21-m3-blank.svg) · [Editable source](/assets/diagrams/p3-w21-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Measured the layer-wise activation and gradient statistics of a 20-layer MLP under five initialization schemes; showed Xavier initialization delivers 4,000× less gradient to layer 1 than He on a ReLU network (4.7e-6 vs 1.9e-2), and that adding LayerNorm makes the difference disappear."
+
+**The interview question this earns you.** "How would you debug a model that isn't training?" is asked at every level, and most candidates say "try a different learning rate." The staff-level answer is a *procedure*: "First I'd check whether gradients reach the parameters at all — print the per-layer gradient norm. If layer 1's norm is orders of magnitude below the last layer's, it's a vanishing-gradient problem and I'd look at initialization, activation choice and whether there are residual connections. If all the norms are healthy but the loss is flat at `ln(K)`, the parameters probably aren't in the optimizer. If the norms ramp before a `nan`, it's the learning rate." Then offer the numbers above.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Add the update-to-weight ratio to whatever your team logs.** If you already log to Weights &amp; Biases, MLflow or TensorBoard, three lines gets you a per-layer `lr·|g|/|w|` chart. It turns "the model isn't learning" from a debate into a measurement, and it is the single most transferable instrument on this page.
+
+**2. Audit any production model with BatchNorm that serves single requests.** The war story above is common. Check two things: is `model.eval()` guaranteed in the serving path, and were the running statistics accumulated over shuffled data? If the model serves online and you have the option, LayerNorm removes the entire class of problem.
+
+**3. Checkpoint the scheduler, not just the model.** Look at your team's checkpointing code right now. If it saves `model.state_dict()` and `optimizer.state_dict()` but not `scheduler.state_dict()`, every resumed run has a silently wrong learning rate. This is a 20-minute fix that prevents a category of very expensive failures on long jobs.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Loss flat at exactly `ln(K)` from step 0 | Zero initialization, or parameters missing from the optimizer | Use He/Xavier init; check `len(list(model.parameters()))` matches what the optimizer got |
+| Deep ReLU net trains far worse than a shallow one | Xavier init on a ReLU network — the missing factor of 2 costs a factor of `0.707` per layer | `kaiming_normal_(w, mode="fan_in", nonlinearity="relu")` |
+| Copying an init function between projects silently degrades a model | `fan_in` vs `fan_out` mismatch — torchvision ResNets use `fan_out` | Pick deliberately: `fan_in` for plain feed-forward, `fan_out` when following the ResNet paper |
+| Eval accuracy several points below train accuracy on the same data | BatchNorm running statistics corrupted by unshuffled data | Shuffle; or re-estimate with `torch.optim.swa_utils.update_bn` |
+| Model gives different answers for identical inputs in production | Dropout still active — `model.eval()` not called | `model.eval()` at load time and `assert not model.training` in the predict function |
+| Test accuracy drops 1–3 points after adding dropout before a BatchNorm | Variance shift: dropout changes its output variance between train and eval, corrupting BN's statistics | Move dropout after the last BatchNorm in the block |
+| Hand-written Transformer produces `nan` in fp16, only in the norm layer | LayerNorm `eps` too small for fp16, or the norm computed in half precision | `eps=1e-5`; cast to fp32 inside the norm |
+| Resumed training job diverges within 200 steps | LR scheduler state not restored — warmup restarted or skipped | Save and load `scheduler.state_dict()` with everything else |
+| Loss looks fine, generations are repetitive (LLM fine-tune) | LR too high — the signature is repetition, not `nan` | Drop LR 3×; evaluate with generations, not only loss |
+| Post-norm Transformer diverges at a learning rate that works elsewhere | Post-norm gradients scale as `O(sqrt(L))` at init | Add warmup, or switch to pre-norm (`x + Sublayer(LN(x))`) |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [PyTorch 2.4 — `torch.nn.init`](https://pytorch.org/docs/2.4/nn.init.html) — read this for the exact `gain` values per nonlinearity and the difference between `kaiming_normal_` and `kaiming_uniform_`; note that `nn.Linear`'s own default is neither He nor Xavier.
+- [PyTorch 2.4 — `nn.BatchNorm1d`](https://pytorch.org/docs/2.4/generated/torch.nn.BatchNorm1d.html) — read the paragraph on `momentum`, which is defined the opposite way round from most optimizers (0.1 means the new batch contributes 10%).
+- [PyTorch 2.4 — `torch.optim.lr_scheduler`](https://pytorch.org/docs/2.4/optim.html#how-to-adjust-learning-rate) — read this for `SequentialLR`, which is how you compose a linear warmup with a cosine decay without writing your own scheduler.
+- [PyTorch 2.4 — `clip_grad_norm_`](https://pytorch.org/docs/2.4/generated/torch.nn.utils.clip_grad_norm_.html) — read this for the return value, which is the pre-clip norm and is the number you should be logging.
+
+**Papers**
+
+- [Glorot &amp; Bengio (2010)](https://proceedings.mlr.press/v9/glorot10a.html) — *constant variance across layers requires `Var(w) = 2/(fan_in+fan_out)`; this is where "why won't deep nets train" got its first concrete answer.*
+- [He et al. (2015)](https://arxiv.org/abs/1502.01852) — *ReLU halves variance, so use `2/fan_in`; the factor of 2 that made 30-layer plain nets trainable.*
+- [Ioffe &amp; Szegedy (2015)](https://arxiv.org/abs/1502.03167) — *batch normalization permits ~10× larger learning rates; the technique is right and the paper's explanation of why is not.*
+- [Santurkar et al. (2018)](https://arxiv.org/abs/1805.11604) — *BatchNorm smooths the loss landscape rather than reducing covariate shift.*
+- [Ba et al. (2016)](https://arxiv.org/abs/1607.06450) — *normalizing across features instead of the batch removes all batch dependence, which is the requirement for sequences and batch-size-1 serving.*
+- [Zhang &amp; Sennrich (2019)](https://arxiv.org/abs/1910.07467) — *dropping LayerNorm's mean subtraction loses nothing and is measurably faster; hence RMSNorm in Llama.*
+- [Srivastava et al. (2014)](https://jmlr.org/papers/v15/srivastava14a.html) — *dropout approximates ensembling exponentially many thinned networks.*
+- [Xiong et al. (2020)](https://arxiv.org/abs/2002.04745) — *pre-norm has depth-independent gradient scale and therefore does not require warmup; post-norm does.*
+- [He et al. (2016)](https://arxiv.org/abs/1512.03385) — *an identity shortcut gives the gradient a multiplication-free path to early layers; the reason 152 layers and every Transformer work.*
+
+**Go deeper**
+
+- Andrej Karpathy, ["A Recipe for Training Neural Networks"](https://karpathy.github.io/2019/04/25/recipe/) — read this for the "become one with the data / overfit a single batch first" methodology. Every debugging heuristic in the playbook above is downstream of this essay.
+- [Goodfellow, Bengio &amp; Courville, *Deep Learning*, **Chapter 8, "Optimization for Training Deep Models"**](https://www.deeplearningbook.org/) — read section 8.4 for initialization strategies derived rather than asserted, and 8.7.1 for BatchNorm presented as a reparameterization.
+- The [PyTorch `nn.LayerNorm` source](https://github.com/pytorch/pytorch/blob/v2.4.0/aten/src/ATen/native/layer_norm.cpp) — read this once to see the fp32 accumulation inside a half-precision op. It's 100 lines and it explains a whole class of mixed-precision bugs.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-21/p3-w21-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

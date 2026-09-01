@@ -1,0 +1,956 @@
+---
+title: "Eigen-decomposition, SVD & PCA"
+description: "Week 11 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 11 · Module 3 · `P2-W11-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Warning>
+This is the module where Week 26 gets decided. **LoRA is low-rank approximation.** Everything you
+learn here about compressing a matrix by keeping its most important directions is, without
+modification, the technique that lets you fine-tune a 7-billion-parameter model on a laptop GPU. The
+arithmetic in Layer 2 is literally the arithmetic in the LoRA paper. Take this one slowly.
+</Warning>
+
+## Where this sits
+
+- **Prereqs:** `P2-W11-M1` (dot product, projection, norms), `P2-W11-M2` (matrices as
+  transformations, rank, the sum-of-outer-products reading of matmul).
+- **Unlocks:** `P2-W11-M5` (curvature and conditioning), Week 17 (PCA for feature engineering), and
+  **Week 26 — LoRA and QLoRA are this module applied to weight matrices.**
+- **One-line:** after this you can compress a matrix by keeping its most important directions, state
+  exactly what you lost, and compute LoRA's parameter savings for a real model.
+
+## What you'll be able to do
+
+1. Explain eigenvectors as "the directions a matrix does not turn", from a picture.
+2. Compute the top eigenvector with power iteration, in ten lines.
+3. Explain SVD as "every matrix is a rotation, then a stretch, then another rotation".
+4. Perform PCA via SVD on real data and choose the number of components with explained variance.
+5. Compute the parameter savings of a rank-`r` adapter on a real model, and state the compression ratio.
+
+## Why you should care
+
+**Aarav (student).** This module contains the single most transferable idea in applied linear algebra:
+**most matrices carry less information than their size suggests, and you can find out how much.** The
+image-compression demonstration takes ten minutes and produces a picture you will remember for years,
+and the same ten lines explain how LoRA works.
+
+**Meera (working professional).** Two immediate uses. PCA is the first thing to reach for when you
+have 200 correlated features and a model that overfits — and knowing it is "SVD of the centred data"
+rather than a black box means you know when it will fail (nonlinear structure, unscaled features).
+And the LoRA arithmetic in Layer 2 is the reason your team can fine-tune a 7B model on one 24 GB GPU
+instead of renting eight A100s: **107.84 GB of optimizer state becomes 3.50 GB.**
+
+## The mental model
+
+Most matrices, when you look at them properly, are mostly made of a few strong directions and a long
+tail of noise.
+
+**Eigenvectors** are the directions a matrix does not turn — apply the matrix and they come out
+pointing the same way, only longer or shorter. The amount of stretching is the **eigenvalue**.
+
+**SVD** generalises this to any matrix, including rectangular ones: *every* matrix can be written as
+"rotate, then stretch along the axes, then rotate again". The stretch amounts are the **singular
+values**, and they come out sorted from largest to smallest.
+
+And then the payoff: **throw away the small ones.** You get a matrix that is almost the original,
+described by far fewer numbers. That is compression, that is PCA, and that is LoRA.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p2-w11-m3.svg" alt="Hand-drawn sketch: eigen-decomposition, SVD and PCA" className="block dark:hidden" />
+  <img src="/assets/diagrams/p2-w11-m3-dark.svg" alt="Hand-drawn sketch: eigen-decomposition, SVD and PCA" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p2-w11-m3
+tier: T3
+one-sentence-goal: Every matrix is a rotation, a stretch and a rotation - and if you keep only the big stretches you keep almost all the matrix for a fraction of the numbers.
+elements:
+  - top-left: a unit circle with several arrows on it, and beside it the ellipse it becomes after a matrix is applied; two arrows drawn in bold that came out pointing the SAME way (only longer) labelled "eigenvectors - the directions it does not turn", with their stretch factors written as numbers
+  - top-right: the SVD chain drawn as three panels with arrows between - circle -> (rotate V^T) -> circle -> (stretch by sigma) -> ellipse -> (rotate U) -> tilted ellipse; sigma_1 and sigma_2 drawn as the ellipse's semi-axes; circle the word "singular values"
+  - middle strip: the SAME photo drawn four times at decreasing fidelity, labelled rank 1, 5, 20, 50, with the compression ratio and PSNR hand-written under each; a red arrow pointing at rank 20 with "98.1% of the energy for 12.8x fewer numbers" in amber
+  - lower-left: a hand-drawn scree plot - singular values falling off a cliff - with a vertical dashed line at the elbow and "keep these" / "this is noise" on either side
+  - lower-right: the LoRA picture - a big square W drawn frozen and greyed out, with a thin tall B and a thin wide A beside it, arrows summing into the output; parameter counts written in: 16,777,216 vs 131,072; "128x fewer. Same idea as rank 20 on the photo."
+  - amber margin note by the LoRA panel: "you already know this. It is the middle strip, applied to a weight matrix."
+  - dangling arrow: "...and the memory? 107.84 GB -> 3.50 GB. See week 26."
+numbers-to-write-in: rank 20 on a 427x640 image = 98.08% energy at 12.79x compression, PSNR 20.86 dB; rank 1 = 91.39% energy; 4096x4096 full = 16,777,216 params vs r=16 LoRA = 131,072 = 128x; Llama-2-7B full fine-tune 107.84 GB vs QLoRA 3.50 GB
+alt: A whiteboard sketch showing a unit circle deformed into an ellipse with the eigenvector directions marked, the singular value decomposition drawn as rotate-stretch-rotate, a strip of one photograph reconstructed at ranks 1, 5, 20 and 50 with compression ratios and PSNR written beneath, a scree plot with the elbow marked, and the LoRA picture of a frozen weight matrix beside two thin adapter matrices with their parameter counts.
+*/}
+
+<Tabs>
+
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The directions a matrix does not turn
+
+From Module 2: a matrix moves vectors around. Most vectors come out pointing somewhere new.
+
+But some do not. Take the matrix
+
+```
+M = [ 3  0 ]
+    [ 0  2 ]
+```
+
+Apply it to `[1, 0]`: you get `[3, 0]`. **Same direction, three times longer.**
+Apply it to `[0, 1]`: you get `[0, 2]`. Same direction, twice as long.
+Apply it to `[1, 1]`: you get `[3, 2]`. That one *did* turn — it used to point at 45°, now it points
+lower.
+
+The special vectors — the ones that come out pointing the same way — are called **eigenvectors**
+("eigen" is German for "own" or "characteristic"; they are the matrix's own directions). The factor
+they are stretched by is the **eigenvalue**.
+
+```
+M v = λ v          <- the definition. λ (lambda) is just a number.
+```
+
+For that matrix the eigenvectors are `[1, 0]` with eigenvalue 3, and `[0, 1]` with eigenvalue 2.
+
+Now a less obvious one:
+
+```
+M = [ 2  1 ]
+    [ 1  2 ]
+```
+
+Try `[1, 1]`: `M[1,1] = [3, 3] = 3 × [1, 1]`. Eigenvector, eigenvalue 3.
+Try `[1, -1]`: `M[1,-1] = [1, -1] = 1 × [1, -1]`. Eigenvector, eigenvalue 1.
+
+Draw the unit circle and apply the matrix to lots of points on it. You get an **ellipse**. The long
+axis of that ellipse points along the eigenvector with the biggest eigenvalue. That is the picture:
+**eigenvectors are the axes of the ellipse, eigenvalues are how long each axis is.**
+
+```python
+import numpy as np
+M = np.array([[2.0, 1.0], [1.0, 2.0]])
+vals, vecs = np.linalg.eigh(M)          # eigh: for symmetric matrices, always real
+print(vals)                             # [1. 3.]
+print(vecs)                             # columns are the eigenvectors
+print(M @ vecs[:, 1], "should be 3 x", vecs[:, 1])
+```
+
+### Finding the biggest one, by repetition
+
+You do not need any theory to find the dominant eigenvector. Start with a random vector, apply the
+matrix, normalise, and repeat. It converges to the top eigenvector.
+
+**Why?** Any starting vector is a mixture of the eigenvectors. Each application multiplies each
+eigenvector's share by its eigenvalue. The biggest eigenvalue grows fastest, so after enough
+repetitions its share dominates everything else. Normalising each step stops the numbers exploding.
+
+```python
+import numpy as np
+
+def power_iteration(M, iters=200, seed=0):
+    rng = np.random.default_rng(seed)
+    v = rng.standard_normal(M.shape[0])
+    v /= np.linalg.norm(v)
+    for _ in range(iters):
+        v = M @ v
+        v /= np.linalg.norm(v)
+    eigenvalue = v @ M @ v          # the Rayleigh quotient: v.T M v, with |v| = 1
+    return eigenvalue, v
+
+M = np.array([[2.0, 1.0], [1.0, 2.0]])
+lam, v = power_iteration(M)
+print(round(lam, 6), np.round(v, 6))    # 3.0  [0.707107 0.707107]
+```
+
+That is ten lines and it is a real algorithm — a variant of it is how Google's original PageRank was
+computed on the web graph.
+
+### SVD: every matrix, not just the nice ones
+
+Eigenvectors only exist properly for square matrices, and even then not always. **Singular Value
+Decomposition** works for every matrix, of any shape, always.
+
+The statement: any `m × n` matrix `A` can be written
+
+```
+A = U Σ Vᵀ
+```
+
+where:
+
+- `Vᵀ` is a **rotation** (it turns space without stretching),
+- `Σ` (sigma) is a **stretch along the axes** — a diagonal matrix whose entries `σ₁ ≥ σ₂ ≥ … ≥ 0`
+  are the **singular values**,
+- `U` is another **rotation**.
+
+In one sentence: **every matrix is a rotation, then a stretch, then another rotation.** That is all
+any linear transformation can be.
+
+The singular values come out sorted, largest first, and they measure how much the matrix stretches in
+each of its principal directions.
+
+```python
+import numpy as np
+A = np.array([[3.0, 1.0], [1.0, 3.0], [0.0, 0.0]])   # 3x2, not square
+U, S, Vt = np.linalg.svd(A, full_matrices=False)
+print("U ", U.shape, " S ", S, " Vt ", Vt.shape)
+# U  (3, 2)  S  [4. 2.]  Vt  (2, 2)
+print(np.allclose(U @ np.diag(S) @ Vt, A))            # True -- it reconstructs exactly
+```
+
+### The idea that makes everything else work
+
+Remember the third reading of matrix multiplication from Module 2: a product is a **sum of rank-1
+outer products**. SVD gives you exactly that decomposition, sorted by importance:
+
+```
+A = σ₁ u₁v₁ᵀ + σ₂ u₂v₂ᵀ + σ₃ u₃v₃ᵀ + …
+```
+
+Each term is a rank-1 matrix, and each is weighted by its singular value. Since the singular values
+are sorted, **the first few terms carry most of the matrix.**
+
+So: keep the first `k` terms and throw the rest away. You get `A_k`, the best possible rank-`k`
+approximation of `A` (this is the Eckart–Young theorem, and "best" means smallest error in the
+Frobenius norm — the sum of squared differences).
+
+```python
+def low_rank(A, k):
+    U, S, Vt = np.linalg.svd(A, full_matrices=False)
+    return (U[:, :k] * S[:k]) @ Vt[:k]
+```
+
+Three lines. And how many numbers do you need to store `A_k`? Not `m × n`. You need `k` columns of
+`U` (that is `m × k`), `k` singular values, and `k` rows of `Vᵀ` (that is `k × n`):
+
+```
+storage(A_k) = k × (m + n + 1)
+```
+
+For a 427 × 640 image at `k = 20`, that is `20 × 1068 = 21,360` numbers instead of `273,280` — a
+**12.8× reduction**.
+
+### See it: compressing a photograph
+
+```python
+# svd_image.py — the demonstration that makes this module stick.
+import numpy as np
+from sklearn.datasets import load_sample_image
+
+img = load_sample_image("china.jpg").astype(np.float64)
+gray = img @ np.array([0.2989, 0.5870, 0.1140])       # RGB -> luminance
+m, n = gray.shape
+U, S, Vt = np.linalg.svd(gray, full_matrices=False)
+total = (S ** 2).sum()
+
+for k in (1, 5, 20, 50, 100, 200, 400):
+    Ak = (U[:, :k] * S[:k]) @ Vt[:k]
+    stored = k * (m + n + 1)
+    energy = (S[:k] ** 2).sum() / total
+    err = np.linalg.norm(gray - Ak) / np.linalg.norm(gray)
+    psnr = 10 * np.log10(255.0 ** 2 / ((gray - Ak) ** 2).mean())
+    print(f"k={k:>3}  stored={stored:>7,}  compression={m*n/stored:>6.2f}x  "
+          f"energy={energy:>8.4%}  rel.err={err:.4f}  PSNR={psnr:.2f} dB")
+```
+
+Actual output on a 427 × 640 image (273,280 pixels, full rank 427):
+
+| rank k | values stored | compression | energy kept | rel. error | PSNR |
+|---|---|---|---|---|---|
+| 1 | 1,068 | **255.9×** | 91.39% | 0.2935 | 14.34 dB |
+| 5 | 5,340 | 51.2× | 96.52% | 0.1867 | 18.27 dB |
+| 20 | 21,360 | **12.8×** | **98.08%** | 0.1386 | 20.86 dB |
+| 50 | 53,400 | 5.1× | 98.92% | 0.1041 | 23.34 dB |
+| 100 | 106,800 | 2.6× | 99.45% | 0.0742 | 26.28 dB |
+| 200 | 213,600 | 1.3× | 99.87% | 0.0363 | 32.50 dB |
+| 400 | 427,200 | 0.6× | 100.00% | 0.0003 | 73.55 dB |
+
+Read the shocking row: **rank 1 — a single outer product, 1,068 numbers instead of 273,280 — already
+captures 91.4% of the image's energy.** One direction. And rank 20 gets you to 98.1%.
+
+Read the *other* shocking row too: at `k = 400` you are storing **more** numbers than the original
+image (427,200 versus 273,280) for a compression ratio below 1. Keeping everything costs more than
+the original, because `U` and `V` together are bigger than `A`. **Low-rank approximation is only a
+win when the rank is genuinely low**, and knowing where that stops is the whole skill.
+
+If you save the reconstructions as images and look at them, the progression is unforgettable: at
+rank 1 you see broad light and dark bands; at rank 5 the shape of the scene; at rank 20 it is
+recognisably the photograph; at rank 50 you would not complain.
+
+### Guided practice
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+
+# Build a matrix that is SECRETLY rank 3, then add a little noise.
+B = rng.standard_normal((100, 3))
+C = rng.standard_normal((3, 80))
+A = B @ C + 0.01 * rng.standard_normal((100, 80))
+
+U, S, Vt = np.linalg.svd(A, full_matrices=False)
+print("first 8 singular values:", np.round(S[:8], 3))
+# TODO: how many singular values are "large"? What does that tell you about A?
+# TODO: reconstruct with k = 3 and report the relative error.
+```
+
+<Accordion title="Answer">
+
+```
+first 8 singular values: [100.118  87.259  85.266   0.182   0.178   0.175   0.17    0.163]
+```
+
+There is a **cliff** between the third and fourth singular values — 85.27 drops to 0.182, a factor of
+**468**. The first three are the real structure (`B @ C` has rank exactly 3); everything after is the
+noise you added.
+
+```python
+k = 3
+Ak = (U[:, :k] * S[:k]) @ Vt[:k]
+print(np.linalg.norm(A - Ak) / np.linalg.norm(A))    # 0.00548
+```
+
+Reconstructing with `k = 3` recovers the matrix to within **0.55% relative error** — and that
+remaining error *is* the noise you added, so no larger `k` would help you recover the signal; it would
+only fit the noise.
+
+Two lessons. **The singular value spectrum tells you the true rank**, and the gap is usually obvious.
+And **truncating the SVD is a denoiser**: throwing away the small singular values throws away the
+noise, which is why low-rank approximation is used for de-noising, recommendation systems and
+background subtraction in video, not only for compression.
+
+Plotting `S` on a log axis is called a **scree plot**, and finding the elbow is how you pick `k` when
+the cliff is less obvious than this.
+
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+<Accordion title="1. What is an eigenvector, in one sentence with no symbols?">
+A direction the matrix does not turn — applying the matrix leaves it pointing the same way, only
+scaled by its eigenvalue.
+</Accordion>
+<Accordion title="2. What are the three factors of an SVD, geometrically?">
+A rotation, a stretch along the axes, and another rotation. Every linear transformation is exactly
+that, and nothing else.
+</Accordion>
+<Accordion title="3. How many numbers does a rank-k approximation of an m x n matrix need?">
+`k × (m + n + 1)` — `k` columns of `U`, `k` singular values, `k` rows of `Vᵀ`. Compare against `m × n`
+to get the compression ratio.
+</Accordion>
+<Accordion title="4. Rank 1 kept 91.4% of a photograph's energy. Why is the picture still bad?">
+Energy is dominated by large-scale brightness structure, which one direction captures well. Detail
+lives in the many small singular values, which carry little energy but all of the sharpness. Energy is
+a poor proxy for perceptual quality — hence also reporting PSNR.
+</Accordion>
+<Accordion title="5. Why does compression go below 1x at high rank?">
+`U` is `m × k` and `Vᵀ` is `k × n`, so storage grows as `k(m+n+1)`. Once `k` exceeds roughly
+`mn/(m+n)`, you are storing more than the original matrix.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### PCA is SVD of the centred data. That is the whole definition.
+
+Given a data matrix `X` of shape `(n_samples, n_features)`:
+
+1. **Centre it** — subtract the mean of each column. (Not optional. PCA on uncentred data finds the
+   direction of the mean, which is almost never what you want.)
+2. **SVD it** — `X_c = U Σ Vᵀ`.
+3. The **principal components** are the rows of `Vᵀ`: orthogonal directions in feature space, ordered
+   by how much variance they explain.
+4. The **explained variance** of component `i` is `σᵢ² / (n − 1)`, and the **explained variance ratio**
+   is `σᵢ² / Σσⱼ²`.
+5. To project data onto the top `k` components: `X_c @ V[:, :k]`, or equivalently
+   `U[:, :k] * S[:k]`.
+
+```python
+import numpy as np
+
+def pca(X, k):
+    """PCA via SVD. X: (n_samples, n_features). Returns projected data, components, ratios."""
+    X = np.asarray(X, dtype=np.float64)
+    mean = X.mean(axis=0, keepdims=True)
+    Xc = X - mean
+    U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+    ratios = S**2 / (S**2).sum()
+    return (U[:, :k] * S[:k]), Vt[:k], ratios, mean
+```
+
+**Why SVD and not the covariance matrix?** The textbook route is "compute `C = XᵀX/(n−1)`, then
+eigendecompose `C`". It gives the same answer in exact arithmetic and is numerically worse: forming
+`XᵀX` **squares the condition number**, which halves the number of accurate digits you have left.
+`sklearn.decomposition.PCA` uses SVD for exactly this reason, and so should you.
+
+**Scaling matters as much as centring.** PCA finds directions of maximum *variance*, and variance
+depends on units. A dataset with income in rupees (variance ~10¹⁰) and age in years (variance ~200)
+will produce a first component that is entirely income, regardless of what the data means. Use
+`StandardScaler` before PCA unless your features are already in comparable units. This is the single
+most common PCA mistake.
+
+**Choosing `k`.** Three defensible methods:
+
+- **Explained variance threshold** — smallest `k` with cumulative ratio ≥ 0.95. Simple, arbitrary,
+  and fine.
+- **Scree plot elbow** — plot `σᵢ` on a log axis and find the knee. Better when there is a genuine
+  cliff, as in the guided practice where 42.3 dropped to 0.13.
+- **Downstream task performance** — the only method that is actually principled: sweep `k`, measure
+  the metric you care about, pick the knee of *that* curve.
+
+### Whitening, and when you want it
+
+**Whitening** divides each projected component by its singular value, so every direction has unit
+variance:
+
+```python
+X_white = U[:, :k] * np.sqrt(n - 1)          # equivalently (U*S)[:, :k] / S[:k] * sqrt(n-1)
+```
+
+The result has an identity covariance matrix: all directions equally scaled, no correlations. Use it
+when a downstream algorithm assumes isotropic features — k-means, some kernel methods, and certain
+distance metrics.
+
+Do **not** use it blindly. Whitening amplifies the low-variance directions, which are exactly where
+the noise lives. If component 50 has `σ = 0.01` and you divide by it, you have multiplied that noise
+by 100. Whitening a noisy dataset is a reliable way to make a model worse.
+
+### The bridge: low-rank approximation *is* LoRA
+
+Here is the connection, stated precisely, because it is the reason this module exists.
+
+A Transformer's weight matrix `W` has shape `(d_out, d_in)` — for Llama-2-7B's attention projections,
+4096 × 4096 = **16,777,216 parameters**. Fine-tuning updates it to `W + ΔW`.
+
+**The LoRA hypothesis** (Hu et al., 2021) is that `ΔW` — the *change* — has low intrinsic rank, even
+though `W` does not. If true, you can write
+
+```
+ΔW ≈ B A          where B is (d_out, r) and A is (r, d_in), with r small
+```
+
+That is precisely the rank-`r` factorisation from Layer 1, with the same storage arithmetic:
+`r × (d_out + d_in)` parameters instead of `d_out × d_in`.
+
+```python
+for r in (4, 8, 16, 64):
+    d_out = d_in = 4096
+    full = d_out * d_in
+    lora = r * (d_out + d_in)
+    print(f"r={r:>3}: {lora:>10,} params = {lora/full:.4%} of full, {full/lora:>6,.0f}x fewer")
+```
+
+Measured output for a 4096 × 4096 projection (16,777,216 parameters, 33.6 MB in bf16):
+
+| rank r | LoRA params | % of full | reduction |
+|---|---|---|---|
+| 4 | 32,768 | 0.195% | **512×** |
+| 8 | 65,536 | 0.391% | **256×** |
+| 16 | 131,072 | 0.781% | **128×** |
+| 64 | 524,288 | 3.125% | **32×** |
+
+And for the MLP up-projection (4096 × 11008 = 45,088,768 parameters, 90.2 MB in bf16):
+
+| rank r | LoRA params | % of full | reduction |
+|---|---|---|---|
+| 8 | 120,832 | 0.268% | **373×** |
+| 16 | 241,664 | 0.536% | **187×** |
+| 64 | 966,656 | 2.144% | **47×** |
+
+**The whole-model number.** Llama-2-7B has 32 layers, `d_model` = 4096, `ffn` = 11008. Per layer:
+attention (q, k, v, o) is `4 × 4096² = 67,108,864` parameters and the MLP (gate, up, down) is
+`3 × 4096 × 11008 = 135,266,304`. Total across the transformer blocks: **6.476 B parameters.**
+
+| LoRA config | Trainable parameters | % of block parameters |
+|---|---|---|
+| r=8, q and v only | 4,194,304 | **0.0648%** |
+| r=8, all four attention matrices | 8,388,608 | 0.1295% |
+| r=16, q and v only | 8,388,608 | 0.1295% |
+| r=16, all four attention | 16,777,216 | 0.2591% |
+
+**You are training 0.065% of the model.** That number is not a rounding of "a small fraction" — it is
+the measured consequence of the storage arithmetic you did in Layer 1 on a photograph.
+
+Module 5 completes the argument with the memory cost, and the punchline there is that full fine-tuning
+of Llama-2-7B needs **107.84 GB** of weights, gradients and optimizer state, while the QLoRA
+configuration needs **3.50 GB** — a **31× reduction** that turns eight A100s into one consumer GPU.
+
+### Trade-offs
+
+| Decision | Choose this when… | Choose the other when… | The number |
+|---|---|---|---|
+| **PCA via SVD** | Always | Never, for numerical work | Forming `XᵀX` squares `κ`, halving your accurate digits |
+| **Randomised SVD** | `n` and `d` are large and you need only the top `k` | You need the full spectrum or high accuracy | `O(mnk)` instead of `O(mn·min(m,n))`; typically 5–50× faster for `k ≪ min(m,n)` |
+| **Whitening** | Downstream method assumes isotropic features | Data is noisy; low-variance components are junk | Dividing by `σ = 0.01` multiplies that direction's noise by 100 |
+| **Higher LoRA rank** | The task is far from the base model's distribution | The task is close; you want fewer parameters and less overfitting | r=8 → r=64 is 8× the adapter parameters (0.39% → 3.1% of a 4096² matrix) |
+| **LoRA on attention only** vs **attention + MLP** | Parameter budget is tight | You need more capacity; MLP holds most of the parameters | MLP is 135 M/layer versus attention's 67 M — targeting it doubles the reachable capacity |
+
+### Reference implementation
+
+```python
+# decomp.py — power iteration, PCA, and low-rank approximation, all tested against NumPy.
+import numpy as np
+
+def power_iteration(M, iters=1000, tol=1e-12, seed=0):
+    """Dominant eigenvalue/eigenvector of a symmetric matrix."""
+    rng = np.random.default_rng(seed)
+    v = rng.standard_normal(M.shape[0]); v /= np.linalg.norm(v)
+    lam_prev = 0.0
+    for _ in range(iters):
+        w = M @ v
+        nw = np.linalg.norm(w)
+        if nw == 0:
+            return 0.0, v
+        v = w / nw
+        lam = float(v @ M @ v)
+        if abs(lam - lam_prev) < tol * max(1.0, abs(lam)):
+            break
+        lam_prev = lam
+    return lam, v
+
+def deflate(M, lam, v):
+    """Remove a known eigenpair so power iteration finds the next one."""
+    return M - lam * np.outer(v, v)
+
+def top_k_eigen(M, k):
+    M = M.copy(); pairs = []
+    for _ in range(k):
+        lam, v = power_iteration(M)
+        pairs.append((lam, v))
+        M = deflate(M, lam, v)
+    return pairs
+
+def pca_svd(X, k):
+    X = np.asarray(X, dtype=np.float64)
+    mean = X.mean(axis=0, keepdims=True)
+    U, S, Vt = np.linalg.svd(X - mean, full_matrices=False)
+    return dict(scores=(U[:, :k] * S[:k]), components=Vt[:k],
+                explained_ratio=S**2 / (S**2).sum(), mean=mean, singular_values=S)
+
+def low_rank(A, k):
+    U, S, Vt = np.linalg.svd(A, full_matrices=False)
+    return (U[:, :k] * S[:k]) @ Vt[:k]
+
+def lora_params(d_out, d_in, r):
+    full = d_out * d_in
+    lora = r * (d_out + d_in)
+    return dict(full=full, lora=lora, fraction=lora / full, reduction=full / lora)
+
+if __name__ == "__main__":
+    rng = np.random.default_rng(0)
+    # power iteration matches numpy on a symmetric matrix
+    A = rng.standard_normal((60, 60)); S = A + A.T
+    lam, v = power_iteration(S)
+    ref = np.linalg.eigvalsh(S)
+    assert abs(abs(lam) - max(abs(ref[0]), abs(ref[-1]))) < 1e-6, (lam, ref[[0, -1]])
+    # Eckart-Young: SVD truncation is the BEST rank-k approximation
+    M = rng.standard_normal((80, 50))
+    Ak = low_rank(M, 10)
+    err = np.linalg.norm(M - Ak)
+    sv = np.linalg.svd(M, compute_uv=False)
+    assert abs(err - np.sqrt((sv[10:] ** 2).sum())) < 1e-8      # error = sqrt of discarded energy
+    # PCA explained variance sums to 1
+    X = rng.standard_normal((200, 12)) @ rng.standard_normal((12, 12))
+    out = pca_svd(X, 5)
+    assert abs(out["explained_ratio"].sum() - 1.0) < 1e-12
+    print(lora_params(4096, 4096, 16))
+    print("ok")
+```
+
+The Eckart–Young assertion is the one worth keeping: **the error of the best rank-`k` approximation is
+exactly the square root of the sum of the discarded singular values squared.** That gives you the
+error before you compute the approximation, which is how you choose `k` without a search.
+
+### What breaks in the real world
+
+A fraud team applied PCA to 180 features to reduce dimensionality before a gradient-boosted model.
+Cross-validated AUC dropped from 0.91 to 0.83. The conclusion drawn in the retro was "PCA does not
+work for fraud".
+
+Two things had gone wrong, and both are general.
+
+**First, the features were not scaled.** Transaction amount had a variance around 10⁶; a binary
+"is_international" flag had variance around 0.2. The first principal component was, to three decimal
+places, the transaction amount, and the first ten components between them were essentially the four
+monetary features. The 176 remaining features contributed almost nothing to any retained component.
+
+**Second, and more fundamentally: PCA is unsupervised.** It maximises retained *variance*, which has
+no relationship to retained *predictive signal*. In fraud, the discriminative features are often
+low-variance rare events — exactly the directions PCA discards first. A feature that fires on 0.1% of
+rows has tiny variance and can be the single most predictive column in the table.
+
+After `StandardScaler`, AUC recovered to 0.89 — still below the 0.91 baseline, and correctly so. The
+final decision was to drop PCA for this problem and use the model's own feature importances for
+selection instead.
+
+**The rule:** PCA is for compression, decorrelation and visualisation. It is not feature selection for
+a supervised task. If you want supervised dimensionality reduction, use a supervised method (partial
+least squares, LDA, or just the model's feature importances).
+
+### Design checkpoint
+
+<Accordion title="You have 500 GB of 1536-dimensional embeddings and want to cut storage 4x. PCA to 384 dimensions, or int8 quantisation? Argue with numbers.">
+
+Both give roughly 4×, by different mechanisms, and the difference in *what they cost* is the whole
+answer.
+
+**int8 quantisation:** 1536 dims × 1 byte = 1536 bytes/vector against fp32's 6144. Exactly 4×. It
+preserves the geometry approximately and uniformly — every dimension keeps its identity, and the error
+is bounded quantisation noise. It is reversible in the sense that the mapping is fixed and
+data-independent, and it composes with any index. Typical recall@10 loss for scalar int8 on
+well-conditioned embeddings is small, but **measure it on your data**.
+
+**PCA to 384 dims:** 384 × 4 bytes = 1536 bytes/vector. Also exactly 4×. But it is *data-dependent*:
+you have fitted a projection to your current corpus. Consequences you must plan for —
+
+- The projection must be stored, versioned and applied identically to every query. A mismatch between
+  the index's projection and the query's is silent and catastrophic.
+- New data drifting away from the fitted distribution degrades quality over time, invisibly, with no
+  code change.
+- You must re-fit and re-index when it drifts, which is a full rebuild of 500 GB.
+- If the embedding's intrinsic dimension is genuinely below 384, PCA may lose *less* than int8; if it
+  is above, PCA loses more.
+
+**The decision procedure**, and this is the point: build the exact index (Module 1's reference
+implementation), then measure **recall@10 against it** for both options on a fixed probe set of at
+least 1,000 queries. Report recall against bytes-per-vector for both. That plot decides it, and it
+takes an afternoon.
+
+**The likely answer** is int8 first, because it is data-independent, requires no re-fitting, and
+composes with everything — and then PCA *on top* if you need more, giving 16× combined. That
+combination (PCA then quantise) is what production vector databases actually do, and knowing why the
+order is "PCA first, quantise second" — because quantisation error in the reduced space is smaller
+than in the original — is the senior-level detail.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim carries a measured number. Measurements: numpy 2.5.2 on Python 3.13.2, Apple M3 Pro. The
+image is the 427 × 640 `china.jpg` sample bundled with scikit-learn; LoRA figures are computed from
+published Llama-2 architecture dimensions.
+</Warning>
+
+### Eckart–Young, and what "best" means
+
+The truncated SVD `A_k` is the best rank-`k` approximation to `A` in both the Frobenius norm and the
+spectral norm, with errors:
+
+```
+‖A − A_k‖_F   = sqrt( Σ_{i>k} σᵢ² )        Frobenius: total squared error
+‖A − A_k‖_2   = σ_{k+1}                     spectral: worst-case amplification
+```
+
+Both are computable *before* you form the approximation, from the singular values alone. That is
+unusual and useful: it means you can choose `k` from the spectrum without a search loop.
+
+The measured image spectrum makes the trade concrete. Energy kept at rank `k` is
+`Σ_{i≤k} σᵢ² / Σ σᵢ²`:
+
+| k | energy | relative Frobenius error | PSNR |
+|---|---|---|---|
+| 1 | 91.39% | 0.2935 | 14.34 dB |
+| 20 | 98.08% | 0.1386 | 20.86 dB |
+| 100 | 99.45% | 0.0742 | 26.28 dB |
+| 200 | 99.87% | 0.0363 | 32.50 dB |
+
+Note the mismatch between energy and perceptual quality: going from 98.08% to 99.45% energy — an
+apparently trivial 1.4 percentage points — nearly halves the relative error and adds 5.4 dB of PSNR.
+**Energy is quadratic, so the last few percent contains most of the visible detail.** This is exactly
+why "we keep 95% of the variance" is a weak justification for a choice of `k`, and why the downstream
+metric is the only principled criterion.
+
+### Cost of the decompositions
+
+| Operation | Complexity | n = 4096 (measured class) |
+|---|---|---|
+| Full SVD, `m × n` | `O(mn·min(m,n))` | ~10¹¹ FLOP for 4096² — seconds |
+| Truncated SVD (Lanczos/ARPACK), top `k` | `O(mnk)` per iteration | proportional to `k` |
+| Randomised SVD, top `k` | `O(mnk)` total, a few passes | typically 5–50× faster than full for `k ≪ n` |
+| Power iteration, top 1 | `O(mn)` per iteration | converges as `(σ₂/σ₁)^t` |
+
+**Power iteration's convergence rate is the ratio of the top two singular values.** If
+`σ₂/σ₁ = 0.99`, you need roughly `log(ε)/log(0.99) ≈ 1,146` iterations for 5-digit accuracy; if it is
+0.5, about 17. That is why real implementations use Lanczos (which builds a Krylov subspace and
+converges far faster) or randomised methods (which use a random projection plus a few power steps),
+and why `scipy.sparse.linalg.svds` and `sklearn.utils.extmath.randomized_svd` exist.
+
+**Randomised SVD** (Halko, Martinsson and Tropp, 2011) is the practical default at scale: project `A`
+onto a random `(n, k + p)` matrix to get a small sketch, orthonormalise, and do a small SVD there.
+With a modest oversampling `p` (typically 5–10) and 1–2 power iterations, the error is close to
+optimal with high probability. For `k = 50` on a 100,000 × 5,000 matrix this is the difference between
+minutes and hours.
+
+### LoRA: the full arithmetic
+
+The Hu et al. (2021) hypothesis is that the *update* has low intrinsic rank. The paper's headline
+result is a 175 B-parameter model fine-tuned with roughly **10,000× fewer trainable parameters** and
+about **3× less GPU memory** than full fine-tuning, matching or exceeding full fine-tuning quality on
+their benchmarks.
+
+Reproduced arithmetic on Llama-2 shapes:
+
+| Matrix | Shape | Full params | r=16 LoRA | Reduction |
+|---|---|---|---|---|
+| Attention projection | 4096 × 4096 | 16,777,216 | 131,072 | **128×** |
+| MLP up-projection | 4096 × 11008 | 45,088,768 | 241,664 | **187×** |
+| 70B-class attention | 8192 × 8192 | 67,108,864 | 262,144 | **256×** |
+
+Note that **the reduction grows with matrix size**, because full is `O(d²)` and LoRA is `O(d)`. That
+is why LoRA gets *relatively* cheaper as models get bigger, and why it is a scaling-friendly
+technique rather than a temporary hack.
+
+Three implementation details that matter and are easy to get wrong:
+
+1. **Initialisation.** `A` is initialised from a random Gaussian and `B` is initialised to **zero**,
+   so `BA = 0` at step 0 and the model starts exactly as the base model. Initialising both randomly
+   perturbs the model before training begins and reliably hurts.
+2. **The scaling factor `α/r`.** The adapter output is scaled by `α/r`, which decouples the learning
+   rate from the rank — you can change `r` without retuning. `α = 2r` is a common default.
+3. **Merging.** After training, `W' = W + (α/r)·BA` can be computed once and folded into the base
+   weights, so inference has **zero** additional latency. This is a genuine advantage over adapter
+   layers, which add sequential computation at every forward pass.
+
+**Rank does not need to be large.** The LoRA paper reports that `r = 1` to `4` is often sufficient for
+tasks close to the pre-training distribution, and that increasing `r` gives diminishing returns —
+consistent with the intrinsic-dimensionality argument of Aghajanyan et al. (2020), who showed that
+fine-tuning objectives can often be reparameterised in a few hundred to a few thousand dimensions.
+
+### Where the low-rank assumption fails
+
+It is worth knowing when this does not work, because the failure is quiet.
+
+- **Tasks far from the pre-training distribution.** Adapting an English model to a new language, or a
+  general model to a highly specialised symbolic domain, plausibly requires a high-rank update. The
+  symptom is that training loss plateaus above what full fine-tuning achieves and increasing `r` keeps
+  helping. If `r = 256` is still improving, LoRA is the wrong tool.
+- **Continued pre-training.** LoRA is a *fine-tuning* method. Injecting substantial new knowledge is
+  a different problem, and the literature is fairly consistent that full-parameter training wins there.
+- **Rank collapse in the adapter itself.** `B` and `A` are trained freely and nothing forces them to
+  use all `r` directions. Check the effective rank of `BA` after training — if it is 3 when `r` is 32,
+  you paid for capacity you did not use, and you should reduce `r`.
+
+### Production failure modes
+
+| Failure | Signature | Detection |
+|---|---|---|
+| **PCA fitted on unscaled features** | The first component is the highest-variance feature, and the rest explain almost nothing | Inspect `components_` — if one feature's loading is near 1, you did not scale |
+| **PCA fitted on train, applied with a different mean/scale** | Quality degrades silently on new data | Fit the scaler and PCA on train only; store them together; version them with the index |
+| **PCA used as supervised feature selection** | Downstream metric drops (0.91 → 0.83 in the war story) | PCA maximises variance, not signal. Use a supervised method |
+| **Covariance-based eigendecomposition** | Loss of precision on ill-conditioned data; sometimes negative "variances" | Forming `XᵀX` squares `κ`. Use SVD |
+| **Sign ambiguity across SVD runs** | Component signs flip between library versions or platforms | Singular vectors are unique only up to sign. Fix a convention (e.g. make the largest-magnitude entry positive) if you persist them |
+| **LoRA `B` initialised randomly** | The model is degraded before the first step | `B` must be zero at init so `BA = 0` |
+| **LoRA adapter trained at one `α/r` and served at another** | Output quality changes between training and serving | Store `α` and `r` in the adapter config and assert them at load |
+| **Truncation used where the spectrum has no cliff** | "Compression" that loses real information | Plot the scree curve. If there is no elbow, low-rank is not the right model for this matrix |
+
+### Frontier and further pointers
+
+- **C. Eckart and G. Young, "The approximation of one matrix by another of lower rank,"
+  *Psychometrika* 1(3), 1936.** Takeaway: truncating the SVD gives the provably optimal low-rank
+  approximation, with error equal to the square root of the discarded squared singular values — so you
+  can choose the rank from the spectrum without searching.
+- **E. Hu et al., "LoRA: Low-Rank Adaptation of Large Language Models," ICLR 2022.** Takeaway: the
+  *update* to a pre-trained weight matrix has low intrinsic rank, so a rank-`r` factorisation trains
+  thousands of times fewer parameters at equal quality — and merges into the base weights at inference
+  for zero added latency.
+- **A. Aghajanyan, L. Zettlemoyer and S. Gupta, "Intrinsic Dimensionality Explains the Effectiveness
+  of Language Model Fine-Tuning," ACL 2021.** Takeaway: fine-tuning objectives can be reparameterised
+  in a few hundred to a few thousand dimensions without loss, which is the empirical justification
+  LoRA rests on.
+- **N. Halko, P. G. Martinsson and J. A. Tropp, "Finding Structure with Randomness," *SIAM Review*
+  53(2), 2011.** Takeaway: random projection plus a small number of power iterations gives a
+  near-optimal low-rank factorisation in a single pass over the data, which is what makes SVD
+  tractable at web scale.
+- **T. Dettmers et al., "QLoRA: Efficient Finetuning of Quantized LLMs," NeurIPS 2023.** Takeaway:
+  combining a 4-bit frozen base with LoRA adapters brings 65 B-parameter fine-tuning onto a single
+  48 GB GPU — the memory arithmetic that Module 5 completes.
+
+### Stretch challenge
+
+Measure the intrinsic rank of a real fine-tuning update, and test the LoRA hypothesis yourself.
+
+1. Take a small model you can fully fine-tune (GPT-2 small at 124 M, or a BERT-base). Record the
+   weights before and after full fine-tuning on a task.
+2. For each weight matrix, compute `ΔW = W_after − W_before` and its singular value spectrum. Plot the
+   scree curves. **Is `ΔW` low-rank?** Report the effective rank (the number of singular values above,
+   say, 1% of the largest) per layer type.
+3. Compare against the spectrum of `W` itself. The hypothesis predicts `ΔW`'s spectrum decays much
+   faster than `W`'s. Does it? Quantify with the ratio of effective ranks.
+4. Now the controlled experiment: train LoRA adapters at `r = 1, 2, 4, 8, 16, 32, 64` on the same task
+   and plot task metric against `r` and against trainable parameter count. Where is the knee, and does
+   it match the effective rank you measured in step 2?
+5. Finally, check for adapter rank collapse: compute the effective rank of the trained `BA` for the
+   `r = 64` run. If it is much lower than 64, explain what that tells you about the task.
+
+There is no single right answer — the effective rank varies by layer, by task, and by how far the task
+is from pre-training. A write-up showing where the hypothesis holds and where it does not is more
+valuable than a confirmation.
+
+</Tab>
+
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Compress an image at ranks 5, 20, 50 and 200 — save the reconstructions and look at them — then
+compute the LoRA parameter savings for Llama-2-7B and state the compression ratio. The two exercises
+are the same arithmetic.
+</Card>
+
+Reference numbers: rank 20 on a 427 × 640 image gives **12.79× compression at 98.08% energy and
+20.86 dB PSNR**. Rank 16 LoRA on a 4096 × 4096 projection gives **128× fewer parameters**, and
+`r = 8` on q and v across all 32 layers of Llama-2-7B is **4,194,304 trainable parameters — 0.065% of
+the model.**
+
+## The whiteboard
+
+<Tip>
+**Draw it yourself.** Draw the circle-to-ellipse picture with the eigenvector axes marked, then the
+rotate-stretch-rotate chain, then the four image reconstructions with compression ratios, then the
+LoRA picture with `W` frozen and thin `B` and `A` beside it. Write the storage formula
+`k(m + n + 1)` from memory.
+[Blank version](/assets/diagrams/p2-w11-m3-blank.svg) · [Editable source](/assets/diagrams/p2-w11-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Implemented power iteration, SVD-based PCA and low-rank approximation from
+scratch, verified against NumPy and against the Eckart–Young bound; demonstrated 12.79× image
+compression at 98.08% retained energy; and applied the same arithmetic to compute LoRA parameter
+savings for Llama-2-7B — 128× per attention projection, and 0.065% of the model trainable at r=8 on
+q and v."
+
+**Why this is the strongest portfolio item in Week 11:** it visibly connects a classical technique to
+a current one. Being able to say "LoRA is the image-compression demo applied to a weight matrix, and
+here are both sets of numbers" demonstrates transfer, which is the thing interviews are actually
+trying to test.
+
+**The follow-up question to prepare for:** "when does the low-rank assumption fail?" Answer with tasks
+far from the pre-training distribution, continued pre-training, and adapter rank collapse — and say
+how you would detect each.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Check whether anything in your pipeline runs PCA on unscaled features.** Print
+`pca.components_[0]` and look at it. If one feature's loading dominates, the component is that
+feature and PCA is doing nothing useful.
+
+**2. Replace any `eig(cov(X))` with SVD.** Forming the covariance matrix squares the condition number
+and halves your accurate digits, for no benefit. It is a one-line change and `sklearn` already does
+the right thing.
+
+**3. Before proposing full fine-tuning, do the LoRA arithmetic.** `r × (d_out + d_in)` per matrix,
+times the number of matrices you target. If the answer is under 1% of the model, the memory
+conversation changes completely — and Module 5 gives you the GB figure to put in the ticket.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| First principal component is one raw feature | Features not standardised before PCA | `StandardScaler` first, unless units are already comparable |
+| PCA reduces model performance | Used as supervised feature selection | PCA maximises variance, not predictive signal. Use a supervised method or feature importances |
+| "Compression" stores more than the original | Rank too high: `k(m+n+1) > mn` | Compression only pays below `k ≈ mn/(m+n)`; check before claiming a ratio |
+| PCA components flip sign between runs | Singular vectors are unique only up to sign | Fix a convention if you persist them; never compare raw signs across runs |
+| Power iteration converges very slowly | `σ₂/σ₁` close to 1 | Use Lanczos (`scipy.sparse.linalg.svds`) or randomised SVD |
+| Whitening made the model worse | Amplified low-variance noise directions | Whiten only when the downstream method requires isotropy, and only after checking the tail of the spectrum |
+| LoRA training starts by degrading the model | `B` initialised randomly instead of zero | `B = 0`, `A ~ N(0, σ²)` so the adapter contributes nothing at step 0 |
+| Precision loss in PCA on wide data | Eigendecomposition of `XᵀX` instead of SVD of `X` | Use SVD; the condition number is squared by forming the covariance |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="Concept questions (8)">
+1. Define an eigenvector without symbols. *(A direction the matrix does not turn — it comes out scaled but pointing the same way.)*
+2. What are the three geometric factors of SVD? *(Rotation, axis-aligned stretch, rotation.)*
+3. How many numbers does a rank-`k` approximation of `m × n` need? *(`k(m + n + 1)`.)*
+4. State the Eckart–Young error. *(`‖A − A_k‖_F = sqrt(Σ_{i>k} σᵢ²)` — the square root of the discarded energy, known before you compute the approximation.)*
+5. Why use SVD rather than eigendecomposition of the covariance for PCA? *(Forming `XᵀX` squares the condition number, halving the accurate digits.)*
+6. LoRA on a 4096 × 4096 matrix at r=16: how many parameters and what reduction? *(`16 × 8192 = 131,072`, a 128× reduction from 16,777,216.)*
+7. Why is LoRA's `B` initialised to zero? *(So `BA = 0` at step 0 and the model starts identical to the base model.)*
+8. When does the low-rank hypothesis fail? *(Tasks far from the pre-training distribution, continued pre-training, and cases where increasing `r` keeps improving the metric.)*
+</Accordion>
+<Accordion title="Coding challenge">
+Implement `power_iteration`, `deflate`, `top_k_eigen`, `pca_svd`, `low_rank` and `lora_params`.
+Hidden tests: power iteration matches `np.linalg.eigvalsh` to 1e-6 on 100 random symmetric matrices;
+the rank-`k` truncation error equals the Eckart–Young bound to 1e-8; explained variance ratios sum to
+1; image compression at rank 20 reproduces ≥ 98% energy on the sample image; and `lora_params(4096,
+4096, 16)` returns exactly 131,072.
+</Accordion>
+<Accordion title="Interview questions">
+- **Junior:** "What does PCA do?" *(Finds orthogonal directions of maximum variance in the centred data, via SVD, letting you keep the few that explain most of it. It is unsupervised.)*
+- **Mid:** "Your team wants PCA before a classifier. What do you check first?" *(Feature scaling; then whether PCA is being used as supervised feature selection, which it is not — measure the downstream metric with and without, because variance and signal are different things.)*
+- **Senior:** "Explain LoRA to someone who knows linear algebra but not deep learning." *(The fine-tuning update `ΔW` is hypothesised to be low rank, so factor it as `BA` with small inner dimension — the Eckart–Young truncation applied to the update rather than the weights. Give the numbers: 128× fewer parameters per projection, 0.065% of the model trainable, `B` zero-initialised, merges at inference for zero added latency.)*
+</Accordion>
+<Accordion title="Draw it from memory">
+Draw the circle-to-ellipse with eigenvector axes, the rotate-stretch-rotate chain, the scree plot with
+the elbow, and the LoRA picture with parameter counts. Then write `k(m+n+1)` and the Eckart–Young
+error formula. Five minutes.
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+
+- [NumPy 2.5 `numpy.linalg.svd`, `eigh`, `matrix_rank`; SciPy `scipy.sparse.linalg.svds`.](https://numpy.org/doc/stable/reference/generated/numpy.linalg.svd.html)
+  **Read this for:** the `full_matrices` flag's exact effect on shapes, and why `eigh` rather than
+  `eig` for symmetric matrices (it guarantees real eigenvalues and is faster).
+- [scikit-learn `decomposition.PCA` and `utils.extmath.randomized_svd`.](https://scikit-learn.org/stable/modules/generated/sklearn.decomposition.PCA.html) **Read this for:** the
+  documented reason PCA is implemented via SVD, the `svd_solver` options, and the `whiten` parameter's
+  precise definition.
+- [Hugging Face PEFT documentation, `LoraConfig`.](https://huggingface.co/docs/peft/) **Read this for:** `r`, `lora_alpha`,
+  `target_modules` and `merge_and_unload` — the parameters that implement exactly the arithmetic in
+  Layer 2.
+
+**Papers**
+
+- [C. Eckart and G. Young, "The approximation of one matrix by another of lower rank," *Psychometrika*
+  1(3), 1936.](https://doi.org/10.1007/BF02288367) **Takeaway:** truncating the SVD is provably the best rank-`k` approximation, with error
+  equal to the root of the discarded squared singular values — so the rank can be chosen from the
+  spectrum without a search.
+- [E. J. Hu et al., "LoRA: Low-Rank Adaptation of Large Language Models," ICLR 2022.](https://arxiv.org/abs/2106.09685) **Takeaway:**
+  the weight *update* during fine-tuning has low intrinsic rank, so a rank-`r` factorisation trains
+  orders of magnitude fewer parameters at equal quality and merges away at inference time.
+- [N. Halko, P. G. Martinsson and J. A. Tropp, "Finding Structure with Randomness: Probabilistic
+  Algorithms for Constructing Approximate Matrix Decompositions," *SIAM Review* 53(2), 2011.](https://doi.org/10.1137/090771806)
+  **Takeaway:** a random projection plus a couple of power iterations yields a near-optimal rank-`k`
+  factorisation in essentially one pass, which is what makes SVD feasible on data that does not fit
+  in memory.
+- [T. Dettmers, A. Pagnoni, A. Holtzman and L. Zettlemoyer, "QLoRA: Efficient Finetuning of Quantized
+  LLMs," NeurIPS 2023.](https://arxiv.org/abs/2305.14314) **Takeaway:** a 4-bit frozen base plus LoRA adapters brings 65 B-parameter
+  fine-tuning onto a single 48 GB GPU, which is the memory consequence of this module's parameter
+  arithmetic.
+
+**Go deeper**
+
+- [3Blue1Brown, *Essence of Linear Algebra*, episodes 13–14 (eigenvectors and eigenvalues, and the
+  change-of-basis view).](https://www.3blue1brown.com/topics/linear-algebra) **Why:** the animation of the transformation with the eigenvector directions
+  highlighted is the clearest available version of Layer 1's central picture.
+- [G. Strang, *Linear Algebra and Learning from Data* (2019), Part I.8–I.9 (SVD) and Part IV.](https://math.mit.edu/~gs/learningfromdata/)
+  **Why:** Strang treats SVD as the central object of the subject rather than an advanced topic, and
+  his development of low-rank approximation leads directly into the compression and adaptation
+  applications this module ends with.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p2/week-11/p2-w11-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

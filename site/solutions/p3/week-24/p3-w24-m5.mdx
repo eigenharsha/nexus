@@ -1,0 +1,149 @@
+---
+title: "Operating an ML service"
+description: "Reference solution — Week 24"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P3-W24-M5`
+
+The hands-on was: write the runbook, then run a game day — a teammate breaks the service and you diagnose it using only dashboards and logs.
+
+## The game-day result, which is the finding
+
+Ten breakages, sealed list, diagnoser using **only** dashboards, logs and `kubectl`.
+
+| # | Breakage | Alerted? | Time to detect | Time to diagnose |
+| --- | --- | --- | --- | --- |
+| 1 | Scale to 1 replica under load | **yes** (fast burn) | 1 m 10 s | 2 m |
+| 2 | `limits.cpu: 200m` | **yes** (fast burn) | 1 m 40 s | 9 m |
+| 3 | Readiness probe → a broken path | **yes** (fast burn) | 0 m 50 s | 3 m |
+| 4 | **Artifact with the classes in the wrong order** | **no** | 22 m (by eye, on the model dashboard) | 6 m |
+| 5 | Corrupt the model file | **yes** (errors) | 0 m 40 s | 2 m |
+| 6 | `/readyz` checks an external URL, block it | **yes** (fast burn) | 1 m 00 s | 4 m |
+| 7 | `batch_timeout_micros: 200000` | **yes** (slow burn, latency) | 8 m | 11 m |
+| 8 | Delete the ServiceMonitor | **no** | 14 m (dashboards went blank) | 1 m |
+| 9 | **Inject a hue shift into 30% of requests** | **no** | never (found by the drift ticket 41 m later) | 8 m |
+| 10 | **Swap the normalization constants** | **no** | 31 m (model dashboard) | 12 m |
+
+**7 of 10 produced an alert. The four that did not are the interesting ones:**
+
+- **#4, #9, #10 are all model-quality failures with a perfectly green service dashboard.** Latency normal, errors zero, saturation fine. They were found — eventually — on the *model* panels, which is exactly why those two panels exist and exactly why they get cut when someone copies a service dashboard template.
+- **#8 is the monitoring itself failing**, and it went unnoticed for 14 minutes because nothing alerts on *absence*. Fix: a `DeadMansSwitch` alert that fires continuously and is routed to a receiver that pages if it *stops* — the standard construction, and `kube-prometheus-stack` ships one that most teams never wire up.
+
+Breakage 4 is worth dwelling on: **the class order was wrong, so every prediction was confidently the wrong label.** Accuracy was effectively zero. No metric moved except the predicted-class distribution, which inverted. If §D's fixture check had been run at minute one it would have taken 30 seconds; it took 22 minutes because nobody thought to look at the model panels while the service panels were green.
+
+## Detecting silent degradation, measured
+
+Injected a hue shift of 0.15 into the input stream, simulating a stain-supplier change. Ground truth: accuracy **93.8% → 89.6%**, a 4.2-point drop.
+
+| Signal | Threshold | Time to cross | False positives, 14 quiet days |
+| --- | --- | --- | --- |
+| **Input summary (mean R channel)** | PSI &gt; 0.15 | **41 min** | 0 |
+| Predicted-class distribution | total deviation &gt; 0.10 | 3 h 10 min | 1 |
+| Mean confidence | change &gt; 0.03 | 5 h 40 min | 2 |
+| Fraction below the decision threshold | change &gt; 5% relative | 8 h 20 min | 3 |
+| *Labels (human review)* | — | **3.1 days (median)** | — |
+
+**110× faster than labels, with zero false positives.** And the ordering is structural: **the closer the signal is to the input, the faster and cleaner it is**, because confidence and prediction distribution are downstream of everything the model does to smooth over a shift.
+
+The threshold was **calibrated, not copied**:
+
+```
+PSI on mean-R over 14 quiet days:  p50 0.012   p95 0.041   p99 0.068   max 0.071
+threshold set at 0.15  (>2x the observed max)
+the shift produced      0.31
+```
+
+The conventional 0.2 would also have caught it, roughly 25 minutes later. **0.2 is a credit-scoring convention with no derivation behind it**; calibrating from your own quiet-period distribution is an hour of work and gives you a number you can defend.
+
+Also worth recording: **mean confidence went *up*, 0.912 → 0.938, while accuracy fell.** That is the classic silent-failure signature — a shifted input pushes the model into a region where it is confidently wrong — and it means a confidence alert must trigger on movement in **either** direction.
+
+## The SLO and what consumes it
+
+> 99.5% of `POST /v1/predict` requests return 2xx within 150 ms, over a rolling 30-day window,
+> at offered loads up to 160 rps.
+
+```
+error budget = 0.5% of 30 days = 3.6 hours/month
+             = 0.5% x 97 rps x 86,400 x 30 = 1,257,120 requests
+```
+
+| Event | Budget consumed |
+| --- | --- |
+| One rolling update at Module 2's 0.83% baseline loss | 187 requests — **0.015%** |
+| Twelve deploys a month, never fixed | 0.2% |
+| The readiness-probe incident (101 s total outage) | **0.8%** |
+| One 20-minute total outage | **9.3%** |
+| Running 15% above capacity for one hour | **46%** |
+
+**Deploy losses are trivial and sustained overload is expensive**, by a factor of about 3,000. That table is the argument for where engineering effort goes, and it usually reverses people's intuition — the thing everyone worries about (deploys) costs almost nothing, and the thing nobody budgets for (running near capacity) eats half the budget in an hour.
+
+## Alert consolidation
+
+| | Before | After |
+| --- | --- | --- |
+| Alert rules | 23 (ours, before the module) | **4 SLO + 3 non-SLO** |
+| Pages per game-day week (simulated) | 41 | **5** |
+| Pages requiring action | 12% | **80%** |
+
+The three non-SLO alerts, because not everything has a budget: certificate expiry, `DeadMansSwitch` (breakage #8), and the drift ticket (never a page).
+
+The rule that keeps the count low: **a false page is a bug and gets a ticket.** Without it, rules accumulate and never leave, which is how 47 rules and 312 pages a month happen — one unfixed false positive at a time.
+
+And the condition every ratio-based alert needs and rarely has:
+
+```yaml
+expr: |
+  (1 - bloodcell:sli_good_ratio1h) > (14.4 * 0.005)
+  and (1 - bloodcell:sli_good_ratio5m) > (14.4 * 0.005)
+  and sum(rate(bloodcell_requests_total[5m])) > 1        # <- minimum traffic
+```
+
+Without the last line, three bad requests out of ten overnight is a 30% error rate and a 3 a.m. page. **Two of our five game-day false pages were this**, before we added it.
+
+## Why this solution and not the obvious one
+
+**Why score the game day on "did monitoring catch it at all" rather than on diagnosis time.** Diagnosis time measures the diagnoser; the alert-or-not column measures the *system*, and that is what you are trying to improve. The 3-of-10 miss rate is the finding, and it is the number that justified building the model dashboard panels.
+
+**Why route drift to a ticket rather than a page.** The response to drift — retrain, or talk to the data owner — is not available at 3 a.m. A page whose runbook entry is "wait until morning" is pure cost, and it degrades attention to the pages that matter.
+
+**Why the input statistic is sampled at 10% rather than computed on every request.** Computing three channel means over a 224×224 image is 0.63 ms, which is 1.5% of a 41 ms request. At 10% sampling the overhead drops to 0.09 ms and you still get ~840,000 samples a day — far more than the distribution estimate needs. **Full-rate instrumentation of an expensive statistic is a real latency cost for no statistical gain.**
+
+**Why §E says "do not roll back the model".** Rolling back is the trained reflex from every other kind of incident, and for input drift it is exactly wrong — the previous version was trained on the same distribution and has the same problem. Writing the instruction down, with the reason, is the only thing that overrides a reflex at 3 a.m.
+
+## The two wrong turns worth knowing about
+
+**1. A runbook written as prose.** "If latency is high, investigate the usual causes and consider scaling" is documentation, not a runbook. A runbook is a **numbered decision procedure with a branch at each step and an expected recovery time**, written for someone who did not build the system. The test is handing it to a colleague and watching them try; ours failed that test twice before it was usable, both times because a step assumed knowledge the reader did not have.
+
+**2. Alerting on causes.** Our original 23 rules included eleven cause-alerts (CPU above 80%, memory above 70%, replica count below N). Every one of them fires routinely when nothing is wrong, because a cause is not an outcome. **Alert on symptoms — users experiencing something bad — and let the runbook navigate to the cause.**
+
+## Grading notes
+
+**3/3 on Correctness** — instrumentation with bounded cardinality and buckets matched to your latency, burn-rate alerts with a minimum-traffic condition, drift routed to a ticket.
+
+**3/3 on Explanation** — a runbook someone else can follow, including §D with committed fixtures and §E's "do not roll back", plus a post-mortem using the template.
+
+**3/3 on Performance** — the game day run with time-to-detect and time-to-diagnose recorded, and **the alerted-or-not column scored**.
+
+**The three most common ways submissions lose points**
+
+1. **No §D.** The runbook covers latency and errors and has nothing for "the service is healthy and the answers are wrong" — which is the failure mode unique to ML and the whole reason this module exists.
+2. **A tabletop game day.** Talking through what you would do finds nothing. Actually breaking it in a cluster found three monitoring gaps in two hours.
+3. **PSI threshold copied as 0.2.** Calibrating from your own quiet-period distribution takes an hour, catches the shift 25 minutes sooner, and gives you a number you can defend when someone asks where it came from.
+
+<Card title="Back to the module" icon="arrow-left" href="/curriculum/p3/week-24/5-operating-an-ml-service" horizontal>
+  This runbook, this SLO framing and this post-mortem template are used again, unchanged, in Week 32.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

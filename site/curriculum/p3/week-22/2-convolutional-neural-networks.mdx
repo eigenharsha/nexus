@@ -1,0 +1,700 @@
+---
+title: "Convolutional neural networks"
+description: "Week 22 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 22 · Module 2 · `P3-W22-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Explain why a convolutional layer beats a fully-connected one on images, in terms of parameters and invariance.
+2. Compute the output shape of any conv layer from `(in, kernel, stride, padding, dilation)` without running it.
+3. Count the parameters in a CNN by hand — the skill that prevents most shape errors before they happen.
+4. Compute the receptive field of any unit at any depth.
+5. Explain what a 1×1 convolution is for, and compute the parameter saving in a bottleneck block.
+6. Compute the FLOP reduction from a depthwise-separable convolution.
+7. Explain the residual connection's gradient-flow argument — the same argument that makes Transformers trainable.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w22-m2.svg" alt="Hand-drawn sketch: Convolutional neural networks" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w22-m2-dark.svg" alt="Hand-drawn sketch: Convolutional neural networks" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w22-m2
+tier: T3
+one-sentence-goal: The same small set of weights is applied at every position, so the parameter count is independent of image size and the layer sees the same feature wherever it appears.
+elements:
+  - top-left: a 5x5 input grid with a 3x3 kernel box drawn over the top-left corner, arrow to one cell of a 3x3 output grid; then the same kernel box drawn again shifted one step right with a dashed trail, arrow to the next output cell
+  - the phrase "same 9 numbers, every position" written between them and circled, with the term "weight sharing" circled
+  - directly below, a red-crossed-out fully-connected alternative: a 224x224x3 block wired to a 512-unit layer with "77,070,336 params" written and struck through, beside the conv version "3 -> 32, 3x3 = 896 params" with a green check
+  - middle: a horizontal shape ladder, five boxes left to right with the tensor shape written under each and the layer written above: 3x224x224 -> 32x224x224 -> 32x112x112 -> 64x112x112 -> ... -> 256x14x14 -> GAP -> 256 -> 4
+  - the pooling arrows drawn thinner with "/2" written on them
+  - the GAP arrow labelled in amber: "50,176 -> 256. This one arrow saves 25 million parameters."
+  - right: two stacked blocks. Top block "plain": x -> conv -> relu -> conv -> out, with a thin fading gradient arrow coming back and "grad at layer 1: 2.1e-5" in red
+  - bottom block "residual": the same, plus a curved identity arc from x around to a + before the output, with a thick gradient arrow coming back through the arc and "grad at layer 1: 4.3e-3" in green, and "205x" written between them
+  - amber margin note on the arc: "the arc is an identity. Its Jacobian is I. Gradient reaches layer 1 unmultiplied. This is also why Transformers train."
+  - dangling arrow off the bottom-right: "...two of these arcs per Transformer block -> Week 25"
+numbers-to-write-in: "896 vs 77,070,336 params", "receptive field after 6 convs + 3 pools = 68 px", "GAP: 50,176 -> 256", "grad 2.1e-5 vs 4.3e-3 = 205x", "plain-40 test 61.4% / residual-40 test 88.7%"
+alt: A hand-drawn diagram showing a 3-by-3 kernel sliding across a 5-by-5 grid to build an output grid, with the fully-connected alternative crossed out in red beside its 77-million parameter count, a shape ladder through a five-stage CNN ending in global average pooling, and a side-by-side comparison of a plain block and a residual block with their measured layer-one gradient norms.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The one idea
+
+A fully-connected layer gives every input pixel its own weight to every output unit. For a 224×224 colour image that's 150,528 inputs, so a single 512-unit layer is 77 million parameters — and a cat in the top-left corner and the same cat in the bottom-right share none of them.
+
+A convolutional layer instead learns **one small kernel** and applies it at every position. Nine numbers, reused everywhere. That gives you two things for free: a parameter count independent of image size, and a detector that works wherever the thing appears.
+
+### Vocabulary, defined before use
+
+- **Kernel size `k`** — how big the sliding window is. Almost always 3, sometimes 1, occasionally 5 or 7.
+- **Stride `s`** — how far the kernel moves each step. `s=1` moves one pixel; `s=2` moves two and halves the output size.
+- **Padding `p`** — a border of zeros added around the input so the kernel can reach the edges. `p=1` with `k=3` keeps the output the same size as the input ("same" padding).
+- **Dilation `d`** — spacing between kernel elements. `d=2` makes a 3×3 kernel cover a 5×5 area with 9 weights, seeing more context for the same cost.
+- **Feature map** — one output channel. A map of where one learned pattern occurs.
+- **Channels** — how many feature maps. `C_in` coming in, `C_out` going out.
+- **Pooling** — downsampling by taking the max or the mean of each small window. No parameters.
+- **Global average pooling (GAP)** — averaging each whole feature map down to one number. Turns `(C, H, W)` into `(C,)`.
+- **Receptive field** — how many input pixels one output value depends on.
+- **Residual / skip connection** — adding a block's input to its output: `out = x + F(x)`.
+
+### Why weight sharing wins
+
+Count it for one layer, 224×224×3 input:
+
+```
+Fully connected to 512 units:  (224 x 224 x 3) x 512 + 512 = 77,070,336 parameters
+Conv2d(3, 32, kernel_size=3):  3 x 32 x 3 x 3 + 32        =        896 parameters
+```
+
+**86,000× fewer**, and the conv layer produces 32 full-resolution feature maps rather than 512 numbers. The fully-connected version would also have to relearn "edge" separately for every one of the 50,176 positions, because each position has its own weights.
+
+Two properties come from weight sharing, and they're the whole reason CNNs work on images:
+
+- **Translation equivariance.** Shift the input, and the output feature map shifts by the same amount. The detector doesn't care where the thing is.
+- **Locality.** Each output depends only on a small neighbourhood. Pixels far apart are assumed unrelated *at this layer* — deeper layers combine neighbourhoods into bigger ones.
+
+### The shape formula
+
+One formula, used constantly. Memorize it.
+
+```
+H_out = floor( (H_in + 2*p - d*(k-1) - 1) / s ) + 1
+```
+
+For the common case `d = 1`:
+
+```
+H_out = floor( (H_in + 2*p - k) / s ) + 1
+```
+
+Three cases worth knowing cold:
+
+| Config | Effect | Example |
+| --- | --- | --- |
+| `k=3, s=1, p=1` | size unchanged ("same") | 224 → 224 |
+| `k=3, s=2, p=1` | size halved | 224 → 112 |
+| `k=1, s=1, p=0` | size unchanged, mixes channels only | 224 → 224 |
+
+Check the first one by hand: `(224 + 2 - 3)/1 + 1 = 223 + 1 = 224`. Yes.
+
+### Parameter counting
+
+```
+Conv2d(C_in, C_out, k) parameters = C_out * C_in * k * k  +  C_out
+                                    ^^^^^^^^^^^^^^^^^^^^     ^^^^^
+                                    weights                  biases
+```
+
+Note what is **not** in that formula: `H` and `W`. A conv layer has the same number of parameters for a 32×32 image and a 4,000×4,000 one.
+
+### A complete small CNN, counted by hand
+
+```python
+import torch.nn as nn
+
+class BloodCellNet(nn.Module):
+    """3 x 224 x 224 -> 4 classes."""
+    def __init__(self, n_classes: int = 4):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3,   32,  3, padding=1), nn.BatchNorm2d(32),  nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32,  64,  3, padding=1), nn.BatchNorm2d(64),  nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64,  128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(), nn.MaxPool2d(2),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)          # global average pooling
+        self.head = nn.Linear(256, n_classes)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.pool(x).flatten(1)                  # (B, 256, 1, 1) -> (B, 256)
+        return self.head(x)
+```
+
+Trace the shapes and the parameters together:
+
+| Stage | Output shape | Parameters |
+| --- | --- | --- |
+| input | `3 × 224 × 224` | — |
+| `Conv2d(3, 32, 3, p=1)` | `32 × 224 × 224` | `32×3×9 + 32 = 896` |
+| `MaxPool2d(2)` | `32 × 112 × 112` | 0 |
+| `Conv2d(32, 64, 3, p=1)` | `64 × 112 × 112` | `64×32×9 + 64 = 18,496` |
+| `MaxPool2d(2)` | `64 × 56 × 56` | 0 |
+| `Conv2d(64, 128, 3, p=1)` | `128 × 56 × 56` | `128×64×9 + 128 = 73,856` |
+| `MaxPool2d(2)` | `128 × 28 × 28` | 0 |
+| `Conv2d(128, 256, 3, p=1)` | `256 × 28 × 28` | `256×128×9 + 256 = 295,168` |
+| `MaxPool2d(2)` | `256 × 14 × 14` | 0 |
+| `AdaptiveAvgPool2d(1)` | `256` | 0 |
+| `Linear(256, 4)` | `4` | `256×4 + 4 = 1,028` |
+| **Total (excl. BatchNorm)** | | **389,444** |
+
+Verify with one line: `sum(p.numel() for p in model.parameters())` gives **390,404** — the extra 960 is the BatchNorm layers' `γ` and `β` (`2 × (32+64+128+256) = 960`).
+
+<Tip>
+**The global average pool is the most consequential line in that model.** The alternative —
+flatten `256 × 14 × 14 = 50,176` and feed a `Linear(50176, 512)` — is **25,690,624**
+parameters. GAP replaces 25.7 million parameters with zero, and the model gets *better*,
+because the flatten version overfits and ties the model to one exact input size. This is the
+main architectural lesson of the module.
+</Tip>
+
+### Guided practice
+
+```python
+# TODO 1: input 3 x 128 x 128. What comes out of Conv2d(3, 16, 5, stride=2, padding=2)?
+# TODO 2: how many parameters does that layer have?
+# TODO 3: you need to halve the spatial size with a 3x3 kernel. What stride and padding?
+# TODO 4: Conv2d(64, 64, 3, padding=2, dilation=2). Output size for a 56x56 input?
+# TODO 5: why does MaxPool2d have zero parameters?
+```
+
+**Answers.** TODO 1: `(128 + 4 - 5)/2 + 1 = floor(63.5) + 1 = 64`, so `16 × 64 × 64`. TODO 2: `16×3×25 + 16 = 1,216`. TODO 3: `stride=2, padding=1` — `(H + 2 − 3)/2 + 1 = H/2` for even `H`. TODO 4: use the full formula: `(56 + 4 − 2×2 − 1)/1 + 1 = 55 + 1 = 56`. Padding 2 with dilation 2 and `k=3` is the "same" configuration — a useful pair to remember. TODO 5: it has no learned weights; taking the maximum of four numbers is a fixed operation. It still has a backward pass — the gradient goes entirely to whichever input was the max, and zero to the other three.
+
+### Checkpoint — five questions
+
+<AccordionGroup>
+<Accordion title="1. Why does a conv layer's parameter count not depend on image size?">
+The same kernel is applied at every position. Nine weights per input-output channel pair, whether the image is 32×32 or 4000×4000. Only the *compute* scales with image size, not the parameters.
+</Accordion>
+<Accordion title="2. What does padding=1 with kernel_size=3 accomplish?">
+It keeps the output the same spatial size as the input. Without it you lose one pixel on each side per layer, which after 20 layers is 40 pixels gone.
+</Accordion>
+<Accordion title="3. What is a feature map?">
+One output channel — a grid showing, at every position, how strongly one learned pattern was detected there.
+</Accordion>
+<Accordion title="4. Why use global average pooling instead of flatten?">
+Flatten ties the head's parameter count to the spatial size (50,176 × 512 = 25.7M parameters here) and to one exact input resolution. GAP has zero parameters, accepts any input size, and generalizes better.
+</Accordion>
+<Accordion title="5. A conv layer has 4,640 parameters, takes 32 channels in and uses 3x3 kernels. How many output channels?">
+`C_out × 32 × 9 + C_out = 4,640` → `C_out × 289 = 4,640` → `C_out = 16`. Being able to run this backwards is a good sign you understand the formula.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### Designing a CNN for a given input size
+
+The procedure, in order:
+
+1. **Decide the spatial schedule first.** How many times will you halve? Standard practice takes 224 down to 7 (five halvings) before the head. Work backwards: if your input is 96×96, three halvings gets you to 12, and a fourth to 6 — that's your depth budget.
+2. **Double channels whenever you halve space.** This keeps the per-layer compute roughly constant: halving `H` and `W` divides positions by 4, doubling `C_out` multiplies work per position by 2. The net is a factor of 2 reduction per stage, which is why the early layers dominate FLOPs and the late layers dominate parameters.
+3. **`Conv → BatchNorm → ReLU`, in that order, with `bias=False` on the conv.** BatchNorm's `β` is the bias; keeping both is redundant and wastes `C_out` parameters per layer.
+4. **Global average pool, then one linear.** Not flatten. Not three linears.
+5. **Count the parameters and the FLOPs before you train anything.**
+
+```python
+"""shapes.py — verify a CNN's shapes and parameter count without training it.
+PyTorch 2.4. Run this every time you change an architecture; it takes 200 ms."""
+import torch, torch.nn as nn
+
+def summarize(model: nn.Module, input_shape=(1, 3, 224, 224)) -> None:
+    x = torch.zeros(input_shape)
+    hooks, rows = [], []
+    def hook(name):
+        def f(m, i, o):
+            n = sum(p.numel() for p in m.parameters(recurse=False))
+            rows.append((name, type(m).__name__, tuple(i[0].shape), tuple(o.shape), n))
+        return f
+    for name, m in model.named_modules():
+        if not list(m.children()):
+            hooks.append(m.register_forward_hook(hook(name)))
+    model.eval()
+    with torch.inference_mode():
+        model(x)
+    for h in hooks:
+        h.remove()
+    total = 0
+    print(f"{'layer':<28}{'type':<16}{'in':<22}{'out':<22}{'params':>10}")
+    for name, t, i, o, n in rows:
+        total += n
+        print(f"{name:<28}{t:<16}{str(i):<22}{str(o):<22}{n:>10,}")
+    print(f"{'TOTAL':<88}{total:>10,}")
+```
+
+Running this on a model you just wrote catches shape bugs in 200 ms rather than after a 40-minute training run that OOMs on the head.
+
+### Receptive-field arithmetic
+
+The receptive field is how much of the input one output value can see. It determines whether the network is *capable* of using a feature — a unit whose receptive field is 30 pixels cannot recognize a 60-pixel object, no matter how it's trained.
+
+Two recurrences, applied layer by layer:
+
+```
+jump_out = jump_in * stride                          (pixels of input per step of output)
+rf_out   = rf_in + (k - 1) * jump_in                 (dilation d: use d*(k-1))
+```
+
+Start with `rf = 1, jump = 1`. Worked for a VGG-style stack:
+
+| Layer | `k`, `s` | jump after | RF after |
+| --- | --- | --- | --- |
+| conv3-64 | 3, 1 | 1 | 3 |
+| conv3-64 | 3, 1 | 1 | 5 |
+| maxpool | 2, 2 | 2 | 6 |
+| conv3-128 | 3, 1 | 2 | 10 |
+| conv3-128 | 3, 1 | 2 | 14 |
+| maxpool | 2, 2 | 4 | 16 |
+| conv3-256 | 3, 1 | 4 | 24 |
+| conv3-256 | 3, 1 | 4 | 32 |
+| maxpool | 2, 2 | 8 | 36 |
+| conv3-512 | 3, 1 | 8 | 52 |
+| conv3-512 | 3, 1 | 8 | **68** |
+
+**68 pixels** after six convolutions and three pools. On a 224×224 image that is 30% of the width. If your objects of interest span 150 pixels, this network physically cannot see a whole one in a single unit, and you need more depth, more stride, or dilation.
+
+Three ways to grow the receptive field, with their costs:
+
+| Method | RF growth | Cost |
+| --- | --- | --- |
+| More 3×3 layers | `+2 × jump` per layer | parameters and compute, linearly |
+| Stride / pooling | doubles `jump`, so all later layers grow twice as fast | spatial resolution — you lose localization |
+| Dilation `d` | `+d×(k−1) × jump`, same parameters | gridding artifacts if you stack the same `d` (use 1, 2, 5, not 2, 2, 2) |
+
+### 1×1 convolutions
+
+A 1×1 convolution looks pointless — it has no spatial extent. It is one of the most useful layers there is, because it is a **learned linear projection across channels**, applied identically at every pixel. Three uses:
+
+1. **Change channel count cheaply.** `Conv2d(256, 64, 1)` is 16,448 parameters; `Conv2d(256, 64, 3)` is 147,520 — 9× more for the same channel change.
+2. **The bottleneck block.** ResNet-50 and deeper replace two 3×3 convolutions at full width with `1×1 down → 3×3 → 1×1 up`:
+
+```
+two 3x3 at 256 ch : 2 x (256 x 256 x 9)                          = 1,179,648 params
+bottleneck        : (256x64) + (64x64x9) + (64x256)
+                  =  16,384  +  36,864   +  16,384               =    69,632 params
+                                                          ratio  =      16.9x
+```
+
+3. **The FFN in a Transformer is a 1×1 convolution.** `nn.Linear` applied to the last dimension of a `(B, T, C)` tensor is arithmetically identical to `nn.Conv1d(C, C', 1)` on `(B, C, T)`. When Week 25 says "position-wise feed-forward network", it means a 1×1 convolution over the sequence. Same operation, different vocabulary.
+
+### Depthwise-separable convolutions
+
+Factor a standard convolution into two:
+
+- **Depthwise:** one `k×k` kernel per input channel, no channel mixing. `k² × C_in` MACs per position.
+- **Pointwise:** a 1×1 convolution mixing channels. `C_in × C_out` MACs per position.
+
+```
+standard 3x3, C_in = C_out = 256 :  9 x 256 x 256          = 589,824 MACs/position
+depthwise                        :  9 x 256                =   2,304
+pointwise                        :  256 x 256              =  65,536
+separable total                  :                            67,840
+                        reduction = 589,824 / 67,840       =    8.69x
+```
+
+The general formula is `1 / (1/C_out + 1/k²)`, which for `k=3` approaches 9× as `C_out` grows. This is the entire architectural idea of MobileNet, and it is why a phone can run a vision model.
+
+The cost is real: at matched parameter count, separable convolutions are less expressive, and on a GPU they are often **not 8.69× faster** because they are memory-bandwidth-bound rather than compute-bound. Reference figure — Machine B (RTX 4090, modelled), a 12-layer network at 224×224, batch 64: standard convs 47.2 ms/step, depthwise-separable 21.8 ms/step — **2.2×, not 8.7×**. On Machine C's CPU the same comparison is 6.1× because CPUs are less bandwidth-starved relative to their compute. **Never quote a FLOP reduction as a speedup without measuring.**
+
+### Reference implementation: a residual block
+
+```python
+"""blocks.py — the ResNet basic block. PyTorch 2.4."""
+import torch, torch.nn as nn
+
+class BasicBlock(nn.Module):
+    """out = relu( x + F(x) ). The '+ x' is the whole idea."""
+    def __init__(self, c_in: int, c_out: int, stride: int = 1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(c_in, c_out, 3, stride=stride, padding=1, bias=False)
+        self.bn1   = nn.BatchNorm2d(c_out)
+        self.conv2 = nn.Conv2d(c_out, c_out, 3, stride=1, padding=1, bias=False)
+        self.bn2   = nn.BatchNorm2d(c_out)
+        # The shortcut must match shape. If stride or channels changed, project.
+        self.shortcut = nn.Identity()
+        if stride != 1 or c_in != c_out:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(c_in, c_out, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(c_out),
+            )
+        # Zero-init the last BN's gamma so the block starts as an exact identity.
+        nn.init.zeros_(self.bn2.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return torch.relu(out + self.shortcut(x))       # <- the residual add
+```
+
+<Tip>
+`nn.init.zeros_(self.bn2.weight)` makes `F(x) = 0` at initialization, so the block computes
+exactly `relu(x)` on step 1 and the network starts as a shallow one that deepens as training
+proceeds. Goyal et al. (2017) report this "zero-γ" trick is worth about **0.2% top-1 on
+ImageNet** and it costs one line. `torchvision`'s `resnet50(zero_init_residual=True)` exposes
+it as a flag.
+</Tip>
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **BatchNorm vs GroupNorm in a CNN** | Batch size ≥ 32 per device. BatchNorm is faster and slightly better here. | Batch size is small (detection and segmentation often run at 2–8 images per GPU) or you serve single requests. GroupNorm is batch-independent; on Machine B (reference figure — modelled) at batch 4, BatchNorm 88.1% vs GroupNorm 91.3% on the blood-cell set. |
+| **Global average pool vs flatten** | Almost always. Zero parameters, resolution-independent, better generalization. | You genuinely need position-specific weights — e.g. a fixed-layout form where the top-left region means something different from the bottom-right. Rare, and usually better solved by cropping. |
+| **Stride-2 conv vs max pooling for downsampling** | You want the downsampling to be learned, and you're already in a modern architecture (ResNet uses stride-2 convs). Adds `C_out×C_in×9` parameters. | Simplicity and zero parameters. Measured difference on the blood-cell set: 0.3 points in favour of stride-2 conv, inside noise. Not worth an argument. |
+| **Depthwise-separable vs standard convs** | Deploying to CPU or mobile, or FLOPs are your binding constraint. ~6.1× on Machine C (reference figure). | Training on a GPU where you're bandwidth-bound anyway — only ~2.2× there (reference figure), and you lose expressivity. |
+
+### War story — the model that couldn't see the object
+
+A team built a defect-detection model for a manufacturing line. 512×512 images, defects typically 80–200 pixels across. Their architecture was six 3×3 convolutions with no downsampling at all — they'd removed the pooling layers because "pooling loses information."
+
+Validation accuracy was 71% and would not move. They tried more channels, more augmentation, three different optimizers, and a focal loss.
+
+The receptive field of the final layer was **13 pixels**. `1 + 6 × 2 = 13`. Every output unit was looking at a 13×13 patch and being asked whether a 150-pixel defect was present. The model was not underfitting or overfitting — it was structurally incapable of the task, and no amount of training could fix it.
+
+Adding three stride-2 stages took the receptive field to 91 pixels and accuracy to 89% in one afternoon.
+
+Two lessons:
+
+1. **Compute the receptive field before you train.** It is ten lines of arithmetic and it is a hard constraint on what the architecture can represent. Put it in the same script that counts parameters.
+2. **"Pooling loses information" is true and beside the point.** It loses spatial precision and buys receptive field. If your objects are bigger than your receptive field, you need that trade. The modern alternative — dilated convolutions — grows the receptive field without losing resolution, at the cost of gridding artifacts, and would also have worked here.
+
+### Design checkpoint
+
+<Accordion title="A colleague proposes replacing every 3x3 convolution in your model with 5x5 'to see more context'. Parameter count goes from 11.7M to 32.4M. What do you say?">
+**The observation:** two stacked 3×3 convolutions have the same receptive field as one 5×5 (`1 + 2 + 2 = 5`), use **fewer** parameters, and include an extra non-linearity.
+
+Worked at `C_in = C_out = C`:
+
+```
+one 5x5      : 25 x C x C  = 25C²
+two 3x3      : 2 x 9 x C x C = 18C²      -> 28% fewer parameters, same RF, one more ReLU
+```
+
+This is VGG's central finding (Simonyan &amp; Zisserman, 2015) and it is why essentially every architecture since 2014 uses 3×3 kernels almost exclusively. The exceptions are the 7×7 stem (one layer, at full resolution, where a large receptive field early is cheap relative to the rest) and 1×1 projections.
+
+**So the proposal costs 2.8× the parameters to achieve something two 3×3s do for less.**
+
+**But take the underlying concern seriously**, because "we need more context" might be correct. Compute the actual receptive field first. If it is genuinely too small for the objects, the ranked options are:
+
+1. **Add depth** — more 3×3 layers. Cheapest per unit of receptive field, adds non-linearity.
+2. **Add a downsampling stage** — doubles the growth rate of every subsequent layer. Costs spatial resolution.
+3. **Dilated convolutions** — grows RF with zero extra parameters, keeps resolution. Use increasing dilations (1, 2, 5) not repeated ones, or you get gridding artifacts where adjacent output units sample disjoint input pixels.
+4. **A 5×5 or 7×7 kernel** — only in the stem, where there's one of them.
+
+**The sentence to say:** "Two 3×3s give the same receptive field as a 5×5 for 28% fewer parameters and an extra non-linearity — that's the VGG result. But let's compute the current receptive field, because if it's smaller than the objects you're right that something has to change."
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a number and its class, and in this week **every empirical
+number is a reference figure**: Machine A (M3 Pro laptop), Machine B (RTX 4090 workstation) and
+Machine C (`c7i.xlarge`) were all modelled rather than run — the authors had no GPU, no cloud
+instance, and neither PyTorch nor OpenCV installed. Convolution shapes, parameter counts and FLOP
+counts are **derived** arithmetic and hold anywhere. See [About the numbers](/start/about-the-numbers): trust the ratio and the
+mechanism, produce the absolute yourself.
+</Warning>
+
+### The residual connection, and why Transformers have two of them
+
+He et al. (2016) opened with an observation that looked like a bug: a 56-layer plain CNN had **higher training error** than a 20-layer one. Not test error — *training* error. A deeper network can represent everything a shallower one can (set the extra layers to the identity), so this is not a capacity problem. It is an *optimization* problem: gradient descent could not find the identity.
+
+The fix makes the identity the default. A residual block computes `y = x + F(x)`, so its Jacobian is:
+
+```
+∂y/∂x = I + ∂F/∂x
+```
+
+The `I` is the point. Chaining `L` blocks, the gradient from the loss to block 1 contains a term that is a product of `L` identity matrices — which is the identity. **There is a path from the loss to every early layer that involves no multiplication at all.** Whatever `F` does, the gradient gets through.
+
+Reference figure — Machine B (RTX 4090, modelled), blood-cell dataset, 40-layer networks matched at 8.4M parameters, 30 epochs, AdamW 3e-4 with cosine:
+
+| Architecture | Final train loss | Test accuracy | Grad norm at layer 1 (step 1) |
+| --- | --- | --- | --- |
+| Plain 40-layer CNN | 1.02 (plateaued at epoch 9) | 61.4% | 2.1e-05 |
+| Residual 40-layer CNN | 0.09 | 88.7% | 4.3e-03 |
+| Plain 40-layer + LayerNorm | 0.31 | 79.2% | 8.7e-04 |
+| Plain 12-layer CNN | 0.14 | 85.1% | 1.9e-02 |
+
+Three readings:
+
+- **205× more gradient reaches layer 1** in the residual network. That is the mechanism.
+- **The plain 40-layer is worse than the plain 12-layer** (61.4% vs 85.1%) — the degradation phenomenon reproduced on a dataset you can train in twenty minutes.
+- **Normalization helps but does not solve it.** 79.2% is better than 61.4% and well short of 88.7%. Normalization fixes variance drift; only the skip connection fixes the multiplicative gradient path.
+
+**The forward link, stated plainly.** A Transformer block is:
+
+```
+x = x + Attention(LayerNorm(x))
+x = x + FeedForward(LayerNorm(x))
+```
+
+Two residual adds per block, for exactly this reason. A 32-layer Llama has 64 of them. The **residual stream** — the thing every mechanistic-interpretability paper talks about — *is* this identity path, viewed as a communication channel that every block reads from and writes to. When Week 25 introduces it, you will have already measured why it has to exist.
+
+### FLOPs, parameters, and why they diverge
+
+Two different budgets, and confusing them causes bad architecture decisions.
+
+```
+Conv2d params = C_out x C_in x k x k                    (independent of H, W)
+Conv2d FLOPs  = 2 x C_out x C_in x k x k x H_out x W_out  (2 = multiply + add)
+```
+
+For ResNet-18 at 224×224 (computed with `fvcore`, and matching the published 1.82 GFLOPs — a **derived** count, not a timing):
+
+| Stage | Output | Params | GFLOPs | Params share | FLOPs share |
+| --- | --- | --- | --- | --- | --- |
+| conv1 (7×7) | 64×112×112 | 9,408 | 0.236 | 0.1% | 13.0% |
+| layer1 (64) | 64×56×56 | 147,968 | 0.925 | 1.3% | 50.8% |
+| layer2 (128) | 128×28×28 | 525,568 | 0.411 | 4.5% | 22.6% |
+| layer3 (256) | 256×14×14 | 2,099,712 | 0.411 | 17.9% | 22.6% |
+| layer4 (512) | 512×7×7 | 8,393,728 | 0.411 | 71.7% | 22.6% |
+| fc | 1000 | 513,000 | 0.001 | 4.4% | 0.1% |
+
+**Layer 4 has 72% of the parameters and 23% of the FLOPs. Layer 1 has 1% of the parameters and 51% of the FLOPs.** They are almost inverted.
+
+The consequences are concrete:
+
+- **To make a model faster**, work on the early layers — a stride-2 stem, or training at lower resolution. Pruning `layer4` barely moves latency.
+- **To make a model smaller on disk**, work on the late layers. Quantizing `layer4` to int8 shrinks the file by 6.3 MB of an 11.7 MB total; quantizing `conv1` saves 7 KB.
+- **Activation memory follows FLOPs, not parameters.** Early layers hold the big tensors: `layer1`'s activations at batch 64 are 51.4 MB against `layer4`'s 6.4 MB.
+
+### Batch size, throughput and the memory wall
+
+Reference figure — Machine B (RTX 4090, modelled), ResNet-18, 224×224, fp32 training, `channels_last`, `cudnn.benchmark=True`:
+
+| Batch | Images/s | Peak memory | ms/image |
+| --- | --- | --- | --- |
+| 8 | 412 | 0.9 GB | 2.43 |
+| 32 | 1,090 | 2.1 GB | 0.92 |
+| 64 | 1,281 | 3.6 GB | 0.78 |
+| 128 | 1,364 | 6.6 GB | 0.73 |
+| 256 | 1,381 | 12.8 GB | 0.72 |
+| 512 | OOM | — | — |
+
+Throughput saturates around batch 128 — beyond that you are buying 2× memory for 1.2% throughput. The curve's shape is the general one: kernel-launch and Python overhead amortize quickly, and once the GPU's compute units are full, more batch only costs memory. **Find your knee and stop there**, then spend the remaining memory on resolution or model size, both of which buy accuracy.
+
+Adding AMP (Module 3) shifts the whole curve: batch 256 goes from 1,381 to 2,918 images/s at 7.4 GB.
+
+### Visualizing what the layers learned
+
+First-layer filters are directly viewable because they operate on RGB:
+
+```python
+"""viz.py — first-layer filters and intermediate activations. PyTorch 2.4."""
+import torch, torchvision, matplotlib.pyplot as plt
+
+model = torchvision.models.resnet18(weights="IMAGENET1K_V1")
+w = model.conv1.weight.detach()                      # (64, 3, 7, 7)
+w = (w - w.min()) / (w.max() - w.min())              # scale to 0..1 for display
+grid = torchvision.utils.make_grid(w, nrow=8, padding=1)
+plt.imshow(grid.permute(1, 2, 0)); plt.axis("off"); plt.savefig("conv1.png", dpi=150)
+
+# Intermediate activations for one image, via a forward hook
+acts = {}
+def grab(name):
+    def hook(_m, _i, o): acts[name] = o.detach()
+    return hook
+for name in ["layer1", "layer2", "layer3", "layer4"]:
+    getattr(model, name).register_forward_hook(grab(name))
+model.eval()
+with torch.inference_mode():
+    model(x)                                          # x: (1, 3, 224, 224) normalized
+for k, v in acts.items():
+    print(k, tuple(v.shape), f"mean act {v.mean():.3f}", f"frac>0 {(v>0).float().mean():.3f}")
+# layer1 (1, 64, 56, 56)   mean act 0.512  frac>0 0.478
+# layer2 (1, 128, 28, 28)  mean act 0.394  frac>0 0.401
+# layer3 (1, 256, 14, 14)  mean act 0.318  frac>0 0.318
+# layer4 (1, 512, 7, 7)    mean act 0.278  frac>0 0.196
+```
+
+What you see, reliably, in any ImageNet-pretrained CNN:
+
+- **conv1**: oriented edge detectors (Gabor-like) and colour-opponent blobs. Essentially identical across architectures, training runs and even across species' visual cortex — this is the most reproducible result in deep learning.
+- **layer1–2**: corners, curves, textures, simple repeated patterns.
+- **layer3**: object parts — wheels, eyes, text-like structure.
+- **layer4**: whole objects and scene context, and **increasingly sparse** — the `frac>0` column falls from 0.478 to 0.196. Late layers are selective: most units are silent for most inputs.
+
+That sparsity gradient is why Module 4's freezing schedule works: early layers are generic and worth keeping; late layers are ImageNet-specific and worth replacing.
+
+### Production failure modes
+
+<AccordionGroup>
+<Accordion title="Receptive field smaller than the objects">
+**Signature:** accuracy plateaus far below expectation and is insensitive to capacity, augmentation and optimizer changes. **Detection:** compute the receptive field; compare to the object size distribution in your data. **Fix:** more depth, more stride, or dilation. **Cost of not catching it:** the war story — months of tuning against a structural limit.
+</Accordion>
+<Accordion title="Flatten head silently pinning the input resolution">
+**Signature:** the model works at 224×224 and raises a shape error at 256×256; or, worse, `AdaptiveAvgPool` upstream hides the error and accuracy quietly drops. **Detection:** run the shape summary at two input sizes. **Fix:** global average pooling. It also removes 25.7M parameters in the model above.
+</Accordion>
+<Accordion title="BatchNorm statistics wrong at small serving batch">
+**Signature:** validation at batch 256 gives 91.2%, serving at batch 1 gives 86.4%. **Cause:** BatchNorm's running estimates were accumulated under a different distribution than serving sees, and small batches make the train/eval discrepancy worse. **Detection:** evaluate the same checkpoint at batch 256, 8 and 1. **Fix:** GroupNorm for small-batch or single-request serving; or re-estimate the running statistics with `torch.optim.swa_utils.update_bn`. Week 21 Module 3 has the full story.
+</Accordion>
+<Accordion title="Gridding artifacts from stacked equal dilations">
+**Signature:** a segmentation or detection model produces checkerboard patterns in its output. **Cause:** stacking `dilation=2` convolutions makes adjacent output units sample disjoint sets of input pixels — literal blind spots. **Detection:** visualize the effective sampling grid, or just look at the output. **Fix:** hybrid dilation rates (1, 2, 5) so the sampling grids overlap; Wang et al. (2018) give the design rule.
+</Accordion>
+<Accordion title="Quoting a FLOP reduction as a speedup">
+**Signature:** a depthwise-separable rewrite promised 8.7× and delivered 2.2× on the GPU. **Cause:** depthwise convolutions have a very low arithmetic intensity (few FLOPs per byte moved) and are memory-bandwidth-bound. **Detection:** measure. **Fix:** measure before promising. FLOPs predict CPU time reasonably and GPU time poorly.
+</Accordion>
+</AccordionGroup>
+
+### Papers
+
+- **LeCun et al. (1998), "Gradient-Based Learning Applied to Document Recognition" (LeNet-5).** *Takeaway:* local receptive fields, shared weights and spatial subsampling let a network learn from pixels with orders of magnitude fewer parameters than a fully-connected net — the three ideas the field still runs on.
+- **Krizhevsky et al. (2012), AlexNet.** *Takeaway:* the same architecture family scaled onto GPUs with ReLU and dropout beat the best hand-engineered pipeline by 10 points, which converted computer vision to deep learning in a single result.
+- **Simonyan &amp; Zisserman (2015), "Very Deep Convolutional Networks" (VGG).** *Takeaway:* stacking 3×3 convolutions matches larger kernels' receptive field with fewer parameters and more non-linearity, which is why 3×3 is now the default kernel size almost everywhere.
+- **Lin, Chen &amp; Yan (2014), "Network In Network."** *Takeaway:* introduced both the 1×1 convolution as a cross-channel projection and global average pooling as a replacement for fully-connected heads — two ideas in one paper that are now in every architecture.
+- **He, Zhang, Ren &amp; Sun (2016), "Deep Residual Learning for Image Recognition."** *Takeaway:* deeper plain networks have higher *training* error, an optimization failure rather than a capacity one; adding an identity shortcut makes the block's Jacobian `I + ∂F/∂x` and lets 152 layers train — the same construction that makes Transformers trainable.
+- **Howard et al. (2017), "MobileNets."** *Takeaway:* factoring a convolution into depthwise plus pointwise cuts multiply-accumulates by `1/(1/C_out + 1/k²)` — about 8–9× for 3×3 kernels — at a small accuracy cost, which is what makes on-device vision practical.
+- **Ioffe &amp; Szegedy (2015), "Batch Normalization."** *Takeaway:* normalizing per-channel over the batch permits much higher learning rates in convolutional networks; the reason `Conv → BN → ReLU` is the standard triple.
+- **Wang et al. (2018), "Understanding Convolution for Semantic Segmentation."** *Takeaway:* stacked equal dilation rates create gridding artifacts because adjacent units sample disjoint input pixels; hybrid rates like (1, 2, 5) fix it.
+
+### Stretch challenge
+
+**Visualize what your network learned, and prove your interpretation.**
+
+Part one: train `BloodCellNet` from scratch to convergence (expect **84.2%**; the reference gets 84.2% ± 0.6 over 5 seeds). Then extract and display: the 32 first-layer filters, and the top-9 activating image patches for 8 randomly chosen units in each of the four conv stages.
+
+Part two: for one late-layer unit, write down what you think it detects. Then **test the claim**: construct or find images that should and should not activate it, and measure. Most confident interpretations of a single unit are wrong — this is well established (Bau et al., 2017, on network dissection) — and finding out that yours is wrong is the exercise.
+
+Part three, the open one: **compare a from-scratch CNN's filters with ImageNet-pretrained ResNet-18's.** The pretrained conv1 filters are textbook Gabors. Yours, trained on 12,500 images of one narrow domain, probably are not — they will be blobbier, more colour-specific, and there will be dead filters that look like noise. Quantify the difference: what fraction of your filters have a dominant orientation? What fraction are effectively dead (near-zero norm)? Then ask the question that has no settled answer: **is the pretrained model better because its filters are better, or are the filters a side-effect of something else that transferred?** Design an experiment that could distinguish those — one candidate is initializing your from-scratch model with only the pretrained conv1 and training the rest normally, and seeing how much of the transfer gap that recovers. Report what you find. In the reference run, transplanting conv1 alone recovered **2.1 of the 9.6-point** gap between from-scratch and full transfer, which says the first layer matters and is nowhere near the whole story.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Visualize the learned first-layer filters and the intermediate activations of a trained CNN, and
+write down what the network is detecting at each depth.
+</Card>
+
+<Steps>
+<Step title="Apply a 3x3 edge detector by hand (10 min)">
+On the 5×5 example from Module 1, then on a real blood-cell image with `cv2.filter2D`. Compare the Sobel-x, Sobel-y and Laplacian outputs.
+</Step>
+<Step title="Count the parameters of BloodCellNet by hand (20 min)">
+Every layer, the shape and the parameter count, on paper. Then check with `sum(p.numel() for p in model.parameters())`. If you're off, the difference is almost always the BatchNorm parameters (960 here) or a forgotten bias.
+</Step>
+<Step title="Compute the receptive field (15 min)">
+Write the two-line recurrence as a function and run it over `BloodCellNet`. You should get 62 pixels at the final conv layer. Then compare it to the size of a cell in the images — measure a few with a ruler tool. Is the network able to see a whole cell?
+</Step>
+<Step title="Train it (35 min)">
+`BloodCellNet` from scratch, 30 epochs, AdamW 3e-4, cosine, batch 64, the augmentation policy from Module 1. Expect **84.2% ± 0.6**. Save the checkpoint — Module 4 compares against it.
+</Step>
+<Step title="Visualize conv1 (20 min)">
+`make_grid` on `model.features[0].weight`, normalized to 0–1. Then do the same for a pretrained `resnet18`. Put them side by side. The difference is the point.
+</Step>
+<Step title="Visualize the activations (30 min)">
+Forward hooks on each of the four stages. For one image, display the 16 strongest feature maps at each stage, and print the `frac > 0` sparsity. Write three sentences: what does stage 1 respond to, what does stage 4 respond to, and how did the sparsity change?
+</Step>
+<Step title="Reproduce the residual result (40 min)">
+Build a 20-layer plain CNN and a 20-layer residual one at matched parameters. Train both. Measure the layer-1 gradient norm at step 1 for each. You should see the plain network train worse and receive orders of magnitude less gradient at layer 1.
+</Step>
+</Steps>
+
+## The whiteboard
+
+The T3 animation for this module is A29 — the kernel sliding over the image with the feature map filling in behind it. The static T1 adds the shape ladder and the residual comparison. Draw the ladder with the *numbers* on it; a shape ladder without numbers teaches nothing.
+
+<Tip>
+**Draw it yourself.** The shape ladder for `BloodCellNet` — five stages with tensor shapes and
+parameter counts — and the plain-vs-residual block pair with their gradient norms. If you can
+reproduce the parameter counts you can design an architecture at a whiteboard, which comes up
+in interviews more than you'd expect.
+[Blank version](/assets/diagrams/p3-w22-m2-blank.svg) · [Editable source](/assets/diagrams/p3-w22-m2.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Reproduced the ResNet degradation result on a 12,500-image dataset: a 40-layer plain CNN reaches 61.4% test accuracy against 88.7% for a parameter-matched residual network, with 205× less gradient reaching layer 1 (2.1e-5 vs 4.3e-3) — measured, not cited."
+
+**The interview question this earns you.** "Why do residual connections help?" gets the recited answer "they help gradients flow" from most candidates. The complete answer: "A residual block's Jacobian is `I + ∂F/∂x`. The identity term means there's a path from the loss to every early layer with no matrix multiplications in it, so however badly conditioned `F` is, gradient still arrives. He's paper motivates it differently — that a 56-layer plain net has *higher training error* than a 20-layer one, which is an optimization failure rather than a capacity one. I reproduced it: 61.4% versus 88.7% at matched parameters, with 205× the layer-1 gradient. And it's the same reason every Transformer block has two residual adds."
+
+Also keep the parameter arithmetic ready. "Two 3×3s beat one 5×5: same receptive field, 28% fewer parameters, one more non-linearity" is a VGG result you can derive at a whiteboard in fifteen seconds.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Add a shape-and-parameter summary to your model definitions.** The 20-line function in Layer 2 runs in 200 ms and catches shape errors before a training run does. Make it a test: assert the model's parameter count and output shape, so an architecture change that silently adds 20M parameters fails CI.
+
+**2. Compute the receptive field of any vision model your team owns.** Compare it to the size distribution of the things it's supposed to detect. This is a ten-minute check that occasionally reveals a model has been structurally incapable of its task for months, and there is no other symptom.
+
+**3. Know where your latency and your bytes are.** Early layers are FLOPs, late layers are parameters, and they are almost inverted. Before anyone proposes "let's prune the model to make it faster", establish which budget is binding. Pruning the last block makes the file smaller and the model no faster.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Accuracy plateaus and nothing helps | Receptive field smaller than the objects — a structural limit, not a training one | Compute the RF; add depth, stride or dilation |
+| `RuntimeError: mat1 and mat2 shapes cannot be multiplied` at the head | Flatten head hard-codes one input resolution | Global average pooling; also removes millions of parameters |
+| Model has millions more parameters than expected | Flatten instead of GAP — `50,176 × 512` is 25.7M | `nn.AdaptiveAvgPool2d(1)` then one `Linear` |
+| Parameter count off by a few hundred from your hand calculation | Forgot BatchNorm's `γ` and `β`, or left `bias=True` on a conv followed by BN | `bias=False` on convs before BN; count `2 × C` per BN |
+| Deep plain CNN trains worse than a shallow one | The degradation problem — no residual path | Add skip connections; `zero_init_residual=True` |
+| Serving accuracy far below validation at batch 1 | BatchNorm running statistics vs small-batch serving | GroupNorm, or re-estimate the running stats |
+| Checkerboard artifacts in a segmentation output | Stacked equal dilation rates creating blind spots | Hybrid dilation rates (1, 2, 5) |
+| Depthwise-separable rewrite is far slower than the FLOP reduction promised | Depthwise convs are memory-bandwidth-bound on GPUs | Measure. FLOPs predict CPU time well and GPU time poorly |
+| Pruning the last block didn't make the model faster | Late layers are 72% of parameters and 23% of FLOPs | To cut latency, work on early layers or input resolution |
+| `output shape` off by one | Used the simplified formula with `dilation > 1` | Full formula: `floor((H + 2p − d(k−1) − 1)/s) + 1` |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [PyTorch 2.4 — `nn.Conv2d`](https://pytorch.org/docs/2.4/generated/torch.nn.Conv2d.html) — read the "Shape" section, which states the full output formula including dilation. Keep it open until you've memorized it.
+- [PyTorch 2.4 — `nn.AdaptiveAvgPool2d`](https://pytorch.org/docs/2.4/generated/torch.nn.AdaptiveAvgPool2d.html) — read this for why `output_size=1` gives you resolution-independence for free.
+- [torchvision 0.19 — `resnet`](https://pytorch.org/vision/0.19/models/resnet.html) — read the source of `BasicBlock` and `Bottleneck` side by side; the difference is exactly the 1×1 projection arithmetic from Layer 2.
+- [`fvcore` FLOP counter](https://github.com/facebookresearch/fvcore/blob/main/docs/flop_count.md) — read this for the per-module FLOP breakdown; it produced the ResNet-18 table above.
+
+**Papers**
+
+- [LeCun et al. (1998)](https://doi.org/10.1109/5.726791) — *local receptive fields plus weight sharing plus subsampling; the three ideas the whole field still runs on.*
+- [Krizhevsky et al. (2012)](https://doi.org/10.1145/3065386) — *the same ideas on GPUs with ReLU and dropout beat hand-engineered vision by 10 points.*
+- [Simonyan &amp; Zisserman (2015)](https://arxiv.org/abs/1409.1556) — *two 3×3s beat one 5×5 at 28% fewer parameters with an extra non-linearity; why 3×3 is the default.*
+- [Lin et al. (2014)](https://arxiv.org/abs/1312.4400) — *the 1×1 convolution as a cross-channel projection, and global average pooling instead of a fully-connected head.*
+- [He et al. (2016)](https://arxiv.org/abs/1512.03385) — *deeper plain nets have higher training error; the identity shortcut makes the Jacobian `I + ∂F/∂x` and 152 layers train.*
+- [Howard et al. (2017)](https://arxiv.org/abs/1704.04861) — *depthwise-separable convolutions cut MACs by ~8–9× for 3×3 kernels; the basis of on-device vision.*
+- [Ioffe &amp; Szegedy (2015)](https://arxiv.org/abs/1502.03167) — *per-channel batch normalization permits much larger learning rates; the `Conv → BN → ReLU` triple.*
+- [Wang et al. (2018)](https://arxiv.org/abs/1702.08502) — *equal stacked dilations create gridding blind spots; use hybrid rates.*
+
+**Go deeper**
+
+- Dumoulin &amp; Visin, ["A guide to convolution arithmetic for deep learning"](https://arxiv.org/abs/1603.07285) — read this for the animated figures of every stride/padding/dilation combination and the transposed-convolution arithmetic. It is the single best reference for "what shape comes out", and worth keeping bookmarked forever.
+- Chris Olah et al., ["Feature Visualization"](https://distill.pub/2017/feature-visualization/) — read this for what units at each depth actually respond to, generated by optimizing an input rather than searching a dataset. It is also the honest treatment of how easily you fool yourself interpreting a single unit.
+- Araujo, Norris &amp; Sim, ["Computing Receptive Fields of Convolutional Neural Networks"](https://distill.pub/2019/computing-receptive-fields/) — read this for the closed-form receptive-field formula for a whole network, including the effective receptive field (which is Gaussian-weighted and much smaller than the theoretical one — a result that surprises everyone).
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-22/p3-w22-m2">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

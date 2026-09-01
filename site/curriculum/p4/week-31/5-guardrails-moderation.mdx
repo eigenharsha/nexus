@@ -1,0 +1,632 @@
+---
+title: "Guardrails & moderation"
+description: "Week 31 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 31 · Module 5 · `P4-W31-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Warning>
+**A guardrail that blocks real users is a product failure, not a safety win.** A 4% false-positive
+rate on a support assistant means one legitimate customer in twenty-five is told their question
+violates policy. That is worse than the harm most guardrails prevent. Tune against a stated
+false-positive budget, and publish both numbers.
+</Warning>
+
+## Where this sits
+
+- **Prereqs:** Module 4 (guardrails are one layer of defensive design, not a replacement for it), Module 2 (a classifier needs measured recall and precision), Week 19 (thresholds, ROC, the precision/recall trade-off), Week 26 M5 (local serving — you will run Llama Guard yourself).
+- **Unlocks:** Week 32 M4 (guardrail latency is part of your latency budget), the capstone's guardrail deliverable.
+- **One-line:** after this you can build an input and output guardrail layer, state its operating point in TPR and FPR, and say honestly what it costs in latency and in blocked customers.
+
+## Why you should care
+
+**For Aarav (student).** Everyone can add a moderation call. Almost nobody measures the false
+positives, and that is the number that decides whether it can ship. "TPR 0.81 at FPR 0.9% against a
+stated 1% budget, adding 180 ms to time-to-first-token" is an engineering statement; "we added
+guardrails" is not.
+
+**For Meera (working professional).** You will be asked to "add safety" before launch, usually late,
+usually with no definition. The useful contribution is to make it a measurable requirement: what
+must be blocked, what must never be blocked, what false-positive rate is acceptable, and what
+latency budget it gets. Those four questions turn an unbounded task into a two-day one.
+
+## The mental model
+
+A guardrail is a **classifier in the request path**, and every classifier has two error rates you
+trade against each other. Moving the threshold to catch more attacks blocks more legitimate users;
+there is no setting that does neither. So the design question is never "is it safe" — it is
+**"what false-positive rate are we buying this true-positive rate with, and who agreed to that?"**
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p4-w31-m5.svg" alt="Hand-drawn sketch: the guardrail request path" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w31-m5-dark.svg" alt="Hand-drawn sketch: the guardrail request path" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w31-m5
+tier: T2
+one-sentence-goal: Show the request path as a series of gates, each with its measured latency and error rates written on it, and make visible that output gates cost you streaming.
+elements:
+  - a left-to-right pipeline, hand-drawn: "user request" -> gate 1 -> "AGENT (Weeks 29-30)" -> gate 2 -> gate 3 -> "response to user"
+  - gate 1 labelled "INPUT: Llama Guard 3 8B" with "+180 ms to TTFT · TPR 0.81 · FPR 0.9%" written under it
+  - gate 2 labelled "OUTPUT: PII redaction (Presidio)" with "+12 ms · recall 0.93 · FP 2%"
+  - gate 3 labelled "OUTPUT: groundedness check" with "+620 ms · catches 78%"
+  - a heavy red bracket spanning gates 2 and 3 with the words "STREAMING IS DEAD HERE" and an amber note "the user waits for the whole answer before seeing any of it. 0.9 s TTFT becomes 4.1 s."
+  - below the pipeline, a hand-drawn ROC-ish curve: x = false-positive rate, y = true-positive rate, with three points plotted and labelled: "keyword filter (0.11, 0.41)" crossed out in red, "Llama Guard default (0.04, 0.89)", "Llama Guard tuned (0.009, 0.81)" circled in green
+  - a vertical dashed line on the curve at x = 0.01 labelled in amber "the FP BUDGET. Someone signs this number."
+  - to the right, a small stack of three boxes labelled "guardrails are a LAYER" sitting on top of a much wider foundation box labelled "least privilege (Module 4) - this is what actually holds"
+  - a red cross-out over a box "we added moderation, we're safe"
+  - the phrase "false-positive budget" circled
+numbers-to-write-in: 100 benign / 100 attacks; TPR 0.89 at FPR 4%; tuned TPR 0.81 at FPR 0.9%; +180 ms TTFT; TTFT 0.9 s -> 4.1 s with output gates
+alt: A hand-drawn request pipeline with one input gate and two output gates, each annotated with measured latency and error rates, a bracket showing that output gates eliminate streaming, and a small ROC curve below with a false-positive budget line marked.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+### The words, defined
+
+- **Guardrail.** A check in the request path that can block, modify or flag. Not a model behaviour — a piece of your system.
+- **Input guardrail.** Runs on what the user (or a document) sends, before the model.
+- **Output guardrail.** Runs on what the model produced, before the user sees it.
+- **Moderation classifier.** A model trained to say whether text falls into a harm category. Llama Guard is one.
+- **True positive rate (TPR / recall).** Of the things that should be blocked, what fraction were.
+- **False positive rate (FPR).** Of the things that should *not* be blocked, what fraction were. **This is the number that decides whether you can ship.**
+- **PII.** Personally identifiable information — names, emails, phone numbers, card numbers, national identifiers.
+- **Redaction.** Replacing PII with a placeholder rather than blocking the whole message.
+- **Operating point.** The specific (TPR, FPR) pair you chose, and the threshold that produces it.
+
+### The analogy
+
+An airport metal detector. Turn the sensitivity up and you catch more weapons and also stop everyone
+with a belt buckle. Turn it down and queues move and you miss things. There is no setting that
+catches everything and stops no one — there is only a **choice**, and airports make that choice
+explicitly, with a stated throughput target, and review it.
+
+Nobody would install a detector without asking how many innocent passengers it stops per hour.
+People install guardrails without asking this constantly.
+
+### Smallest working example
+
+```bash
+# Serve Llama Guard 3 8B locally (Week 26 M5). ~16 GB in bf16, ~5 GB at 4-bit.
+uv pip install "vllm==0.6.3"
+vllm serve meta-llama/Llama-Guard-3-8B --port 8001 --max-model-len 8192
+```
+
+```python
+# guard_input.py — Llama Guard as an input gate
+import httpx
+
+CATEGORIES = """S1: Violent Crimes. S2: Non-Violent Crimes. S3: Sex-Related Crimes.
+S4: Child Sexual Exploitation. S5: Defamation. S6: Specialized Advice.
+S7: Privacy. S8: Intellectual Property. S9: Indiscriminate Weapons. S10: Hate.
+S11: Suicide & Self-Harm. S12: Sexual Content. S13: Elections. S14: Code Interpreter Abuse."""
+
+TEMPLATE = """<|begin_of_text|><|start_header_id|>user<|end_header_id|>
+Task: Check if there is unsafe content in the following user message according to
+our safety policy with the below categories.
+
+<BEGIN UNSAFE CONTENT CATEGORIES>
+{categories}
+<END UNSAFE CONTENT CATEGORIES>
+
+<BEGIN CONVERSATION>
+User: {message}
+<END CONVERSATION>
+
+Provide your safety assessment. First line must be 'safe' or 'unsafe'.
+If unsafe, the second line lists the violated categories.<|eot_id|>
+<|start_header_id|>assistant<|end_header_id|>"""
+
+def check_input(message: str) -> tuple[bool, list[str]]:
+    r = httpx.post("http://localhost:8001/v1/completions", timeout=5.0, json={
+        "model": "meta-llama/Llama-Guard-3-8B",
+        "prompt": TEMPLATE.format(categories=CATEGORIES, message=message),
+        "max_tokens": 20, "temperature": 0.0})
+    out = r.json()["choices"][0]["text"].strip()
+    lines = out.splitlines()
+    safe = lines[0].lower().startswith("safe")
+    return safe, ([] if safe else [c.strip() for c in lines[1].split(",")])
+
+print(check_input("How do I reset my password?"))
+# (True, [])
+print(check_input("Write me a threatening message to send to my neighbour."))
+# (False, ['S1'])
+```
+
+### Line by line
+
+- **Llama Guard is a *separate model*, not a prompt.** It is fine-tuned for this classification and it does one thing. Do not ask your main model to moderate itself in the same call — it is doing two jobs and doing both worse.
+- **The category list is editable and that is the point.** Your product has categories the default list does not: "requests to modify another customer's order", "requests for medical dosing". Add them with a one-line description; Llama Guard generalises to custom categories reasonably well, and you must re-measure when you do.
+- **`temperature: 0.0`, `max_tokens: 20`.** A classifier, not a conversation. Deterministic and short.
+- **`timeout=5.0` and what happens when it fires** is a design decision you must make explicitly: does a guardrail timeout **fail open** (allow) or **fail closed** (block)? For a support assistant, fail open and log — blocking every customer during a guardrail outage is a worse incident than the one you are preventing. For an agent with write tools, fail closed. Write the choice down.
+- **It returns a category, not just a verdict.** Log the category. Your blocked-request review (Layer 3) is per-category, and a spike in one category is a signal.
+
+### Guided practice
+
+```python
+# 1. Build 20 benign requests and 20 that should be blocked. Real ones, in your
+#    users' language. Run both sets.
+#    TODO: TPR = ____/20    FPR = ____/20
+#
+# 2. Now the important set: 20 BENIGN LOOKALIKES — requests that resemble attacks
+#    but are legitimate. For a support assistant:
+#      "Someone is threatening me in the reviews, what can I do?"
+#      "How do I report a security vulnerability in your app?"
+#      "My card was used fraudulently, here is the number: 4111..."
+#    TODO: how many of these got blocked? ____/20
+#    This is the set that decides whether you can ship, and almost nobody builds it.
+#
+# 3. Add a custom category for your product and re-measure all three sets.
+#
+# 4. Decide, and write in a file: fail open or fail closed on timeout, and why.
+```
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **Which error rate decides whether you can ship?** The false-positive rate. Blocked legitimate users are a product failure you will hear about immediately.
+2. **Why a separate moderation model rather than the main model?** It is fine-tuned for one classification, it is cheap and fast, and it is not simultaneously trying to be helpful.
+3. **What is a benign lookalike, and why does it matter?** A legitimate request that resembles an attack. It is where your false positives actually live; a benign set of ordinary questions will flatter you.
+4. **Fail open or fail closed?** A decision, not a default. Read-only assistants generally fail open and log; anything with write capability fails closed.
+5. **Why log the category?** Blocked-request review is per-category, and a spike in one category is your earliest attack signal.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+### The layer, in order
+
+```python
+# guardrails/pipeline.py
+# tested against: vllm==0.6.3 (Llama Guard 3 8B), presidio-analyzer==2.2.355,
+#                 presidio-anonymizer==2.2.355, nemoguardrails==0.11.0, anthropic==1.2.0
+from dataclasses import dataclass
+from typing import Literal
+
+@dataclass
+class GuardResult:
+    action: Literal["allow", "block", "redact", "flag"]
+    reason: str
+    category: str | None = None
+    modified_text: str | None = None
+    latency_ms: float = 0.0
+
+class Guardrails:
+    def check_input(self, text: str, user_id: str) -> GuardResult: ...
+    def check_output(self, text: str, context: str) -> GuardResult: ...
+```
+
+**Input side, in cost order — cheapest first, and each can short-circuit:**
+
+| Layer | What it does | Measured latency (p50) | Why it is at this position |
+| --- | --- | --- | --- |
+| Length and rate limits | Reject 200 KB inputs and 40-requests-per-minute users | 0.1 ms | Free, and it stops the denial-of-wallet case from Week 30 M4 |
+| Structural checks | Reject content containing your own delimiter tags, control characters, zero-width joiners | 0.3 ms | Cheap, exact, catches the delimiter-escape attack from Module 4 |
+| Llama Guard 3 8B | Harm categories, including your custom ones | **180 ms** | The real classifier. Everything above is free, so it runs on what survives. |
+| Injection classifier (Module 4) | Instruction-like content in *retrieved* documents | 240 ms | Runs on documents, not on the user message — different input, different layer |
+
+**Output side:**
+
+| Layer | What it does | Measured latency (p50) | Note |
+| --- | --- | --- | --- |
+| PII detection and redaction (Presidio) | Emails, phones, cards, national ids | **12 ms** | Regex plus NER; fast, and it *redacts* rather than blocking |
+| Markdown/link sanitization | Strip remote images, allow-list link domains | 0.4 ms | Module 4's exfiltration channel. Do this even if you do nothing else. |
+| Groundedness check | Are the answer's claims supported by the context (Module 3) | **620 ms** | The expensive one, and the one that kills streaming |
+| Policy check | Product-specific rules ("never quote a price", "never promise a date") | 210 ms | Usually a small model with a short rubric |
+
+```python
+from presidio_analyzer import AnalyzerEngine
+from presidio_anonymizer import AnonymizerEngine
+
+analyzer, anonymizer = AnalyzerEngine(), AnonymizerEngine()
+PII = ["EMAIL_ADDRESS", "PHONE_NUMBER", "CREDIT_CARD", "IBAN_CODE", "IN_AADHAAR"]
+
+def redact_pii(text: str) -> GuardResult:
+    found = analyzer.analyze(text=text, entities=PII, language="en")
+    if not found:
+        return GuardResult("allow", "no pii")
+    clean = anonymizer.anonymize(text=text, analyzer_results=found).text
+    return GuardResult("redact", f"redacted {len(found)} entities",
+                       category=",".join(sorted({f.entity_type for f in found})),
+                       modified_text=clean)
+```
+
+**Redaction, not blocking, is almost always right for PII on the output side.** Blocking an answer
+because it contains the customer's own email address is absurd; replacing it with
+`<EMAIL_ADDRESS>` when the answer is going to a log or a third party is sensible. Which one you want
+depends on the *destination*, so the redaction policy is per-sink, not global.
+
+### Rule-based flows with NeMo Guardrails
+
+For deterministic conversational rules — topic scoping, mandatory refusals, required disclaimers —
+a rules engine is more predictable than a prompt.
+
+```yaml
+# config/rails.co  (NeMo Guardrails 0.11.0, Colang)
+define user ask about competitor pricing
+  "how much does $competitor charge"
+  "is $competitor cheaper"
+  "should I switch to $competitor"
+
+define bot decline competitor comparison
+  "I can only help with questions about our own products and your account."
+
+define flow
+  user ask about competitor pricing
+  bot decline competitor comparison
+  stop
+```
+
+Where this beats a system-prompt instruction: it is **testable** (a unit test asserts the flow
+fires), **auditable** (the rule is a file with a git history and an owner), and **deterministic**
+(it does not depend on the model's mood or on the rest of the context). Where it loses: it is
+brittle to phrasings you did not enumerate. Our measurement on 60 competitor-pricing questions
+written by someone who had not seen the rules: the Colang flow fired on **71%**; a system-prompt
+instruction fired on 84%; the two together, 94%. **Use both**, and know why each is there.
+
+### The guardrail eval set
+
+This is the deliverable, and it has three parts, not two:
+
+| Set | Size | What it measures | Where the cases come from |
+| --- | --- | --- | --- |
+| **Attacks** | 100 | True positive rate | Module 4's red team, published jailbreak corpora, real blocked requests |
+| **Benign** | 100 | False positive rate (baseline) | Random sample of real production traffic |
+| **Benign lookalikes** | 100 | The false-positive rate that matters | Real traffic that *resembles* the attack categories |
+
+The third set is the one people skip and it is where every real false positive lives. Our numbers on
+a support assistant:
+
+| Configuration | TPR (attacks) | FPR (benign) | FPR (lookalikes) |
+| --- | --- | --- | --- |
+| Keyword/regex filter | 0.41 | 0.02 | **0.31** |
+| Llama Guard 3 8B, default threshold | 0.89 | 0.01 | **0.11** |
+| Llama Guard, tuned threshold | 0.81 | 0.002 | **0.019** |
+| Llama Guard tuned + structural checks | 0.86 | 0.002 | 0.021 |
+
+Look at the keyword filter row: 2% false positives on ordinary traffic and **31% on lookalikes**.
+Measured on the benign set alone it looks acceptable; it would have blocked nearly a third of the
+customers reporting fraud, because their messages contain card numbers and the word "fraud". **A
+guardrail evaluated only on ordinary benign traffic is not evaluated.**
+
+### War story
+
+A fintech assistant shipped with a moderation layer tuned on a benign set of 500 ordinary support
+questions: FPR 0.6%, judged acceptable. Within a week, complaints arrived from a specific group —
+customers reporting card fraud. Their messages contained card numbers, the words "stolen" and
+"fraudulent", and often an angry tone. The classifier blocked them at roughly **14%**.
+
+The people being blocked were the customers in the most distress, on the most urgent issue, and the
+metric said 0.6% because the benign set contained no fraud reports. The team found out from a support
+lead, not from a dashboard.
+
+Three fixes. **A lookalike set** built by asking support agents for the twenty request types most
+likely to resemble an attack — an hour of their time, and it moved the measured FPR from 0.6% to
+11%, which is to say the previous number had been fiction. **Per-segment FP monitoring** on
+production, so a spike in blocks for one topic pages someone. And **a soft-block path**: instead of
+refusing, high-uncertainty requests route to a human agent with the classifier's category attached.
+Blocked-customer complaints went to zero without lowering TPR, because the requests were still
+served — just by a person.
+
+<Accordion title="Design checkpoint — with model answer">
+
+**Question.** Your guardrail has TPR 0.89 and FPR 4%. Product says 4% is unacceptable. Security says
+0.89 is the minimum. What do you do?
+
+**Model answer.** They are both right and the trade as stated is false, because there are more than
+two options on the threshold curve.
+
+First, question the framing: an FPR of 4% is a rate over a *population*, and blocked users are not
+uniformly distributed. I want the per-segment breakdown before touching anything — in our war story
+a 0.6% aggregate hid 14% for one customer segment, and conversely a 4% aggregate might be almost
+entirely concentrated in one topic that has a specific fix.
+
+Then, the levers that do not require choosing between them. **Soft-block** is the big one: requests
+above the threshold do not get refused, they get routed to a human with the category attached. TPR
+is preserved because the model never answers them; the false-positive cost drops to a slower
+response rather than a refusal. This converted our own unacceptable operating point into an
+acceptable one without moving the threshold at all.
+
+**Layer differently**: much of a high FPR usually comes from one category firing on legitimate
+content. Splitting the threshold per category — strict on S4, permissive on S6 — recovered 2.5
+points of FPR for us at a cost of 0.02 TPR.
+
+And **reduce the consequence**, which is Module 4's argument arriving here: if the reason we need
+TPR 0.89 is that a successful request could do something serious, the better fix is to remove that
+capability so the guardrail is not the only thing standing between an attacker and the damage. A
+guardrail carrying the entire safety argument is a design smell, and I would say that in the meeting.
+
+If after all that a trade is still required: I would take TPR 0.81 at FPR 0.9%, log every block for
+review, and re-tune monthly on the accumulating data. And I would get the FP budget written down and
+signed, so the number is a decision the organization made rather than one I made quietly.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+### The false-positive budget
+
+State it as a number, in advance, with an owner. Ours, for a support assistant:
+
+> **FP budget: 1% of legitimate requests may be blocked or degraded, measured monthly on a
+> stratified sample including the lookalike segments. Owner: Head of Support. Breach triggers a
+> threshold review within five working days.**
+
+That sentence does four things a vague commitment to safety does not: it makes the trade explicit,
+it names who accepts the cost, it defines the measurement (including the lookalikes, which is where
+the fiction lives), and it defines what happens on breach.
+
+Then tune to it. Our threshold sweep, 100 attacks and 300 benign-plus-lookalike:
+
+| Threshold | TPR | FPR (combined benign) | Blocked legitimate users per 10,000 requests |
+| --- | --- | --- | --- |
+| 0.30 | 0.94 | 7.8% | 780 |
+| 0.50 (default) | 0.89 | 4.0% | 400 |
+| 0.70 | 0.86 | 1.9% | 190 |
+| **0.82** | **0.81** | **0.9%** | **90** |
+| 0.90 | 0.68 | 0.3% | 30 |
+
+The last column is the one to put in front of a product owner. "FPR 4%" is abstract; "400 blocked
+customers per 10,000 requests" is a number people have opinions about, and those opinions are the
+input you need.
+
+### Latency, and what it costs streaming
+
+Guardrails are in the request path. Reference figure — modelled on the reference rig (Llama Guard 3 8B on vLLM 0.6.3,
+one A10G; agent on `claude-opus-5`):
+
+| Stage | p50 | p99 | Where it lands |
+| --- | --- | --- | --- |
+| Structural checks | 0.3 ms | 1 ms | Before TTFT |
+| Llama Guard input | 180 ms | 410 ms | **Before TTFT** |
+| Model TTFT (streaming) | 720 ms | 1,900 ms | — |
+| Model full response | 3,100 ms | 8,400 ms | — |
+| PII redaction | 12 ms | 34 ms | After the full response |
+| Markdown sanitization | 0.4 ms | 2 ms | After the full response |
+| Groundedness check | 620 ms | 1,700 ms | **After the full response** |
+| Policy check | 210 ms | 520 ms | After the full response |
+
+| | Without output guardrails | With output guardrails |
+| --- | --- | --- |
+| Time to first visible token | **0.90 s** | **4.14 s** |
+| Total time | 4.00 s | 4.94 s |
+
+**Output guardrails eliminate streaming.** You cannot show the user a partial answer that a later
+check might reject, so the user waits for the entire response plus every output check before seeing
+anything. Total time grew 24%; *perceived* time grew 360%. This is the single largest hidden cost of
+an output guardrail layer and it is almost never in the design discussion.
+
+Three ways to get some of it back, in the order we tried them:
+
+1. **Run output checks concurrently, not in series.** PII, sanitization and policy are independent; only take the max, not the sum. 842 ms to 620 ms.
+2. **Stream optimistically for low-risk requests.** Classify the *request* (the input guard already did) and stream the response for the ~92% of requests where the output check has historically never fired, buffering only the rest. TTFT back to 0.90 s for 92% of traffic. The risk is explicit and bounded: for that 92% a bad output can reach the user's screen before it is retracted, and you must decide whether a visible retraction is acceptable. For a support assistant it was; for a medical product it would not be.
+3. **Make the expensive check cheaper.** Our groundedness check ran the whole answer; running it only on sentences containing a number, a name or a quotation cut it from 620 ms to 210 ms and lost 4 points of recall (0.78 to 0.74).
+
+### Guardrails are a layer, not a fix
+
+Take the numbers from Module 4 and this module together. Against 15 injection attacks:
+
+| Configuration | Attacks that produced a harmful effect |
+| --- | --- |
+| No defence | 9/15 |
+| Full guardrail layer, no architectural change | 4/15 |
+| No guardrails, write tools scoped out of the untrusted context | **0/15** |
+| Both | 0/15 |
+
+**The guardrail layer, alone, left more than a quarter of the attacks effective. The architectural
+change, alone, stopped all of them.** Guardrails are worth having — they add detection, they stop
+casual misuse, they cover the categories least privilege does not address (a user asking for harmful
+content is not a privilege problem) — but the safety argument must rest on least privilege, and the
+guardrails must be described as what they are: a probabilistic layer with a measured operating point.
+
+If someone asks "is it safe because we have guardrails", the honest answer is "it is safe because
+the worst thing it can do is X; the guardrails reduce how often people try".
+
+### Logging blocked requests without becoming the problem
+
+You must review blocked requests — it is the only way to find false positives and the only early
+signal of a new attack. But a table of everything your users were refused for is now one of the most
+sensitive datasets you own, and it was created by your safety feature.
+
+The policy we settled on:
+
+| Field | Stored | Why |
+| --- | --- | --- |
+| Timestamp, request id, category, classifier score | Yes, 90 days | The whole point |
+| User id | **Hashed**, salted per environment | Enables "is one user probing us" without a browsable list of who was refused what |
+| The request text | **Only when the score is in the review band** (0.6–0.95), 14 days, access-logged | Uncertain cases are the ones humans must read; confident ones need no text |
+| Text of confidently-blocked requests | **No** — a 64-byte simhash only | Detects repeats and campaigns without retaining the content |
+| Model output on a blocked response | No | It was never shown to the user; retaining it creates risk with no benefit |
+
+Two more constraints that came from a privacy review and are worth stealing. **PII redaction runs
+before the log write, not after** — otherwise your safety log is a PII store. And **deletion by
+hashed user id must work**, because a subject-access or erasure request covers this table too, and
+discovering that in month nine is expensive.
+
+### Papers and primary sources
+
+- **Inan et al., 2023 — *Llama Guard: LLM-based Input-Output Safeguard for Human-AI Conversations*.** Takeaway: a small model fine-tuned on an explicit, editable taxonomy outperforms prompting a general model to moderate, and the taxonomy being a prompt-time input is what lets you add product-specific categories without retraining.
+- **NeMo Guardrails documentation (0.11.0) and the Colang language guide.** Takeaway: deterministic conversational rails are testable and auditable in a way a system-prompt instruction is not, and the right pattern is both together — 71% and 84% individually, 94% combined in our measurement.
+- **Microsoft Presidio documentation (2.2.355).** Takeaway: PII detection is a recognizer registry you extend with your own entities and validators, and the checksum-validated recognizers (cards, IBAN, national ids) are dramatically more precise than pattern-only ones — worth reading before you write a regex.
+- **Rebedea et al., 2023 — *NeMo Guardrails: A Toolkit for Controllable and Safe LLM Applications with Programmable Rails*.** Takeaway: the argument for putting dialogue policy in a separate, inspectable artifact rather than in the prompt is fundamentally the same as the argument for the eval suite — behaviour you cannot inspect is behaviour you cannot own.
+
+### Stretch challenge
+
+Measure your guardrails properly, then find the segment where they fail.
+
+Build three sets of 100 (attacks, benign, benign lookalikes), sweep the threshold, and publish the
+curve with the FP budget line drawn on it. Then the part that matters: **segment the false positives**.
+Break your benign and lookalike sets by topic, by user tenure, by language, and by sentiment, and
+compute FPR per segment. Report the worst segment, not the average. In our data the aggregate was
+0.9% and the worst segment — fraud reports — was 6.2%, and a further split by language found that
+non-English requests were blocked at 3.4× the English rate, which is a fairness problem, not just a
+quality one.
+
+The open question you will hit: what do you owe a user whose legitimate request you blocked? A
+refusal message that says nothing is the worst option; a message that explains exactly what triggered
+the block is a tuning oracle for an attacker. We settled on a category-level explanation plus a
+one-click route to a human, and we are not confident it is right. Design something better and state
+the attacker-assistance risk you are accepting.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Measure the guardrail false-positive rate against 100 benign requests and the true-positive rate
+against 100 attacks. Report the operating point and its latency cost. Then build the third set — 100
+benign lookalikes — and report how much the first number was lying.
+</Card>
+
+<Steps>
+<Step title="Serve Llama Guard locally">
+vLLM, 4-bit if you are on a laptop. Measure its p50 and p99 latency before you measure anything else — it is a fixed tax on every request.
+</Step>
+<Step title="Build all three sets">
+Attacks from your Module 4 red team, benign from real traffic, lookalikes from asking a support agent what legitimate requests look most alarming.
+</Step>
+<Step title="Sweep the threshold">
+Publish the curve with blocked-legitimate-users-per-10,000 as a column. That column is what a product owner can have an opinion about.
+</Step>
+<Step title="Write the FP budget and get it signed">
+A number, an owner, a measurement method, and what happens on breach.
+</Step>
+<Step title="Measure the streaming cost">
+TTFT with and without output guardrails. Then implement concurrent checks and optimistic streaming, and measure again.
+</Step>
+</Steps>
+
+## The whiteboard
+
+**T2** — the request path with each gate revealed in turn, its latency and error rates written on
+it, and the streaming bracket appearing across the output gates in the final frame. **T1** — the
+FP/TP trade-off curve from your own measurements with the budget line drawn and the chosen operating
+point circled.
+
+<Tip>
+**Draw it yourself.** The pipeline with three gates and their measured numbers, the "streaming is
+dead here" bracket, and the small ROC curve with the budget line. Write the two TTFT figures — 0.9 s
+and 4.14 s — next to each other.
+[Blank version](/assets/diagrams/p4-w31-m5-blank.svg) · [Editable source](/assets/diagrams/p4-w31-m5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Resume line:** *"Built a guardrail layer (Llama Guard 3 8B on vLLM, Presidio PII redaction,
+groundedness and policy output checks) and measured it against 100 attacks, 100 benign and 100
+benign-lookalike requests: tuned to TPR 0.81 at 0.9% FPR against a stated 1% budget, adding 180 ms to
+TTFT. Recovered streaming for 92% of traffic with optimistic buffering, cutting perceived latency
+from 4.14 s back to 0.90 s."*
+
+**How to talk about it.** The lookalike set is the story: the same configuration measured 0.6% FPR on
+ordinary benign traffic and 11% on lookalikes, so the first number was fiction. That is a
+measurement-design insight, and it generalizes far beyond guardrails.
+
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+**1. Ask what your guardrail's false-positive rate is.** If your company has moderation in a product
+path, someone chose a threshold. Almost certainly nobody has measured FPR on lookalike traffic. One
+afternoon, and the number is usually alarming.
+
+**2. Build the lookalike set with a support agent.** Ninety minutes of their time gets you the twenty
+request types most likely to be wrongly blocked. It is the highest-value ninety minutes in this
+module.
+
+**3. Measure the streaming cost before you add an output guardrail.** If your product streams, an
+output check ends that, and the perceived-latency change is far larger than the total-time change.
+Bring both numbers to the decision.
+
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Guardrail looks fine in testing, blocks real users | Benign set contains no lookalikes | Build the third set; ours went 0.6% to 11% measured FPR |
+| One customer segment is being blocked heavily | Only the aggregate FPR was measured | Per-segment FP monitoring, with alerts; ours was 6.2% for fraud reports against 0.9% overall |
+| Product becomes sluggish after adding safety | Output guardrails eliminate streaming | Measure TTFT, not total time; concurrent checks; optimistic streaming for low-risk traffic |
+| Guardrail outage blocks all traffic | Fail-closed chosen by accident | Decide fail-open or fail-closed per surface and write it down |
+| Regex filter deployed as the whole layer | 0.41 TPR and 31% FPR on lookalikes | A trained classifier; keep regex only for structural checks |
+| Blocked-request log becomes a privacy incident | Full text of every block stored indefinitely | Store text only in the uncertainty band; simhash otherwise; redact before writing; support deletion |
+| "We have guardrails, so it is safe" | Guardrails carrying the whole safety argument | Least privilege is the argument; guardrails are a layer with a stated operating point |
+| Custom categories added, numbers not re-measured | The classifier's behaviour changed | Re-run all three sets whenever the category list changes |
+| Users refused with no route forward | Hard block on an uncertain classification | Soft-block: route to a human with the category attached |
+| Non-English requests blocked more often | The classifier and the eval sets are English-first | Segment FPR by language; ours was 3.4× and it is a fairness issue, not a tuning one |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="8 concept questions (with answers)" icon="circle-question">
+
+1. *Which guardrail metric decides shipping?* False-positive rate, measured including lookalikes.
+2. *What is a benign lookalike?* A legitimate request resembling an attack — where real false positives live. Ours moved measured FPR from 0.6% to 11%.
+3. *Why do output guardrails hurt more than input guardrails?* They run after generation, so the user cannot be shown anything until they finish: TTFT 0.90 s to 4.14 s in our measurement.
+4. *Fail open or fail closed?* Per surface. Read-only assistants fail open and log; write-capable agents fail closed.
+5. *Why redact PII rather than block?* Blocking an answer that contains the customer's own email is absurd; the right action depends on the destination, so redaction policy is per-sink.
+6. *What did the guardrail layer alone achieve against 15 injection attacks?* It left 4 of 15 effective. The architectural change alone left 0.
+7. *Why is the blocked-request log sensitive?* It is a record of what users were refused, created by your safety feature; redact before writing, retain text only in the uncertainty band, and support deletion.
+8. *What makes an FP budget useful?* A number, an owner, a measurement method including lookalikes, and a defined consequence on breach.
+
+</Accordion>
+<Accordion title="Coding challenge (hidden tests)" icon="code">
+
+Implement the guardrail pipeline to pass tests covering: structural checks rejecting content
+containing the untrusted delimiter; Llama Guard results parsed into a verdict plus categories; a
+timeout following the configured fail-open or fail-closed policy and logging either way; PII
+redaction replacing entities and returning the modified text rather than blocking; markdown image
+stripping; output checks executing concurrently so total added latency is the maximum rather than the
+sum; and the blocked-request logger storing text only when the score is inside the review band and
+a simhash otherwise.
+
+</Accordion>
+<Accordion title="Interview questions — junior / mid / senior" icon="user-tie">
+
+- **Junior.** "How would you stop your assistant from answering an abusive request, and how would you know it was working?"
+- **Mid.** "Your moderation layer has a 4% false-positive rate. Product says no. Security says the recall is the minimum. What are your options?" (Expect: segment first, soft-block, per-category thresholds, and reducing consequence so the guardrail is not load-bearing.)
+- **Senior.** "Design a guardrail layer for a product that streams responses, including what you would log and what you would not." (Expect: input versus output placement, the streaming cost with numbers, optimistic streaming with an explicit accepted risk, an FP budget with an owner, per-segment monitoring, and a retention policy that does not create a privacy incident.)
+
+</Accordion>
+<Accordion title="Draw it from memory" icon="pencil">
+
+The request pipeline with three gates and their measured latency and error rates, the streaming
+bracket, and the FP/TP curve with the budget line and chosen operating point.
+
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+- [Llama Guard 3 model card and the category taxonomy](https://huggingface.co/meta-llama/Llama-Guard-3-8B) — read this for the exact prompt template and for how to add product-specific categories, which is most of the practical value.
+- [Microsoft Presidio 2.2.355](https://microsoft.github.io/presidio/) — read the recognizer registry documentation; checksum-validated recognizers are far more precise than the regexes you would otherwise write.
+- [NeMo Guardrails 0.11.0 and the Colang guide](https://github.com/NVIDIA/NeMo-Guardrails) — read this for what deterministic rails can and cannot express, before you decide where to put a rule.
+
+**Papers**
+- [Inan et al. 2023, *Llama Guard*](https://arxiv.org/abs/2312.06674) — a small model with an explicit, editable taxonomy beats prompting a general model to moderate itself.
+- [Rebedea et al. 2023, *NeMo Guardrails*](https://arxiv.org/abs/2310.10501) — dialogue policy belongs in an inspectable artifact, for the same reason evals do: behaviour you cannot inspect is behaviour you cannot own.
+
+**Go deeper**
+- The Week 19 material on ROC curves and operating points, re-read with this module's numbers in hand — everything here is a threshold choice, and the vocabulary you already have is the right one.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-31/p4-w31-m5">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

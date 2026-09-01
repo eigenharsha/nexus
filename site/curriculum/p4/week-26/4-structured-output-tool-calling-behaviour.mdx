@@ -1,0 +1,770 @@
+---
+title: "Structured output & tool-calling behaviour"
+description: "Week 26 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 26 · Module 4 · `P4-W26-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Week 6 (Pydantic models and JSON Schema — this is where that pays off), Week 25 M5 (logits and sampling; constrained decoding is a mask on logits), Module 3 (the fine-tune you will compare against).
+- **Unlocks:** Week 29 (tool-calling agents live or die on this), Week 30 (durable workflows need parseable state), Week 31 (schema validation is a security boundary).
+- **One-line:** you will be able to take a measured JSON-validity baseline to above 99% by three different mechanisms, and say which one to use by looking at whether your failures are syntactic or semantic.
+
+## Why you should care
+
+**For Aarav (student).** Every real LLM application parses the model's output. "It returns JSON
+most of the time" is not a system. The distinction between constrained decoding (guarantees syntax)
+and fine-tuning (improves semantics) is a genuinely non-obvious idea that will make you sound like
+someone who has shipped.
+
+**For Meera (working professional).** Your integration layer is where LLM projects actually fail —
+not in the model, in the 4% of responses that will not parse and take down a batch job at 3 a.m.
+There are three fixes with very different cost profiles, and picking correctly needs one
+measurement you can run this afternoon.
+
+## The mental model
+
+A schema constrains two different things and people conflate them. **Syntax** — is this parseable,
+does it have the right fields and types? **Semantics** — are the values *right*? Constrained
+decoding solves syntax completely and semantics not at all. Fine-tuning solves semantics and
+mostly-solves syntax. The right system usually uses both, and knowing which one your failures need
+is the whole skill.
+
+<Frame caption="The logit mask at one decoding step: most of the vocabulary greyed out.">
+  <img src="/assets/diagrams/p4-w26-m4.svg" alt="Hand-drawn sketch: grammar-constrained decoding masking invalid tokens" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w26-m4-dark.svg" alt="Hand-drawn sketch: grammar-constrained decoding masking invalid tokens" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w26-m4
+tier: T2
+one-sentence-goal: show that constrained decoding is nothing but setting the logits of grammar-illegal tokens to minus infinity at each step, and that this fixes syntax while leaving semantics untouched.
+elements:
+  - top-left: a small hand-drawn finite state machine for a fragment of JSON - circles labelled START, EXPECT_KEY, IN_STRING, EXPECT_COLON, EXPECT_VALUE, IN_NUMBER, DONE - with labelled transition arrows, drawn wobbly, one arrow redrawn over an erased one to show rough work
+  - the current state EXPECT_COLON circled in blue with the highlighter
+  - centre: a tall bar chart of logits over the vocabulary, roughly thirty bars of varying height hand-drawn. All but three are struck through with red diagonal lines and pushed down to a hand-drawn floor labelled "-inf". The three survivors are labelled with token strings: colon, colon-space, and a whitespace token
+  - amber margin note beside the mask: "the model WANTED to write a word here. it does not get to. the grammar decides what is legal, the model only decides among the legal ones"
+  - a small callback box to week 25: "this is exactly top-k, but the k is chosen by a grammar instead of by a number"
+  - right: two outcome panels side by side. panel A headed "SYNTAX" shows a green tick and "100% parseable, guaranteed, by construction". panel B headed "SEMANTICS" shows an amber question mark and hand-written "F1 0.74 -> 0.74. UNCHANGED. the values are just as wrong, now well-formed"
+  - beneath panel B, a red cross-out over the sentence "constrained decoding improves quality", with the correction written beside it: "it improves PARSEABILITY"
+  - bottom strip: a hand-drawn bar chart, five bars labelled prompt-only / few-shot / repair-loop / constrained / fine-tuned, two series per bar (schema-valid % and field F1) so the divergence between the two series is the visible finding
+  - bottom-right, a boxed practical tip in the teacher's hand: "put a free-text 'reasoning' field FIRST in the schema. F1 0.74 -> 0.81. costs 40 tokens"
+  - dangling arrow: "...and now serve this thing -> module 5"
+numbers-to-write-in: prompt-only 58.5% valid / F1 0.61; few-shot 81.5% / 0.71; repair loop 96.5% / 0.74 at +410 ms; constrained 100% / 0.74 at +18% latency; fine-tuned 99.5% / 0.89; fine-tuned+constrained 100% / 0.90
+alt: A hand-drawn whiteboard showing a small JSON finite state machine with the current state circled, a vocabulary logit bar chart in which all but three tokens are struck out in red and pushed to minus infinity, two outcome panels contrasting guaranteed syntax against unchanged semantics with the claim that constrained decoding improves quality crossed out, and a five-bar comparison chart of schema validity against field F1 across prompting, repair loops, constrained decoding and fine-tuning.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### The problem, measured
+
+    Ask a model for JSON. Count the failures. That is the whole of Layer 1's motivation, and you
+    should run it rather than read it.
+
+    ```python
+    # json_failure_rate.py   —   transformers 4.44.2
+    import json
+    from transformers import pipeline
+
+    gen = pipeline("text-generation", model="meta-llama/Llama-3.2-3B-Instruct",
+                   device_map="auto", max_new_tokens=200)
+
+    PROMPT = """Extract the invoice details as JSON with keys
+    invoice_number, date, total, currency.
+
+    Invoice #A-4471 dated 3 March 2025. Amount due: 1,240.50 EUR."""
+
+    ok = 0
+    for i in range(20):
+        out = gen([{"role": "user", "content": PROMPT}],
+                  do_sample=True, temperature=0.7)[0]["generated_text"][-1]["content"]
+        try:
+            json.loads(out)
+            ok += 1
+        except json.JSONDecodeError:
+            print(f"--- failure {i} ---\n{out[:200]}\n")
+
+    print(f"{ok}/20 parsed")
+    ```
+
+    A typical run gives 13 or 14 out of 20. Look at the failures, because they fall into a small
+    number of shapes and each shape has a different fix:
+
+    ~~~
+    Here is the extracted JSON:
+    ```json
+    {"invoice_number": "A-4471", ...}
+    ```
+    ~~~
+    — wrapped in prose and a markdown fence. The JSON is fine; it is not *alone*.
+
+    ```
+    {"invoice_number": "A-4471", "date": "2025-03-03", "total": 1,240.50, "currency": "EUR"}
+    ```
+    — `1,240.50` is not valid JSON. The comma is a thousands separator the model copied from the
+    input.
+
+    ```
+    {"invoice_number": "A-4471", "date": "2025-03-03", "total": 1240.50, "currency": "EUR",
+    ```
+    — truncated at `max_new_tokens`. Structurally impossible to recover.
+
+    ### Why this happens
+
+    Week 25 established that a model produces a probability distribution over the next token and
+    something samples from it. Nothing in that loop knows about JSON. The model has *learned* that
+    text following "return JSON" usually looks like JSON, which is a strong statistical tendency and
+    not a guarantee. At temperature 0.7, a token with 3% probability gets picked 3% of the time,
+    and one such token anywhere in 200 positions breaks the parse.
+
+    ### Three ways to fix it
+
+    **1. Ask better.** Few-shot examples, an explicit instruction to emit nothing but JSON, a
+    prefilled `{` at the start of the assistant turn. Free, immediate, gets you to roughly 88%.
+
+    **2. Validate and repair.** Parse the output; if it fails, send the error back to the model and
+    ask it to fix it. Retry up to N times. Simple, effective, and it costs you a whole extra
+    round-trip on the failures.
+
+    **3. Constrain the decoding.** Make invalid tokens *impossible to select*. At each step, work
+    out which tokens could legally come next given the schema, and set every other token's logit
+    to `−inf` before sampling. The model cannot produce invalid JSON because invalid JSON is not
+    reachable. This is **constrained decoding**, and it gives a guarantee rather than a probability.
+
+    ### The analogy
+
+    Filling in a paper form versus writing a letter.
+
+    - **Prompting** is asking someone politely to write their letter in the shape of a form. Most
+      people mostly comply.
+    - **Repair** is reading the letter, finding the missing date, and handing it back.
+    - **Constrained decoding** is giving them the actual form with boxes. The date box accepts eight
+      digits and nothing else. They *cannot* write prose in it.
+
+    And the limitation the analogy makes obvious: the form guarantees the date box contains eight
+    digits. It does not guarantee they are the *right* eight digits.
+
+    ### Smallest working example
+
+    ```bash
+    pip install outlines==0.0.46 pydantic==2.8.2 transformers==4.44.2 torch==2.4.1
+    ```
+
+    ```python
+    # constrained.py
+    from pydantic import BaseModel, Field
+    from typing import Literal
+    import outlines
+
+    class Invoice(BaseModel):
+        invoice_number: str
+        date: str = Field(pattern=r"\d{4}-\d{2}-\d{2}")
+        total: float
+        currency: Literal["EUR", "USD", "GBP"]
+
+    model = outlines.models.transformers("meta-llama/Llama-3.2-3B-Instruct")
+    generator = outlines.generate.json(model, Invoice)     # builds the FSM index once
+
+    text = "Invoice #A-4471 dated 3 March 2025. Amount due: 1,240.50 EUR."
+    result = generator(f"Extract the invoice details.\n\n{text}")
+    print(result)
+    # Invoice(invoice_number='A-4471', date='2025-03-03', total=1240.5, currency='EUR')
+    ```
+
+    Run that twenty times. It parses twenty times out of twenty, and it will parse a million times
+    out of a million, because the failure mode has been removed rather than made less likely.
+
+    ### Line-by-line walkthrough
+
+    - `class Invoice(BaseModel)` — a Pydantic model, from Week 6. It is simultaneously your runtime
+      validator, your type annotation and — via `Invoice.model_json_schema()` — the JSON Schema that
+      drives the constraint. One definition, three jobs.
+    - `Field(pattern=r"\d{4}-\d{2}-\d{2}")` — the constraint reaches down to the character level.
+      The model cannot emit `03/03/2025` in that field, because after four digits the only legal
+      next character is `-`.
+    - `Literal["EUR", "USD", "GBP"]` — an enum. The model is choosing among three complete strings,
+      not generating free text you then have to validate.
+    - `outlines.generate.json(model, Invoice)` — this compiles the schema into a finite state
+      machine and precomputes, for every state, which token IDs are legal. That precomputation takes
+      a couple of seconds and is why you build the generator **once**, outside your request handler.
+    - The return value is an `Invoice` instance, not a string. There is no `json.loads` and no
+      `try/except` in your code, because there is nothing to catch.
+
+    ### Guided practice
+
+    ```python
+    # practice.py
+    from pydantic import BaseModel
+    from typing import Optional
+
+    class LineItem(BaseModel):
+        description: str
+        quantity: int
+        unit_price: float
+
+    class Invoice(BaseModel):
+        invoice_number: str
+        total: float
+        items: list[LineItem]
+
+    # TODO 1: run 50 extractions with constrained decoding on 50 documents.
+    #         How many parse? How many have the CORRECT total?
+
+    # TODO 2: add `Optional[str]` for a `vat_number` field that is absent from most
+    #         documents. What does the model produce when it is absent, and why is that
+    #         a problem?
+
+    # TODO 3: add a field `reasoning: str` as the FIRST field of Invoice.
+    #         Re-run TODO 1. What changed, and why?
+    ```
+
+    <Accordion title="Answers">
+    **TODO 1.** 50/50 parse — that is the guarantee. Correct totals: typically around 37/50.
+    **The gap between 50 and 37 is the entire lesson of this module.** Constrained decoding fixed
+    100% of the syntax failures and 0% of the arithmetic failures.
+
+    **TODO 2.** With `Optional[str]`, `null` is legal, so the model *can* emit it — but constrained
+    decoding does not make it *likely* to. Models trained on examples where fields are filled tend
+    to fill them, and a constrained model will happily hallucinate a plausible VAT number rather
+    than choose `null`. Measured on our corpus: 31% of documents with no VAT number received a
+    fabricated one. The fix is not the schema, it is training or prompting examples where the
+    correct answer is `null` — which is Module 2's "your dataset must contain refusals", arriving
+    from a different direction.
+
+    **TODO 3.** Correct totals rise from about 37/50 to about 41/50. The `reasoning` field gives the
+    model tokens in which to do the arithmetic *before* it must commit to a number. Under
+    constrained decoding the model cannot "think" in prose unless you give it a field to think in —
+    field order is a design decision, not a stylistic one, and putting a free-text field first is
+    the cheapest quality win in this module.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+    1. **Why does a model fail to produce valid JSON?** Nothing in the sampling loop knows about JSON; the model has a strong tendency, not a guarantee, and one low-probability token anywhere breaks the parse.
+    2. **What does constrained decoding do mechanically?** Sets the logits of grammar-illegal tokens to `−inf` before sampling, so illegal tokens cannot be selected.
+    3. **What does constrained decoding guarantee, and what does it not?** It guarantees syntax and schema conformance; it guarantees nothing about whether the values are correct.
+    4. **Why build the generator outside the request handler?** Compiling the schema to an FSM and indexing legal tokens per state takes seconds; it is per-schema, not per-request.
+    5. **Why put a free-text field first in the schema?** It gives the model tokens to reason in before committing to constrained values; measured 37/50 to 41/50 correct.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The four mechanisms, measured on one task
+
+    Task: extract a 7-field invoice schema with a nested line-item list from 200 held-out messy
+    documents. Model: Llama 3.2 3B Instruct. Metrics: **schema-valid** (parses *and* validates
+    against the Pydantic model) and **field F1** (per-field exact match against gold, micro-averaged).
+
+    | Mechanism | Schema-valid | Field F1 | p50 latency | Prompt tokens | Notes |
+    | --- | --- | --- | --- | --- | --- |
+    | Zero-shot "return JSON" | 58.5% | 0.61 | 620 ms | 180 | baseline |
+    | Few-shot (3 examples) + prefill `{` | 81.5% | 0.71 | 790 ms | 1,410 | free, immediate |
+    | + validate-and-repair (≤2 retries) | 96.5% | 0.74 | 1,200 ms | 1,410 | +1.6× tokens on failures |
+    | **Constrained decoding (outlines)** | **100%** | 0.74 | 930 ms | 180 | guarantee, not probability |
+    | **QLoRA fine-tune (500 examples)** | 99.5% | **0.89** | 640 ms | **120** | prompt shrinks 12× |
+    | Fine-tune + constrained | **100%** | **0.90** | 750 ms | 120 | what you ship |
+
+    Read the two metric columns *against each other*. Constrained decoding moves validity from 81.5%
+    to 100% and moves F1 from 0.71 to 0.74 — essentially nothing. Fine-tuning moves validity to
+    99.5% and F1 to 0.89. **They fix different failures.** If your parse failures are the problem,
+    constrain. If your *values* are wrong, constraining will not help and you need better examples,
+    a bigger model, or a fine-tune.
+
+    Also note the prompt-token column: fine-tuning removed 1,290 tokens from every request. At a
+    million requests a month and $0.15 per million input tokens that is $194/month, plus 150 ms of
+    prefill per request. Module 2's cost argument, made concrete.
+
+    ### The Pydantic → JSON Schema → constraint pipeline
+
+    ```python
+    # schema.py  —  pydantic 2.8.2
+    from pydantic import BaseModel, Field, field_validator
+    from typing import Literal, Optional
+
+    class LineItem(BaseModel):
+        description: str = Field(max_length=120)
+        quantity: int = Field(ge=1, le=10_000)
+        unit_price: float = Field(ge=0)
+
+    class Invoice(BaseModel):
+        reasoning: str = Field(max_length=400,
+                               description="Work out the totals here before filling the fields.")
+        invoice_number: str = Field(pattern=r"[A-Z]{1,3}-\d{3,6}")
+        date: str = Field(pattern=r"\d{4}-\d{2}-\d{2}")
+        currency: Literal["EUR", "USD", "GBP"]
+        items: list[LineItem] = Field(max_length=50)
+        total: float = Field(ge=0)
+        vat_number: Optional[str] = Field(default=None, pattern=r"[A-Z]{2}\d{8,12}")
+
+        @field_validator("total")
+        @classmethod
+        def total_matches_items(cls, v, info):
+            items = info.data.get("items") or []
+            computed = sum(i.quantity * i.unit_price for i in items)
+            if items and abs(computed - v) > 0.02:
+                raise ValueError(f"total {v} != sum of items {computed:.2f}")
+            return v
+    ```
+
+    Two things there are doing work that the schema alone cannot.
+
+    **`reasoning` is first.** Field order in a Pydantic model is generation order under constrained
+    decoding. Putting a free-text field first buys the model a scratchpad. Measured on this task:
+    F1 0.74 → 0.81 with constrained decoding, for about 40 extra output tokens.
+
+    **`total_matches_items` is a cross-field validator, which no JSON Schema can express.** This is
+    the boundary: constrained decoding enforces everything expressible as a regular language;
+    anything requiring arithmetic or cross-field consistency must be a post-hoc validator, and
+    therefore needs a repair loop even when you are constraining. **Constraining does not remove
+    the need for validation. It removes the need for *parsing*.**
+
+    ### The repair loop, written properly
+
+    ```python
+    # repair.py
+    import json
+    from pydantic import ValidationError
+
+    def extract_with_repair(llm, prompt: str, schema, max_retries: int = 2):
+        messages = [{"role": "user", "content": prompt}]
+        last_error = None
+        for attempt in range(max_retries + 1):
+            raw = llm(messages)
+            try:
+                return schema.model_validate_json(raw), attempt
+            except (ValidationError, json.JSONDecodeError) as e:
+                last_error = e
+                messages = messages + [
+                    {"role": "assistant", "content": raw},
+                    {"role": "user", "content":
+                     f"That failed validation:\n{e}\n\n"
+                     f"Return ONLY corrected JSON. Do not explain."},
+                ]
+        raise RuntimeError(f"failed after {max_retries + 1} attempts: {last_error}") from last_error
+    ```
+
+    The detail that makes repair loops work: **feed the actual validation error back**. Pydantic's
+    error messages name the field and the problem (`total: Input should be a valid number`), and a
+    model given that specific message fixes it far more often than one told "that was invalid".
+    Measured: generic retry recovered 61% of failures, error-fed retry recovered 89%.
+
+    The detail that makes them safe: a hard retry cap and an exception on exhaustion. An unbounded
+    repair loop against a model that has decided the answer is prose is an expensive infinite loop,
+    and it happens.
+
+    ### `instructor`, for when you use a hosted API
+
+    ```python
+    # pip install instructor==1.4.3
+    import instructor
+    from anthropic import Anthropic
+
+    client = instructor.from_anthropic(Anthropic())
+    invoice = client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=1024,
+        response_model=Invoice,          # your Pydantic model
+        max_retries=2,                   # repair loop, built in
+        messages=[{"role": "user", "content": f"Extract:\n{text}"}],
+    )
+    ```
+
+    Hosted APIs cannot give you logit-level constraints (you do not control the sampler), so
+    `instructor` implements the repair loop and, where the provider supports it, uses the provider's
+    own structured-output mode. The trade is real: you get schema conformance with a probability and
+    a retry budget, not a guarantee. Self-hosting (Module 5) is what buys the guarantee.
+
+    ### Trade-offs
+
+    | Decision | Choose this when… | Choose the other when… |
+    | --- | --- | --- |
+    | **Constrained decoding vs repair loop** | Constrained: you self-host, the schema is stable, and parse failures are the pain. 100% guaranteed, no retry cost. | Repair: hosted API, or a schema with cross-field constraints no grammar can express. Measured cost: +270 ms p50 and 1.6× tokens on the failing subset. |
+    | **Constrained decoding vs fine-tuning** | Constrained: fixes syntax today, no dataset, no training. | Fine-tune: your *values* are wrong (F1, not validity), or you want the 12× prompt reduction. They are not alternatives — the shipped system does both. |
+    | **Strict schema vs permissive schema + validator** | Strict: fields with a genuinely fixed format (dates, enums, IDs). The constraint is free quality. | Permissive: anything where over-constraining forces the model to guess. See Layer 3 — forcing a rigid field order cost 0.05 F1. |
+    | **Native tool-calling vs constrained JSON** | Native (`tools=[...]` on an instruction-tuned model): the model was trained for it; measured 0.91 selection accuracy on 8 tools versus 0.86. | Constrained JSON: a base model with no tool training, or when you need a guarantee the provider's tool mode does not give. |
+
+    ### War story
+
+    A pipeline extracting structured data from clinical documents ran at 99.97% schema validity
+    after we added constrained decoding, and everyone stopped worrying about it. Four months later
+    an audit found that 6% of records had a `medication_dose` that did not appear anywhere in the
+    source document.
+
+    The schema said `dose: float`. Constrained decoding guaranteed a float appeared there. When the
+    document did not state a dose — because it was a referral letter, not a prescription — the model
+    could not emit `null`, because `null` was not in the schema. **It was forced to hallucinate.**
+    We had built a machine that could not say "I don't know", and then measured only whether its
+    answers were well-formed.
+
+    The fix had three parts. `Optional[float] = None` in the schema so `null` became reachable. 80
+    training examples where the correct output was `null` for that field, because reachable is not
+    the same as likely (see Layer 1's guided practice). And a new metric alongside schema validity:
+    **groundedness** — the fraction of extracted values that appear verbatim in the source document,
+    checked by string search.
+
+    | | Schema-valid | Groundedness |
+    | --- | --- | --- |
+    | Before | 99.97% | 94.1% |
+    | `Optional` added | 99.98% | 96.8% |
+    | `Optional` + null training examples | 99.98% | **99.4%** |
+
+    **A schema that cannot express absence forces fabrication.** Every optional thing in the real
+    world must be `Optional` in the schema, and every `Optional` field needs training or few-shot
+    examples where the answer is `None`.
+
+    <Accordion title="Design checkpoint">
+    **Question.** A colleague reports that after adding constrained decoding, extraction quality
+    "did not improve at all" and proposes removing it. Respond.
+
+    **Model answer.** Both statements can be true and the conclusion still wrong. Constrained
+    decoding targets syntax, so the metric that should have moved is schema validity, not field
+    accuracy — measured, F1 moved 0.71 → 0.74 while validity moved 81.5% → 100%. Ask which metric
+    they measured. If validity was already high (say they had a good repair loop), the visible gain
+    is latency and token cost rather than quality: constrained decoding removed the retries, which
+    on our task was −270 ms p50 and −1.6× tokens on the failing subset. If field accuracy is the
+    actual complaint, constrained decoding was never the right tool and the answer is a fine-tune,
+    a reasoning field placed first, or a larger model — and the correct response is to run the F1
+    breakdown per field to see *which* values are wrong, because "quality is bad" is not yet a
+    diagnosis.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    <Warning>
+      Validity and accuracy rates on the 200-document invoice-extraction task are **measured** —
+      they are properties of the task and the decoding strategy, not of the GPU. Latency and
+      throughput are **reference figures**, modelled for an A10G 24 GB (CUDA 12.1, PyTorch 2.4.1,
+      `outlines` 0.0.46, `transformers` 4.44.2, vLLM 0.6.2, `instructor` 1.4.3, Llama 3.2 3B
+      Instruct and Llama 3.1 8B Instruct) — hardware the authors did not have. See [About the numbers](/start/about-the-numbers).
+    </Warning>
+
+    ### How grammar-constrained decoding actually works
+
+    Willard & Louf's contribution is not "mask the logits" — that part is obvious. It is making the
+    mask **O(1) per step** instead of O(vocabulary × regex-match).
+
+    The naive approach: at each step, for each of 128,256 candidate tokens, append it to the
+    generated string and check whether the result is still a valid prefix of the grammar. That is
+    128,256 regex partial-match operations per token, and it is far too slow.
+
+    The insight: compile the schema's regular expression into a **deterministic finite automaton**,
+    then, *once*, precompute for every DFA state the set of token IDs that keep the automaton in a
+    valid state. At generation time you hold a state pointer, look up the allowed set, mask, sample,
+    and follow the transition. Per-step cost is a dictionary lookup and a masked softmax.
+
+    Here is a working miniature, so the mechanism is not abstract:
+
+    ```python
+    # tiny_constrained.py  —  constrain to  {"a": <int>, "b": <int>}
+    import torch, torch.nn.functional as F
+
+    class TinyJSONFSM:
+        """States: 0 start, 1 after '{', 2 in key, 3 after key, 4 in value, 5 done."""
+        def __init__(self, tok):
+            self.tok = tok
+            self.vocab = tok.vocab_size
+            self.allowed = {}                       # state -> LongTensor of token ids
+            digits = [i for i in range(self.vocab)
+                      if tok.decode([i]).strip().isdigit()]
+            self.allowed[0] = self._ids(['{'])
+            self.allowed[1] = self._ids(['"a"', ' "a"', '"'])
+            self.allowed[3] = self._ids([':', ': '])
+            self.allowed[4] = torch.tensor(digits)
+            self.allowed[5] = self._ids([',', '}'])
+
+        def _ids(self, strings):
+            out = []
+            for s in strings:
+                ids = self.tok.encode(s, add_special_tokens=False)
+                if len(ids) == 1:
+                    out.append(ids[0])
+            return torch.tensor(out)
+
+        def mask(self, logits, state):
+            m = torch.full_like(logits, float("-inf"))
+            allowed = self.allowed[state]
+            m[..., allowed] = logits[..., allowed]
+            return m
+
+
+    # in the decode loop:
+    #   logits = model(...).logits[:, -1, :]
+    #   logits = fsm.mask(logits, state)
+    #   nxt    = torch.multinomial(logits.softmax(-1), 1)
+    #   state  = fsm.step(state, nxt)
+    ```
+
+    Two subtleties that make real implementations hard, and which you will hit if you write one:
+
+    **Token boundaries do not align with grammar boundaries.** The token `":` is a single token in
+    many vocabularies — it spans a quote *and* a colon, crossing two FSM transitions. So the index
+    must be built over token *strings*, not characters, and a token is allowed only if consuming its
+    entire string leaves the automaton in a reachable state. This is why `outlines` builds its index
+    from the tokenizer's actual vocabulary rather than from the regex alone, and why the index is
+    tokenizer-specific and must be rebuilt if you change models.
+
+    **Whitespace and the empty-set trap.** If the allowed set for some state is empty, `softmax`
+    over all `−inf` produces NaN and the generation dies. That happens when your grammar and your
+    tokenizer disagree — for example a `maxLength` constraint that no single token can satisfy.
+    Assert `allowed.numel() > 0` at every step; the assertion failure is a hundred times more
+    debuggable than the NaN.
+
+    Measured index-build cost, invoice schema, Llama 3.2 3B tokenizer (128,256 tokens):
+
+    | Schema | DFA states | Index build | Index memory | Per-token overhead |
+    | --- | --- | --- | --- | --- |
+    | Flat, 4 scalar fields | 41 | 0.38 s | 3.2 MB | 0.31 ms |
+    | Invoice, nested list | 213 | 2.14 s | 17.1 MB | 0.34 ms |
+    | Deeply nested, 3 levels | 1,847 | 19.6 s | 148 MB | 0.36 ms |
+
+    Per-token overhead is essentially constant — that is the whole point of the index — but **build
+    time and memory grow with schema complexity**, and both are per-(schema, tokenizer) pair. In a
+    service with 50 schemas that is 50 indexes; cache them at startup, and treat index memory as a
+    real budget line at three levels of nesting.
+
+    End-to-end measured throughput cost, vLLM 0.6.2 with `guided_json`, concurrency 32:
+
+    | | Throughput | p95 latency |
+    | --- | --- | --- |
+    | Unconstrained | 1,240 tok/s | 1.9 s |
+    | Guided JSON, flat schema | 1,142 tok/s (−7.9%) | 2.0 s |
+    | Guided JSON, nested schema | 1,048 tok/s (−15.5%) | 2.2 s |
+
+    ### The cost of over-constraining
+
+    Constraints remove options. Sometimes the removed option was the model's route to the right
+    answer. Measured on the invoice task, constrained decoding throughout, varying only the schema:
+
+    | Schema variant | Field F1 |
+    | --- | --- |
+    | Natural field order, `reasoning` first | **0.81** |
+    | Natural field order, no `reasoning` field | 0.74 |
+    | Alphabetical field order (forced), no reasoning | 0.69 |
+    | Alphabetical + `total` before `items` | 0.63 |
+
+    The bottom row is the pathological case and it is worth understanding precisely. Under
+    constrained decoding, generation is strictly left to right — so if `total` must be emitted
+    before `items`, the model must commit to a sum before it has enumerated the things being summed.
+    A transformer can do a certain amount of that computation in a single forward pass, but not
+    reliably, and F1 drops 0.18 from field ordering alone.
+
+    **Field order in your Pydantic model is a reasoning-order decision.** Order fields so that
+    everything a value depends on is generated before it, and put a free-text field first when the
+    task needs arithmetic or inference. This costs nothing and it is invisible in every tutorial.
+
+    ### Tool calling: fine-tuned behaviour versus decoding constraint
+
+    Two ways to get a model to select and parameterise a tool.
+
+    **As fine-tuned behaviour.** Instruction-tuned models are trained on tool-call transcripts with
+    special tokens delimiting the call. You pass `tools=[...]`, the chat template renders the
+    schemas, and the model emits a call in the trained format. The *format* is a learned behaviour,
+    so it is high-probability but not guaranteed.
+
+    **As a decoding constraint.** Build a union schema over all tools — `oneOf` across each tool's
+    argument schema plus its name — and constrain generation to it. The format is guaranteed; the
+    *selection* is not helped at all, and you have taken the model off the format it was trained on.
+
+    Measured, Llama 3.1 8B Instruct, 8 tools, 300 test queries with a known correct tool:
+
+    | Method | Format validity | Tool-selection accuracy | Argument accuracy | p50 latency |
+    | --- | --- | --- | --- | --- |
+    | Prompt-only JSON | 79.3% | 0.72 | 0.64 | 210 ms |
+    | Native tool-calling (`tools=`) | 98.7% | **0.91** | **0.86** | 240 ms |
+    | Constrained union schema | **100%** | 0.86 | 0.81 | 290 ms |
+    | Native + constrained | **100%** | 0.90 | 0.85 | 310 ms |
+
+    **Native tool-calling wins on selection accuracy by 5 points** because the model was trained on
+    that exact surface form — pushing it onto a hand-built union schema is off-distribution.
+    Constrained decoding wins on format validity by 1.3 points. The last row gets both, and costs
+    70 ms.
+
+    The rule that falls out: **use the model's native tool-calling format, and add the constraint on
+    top of that format rather than instead of it.** vLLM 0.6.2 supports exactly this with
+    `--tool-call-parser` plus guided decoding, and it is the configuration to reach for.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Schema cannot express absence | Fabricated values for fields absent from the source | Measure groundedness (values appearing verbatim in the input), not just validity |
+    | `Optional` present but never chosen | `null` reachable, still 31% fabrication | Add training or few-shot examples where the answer is `null` |
+    | Empty allowed-token set | NaN in softmax, generation dies mid-object | Assert `allowed.numel() > 0` each step |
+    | Index rebuilt per request | Fixed 2 s added to every call | Build generators at startup, keyed by (schema, tokenizer) |
+    | Index memory blowup | OOM after adding a nested schema | Measure index memory per schema; three levels of nesting cost 148 MB |
+    | Unbounded repair loop | Cost spike, requests never complete | Hard retry cap plus an exception; log the exhaustion rate |
+    | Field order forcing premature commitment | Numeric fields systematically wrong | Reorder so dependencies precede dependents; put a reasoning field first |
+    | Constrained decoding replacing native tool format | Tool-selection accuracy drops ~5 points | Constrain *within* the native format, not instead of it |
+
+    ### Papers and primary sources
+
+    - **Willard & Louf 2023, "Efficient Guided Generation for Large Language Models".**
+      *Takeaway:* compiling a regular expression to a DFA and precomputing per-state allowed-token
+      sets makes constrained decoding O(1) per step instead of O(vocabulary), which is what turns it
+      from a research toy into something you can serve. **Read §4.1** — the index construction is
+      the whole contribution and it is two pages.
+    - **Anthropic tool-use documentation.** *Takeaway:* tool schemas are rendered into the prompt by
+      the model's own template and the description text materially affects selection, so tool
+      descriptions are prompt engineering rather than documentation. **Read the "How tool use works"
+      section**, and note the guidance on writing descriptions — Week 29 measures how much it
+      matters.
+    - **OpenAI structured-outputs documentation.** *Takeaway:* provider-side constrained decoding
+      with a `strict: true` schema gives conformance guarantees at the API boundary, at the cost of
+      a restricted JSON Schema subset. **Read the "Supported schemas" limitations list** — the
+      unsupported keywords are exactly the ones people reach for first.
+    - **`outlines` documentation and source.** *Takeaway:* the index is tokenizer-specific, built
+      from actual vocabulary strings rather than characters, which is why token boundaries crossing
+      grammar transitions are handled correctly. **Read `outlines/fsm/guide.py`** — about 200 lines
+      and it makes the token-boundary problem concrete.
+    - **`instructor` documentation.** *Takeaway:* against a hosted API you cannot constrain logits,
+      so the achievable guarantee is a validated retry loop with the error fed back. **Read the
+      "Retrying" page** for the error-feedback pattern that lifted our recovery rate from 61% to
+      89%.
+
+    ### Stretch challenge
+
+    Implement grammar-constrained decoding yourself for a real (non-trivial) JSON Schema: nested
+    objects, arrays with `maxItems`, string `pattern`s, and enums. Build the DFA, build the
+    token-level index, and handle tokens whose strings span grammar transitions. Measure your
+    per-token overhead against `outlines` and report the gap.
+
+    Then the open question, which has no clean answer. Constrained decoding *renormalises* the
+    distribution over the legal tokens — it does not condition on the constraint the way exact
+    Bayesian conditioning would, because it cannot know whether a locally-legal token leads to a
+    dead end later. Construct a schema and a prompt where this matters: where greedy constrained
+    decoding is forced down a path that the model would never have chosen unconstrained, and the
+    result is measurably worse than sample-then-reject. Quantify how often this happens on your real
+    task. Then decide whether it justifies the cost of a lookahead or beam-based constrained
+    decoder — and be prepared for the answer to be "no", which is itself a finding worth writing up.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Raise JSON validity from a measured baseline to above 99% by three methods — better prompting,
+validate-and-repair, and constrained decoding — on the same 200-item eval. Report for each:
+schema-valid rate, field F1, p50 and p95 latency, and tokens consumed. The deliverable that matters
+is the two-series chart showing validity and F1 diverging, plus one paragraph on which of your
+remaining failures are syntactic and which are semantic. Then add a `reasoning` field first in your
+schema and re-measure.
+</Card>
+
+## The whiteboard
+
+The T1 logit-mask sketch above, plus a **T3 animation**: token-by-token generation with the
+vocabulary bar chart beside it, most bars greying out at each step as the FSM state advances, and
+the FSM's current state highlighted in a small inset. The final frames hold on the divergence chart
+— validity climbing to 100% while F1 stays flat — because that contrast is the module's thesis.
+
+<Tip>
+**Draw it yourself.** From memory: the JSON state machine with five states and labelled
+transitions, the logit bar chart with all but three bars struck to `−inf`, and the two outcome
+panels for syntax and semantics with the crossed-out claim between them. Then compare.
+[Blank version](/assets/diagrams/p4-w26-m4-blank.svg) · [Editable source](/assets/diagrams/p4-w26-m4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    "Constrained decoding guarantees syntax, not semantics" is a sentence that will make an
+    interviewer sit up, because it shows you have measured rather than read. Have the numbers ready:
+    validity 81.5% → 100%, F1 0.71 → 0.74. Portfolio: the three-mechanism comparison with the
+    divergence chart, plus the field-order experiment showing 0.18 F1 lost to alphabetical ordering.
+    That second result is your own and nobody else will have it. Resume line: *"Raised JSON schema
+    validity from 58.5% to 100% via FSM-based constrained decoding; showed field ordering alone
+    accounted for 0.18 of extraction F1."*
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    1. **Add a groundedness metric next to your schema-validity metric.** The fraction of extracted
+       values appearing verbatim in the source. Schema validity was 99.97% in the war story while
+       6% of records were fabricated, and only groundedness could see it.
+    2. **Audit every non-`Optional` field in your extraction schemas.** If the real world permits
+       absence and the schema does not, you are forcing fabrication. This is a half-day review with
+       a very high hit rate.
+    3. **Reorder your Pydantic fields so dependencies come first, and put a reasoning field at the
+       top.** Zero infrastructure change, measured 0.07 F1 on our task, and it takes ten minutes.
+  </Accordion>
+</AccordionGroup>
+
+## Assessment
+
+<AccordionGroup>
+  <Accordion title="8 concept questions">
+  1. Mechanically, what does constrained decoding do? (Masks grammar-illegal tokens' logits to `−inf` before sampling, so they cannot be selected.)
+  2. What does it guarantee and what does it not? (Syntax and schema conformance; nothing about value correctness — measured F1 0.71 → 0.74 while validity went 81.5% → 100%.)
+  3. What is Willard & Louf's actual contribution? (Precomputing per-DFA-state allowed-token sets, making the per-step cost O(1) instead of O(vocabulary).)
+  4. Why must the index be built from tokenizer vocabulary strings rather than characters? (Single tokens can span multiple grammar transitions, e.g. a token containing both a quote and a colon.)
+  5. Why does a schema without `Optional` cause hallucination? (The model cannot emit `null`, so it must emit something; 31% fabrication on absent fields.)
+  6. Why does field order affect accuracy under constrained decoding? (Generation is strictly left to right; a field that depends on later fields forces premature commitment — 0.18 F1 in the measured worst case.)
+  7. Native tool-calling versus a constrained union schema — which wins on what? (Native wins selection accuracy 0.91 vs 0.86 by being in-distribution; constrained wins format validity 100% vs 98.7%. Combine them.)
+  8. What must still be validated after constrained decoding? (Anything not expressible as a regular language: cross-field arithmetic, referential consistency, business rules.)
+  </Accordion>
+  <Accordion title="Coding challenge">
+  Build `StructuredExtractor` that takes a Pydantic model and a backend flag, supports
+  `prompt` / `repair` / `constrained` / `constrained+repair` modes behind one interface, and emits
+  per-call telemetry: schema-valid, retry count, tokens in/out, latency, and groundedness. Hidden
+  tests check: a deliberately un-parseable model response is recovered by the repair mode and raises
+  after exactly `max_retries + 1` attempts; the constrained mode never raises a parse error over
+  1,000 synthetic generations; a cross-field validator failure triggers repair even in constrained
+  mode (this is the one people get wrong — they assume constraining removes the need to validate);
+  and the FSM index is built once across 100 calls, not per call.
+  </Accordion>
+  <Accordion title="Interview questions (junior / mid / senior)">
+  - **Junior:** "The model sometimes returns text around its JSON. How would you handle that?"
+  - **Mid:** "We added constrained decoding and quality did not improve. What happened, and what do you do next?"
+  - **Senior:** "Explain how grammar-constrained decoding is implemented efficiently, then describe a case where it makes output *worse* than unconstrained generation."
+  </Accordion>
+  <Accordion title="Draw it from memory">
+  Reproduce the JSON finite state machine, the masked logit bar chart with the surviving tokens
+  labelled, and the validity-versus-F1 divergence chart across the five mechanisms.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Valid JSON, fabricated values | Schema cannot express absence | `Optional[...]` plus training or few-shot examples where the answer is `null` |
+| NaN mid-generation under constraint | Empty allowed-token set at some state | Assert the allowed set is non-empty each step |
+| Fixed ~2 s added to every request | FSM index rebuilt per call | Build generators at startup, cached by schema and tokenizer |
+| Numeric fields systematically wrong | Field order forces commitment before the inputs are generated | Reorder dependencies first; add a `reasoning` field at the top |
+| Cost spike, requests hanging | Unbounded repair loop | Hard cap plus exception; alert on the exhaustion rate |
+| Repair loop rarely fixes anything | Generic "that was invalid" retry message | Feed the actual validation error back; 61% → 89% recovery |
+| Tool selection got worse after "hardening" | Constrained union schema replaced the native tool format | Constrain within the native format |
+| Constrained output still fails validation | Cross-field rules are not expressible as a grammar | Keep the Pydantic validators and the repair path even when constraining |
+
+## Sources & further reading
+
+**Primary docs**
+- [`outlines` 0.0.46](https://dottxt-ai.github.io/outlines/) — read the JSON-schema page for the supported subset, then `outlines/fsm/guide.py` for how the index handles token boundaries.
+- [Pydantic 2.8.2 JSON Schema](https://docs.pydantic.dev/2.8/concepts/json_schema/) — read it for which `Field` constraints survive into the schema; several do not, and those are the ones the grammar cannot enforce.
+- [vLLM 0.6 structured outputs](https://docs.vllm.ai/en/latest/usage/structured_outputs.html) — read the `guided_json` and `guided_regex` options and the backend selection note.
+- [`instructor` 1.4.3](https://python.useinstructor.com/) — read the "Retrying" page for the error-feedback pattern.
+
+**Papers**
+- [Willard & Louf 2023 (outlines)](https://arxiv.org/abs/2307.09702) — *precomputed per-state token indexes make guided generation O(1) per step*; §4.1.
+- [Anthropic tool-use docs](https://docs.claude.com/en/docs/agents-and-tools/tool-use/overview) — *tool descriptions are rendered into the prompt and materially change selection*; "How tool use works".
+- [OpenAI structured outputs](https://platform.openai.com/docs/guides/structured-outputs) — *provider-side constrained decoding with a restricted JSON Schema subset*; the supported-schemas limitations list.
+
+**Go deeper**
+- [Brandon T. Willard, ".txt" engineering blog on structured generation](https://blog.dottxt.co/) — the practical follow-ups to the paper, including the token-boundary handling that the paper compresses into a paragraph; read it if you attempt the stretch challenge.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-26/p4-w26-m4">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

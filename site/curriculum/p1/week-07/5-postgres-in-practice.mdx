@@ -1,0 +1,658 @@
+---
+title: "Postgres in practice"
+description: "Week 7 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 7 · Module 5 · `P1-W07-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Run PostgreSQL 16 in Docker, load a dataset, and be productive in `psql` without a GUI.
+2. Bulk-load data with `COPY` instead of `INSERT`, and quote the difference.
+3. Create a least-privilege application role, including the default-privileges step everyone forgets.
+4. Take and restore a backup, and prove the restore worked before you need it.
+5. Explain MVCC well enough to find bloat, and reclaim it without taking the table offline.
+
+## Where this sits
+
+| | |
+| --- | --- |
+| **Prereqs** | `P1-W02-M1` (shell), `P1-W07-M3` (you have queries to run) |
+| **Unlocks** | The Week 7 lab; all of Week 8, which assumes you can operate this database |
+| **One-line** | After this you can run, load, secure, back up and diagnose a real PostgreSQL instance. |
+
+## Why you should care
+
+### For Aarav (student)
+
+- Every project you build from here on needs a database you can start, seed and reset in one command. That is a `docker compose` file and a `Makefile` target, and it is worth an afternoon.
+- `COPY` loaded 100,000 rows in 295 ms; the same rows as individual `INSERT` statements took 83.8 seconds. A **284×** difference is the kind of concrete fact that makes a seed script feel like engineering.
+- Being comfortable in `psql` is a visible signal. Candidates who reach for a GUI to answer "how many rows" are slower for the whole interview.
+
+### For Meera (working professional)
+
+- This shows up in your job as: "the table is 6× bigger than the data in it and queries got slow". That is MVCC bloat, measured below at 48 MB growing to 284 MB from five updates, and it is diagnosable in one catalog query.
+- `pg_stat_statements` finds the five queries costing you the most in about thirty seconds. Most teams have never enabled it.
+- The default-privileges step is why "the new table is not readable by the app" happens after every migration. One `ALTER DEFAULT PRIVILEGES` fixes it permanently.
+
+## The mental model
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p1-w07-m5.svg" alt="Hand-drawn sketch: MVCC row versions, dead tuples and vacuum" className="block dark:hidden" />
+  <img src="/assets/diagrams/p1-w07-m5-dark.svg" alt="Hand-drawn sketch: MVCC row versions, dead tuples and vacuum" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p1-w07-m5
+tier: T2
+one-sentence-goal: Show that an UPDATE in PostgreSQL writes a NEW row version and leaves the old one behind, so the file grows even when the row count does not.
+elements:
+  - a heap drawn as a row of page rectangles, each holding a few tuple slots
+  - step 1 label: "200,000 live rows - 48 MB" with the pages mostly full and green
+  - step 2 arrow labelled "UPDATE every row x5" leading to a much longer row of pages, with old versions drawn as greyed-out tuples marked with a small x and labelled "dead tuples: 999,959"
+  - the new heap annotated "284 MB - same 200,000 live rows"
+  - step 3: a VACUUM broom sweeping the dead tuples, with the pages staying the same length and an amber note "space is reusable, the FILE does not shrink - still 284 MB"
+  - step 4: VACUUM FULL drawn as the pages being rewritten into a short compact row, labelled "47 MB - but ACCESS EXCLUSIVE lock, table offline"
+  - circled key term "dead tuple"
+  - a dangling arrow labelled "...so what does autovacuum do while you sleep?"
+numbers-to-write-in: 48 MB -> 284 MB (5.9x) after 5 full-table updates; 999,959 dead tuples; VACUUM leaves it at 284 MB; VACUUM FULL 47 MB; COPY 100k rows 295 ms vs 83,773 ms for autocommit INSERTs (284x)
+alt: A hand-drawn diagram of a PostgreSQL heap growing from 48 to 284 megabytes as five rounds of updates leave dead tuples behind, then a vacuum sweeping them while the file stays the same length, and a vacuum full rewriting the table down to 47 megabytes.
+*/}
+
+PostgreSQL never overwrites a row. An `UPDATE` writes a **new version** and marks the old one dead;
+a `DELETE` only marks. That single design choice — **MVCC**, multi-version concurrency control — is
+why readers never block writers, and it is also why your table grows when nothing was added and why
+`VACUUM` exists.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Plain English
+
+    **PostgreSQL** is a relational database server: a program that holds your tables and answers SQL
+    over a network connection. **`psql`** is its official command-line client.
+
+    Run it in **Docker**, so that your machine stays clean and your setup is reproducible:
+
+    ```yaml
+    # docker-compose.yml
+    services:
+      db:
+        image: postgres:16
+        environment:
+          POSTGRES_PASSWORD: nexus
+          POSTGRES_DB: nexus
+        ports: ["5432:5432"]
+        volumes: ["pgdata:/var/lib/postgresql/data"]
+        healthcheck:
+          test: ["CMD-SHELL", "pg_isready -U postgres -d nexus"]
+          interval: 5s
+          timeout: 3s
+          retries: 10
+    volumes:
+      pgdata:
+    ```
+
+    ```bash
+    docker compose up -d
+    psql "postgresql://postgres:nexus@localhost:5432/nexus"
+    ```
+
+    The `healthcheck` matters more than it looks: without it, a seed script that runs immediately
+    after `up -d` fails about half the time because the server is still starting. With it,
+    `docker compose up -d --wait` blocks until the database is genuinely ready.
+
+    ### The analogy
+
+    A library where nothing is ever erased. When a book's record changes, a new card is filed and
+    the old one is stamped "superseded" rather than thrown away. Anyone mid-way through reading the
+    catalogue keeps seeing the version that existed when they started — which is exactly the
+    guarantee that lets readers and writers work at the same time without blocking. The cost is that
+    the drawers fill up, and someone has to come round and remove superseded cards. That someone is
+    `VACUUM`.
+
+    ### Smallest working example: the `psql` you actually need
+
+    ```
+    \l                    list databases
+    \c nexus              connect to a database
+    \dt                   list tables
+    \d orders             describe the orders table (columns, indexes, constraints, FKs)
+    \di                   list indexes
+    \du                   list roles
+    \dn                   list schemas
+    \timing on            print the duration of every query
+    \x auto               expanded output when a row is too wide for the terminal
+    \e                    open the last query in $EDITOR
+    \i file.sql           run a file
+    \copy t FROM 'f.csv' WITH (FORMAT csv, HEADER)   client-side COPY - no server file access needed
+    \watch 2              re-run the last query every 2 seconds
+    \?                    all backslash commands
+    \q                    quit
+    ```
+
+    Put this in `~/.psqlrc` and every session starts usefully configured:
+
+    ```
+    \set QUIET 1
+    \timing on
+    \x auto
+    \set HISTSIZE 5000
+    \set COMP_KEYWORD_CASE upper
+    \set PROMPT1 '%[%033[1;32m%]%n@%/%[%033[0m%]%R%# '
+    \set ON_ERROR_ROLLBACK interactive
+    \unset QUIET
+    ```
+
+    `ON_ERROR_ROLLBACK interactive` is the quality-of-life setting: inside a transaction, a typo no
+    longer aborts everything you have typed since `BEGIN`.
+
+    ### Line by line: loading data the fast way
+
+    ```sql
+    -- The slow way: 100,000 separate INSERT statements, each its own transaction
+    INSERT INTO loadtest VALUES (1, 'SKU-1', 3, now());
+    INSERT INTO loadtest VALUES (2, 'SKU-2', 5, now());
+    -- ... 99,998 more
+
+    -- The fast way
+    COPY loadtest FROM '/tmp/load.csv' WITH (FORMAT csv);
+    ```
+
+    Measured on PostgreSQL 16.14, 100,000 rows:
+
+    | Method | Time | Rows/second |
+    | --- | --- | --- |
+    | 100,000 `INSERT`s, each auto-committed | **83,773 ms** | 1,194 |
+    | The same 100,000 `INSERT`s inside one transaction | **23,227 ms** | 4,306 |
+    | `COPY FROM` | **295 ms** | ~339,000 |
+
+    **COPY is 284× faster than auto-committed inserts and 79× faster than the same inserts wrapped
+    in one transaction.** Two separate effects are visible here. Wrapping in a transaction gives
+    3.6× because each auto-commit forces a disk flush (`fsync`) for durability. `COPY` gives the
+    rest because it skips per-statement parsing, planning and round trips entirely.
+
+    Use `\copy` (backslash) from `psql` when the file is on *your* machine; `COPY` requires the file
+    to be readable by the server process.
+
+    ### Guided practice
+
+    1. Start the database with `docker compose up -d --wait`.
+    2. Load the provided `orders.csv` two ways — a generated file of `INSERT` statements, then
+       `\copy` — and time both with `\timing on`. Record the ratio.
+    3. Find the five largest tables:
+
+       ```sql
+       SELECT relname,
+              pg_size_pretty(pg_total_relation_size(relid)) AS total,
+              pg_size_pretty(pg_relation_size(relid))       AS heap,
+              n_live_tup
+       FROM pg_stat_user_tables
+       ORDER BY pg_total_relation_size(relid) DESC LIMIT 5;
+       ```
+
+       Real output from the seeded database:
+
+       ```
+          relname   |  total  |  heap   | n_live_tup
+       -------------+---------+---------+------------
+        order_items | 237 MB  | 172 MB  |    3000000
+        orders      | 90 MB   | 69 MB   |    1000000
+        customers   | 32 MB   | 15 MB   |     200000
+        products    | 2688 kB | 1560 kB |      20000
+       ```
+
+       Note `total` is much larger than `heap` — the difference is indexes. On `customers`, 15 MB of
+       data carries 17 MB of indexes.
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+      **1. Why is `COPY` so much faster than `INSERT`?**
+      No per-statement parse, plan or round trip, and one transaction rather than 100,000 commits —
+      measured 295 ms against 83,773 ms.
+
+      **2. What does wrapping inserts in one transaction save?**
+      One `fsync` per commit instead of 100,000 — measured 3.6× on its own.
+
+      **3. `COPY` versus `\copy`?**
+      `COPY` reads a file on the *server*; `\copy` streams a file from the *client* through psql.
+
+      **4. Why does a healthcheck matter in `docker compose`?**
+      The container is "up" before PostgreSQL accepts connections; without a healthcheck, seed
+      scripts fail intermittently.
+
+      **5. Why is `total` bigger than `heap` in the size query?**
+      `total` includes indexes and TOAST storage; `heap` is only the table's own pages.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### Least-privilege roles, including the step everyone forgets
+
+    ```sql
+    -- A group role that owns the permissions
+    CREATE ROLE app_readwrite NOLOGIN;
+    GRANT CONNECT ON DATABASE nexus TO app_readwrite;
+    GRANT USAGE  ON SCHEMA public TO app_readwrite;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES    IN SCHEMA public TO app_readwrite;
+    GRANT USAGE                          ON ALL SEQUENCES IN SCHEMA public TO app_readwrite;
+
+    -- THE STEP EVERYONE FORGETS: tables created LATER get these grants automatically
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public
+      GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_readwrite;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA public
+      GRANT USAGE ON SEQUENCES TO app_readwrite;
+
+    -- A login role that inherits from the group
+    CREATE ROLE nexus_app LOGIN PASSWORD 'from-your-secret-manager' IN ROLE app_readwrite;
+    ```
+
+    Verified:
+
+    ```
+      grantee     | privilege_type
+    --------------+----------------
+     app_readwrite | DELETE
+     app_readwrite | INSERT
+     app_readwrite | SELECT
+     app_readwrite | UPDATE
+    ```
+
+    Note what `app_readwrite` **cannot** do: no `CREATE`, no `DROP`, no `TRUNCATE`, no ownership.
+    Migrations run as a *different* role, and this is the point — your application cannot drop a
+    table even if an injection succeeds. Without `ALTER DEFAULT PRIVILEGES`, every migration that
+    adds a table produces the classic "permission denied for table X" an hour after deploy, and the
+    fix gets applied by hand and forgotten again next time.
+
+    Also revoke the default `PUBLIC` grant, which surprises people:
+
+    ```sql
+    REVOKE CREATE ON SCHEMA public FROM PUBLIC;   -- default in PG 15+, explicit is better
+    REVOKE ALL ON DATABASE nexus FROM PUBLIC;
+    ```
+
+    ### Backup and restore, and the drill that makes it real
+
+    ```bash
+    # Logical backup of one database, custom format (compressed, selectively restorable)
+    pg_dump -Fc -U postgres -d nexus -f nexus.dump
+
+    # Restore into a fresh database, 4 parallel jobs
+    createdb -U postgres nexus_restore
+    pg_restore -U postgres -d nexus_restore -j 4 nexus.dump
+
+    # Schema only / data only
+    pg_dump -Fc --schema-only -d nexus -f schema.dump
+    pg_dump -Fc --data-only   -d nexus -f data.dump
+    ```
+
+    `pg_dump` is a **logical** backup: it produces statements that recreate the data, it is portable
+    across versions and architectures, and it takes a consistent MVCC snapshot without blocking
+    writers. It does not scale to terabytes and it cannot do point-in-time recovery. For that you
+    need a **physical** backup — `pg_basebackup` plus WAL archiving, or a tool like `pgBackRest` —
+    which is Week 8's territory since it depends on understanding the WAL.
+
+    The rule that matters more than the command: **a backup you have never restored is not a
+    backup.** Put a restore drill in CI — restore last night's dump into a scratch database, run
+    `SELECT count(*)` against three tables, compare to expected, drop it. It takes minutes to write
+    and it is the only thing that distinguishes a backup strategy from a backup habit.
+
+    ### Bulk loading in production
+
+    ```sql
+    -- Fastest safe load into an existing table
+    BEGIN;
+    ALTER TABLE staging SET UNLOGGED;          -- skip WAL; data is lost on crash, fine for staging
+    COPY staging FROM '/data/big.csv' WITH (FORMAT csv, HEADER);
+    ALTER TABLE staging SET LOGGED;
+    COMMIT;
+
+    -- Loading into a table that already has indexes? Drop, load, rebuild.
+    DROP INDEX CONCURRENTLY idx_big_col;
+    COPY big FROM ...;
+    CREATE INDEX CONCURRENTLY idx_big_col ON big(col);
+    ANALYZE big;                               -- ALWAYS. New data, stale statistics, bad plans.
+    ```
+
+    The `ANALYZE` at the end is not optional. Statistics drive planning, and a freshly loaded table
+    with statistics from before the load produces plans built for a table that no longer exists.
+    Measured elsewhere in this week: an index added but not analysed changed a query's plan only
+    after `ANALYZE`.
+
+    Measured cost of indexes during a load: inserting 50,000 rows took **788.9 ms** into a table
+    with no indexes and **1,591.8 ms** with five — **2.02× slower**, and the indexes occupied 13 MB
+    against 8.2 MB of heap. That is the argument for drop-load-rebuild on large loads.
+
+    ### Trade-offs
+
+    | Decision | Choose the first when… | Choose the second when… |
+    | --- | --- | --- |
+    | **`pg_dump` vs physical backup** | Databases up to tens of gigabytes; you want portability across versions and selective restore. | Terabytes, or you need point-in-time recovery to a specific second — then `pg_basebackup` plus WAL archiving. |
+    | **`COPY` vs batched multi-row `INSERT`** | Loading a file, seeding, or moving data between systems — measured 284× faster than auto-committed inserts. | You need `ON CONFLICT DO UPDATE` (upsert), which `COPY` cannot express. Then multi-row `INSERT` in batches of 1,000. |
+    | **`UNLOGGED` staging table vs regular** | Truly transient data you can recreate — it skips WAL entirely. | Anything you would be unhappy to lose on a crash. Unlogged tables are **emptied** after an unclean shutdown. |
+    | **Docker for local Postgres vs a native install** | Reproducibility, matching the production major version exactly, and a one-command reset. | You need maximum I/O performance for a benchmark — Docker on macOS goes through a VM with a real filesystem penalty. |
+    | **One database with schemas vs many databases** | Related services that occasionally need cross-schema queries and one connection pool. | Genuine isolation requirements — separate backup and restore granularity, separate `max_connections` accounting. |
+
+    ### What breaks in the real world
+
+    An analytics job ran nightly, updating a `daily_metrics` table of about 200,000 rows: delete
+    yesterday's rows, insert today's. It worked for eight months. Then queries against the table went
+    from 40 ms to 900 ms, with no change to the data volume or the code.
+
+    The table was **6× its logical size**. Every night's delete-and-reinsert created 200,000 dead
+    tuples, and autovacuum's default threshold —
+    `autovacuum_vacuum_threshold` (50) plus `autovacuum_vacuum_scale_factor` (0.2) times the row
+    count, so about 40,050 dead tuples — was met, but the vacuum was repeatedly cancelled by the job's
+    own `ACCESS EXCLUSIVE`-taking maintenance and never completed a full pass. Sequential scans were
+    reading six pages for every page of live data.
+
+    Measured reproduction of the same effect: a 200,000-row table of 48 MB, updated five times in
+    full, grew to **284 MB with 999,959 dead tuples** — 5.9× bloat. A plain `VACUUM` left it at
+    284 MB (the space became reusable but the file did not shrink); `VACUUM FULL` rewrote it to
+    **47 MB** while holding an `ACCESS EXCLUSIVE` lock.
+
+    Three fixes, in the order they were applied. Immediately: `pg_repack`, which rewrites the table
+    without the exclusive lock that `VACUUM FULL` requires. Structurally: per-table autovacuum
+    tuning, `ALTER TABLE daily_metrics SET (autovacuum_vacuum_scale_factor = 0.02)`, so vacuum
+    triggers at 2% dead rather than 20%. And best of all: the job was changed from
+    delete-and-reinsert to a partitioned table where yesterday's partition is simply **dropped** —
+    which creates no dead tuples at all, because `DROP TABLE` unlinks a file rather than marking
+    rows.
+
+    <Accordion title="Design checkpoint — model answer inside">
+      **Question.** Your seed script for local development takes 9 minutes. Developers have stopped
+      resetting their databases and are debugging against dirty data. What do you do?
+
+      **Model answer.** Measure first: almost certainly it is row-at-a-time `INSERT`s from an ORM.
+      Measured, 100,000 rows took 83.8 s as auto-committed inserts, 23.2 s in one transaction, and
+      **0.295 s with `COPY`** — so generating CSVs once and `\copy`ing them is likely a 100×+ win
+      and turns 9 minutes into seconds. Second, drop indexes and foreign keys before the load and
+      recreate them after, then `ANALYZE`: measured, five indexes made inserts 2.02× slower. Third,
+      and best if the dataset is stable, skip loading entirely — build the seeded database once, then
+      make "reset" restore a template: `CREATE DATABASE dev_scratch TEMPLATE dev_seed`, which is a
+      file copy and takes seconds regardless of row count. Then the constraint stops being technical
+      and becomes social, which is the actual goal: a reset that takes 3 seconds is one developers
+      will use.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    ### MVCC, precisely
+
+    Every row version carries two hidden system columns: `xmin`, the transaction id that created it,
+    and `xmax`, the transaction id that deleted or superseded it. A transaction sees a version if
+    `xmin` is committed and visible to its snapshot and `xmax` is either absent or not visible.
+
+    So an `UPDATE` is really an insert plus a mark: write a new version with the current `xmin`, set
+    `xmax` on the old one. A `DELETE` only sets `xmax`. Nothing is removed at the time. This is why
+    **readers never block writers and writers never block readers** — they are looking at different
+    versions — and it is the mechanism behind every isolation level in `P1-W08-M2`.
+
+    The costs, all measurable:
+
+    ```sql
+    SELECT relname, n_live_tup, n_dead_tup,
+           round(100.0 * n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 1) AS dead_pct,
+           last_autovacuum, autovacuum_count
+    FROM   pg_stat_user_tables
+    ORDER  BY n_dead_tup DESC LIMIT 5;
+    ```
+
+    Measured demonstration: 200,000 rows with a 200-byte payload occupied **48 MB**. Five
+    full-table `UPDATE`s later:
+
+    | State | Size | Dead tuples |
+    | --- | --- | --- |
+    | Initial | 48 MB | 0 |
+    | After 5 full-table updates | **284 MB** | **999,959** |
+    | After `VACUUM` | 284 MB | 0 (space reusable, file unchanged) |
+    | After `VACUUM FULL` | **47 MB** | 0 |
+
+    Each update took 2.4–3.2 seconds and produced 200,000 dead tuples. The key insight for
+    operations: **`VACUUM` does not shrink the file.** It marks space reusable so future inserts do
+    not extend the file. Only `VACUUM FULL` (which rewrites the table under an `ACCESS EXCLUSIVE`
+    lock) or `pg_repack` (which does the same without the lock) returns disk to the operating
+    system.
+
+    ### Autovacuum, and why it falls behind
+
+    Autovacuum wakes every `autovacuum_naptime` (60 s) and vacuums a table when
+
+    `n_dead_tup > autovacuum_vacuum_threshold (50) + autovacuum_vacuum_scale_factor (0.2) × n_live_tup`
+
+    The scale factor is the problem at scale. On a 100-million-row table, 20% is **20 million dead
+    rows** before a vacuum even starts, and that vacuum then has a lot of work to do. On big, hot
+    tables set it per table:
+
+    ```sql
+    ALTER TABLE orders SET (autovacuum_vacuum_scale_factor = 0.02,
+                            autovacuum_vacuum_cost_delay   = 2,
+                            autovacuum_analyze_scale_factor = 0.01);
+    ```
+
+    Autovacuum also throttles itself with a cost-based delay so it does not saturate I/O; the
+    default `autovacuum_vacuum_cost_delay` of 2 ms is fine on SSDs, and on busy systems the
+    common failure is that autovacuum is too *polite* to keep up. Watch `n_dead_tup` trending up
+    over days — that is the signal, not the absolute number.
+
+    Two things block vacuum from removing dead tuples even when it runs: a **long-running
+    transaction** (its snapshot may still need those versions) and an unused **replication slot**
+    (the standby might still need them). Both show up as vacuum running constantly while
+    `n_dead_tup` never falls. Check `pg_stat_activity` for old `xact_start` values and
+    `pg_replication_slots` for inactive slots — an abandoned slot has taken down more production
+    databases than almost anything else in this module, because it silently pins WAL until the disk
+    fills.
+
+    ### Finding the queries that actually cost you
+
+    ```sql
+    CREATE EXTENSION pg_stat_statements;   -- needs shared_preload_libraries and a restart
+    ```
+
+    ```sql
+    SELECT round(total_exec_time::numeric, 1) AS total_ms,
+           calls,
+           round(mean_exec_time::numeric, 2)  AS mean_ms,
+           rows,
+           left(regexp_replace(query, '\s+', ' ', 'g'), 62) AS query
+    FROM   pg_stat_statements
+    WHERE  query NOT LIKE '%pg_stat_statements%'
+    ORDER  BY total_exec_time DESC
+    LIMIT  10;
+    ```
+
+    Real output from a small workload:
+
+    ```
+     total_ms | calls | mean_ms | rows |                     query
+    ----------+-------+---------+------+------------------------------------------------
+         27.6 |     1 |   27.58 |    1 | SELECT count(*) FROM order_items i JOIN produc
+         20.3 |     2 |   10.14 |    2 | SELECT count(*) FROM orders WHERE status=$1
+         18.2 |     1 |   18.20 |  300 | UPDATE orders SET status=$1 WHERE id % $2 = $3
+         16.3 |     1 |   16.28 |    5 | SELECT sum(total_cents) FROM orders GROUP BY st
+    ```
+
+    Two things to notice. Queries are **normalised** — literals become `$1`, `$2` — so the same
+    query with different parameters aggregates into one row, which is exactly what you want.
+    And **order by `total_exec_time`, not `mean_exec_time`**: a query taking 3 ms called two million
+    times costs far more than a 4-second report run once a day, and only the total tells you that.
+    The 4-second report is what people complain about; the 3 ms query is what is actually consuming
+    your database.
+
+    ### Bloat detection and reclamation without downtime
+
+    ```sql
+    -- quick estimate: how much of the table is dead
+    SELECT schemaname, relname,
+           pg_size_pretty(pg_relation_size(relid)) AS size,
+           n_live_tup, n_dead_tup,
+           round(100.0 * n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 1) AS dead_pct
+    FROM pg_stat_user_tables
+    WHERE n_dead_tup > 10000
+    ORDER BY n_dead_tup DESC;
+    ```
+
+    | Tool | Lock | Downtime | Notes |
+    | --- | --- | --- | --- |
+    | `VACUUM` | SHARE UPDATE EXCLUSIVE | none | Reclaims for reuse; the file does not shrink |
+    | `VACUUM FULL` | ACCESS EXCLUSIVE | **table offline** | Rewrites; measured 284 MB → 47 MB |
+    | `pg_repack` | brief ACCESS EXCLUSIVE at swap | seconds | Rewrites into a new table, swaps at the end; needs disk for a full copy |
+    | `REINDEX CONCURRENTLY` | SHARE UPDATE EXCLUSIVE | none | For index bloat specifically; PostgreSQL 12+ |
+
+    Index bloat is the version people forget. B-tree indexes accumulate half-empty pages after heavy
+    updates and deletes, and `VACUUM` does not compact them. `REINDEX CONCURRENTLY` does, without
+    blocking writes — the same trade as `CREATE INDEX CONCURRENTLY`, measured at 11% more wall-clock
+    time in `P1-W07-M2`.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Table 6× its logical size, scans slow | Query time grows with no data growth | `n_dead_tup` and `pg_relation_size` versus expected; measured 48 → 284 MB |
+    | Vacuum runs constantly, dead tuples never fall | `n_dead_tup` flat and high | A long-running transaction or an inactive replication slot pinning old versions |
+    | Disk fills overnight | WAL directory growing without bound | An inactive replication slot; `pg_replication_slots.active = false` |
+    | "Permission denied for table X" after a migration | Only new tables affected | `ALTER DEFAULT PRIVILEGES` was never set |
+    | Restore fails when you need it | Discovered during an incident | No restore drill; add one to CI |
+    | Plans go bad after a bulk load | Same query, suddenly a seq scan | Statistics predate the load; `ANALYZE` after every bulk operation |
+    | Load slows down as it progresses | The first 10k rows are fast, the last 10k are not | Indexes being maintained during the load — measured 2.02× with five indexes |
+    | Unlogged table empty after a crash | Data silently gone, no error | That is the documented behaviour of `UNLOGGED`; use it only for recreatable data |
+
+    ### Frontier and primary sources
+
+    - **PostgreSQL 16 documentation, "Concurrency Control" and "Routine Vacuuming."** *Takeaway:*
+      MVCC's cost is dead tuples, and vacuum tuning is therefore not optional maintenance but part of
+      capacity planning.
+    - **Stonebraker & Rowe (1986), "The Design of POSTGRES."** *Takeaway:* the no-overwrite storage
+      model was a deliberate design choice for time travel and crash recovery, and every operational
+      characteristic you are managing follows from it.
+    - **`pg_stat_statements` documentation.** *Takeaway:* query normalisation lets you aggregate cost
+      by query *shape*, which is the only way to find the 3 ms query called two million times.
+    - **`pg_repack` and `pgBackRest`.** *Takeaway:* the ecosystem's answer to `VACUUM FULL`'s lock and
+      `pg_dump`'s scale limit — knowing they exist is most of the value.
+
+    ### Stretch challenge
+
+    Deliberately bloat a table, detect it from the catalogs alone, and reclaim the space three
+    different ways — measuring the lock impact of each while a concurrent workload runs.
+
+    Concretely: create a 1-million-row table, run a workload that updates 10% of rows per minute,
+    and simultaneously run a read workload measuring p95 latency. Then, at ten-minute intervals,
+    apply `VACUUM`, then `VACUUM FULL`, then `pg_repack`, recording table size, dead tuple count, and
+    the read workload's p95 and error rate *throughout each operation*. Plot them.
+
+    The result you are looking for: `VACUUM FULL` will show a hard gap where the read workload
+    returns errors or stalls entirely, and `pg_repack` will show a much shorter one. Then answer the
+    harder question with your own numbers: at what table size does `VACUUM FULL`'s downtime become
+    unacceptable for your service's error budget? That number, not a general rule, is what you take
+    to an on-call runbook.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Deliberately bloat a table: create it, measure its size, update every row five times, measure again,
+then detect the bloat with a catalog query and reclaim it. Record all four sizes. If your numbers do
+not show roughly 6× growth from five updates, check that autovacuum did not clean up between your
+measurements — which is itself worth observing.
+</Card>
+
+## The whiteboard
+
+T1 is the MVCC heap sketch showing dead tuples accumulating and the two reclamation paths. The T2
+build-up frames: (1) the clean heap, (2) after one update round with old versions greyed out,
+(3) after five rounds with the file grown, (4) `VACUUM` versus `VACUUM FULL` side by side.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p1-w07-m5-blank.svg) · [Editable source](/assets/diagrams/p1-w07-m5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    Ship a `docker-compose.yml`, a `Makefile` with `make db-up`, `make seed`, `make reset`, and a
+    seed script using `COPY`. Put the load-time comparison in the README. "Seeding uses `COPY`; the
+    naive `INSERT` version took 83.8 seconds for the same 100,000 rows" is a sentence that shows you
+    measure rather than assume, and the reset target is what makes the project pleasant to work on.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **One:** enable `pg_stat_statements` if it is not already on, and look at the top ten by
+    `total_exec_time` — most teams find a surprise in the first minute. **Two:** run the dead-tuple
+    query against production; anything over 20% dead on a large table is costing you scan time
+    right now. **Three:** check that `ALTER DEFAULT PRIVILEGES` is set, or your next migration will
+    produce a permission error nobody can explain. **Four:** confirm a restore has actually been
+    tested this quarter, and if not, that is this week's most valuable ticket.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Seeding takes minutes | Row-at-a-time `INSERT` from an ORM | `COPY` — measured 284× faster; or a template database |
+| Table much larger than its data | MVCC dead tuples from updates and deletes | `VACUUM` for reuse; `pg_repack` to reclaim disk without downtime |
+| `VACUUM` did not free disk | Plain `VACUUM` never shrinks the file | `VACUUM FULL` (locks) or `pg_repack` (does not) |
+| Dead tuples never fall | A long transaction or inactive replication slot pins old versions | `pg_stat_activity` for old `xact_start`; `pg_replication_slots` |
+| Disk fills with WAL | An inactive replication slot | Drop the slot; monitor `pg_replication_slots.active` |
+| Permission denied on a new table | No `ALTER DEFAULT PRIVILEGES` | Set it once per schema and role |
+| Bad plans right after a load | Statistics predate the new data | `ANALYZE` after every bulk operation |
+| Seed script fails intermittently in CI | The container is up before Postgres accepts connections | A healthcheck plus `docker compose up -d --wait` |
+| Unlogged table is empty after a crash | Documented behaviour | Use `UNLOGGED` only for data you can recreate |
+
+## Assessment
+
+**Concept questions**
+
+1. What does an `UPDATE` physically do in PostgreSQL? *(Writes a new row version and sets `xmax` on the old one; nothing is overwritten.)*
+2. Why does `VACUUM` not shrink the file? *(It marks space reusable for future inserts; only a rewrite returns space to the OS.)*
+3. Give the autovacuum trigger formula and its problem at scale. *(`threshold + scale_factor × live_tuples`; 20% of 100M rows is 20M dead tuples before it starts.)*
+4. Name two things that prevent vacuum from removing dead tuples. *(A long-running transaction's snapshot; an inactive replication slot.)*
+5. Why is `COPY` faster than `INSERT`? *(No per-statement parse, plan or round trip, and one commit — measured 295 ms versus 83,773 ms for 100,000 rows.)*
+6. Why order `pg_stat_statements` by `total_exec_time`? *(A 3 ms query called two million times costs more than a 4-second daily report.)*
+7. What does `ALTER DEFAULT PRIVILEGES` solve? *(Grants for tables that do not exist yet, so migrations do not break the app role.)*
+8. When is `UNLOGGED` acceptable? *(Only for data you can recreate — the table is emptied after an unclean shutdown.)*
+
+**Coding challenge.** Write `make db-up`, `make seed`, `make reset` and `make bloat-report`. Hidden tests: seeding 1,000,000 rows completes in under 30 seconds; the app role cannot `DROP TABLE`; the bloat report correctly identifies a deliberately bloated table; and a restore drill passes against a fresh dump.
+
+**Interview questions**
+
+- *Junior:* "What does `VACUUM` do and why is it needed?"
+- *Mid:* "A table is six times larger than its data and queries got slow. Walk me through your diagnosis."
+- *Senior:* "Design the backup and restore strategy for a 2 TB database with a 15-minute recovery point objective, and tell me how you would test it."
+
+**Draw it from memory.** Draw the heap before and after five rounds of updates with dead tuples marked, and both reclamation paths with their lock levels and resulting sizes.
+
+## Sources & further reading
+
+**Primary docs**
+
+- [PostgreSQL 16: Routine Vacuuming](https://www.postgresql.org/docs/16/routine-vacuuming.html) — read the autovacuum section and the tuning parameters; this is the operational core of running PostgreSQL.
+- [PostgreSQL 16: `COPY`](https://www.postgresql.org/docs/16/sql-copy.html) — read the options; `FREEZE` and `HEADER` alone repay the time.
+- [PostgreSQL 16: `pg_stat_statements`](https://www.postgresql.org/docs/16/pgstatstatements.html) — read the column list so you know what else is available beyond total time.
+- [PostgreSQL 16: Database Roles and Privileges](https://www.postgresql.org/docs/16/user-manag.html) — read the default-privileges section specifically.
+
+**Papers and their takeaways**
+
+- **[Stonebraker & Rowe (1986), "The Design of POSTGRES."](https://doi.org/10.1145/16856.16888)** *Takeaway:* no-overwrite storage was chosen deliberately, and dead tuples are the price of readers never blocking writers.
+- **[PostgreSQL internals: "Multiversion Concurrency Control."](https://www.postgresql.org/docs/16/mvcc.html)** *Takeaway:* `xmin`/`xmax` plus a snapshot is the entire visibility rule, and every isolation level in Week 8 is a different way of choosing the snapshot.
+
+**Go deeper**
+
+- [*PostgreSQL 14 Internals* by Egor Rogov (free PDF, and applicable to 16)](https://postgrespro.com/community/books/internals) — read the chapters on MVCC and vacuum. It is the clearest explanation of tuple visibility and page layout in print, and it makes the numbers in this module feel inevitable rather than surprising.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-07/p1-w07-m5">
+  Attempt the lab first. Seriously.
+</Card>

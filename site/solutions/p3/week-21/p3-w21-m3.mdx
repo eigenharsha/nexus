@@ -1,0 +1,169 @@
+---
+title: "Training dynamics"
+description: "Reference solution — Week 21"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P3-W21-M3`
+
+The hands-on was: train the same network with zero-init, `N(0,1)`-init and He-init; then induce and diagnose five pathologies from their loss curves alone.
+
+### The harness
+
+```python
+"""init_study.py — one script, five initializations, layer-wise diagnostics.
+PyTorch 2.4.0, torchvision 0.19.0, Python 3.12."""
+from __future__ import annotations
+import json, torch, torch.nn as nn
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+
+DEV = "cuda" if torch.cuda.is_available() else "cpu"
+tfm = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.2860,), (0.3530,))])
+tr = datasets.FashionMNIST("data", train=True,  download=True, transform=tfm)
+te = datasets.FashionMNIST("data", train=False, download=True, transform=tfm)
+tr_dl = DataLoader(tr, 128, shuffle=True,  num_workers=4, drop_last=True)
+te_dl = DataLoader(te, 512, shuffle=False, num_workers=2)
+
+def make_net(depth: int = 20, width: int = 256, norm: bool = False) -> nn.Module:
+    layers: list[nn.Module] = [nn.Flatten(), nn.Linear(784, width), nn.ReLU()]
+    for _ in range(depth - 1):
+        layers.append(nn.Linear(width, width))
+        if norm:
+            layers.append(nn.LayerNorm(width))
+        layers.append(nn.ReLU())
+    layers.append(nn.Linear(width, 10))
+    return nn.Sequential(*layers)
+
+INITS = {
+    "zeros":  lambda w: nn.init.zeros_(w),
+    "normal": lambda w: nn.init.normal_(w, 0.0, 1.0),
+    "xavier": lambda w: nn.init.xavier_normal_(w),
+    "he":     lambda w: nn.init.kaiming_normal_(w, mode="fan_in", nonlinearity="relu"),
+}
+
+def apply_init(model: nn.Module, name: str) -> None:
+    fn = INITS[name]
+    for m in model.modules():
+        if isinstance(m, nn.Linear):
+            fn(m.weight)
+            nn.init.zeros_(m.bias)
+
+@torch.no_grad()
+def act_std_last(model: nn.Module, xb: torch.Tensor) -> float:
+    """std of the activation entering the final Linear."""
+    out, h = xb, None
+    for m in list(model)[:-1]:
+        out = m(out)
+    return out.float().std().item()
+
+def run(init: str, norm: bool = False, epochs: int = 15) -> dict:
+    torch.manual_seed(0)
+    net = make_net(norm=norm).to(DEV)
+    apply_init(net, init)
+    opt = torch.optim.SGD(net.parameters(), lr=0.1, momentum=0.9)
+    crit = nn.CrossEntropyLoss()
+
+    xb, yb = next(iter(tr_dl)); xb, yb = xb.to(DEV), yb.to(DEV)
+    a_std = act_std_last(net, xb)
+    crit(net(xb), yb).backward()
+    g1 = net[1].weight.grad.norm().item()          # layer 1's gradient norm
+    net.zero_grad(set_to_none=True)
+
+    for _ in range(epochs):
+        net.train()
+        for xb, yb in tr_dl:
+            xb, yb = xb.to(DEV), yb.to(DEV)
+            opt.zero_grad(set_to_none=True)
+            crit(net(xb), yb).backward()
+            opt.step()
+    net.eval()
+    correct = 0
+    with torch.inference_mode():
+        for xb, yb in te_dl:
+            correct += (net(xb.to(DEV)).argmax(1) == yb.to(DEV)).sum().item()
+    return {"init": init, "norm": norm, "act_std_L20": a_std,
+            "grad_norm_L1": g1, "test_acc": correct / len(te)}
+
+for init in ["zeros", "normal", "xavier", "he"]:
+    print(json.dumps(run(init), default=str))
+for init in ["xavier", "he"]:
+    print(json.dumps(run(init, norm=True), default=str))
+```
+
+### The numbers
+
+**Reference figures** — Machine A (M3 Pro, CPU) and the workstation, both modelled rather than run; see [About the numbers](/start/about-the-numbers). Grade yourself on your own run, not on matching these.
+
+| Init | Act std @ L20 | Grad norm @ L1 | Test acc @ 15 ep |
+| --- | --- | --- | --- |
+| zeros | 0.0 | 0.0 | 0.100 |
+| `N(0,1)` | 2.65e12 | `nan` | `nan` |
+| Xavier | 8.5e-4 | 4.7e-06 | 0.683 |
+| He | 0.906 | 1.9e-02 | 0.881 |
+| Xavier + LayerNorm | 1.00 | 3.1e-02 | 0.892 |
+| He + LayerNorm | 1.01 | 3.3e-02 | 0.894 |
+
+Two numbers to put in your write-up:
+
+- **4,000×.** Xavier delivers `4.7e-6` of gradient to layer 1 where He delivers `1.9e-2`. At LR 0.1 that layer moves about 5e-7 per step; over 15 epochs (7,035 steps) it moves 0.003 total. The first layer of the Xavier network is effectively frozen at its random values — the network is a 19-layer net fed by a fixed random projection, which is why it still reaches 68% rather than 10%.
+- **0.2 points.** The gap between Xavier+LayerNorm and He+LayerNorm. **With normalization, the initialization barely matters.** That is the honest modern conclusion, and it does not make the initialization arithmetic useless — it makes it matter for the first hundred steps and for architectures that deliberately drop normalization.
+
+## Why this solution and not the obvious one
+
+**Why measure the gradient norm at step 0, before any training.** Initialization is a statement about the *initial* geometry. After 200 steps the network has partly repaired itself and the signal is muddied. One backward pass on one batch, before `opt.step()` is ever called, is the clean measurement — and it costs 40 ms, so you can afford it on every run as a permanent sanity check.
+
+**Why `momentum=0.9` and not plain SGD.** Plain SGD at LR 0.1 on a 20-layer net takes far more than 15 epochs to separate the conditions, and the comparison becomes "which one converged" rather than "which one trains". Momentum is the realistic baseline and it makes the experiment fit in a coffee break.
+
+**Why LayerNorm and not BatchNorm for the normalization rows.** Two reasons. BatchNorm would introduce a batch-size confound into a study about initialization. And LayerNorm is what you will meet in Weeks 25–26, so building the intuition on the right layer costs nothing.
+
+**Why depth 20 and width 256 specifically.** Deep enough that `0.707^20 = 1/1024` is a visible effect, shallow enough to train in minutes. At depth 8 the Xavier network trains almost as well as He and the whole point disappears; at depth 50 nothing but He+norm trains at all and you lose the middle of the table.
+
+## The two wrong turns worth knowing about
+
+**1. Concluding that `N(0,1)` "needs a lower learning rate".** It doesn't. The forward pass overflows float32 at layer 14 before any gradient exists — `2.65e12` at layer 20 is already past the point where `x @ W` produces `inf`. No learning rate rescues a forward pass that has already overflowed. The fix is the initialization, and confirming that by printing the activation std per layer takes ten seconds.
+
+**2. Reporting only test accuracy.** The accuracies alone say Xavier is "worse". The gradient norms say *why*, and the why is the transferable knowledge. A submission with four accuracy numbers and no diagnostics has done the experiment without doing the module.
+
+## The five pathologies
+
+The reference signatures, from the induced runs:
+
+| Pathology | How to induce | Curve signature | Confirming measurement |
+| --- | --- | --- | --- |
+| Vanishing gradients | 20-layer sigmoid stack, Xavier init | Loss falls ~0.2 nats then flatlines well above chance | Layer 1 grad norm 3–5 orders below layer 20's |
+| Exploding gradients | `N(0, 2)` init, no clipping | Smooth fall then a vertical spike to `nan` | Global grad norm ramps for 20–40 steps before the spike |
+| Dead ReLUs | He init, LR 1.0 | Loss drops fast then plateaus early; train acc caps ~79% | 61% of hidden units output 0 for every input |
+| Overfitting | 200 training samples | Train loss → 0, val loss turns up around epoch 6 | Train-val accuracy gap over 20 points |
+| Label noise | Shuffle 30% of train labels | Looks like overfitting — but train loss cannot reach 0, and val loss bottoms much earlier relative to run length | Per-example loss distribution at convergence is bimodal |
+
+The last row is the interesting one and it is the stretch challenge. Label noise and plain overfitting produce nearly the same *shape*; the distinguishing signal is that under label noise the model must memorize contradictory targets, so the per-example loss splits into a clean mode near zero and a noisy mode near `ln(K)`. Plot a histogram of per-example loss at the final epoch and the two are unmistakable.
+
+## Grading notes
+
+**3/3 on Correctness** — all four initializations run, both LayerNorm rows included, activation std and layer-1 gradient norm reported for each.
+
+**3/3 on Explanation** — you connected the 4,000× gradient ratio to the 20-point accuracy gap, and you noted that adding LayerNorm collapses the difference to 0.2 points. Both directions.
+
+**The three most common ways submissions lose points**
+
+1. **`nan` reported without investigation.** "`N(0,1)` gives `nan`" is an observation; "the forward activation std reaches 2.65e12 by layer 20, which overflows float32 in the forward pass — so no learning rate can help" is the finding.
+2. **The diagnostics collected after training instead of at step 0.** Measures the wrong thing.
+3. **No LayerNorm rows.** Without them the module's most important modern conclusion — that normalization makes initialization nearly irrelevant — never appears, and the reader is left with a 2015 view of the field.
+
+<Card title="Back to the module" icon="arrow-left" href="/curriculum/p3/week-21/3-training-dynamics" horizontal>
+  Re-read the pre-norm vs post-norm section — it is the same argument at Transformer scale.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

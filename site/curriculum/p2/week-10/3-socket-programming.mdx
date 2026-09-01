@@ -1,0 +1,830 @@
+---
+title: "Socket programming"
+description: "Week 10 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 10 · Module 3 · `P2-W10-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** `P2-W10-M2` (TCP is a byte stream; you have seen 1,000 sends become 413 reads),
+  Week 4 (`asyncio` and the event loop).
+- **Unlocks:** `P2-W10-M4` (protocol design), the Week 10 lab, and Week 24 (a Kubernetes readiness
+  probe is an `accept()` on a listening socket).
+- **One-line:** after this you can write a server that handles a thousand concurrent connections
+  correctly, and you can say — with measured memory and latency — which concurrency model to use.
+
+## What you'll be able to do
+
+1. Walk the socket lifecycle: `socket`, `bind`, `listen`, `accept`, `connect`, `send`, `recv`, `close`.
+2. Write `recv_exactly` and length-prefixed framing, and explain why both are mandatory.
+3. Handle `ECONNRESET`, `EPIPE`, partial writes and half-close without leaking connections.
+4. Implement the same server three ways — threads, `selectors`, `asyncio` — and benchmark them.
+5. Choose a concurrency model with a number: memory per connection, p99 latency, and thread count.
+
+## Why you should care
+
+**Aarav (student).** A working chat server is the most demonstrable portfolio project in this entire
+phase — it is visual, it is concurrent, and every interviewer understands the problem instantly.
+Building it three ways and having the benchmark table is what turns it from "I did a tutorial" into
+"I have an opinion about concurrency models, and here is the data".
+
+**Meera (working professional).** You have used `requests`, `FastAPI` and a database driver. All
+three are this module underneath, and every mysterious behaviour you have seen — a connection pool
+that hangs, a client that never times out, an `ECONNRESET` in the logs at 3 a.m. — is explained by
+one of the six failure modes below. Also: the C10K discussion is the reason `nginx` beat Apache and
+the reason `asyncio` exists, and you should be able to argue about it with numbers.
+
+## The mental model
+
+A socket is a file descriptor with a network on the other end. Everything else follows from that:
+
+- You `read()` and `write()` it (spelled `recv`/`send`), and both can return **less than you asked
+  for**. That is not an error; it is the contract.
+- It can be blocking (the call waits) or non-blocking (the call returns `EWOULDBLOCK` immediately and
+  you come back later).
+- A server socket is a special one: it does not carry data, it produces *more sockets* via `accept()`.
+
+The whole design space of network servers is one question: **when a connection has nothing to say,
+what is your program doing?** Blocking in a thread costs a thread. Blocking in a coroutine costs a
+few kilobytes. Polling costs CPU. The three models below are three answers.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p2-w10-m3.svg" alt="Hand-drawn sketch: socket programming" className="block dark:hidden" />
+  <img src="/assets/diagrams/p2-w10-m3-dark.svg" alt="Hand-drawn sketch: socket programming" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p2-w10-m3
+tier: T2
+one-sentence-goal: The socket lifecycle is fixed; the only real choice is what your program does while a connection is idle.
+elements:
+  - left column: the lifecycle as a numbered ladder - server side socket/bind/listen/accept and client side socket/connect - with a horizontal double arrow between accept and connect labelled "3-way handshake happens HERE, inside connect()"
+  - circle "accept() returns a NEW socket" with amber note "the listening socket never carries data"
+  - middle: a byte stream drawn as a long ribbon with 4-byte length prefixes drawn as small tags along it; a scissors icon cutting at the right places; beside it in red a crossed-out "recv(1024) == one message"
+  - right: three panels side by side, same server, three shapes - (a) 1000 little thread boxes stacked, "1002 OS threads, 35.7 KiB/conn peak"; (b) one box with a select() loop and 1000 tiny fds in a list, "2 threads, 0.9 KiB/conn"; (c) one loop with coroutine bubbles, "2 threads, 6.0 KiB/conn"
+  - under the three panels a hand-drawn bar for p99 latency at 500 connections: threads 181 us, selectors 80 us, asyncio 267 us
+  - amber margin note: "asyncio is not the fastest. It is the most writable. Know which you are optimising."
+  - a dangling arrow off the framing ribbon: "...and what goes INSIDE the frame? -> Module 4"
+numbers-to-write-in: 1002 threads vs 2; peak RSS 35.7 / 0.9 / 6.0 KiB per connection; p99 at 500 conns 180.7 / 79.7 / 266.7 us; throughput at 500 conns 26.5k / 41.3k / 15.2k msg/s
+alt: A whiteboard sketch showing the socket lifecycle ladder with the three-way handshake marked inside connect, a byte-stream ribbon annotated with length-prefix tags and a crossed-out assumption that one recv equals one message, and three side-by-side panels comparing thread-per-connection, selector-based and asyncio servers with measured memory per connection and p99 latency written under each.
+*/}
+
+<Tabs>
+
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The words, defined
+
+- **File descriptor (fd)** — a small integer the OS gives you to refer to an open file, pipe or
+  socket. Everything in Unix is an fd.
+- **`bind`** — claim a local address and port.
+- **`listen`** — tell the OS this socket accepts incoming connections, and how many may queue up.
+- **`backlog`** — the queue length passed to `listen()`. Connections that have completed the
+  handshake but which your program has not yet `accept()`ed wait here.
+- **`accept`** — take one connection off the queue and get a **new** socket for it.
+- **Blocking** — the call does not return until it can do something.
+- **Half-close** — one side has finished sending (`shutdown(SHUT_WR)`) but can still receive.
+
+### The lifecycle
+
+```
+SERVER                              CLIENT
+socket()   create the fd            socket()
+bind()     claim host:port
+listen()   start queueing
+accept()   <---- handshake ---->    connect()
+   |  returns a NEW socket             |
+recv()/send() on that socket        send()/recv()
+close()                             close()
+```
+
+Two things beginners get wrong here, both worth stating explicitly:
+
+1. **`accept()` returns a different socket.** The listening socket is a factory; it never carries
+   data. If you `recv()` on the listening socket you will get an error.
+2. **The three-way handshake happens inside `connect()` and completes before `accept()` returns.**
+   The kernel finishes the handshake and puts the connection in the backlog queue; `accept()` just
+   dequeues it. That is why a server can be "up" (kernel accepting handshakes) while the application
+   is wedged and never calling `accept()` — the connections pile up in the backlog and then get
+   dropped.
+
+### The smallest working echo server
+
+```python
+# echo_server.py — the 20-line version. Correct for exactly one client at a time.
+import socket
+
+HOST, PORT = "127.0.0.1", 9000
+srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)   # allow rebind after restart
+srv.bind((HOST, PORT))
+srv.listen(128)                                              # backlog of 128
+print(f"listening on {HOST}:{PORT}")
+
+while True:
+    conn, addr = srv.accept()          # blocks until a client connects
+    print("connected:", addr)
+    with conn:
+        while True:
+            data = conn.recv(4096)     # blocks until bytes arrive
+            if not data:               # empty bytes == the peer closed
+                break
+            conn.sendall(data)         # echo back
+    print("disconnected:", addr)
+```
+
+```python
+# echo_client.py
+import socket
+with socket.create_connection(("127.0.0.1", 9000)) as s:
+    s.sendall(b"hello")
+    print(s.recv(4096))                # b'hello'
+```
+
+Run the server, then the client. It works. Now note everything it gets wrong, because each one is a
+real production incident:
+
+- **One client at a time.** A second client waits in the backlog until the first disconnects.
+- **No framing.** It happens to work because echo does not care about boundaries — the moment you
+  send structured messages, Module 2's demonstration bites you.
+- **No timeouts.** A client that connects and says nothing holds the server forever.
+- **`sendall` can still fail.** If the peer has gone away, you get `BrokenPipeError`.
+- **`recv` can raise `ConnectionResetError`** if the peer sent RST rather than closing cleanly.
+
+### `recv` returns less than you asked for
+
+This is the rule that trips everyone. `conn.recv(4096)` means "give me *up to* 4096 bytes, and at
+least one, blocking until at least one is available". It does **not** mean "give me 4096 bytes".
+
+So if you need exactly `n` bytes, you must loop:
+
+```python
+def recv_exactly(sock, n):
+    """Read exactly n bytes, or return None if the peer closed first."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:            # peer closed mid-message
+            return None
+        buf += chunk
+    return bytes(buf)
+```
+
+Every network program you ever write needs this function. Write it once, test it, and never write
+`recv()` bare again for structured data.
+
+### Framing: getting your messages back
+
+From Module 2 you know TCP does not preserve boundaries. The fix is to put the boundaries into the
+bytes yourself. The standard technique is a **length prefix**: before each message, send its length
+as a fixed-size integer.
+
+```python
+import struct
+
+HEADER = struct.Struct("!I")        # ! = network byte order (big-endian), I = 4-byte unsigned
+
+def send_msg(sock, payload: bytes):
+    """One message = 4-byte big-endian length, then that many bytes."""
+    sock.sendall(HEADER.pack(len(payload)) + payload)   # ONE sendall, not two
+
+def recv_msg(sock):
+    header = recv_exactly(sock, 4)
+    if header is None:
+        return None
+    (n,) = HEADER.unpack(header)
+    if n > 10 * 1024 * 1024:                             # sanity limit — see Layer 2
+        raise ValueError(f"message too large: {n}")
+    return recv_exactly(sock, n)
+```
+
+Three details that are not decoration:
+
+- **`!` means network byte order.** Different CPUs store multi-byte integers in different orders
+  (little-endian on x86 and ARM, big-endian historically on others). The network standard is
+  big-endian. If you use `struct.Struct("I")` without `!`, your protocol breaks between machines.
+- **One `sendall`, not two.** `sendall(header); sendall(payload)` is exactly the pattern that
+  triggers the Nagle/delayed-ACK 40 ms stall from Module 2. Concatenate and send once.
+- **The sanity limit is a security control.** Without it, a client sends a header claiming 4 GB and
+  your server allocates 4 GB. That is a one-line denial of service.
+
+### Now it handles more than one client
+
+```python
+# threaded_echo.py — one thread per connection.
+import socket, threading
+
+def handle(conn, addr):
+    with conn:
+        conn.settimeout(30)                 # never block forever
+        try:
+            while True:
+                msg = recv_msg(conn)
+                if msg is None:
+                    break
+                send_msg(conn, msg)
+        except (ConnectionResetError, socket.timeout, BrokenPipeError) as e:
+            print(f"{addr}: {type(e).__name__}")
+    print("closed", addr)
+
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("127.0.0.1", 9000)); srv.listen(128)
+while True:
+    conn, addr = srv.accept()
+    threading.Thread(target=handle, args=(conn, addr), daemon=True).start()
+```
+
+That is a correct, concurrent server in 20 lines. It handles hundreds of connections comfortably.
+Layer 2 shows you where it stops.
+
+### Guided practice
+
+Fill in the graceful-shutdown path. When the server wants to stop, it should stop accepting, let
+in-flight messages finish, and close cleanly.
+
+```python
+import socket, threading
+stopping = threading.Event()
+
+def handle(conn, addr):
+    with conn:
+        conn.settimeout(1.0)
+        while not stopping.is_set():
+            try:
+                msg = recv_msg(conn)
+            except socket.timeout:
+                continue                  # give the loop a chance to see `stopping`
+            if msg is None:
+                break
+            send_msg(conn, msg)
+        # TODO: tell the peer we are done sending, but keep reading briefly
+        ____
+```
+
+<Accordion title="Answer">
+
+```python
+        try:
+            conn.shutdown(socket.SHUT_WR)     # send FIN: "I have no more data for you"
+        except OSError:
+            pass                              # peer may already be gone
+```
+
+`shutdown(SHUT_WR)` performs a **half-close**: it sends a FIN so the peer's `recv()` returns empty
+and it knows you are finished, while you can still read anything already in flight. `close()` would
+tear down both directions at once, potentially discarding data the peer already sent.
+
+This is the difference between a clean disconnect and the peer seeing `ECONNRESET`. It is also why
+`shutdown` exists as a separate call from `close`.
+
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+<Accordion title="1. Why does accept() return a new socket?">
+The listening socket must stay available to accept further connections. Each connection needs its own
+fd carrying its own byte stream and its own 4-tuple.
+</Accordion>
+<Accordion title="2. `recv(4096)` returned 7 bytes. Is that an error?">
+No. `recv` returns up to `n` bytes and at least one. Needing exactly `n` means looping — that is what
+`recv_exactly` is for.
+</Accordion>
+<Accordion title="3. What does an empty return from recv() mean?">
+The peer performed an orderly close (sent FIN). It is not an error and not a timeout — it is
+end-of-stream, and you must handle it distinctly from both.
+</Accordion>
+<Accordion title="4. Why send the length prefix and payload in one sendall()?">
+Two writes risk the Nagle/delayed-ACK interaction (a ~40 ms stall) and double the syscall count. One
+concatenated write avoids both.
+</Accordion>
+<Accordion title="5. Why does the length prefix need a maximum?">
+Because the length comes from an untrusted peer. Without a bound, a 4-byte header claiming 4 GB
+causes a 4 GB allocation — a trivial denial of service.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### The three concurrency models
+
+The same length-prefixed echo server, written three ways. All three are in the lab starter.
+
+**Thread per connection** — blocking calls, one OS thread each. Simple, and the code reads top to
+bottom.
+
+```python
+def thread_server(host, port, ready):
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((host, port)); s.listen(2048); ready.set()
+    def handle(c):
+        with c:
+            while True:
+                h = recv_exactly(c, 4)
+                if not h: return
+                n, = HDR.unpack(h)
+                body = recv_exactly(c, n)
+                if body is None: return
+                c.sendall(h + body)
+    while True:
+        c, _ = s.accept()
+        threading.Thread(target=handle, args=(c,), daemon=True).start()
+```
+
+**Selectors** — one thread, non-blocking sockets, and a readiness API (`epoll` on Linux, `kqueue` on
+macOS/BSD). You own the buffering.
+
+```python
+def selector_server(host, port, ready):
+    sel = selectors.DefaultSelector()
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((host, port)); s.listen(2048); s.setblocking(False)
+    sel.register(s, selectors.EVENT_READ, None); ready.set()
+    bufs = {}
+    while True:
+        for key, _ in sel.select():
+            if key.data is None:                       # the listening socket
+                c, _ = key.fileobj.accept(); c.setblocking(False)
+                bufs[c] = bytearray(); sel.register(c, selectors.EVENT_READ, True)
+            else:
+                c = key.fileobj
+                try: data = c.recv(65536)
+                except (ConnectionResetError, BlockingIOError): data = b""
+                if not data:
+                    sel.unregister(c); c.close(); bufs.pop(c, None); continue
+                b = bufs[c]; b += data
+                out = bytearray()
+                while len(b) >= 4:                     # drain complete frames
+                    n, = HDR.unpack(b[:4])
+                    if len(b) < 4 + n: break
+                    out += b[:4 + n]; del b[:4 + n]
+                if out:
+                    try: c.sendall(out)
+                    except OSError: pass
+```
+
+Notice the per-connection buffer and the drain loop. **That is the framing logic you got for free
+with blocking reads, now written by hand.** It is the real cost of event-driven code, and it is
+where the bugs live.
+
+**asyncio** — the event loop, with the buffering hidden behind `readexactly`.
+
+```python
+async def _main(host, port, ready):
+    async def handle(reader, writer):
+        try:
+            while True:
+                h = await reader.readexactly(4)
+                n, = HDR.unpack(h)
+                body = await reader.readexactly(n)
+                writer.write(h + body); await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionResetError):
+            pass
+        finally:
+            writer.close()
+    srv = await asyncio.start_server(handle, host, port, backlog=2048)
+    ready.set()
+    async with srv:
+        await srv.serve_forever()
+```
+
+`asyncio` gives you the selector model with the readability of the threaded one. `readexactly` is
+`recv_exactly`, and `await drain()` is the back-pressure hook Module 4 will need.
+
+### Measured: what each model actually costs
+
+**Memory and thread count**, 1,000 idle connections, Python 3.13.2 on macOS 26.2 (Apple M3 Pro).
+Both client and server sockets live in the same process, so these are upper bounds for the server
+side alone:
+
+| Model | OS threads | Peak RSS growth per connection |
+|---|---|---|
+| thread-per-connection | **1,002** | **35.7 KiB** |
+| selectors | **2** | **0.9 KiB** |
+| asyncio | **2** | **6.0 KiB** |
+
+The thread count is the headline. 1,002 versus 2. Note also that *resident* memory for threads is
+much lower than *reserved* — thread stacks are lazily committed, so current RSS grew by only about
+4 KiB/connection while peak RSS grew by 35.7. Both numbers are true and they mean different things:
+peak is what your container's memory limit sees during a burst.
+
+**Throughput and latency**, 64-byte echo messages, synchronous request/response client:
+
+| Connections | Model | Throughput | p50 | p99 |
+|---|---|---|---|---|
+| 10 | threads | 9,256 msg/s | 45.6 µs | 1353.5 µs |
+| 10 | selectors | **21,792 msg/s** | 37.7 µs | **159.5 µs** |
+| 10 | asyncio | 4,816 msg/s | 72.4 µs | 2475.5 µs |
+| 100 | threads | 20,687 msg/s | 31.7 µs | 342.5 µs |
+| 100 | selectors | 18,333 msg/s | 42.4 µs | 253.6 µs |
+| 100 | asyncio | 15,530 msg/s | 51.2 µs | 202.7 µs |
+| 500 | threads | 26,531 msg/s | 24.1 µs | 180.7 µs |
+| 500 | selectors | **41,250 msg/s** | **21.5 µs** | **79.7 µs** |
+| 500 | asyncio | 15,194 msg/s | 47.5 µs | 266.7 µs |
+
+Three honest readings of that table:
+
+1. **`selectors` wins on this workload**, and by a wide margin at 500 connections — 2.7× the
+   throughput of `asyncio` and a p99 3.3× lower. The reason is that `asyncio` adds a coroutine
+   scheduling step, a `Transport`/`Protocol` object pair, and a `Task` per connection, and Python's
+   per-object overhead is not free.
+2. **Threads are not embarrassing.** At 500 connections they beat `asyncio` here. Python's GIL is
+   released during socket I/O, so threads genuinely overlap on a blocking-I/O workload. The problem
+   with threads is not throughput at 500; it is memory and scheduler pressure at 50,000.
+3. **These numbers were taken on a heavily loaded machine** and the absolute values are noisy — the
+   run-to-run variation is tens of percent. Reproduce them yourself. The *ordering* was stable across
+   runs; the magnitudes were not.
+
+The generalisable rule: **`asyncio` is chosen for writability and for composing with async
+libraries, not because it is the fastest.** If raw throughput on one core is what you need, a
+hand-written `selectors` loop or a compiled runtime (`uvloop`, or Go/Rust) beats it.
+
+### Errors you must handle, and what they mean
+
+| Exception | Cause | Correct response |
+|---|---|---|
+| `ConnectionResetError` (ECONNRESET) | Peer sent RST — crashed, or closed with unread data in its buffer | Log at debug, clean up the connection. It is not a bug in your code |
+| `BrokenPipeError` (EPIPE) | You wrote to a socket the peer has closed | Same. Wrap `sendall` in try/except; do not let it kill the accept loop |
+| `socket.timeout` | Your `settimeout` fired | Decide: retry, or close. Never ignore it |
+| `BlockingIOError` (EWOULDBLOCK) | Non-blocking socket with nothing ready | Expected in event-driven code; go back to `select()` |
+| `OSError: [Errno 24] Too many open files` | fd limit reached | Raise `ulimit -n`; find the leak first |
+| `OSError: [Errno 48/98] Address already in use` | Previous socket in `TIME_WAIT` | `SO_REUSEADDR` before `bind()` |
+
+The rule that saves you: **every `recv` and every `send` is a syscall that can fail for reasons that
+are not your fault.** A server whose accept loop can be killed by one misbehaving client is not a
+server.
+
+### Backlog sizing
+
+`listen(backlog)` sets the completed-connection queue length. On Linux the effective value is
+`min(backlog, net.core.somaxconn)`, and `somaxconn` defaulted to 128 for years (4096 in newer
+kernels). Passing `listen(2048)` while `somaxconn` is 128 silently gives you 128.
+
+The symptom of an undersized backlog is nasty: under a burst, connections that completed the
+handshake are dropped. The client sees a connection that "succeeded" and then times out, because
+from its point of view the handshake completed. On Linux, `nstat -az TcpExtListenOverflows` counts
+exactly this, and `ss -ltn` shows `Recv-Q` (current backlog depth) against `Send-Q` (the maximum).
+
+Practical sizing: backlog should cover the burst you expect between `accept()` calls. If your
+accept loop is fast, 128–512 is plenty. If your accept loop does work inline (it should not), you
+need a much bigger backlog and you should fix the accept loop instead.
+
+### Trade-offs
+
+| Decision | Choose this when… | Choose the other when… | The number |
+|---|---|---|---|
+| **Threads** | ≤ a few thousand connections; blocking libraries; simple code | Tens of thousands of connections | 35.7 KiB peak per connection and one OS thread each: 10,000 connections is ~350 MB and 10,000 threads |
+| **`selectors`** | Maximum throughput on one core; you want full control | You want readable business logic | 41,250 msg/s at 500 connections, p99 79.7 µs — the best measured here, at the cost of hand-written buffering |
+| **`asyncio`** | You have async libraries; readability matters; many connections | You need peak single-core throughput | 6.0 KiB per connection and 2 threads, but 2.7× lower throughput than `selectors` here |
+| **`asyncio` + `uvloop`** | You want asyncio's model with better numbers | Windows (unsupported) | libuv-backed event loop; commonly reported 2–4× improvement over the stock loop |
+| **Blocking `recv` with timeout** vs **non-blocking + poll** | Thread-per-connection | Event-driven | A timeout is essential either way; a blocking socket with no timeout is an unbounded resource leak |
+
+### What breaks in the real world
+
+A message-ingest service ran on thread-per-connection and handled 2,000 clients fine for a year.
+Then a customer's fleet grew to 12,000 devices. The service did not fall over — it got *slower and
+slower*, with p99 latency rising from 40 ms to over 4 seconds, while CPU sat around 35%.
+
+The cause was thread scheduling, not I/O. 12,000 OS threads meant the scheduler was spending
+substantial time on context switches and the run queue, and each thread's 8 MB of reserved stack
+(mostly untouched, but reserved) pushed the process's virtual size past what the container's
+accounting was comfortable with. Memory *looked* fine in RSS terms right up until a burst caused
+several thousand stacks to be touched at once and the container was OOM-killed.
+
+The fix was `asyncio` with `uvloop` — chosen over a `selectors` rewrite because the handler logic
+was 400 lines of protocol code that had to be preserved and was much easier to port to `async def`
+than to a state machine. p99 went to 60 ms, memory to roughly a tenth, and the thread count to 4.
+
+The lesson has two halves. **Thread-per-connection has a cliff, and the cliff is scheduler and
+memory pressure, not throughput** — which is why the symptom was gradual degradation rather than a
+clean failure. And **the right rewrite is the one that preserves your logic**: `selectors` was
+measurably faster in a microbenchmark and would have taken three weeks and introduced bugs.
+
+### Design checkpoint
+
+<Accordion title="Your chat server must support 50,000 concurrent connections that are mostly idle, with a p99 broadcast latency under 100 ms. Design it, with numbers.">
+
+**Rule out threads immediately.** 50,000 × 35.7 KiB peak ≈ 1.8 GB of stack pressure plus 50,000 OS
+threads. Linux will schedule it, badly.
+
+**Event-driven, single process, is 50,000 × 6.0 KiB ≈ 300 MB** with `asyncio` — comfortable. With
+hand-written `selectors` it is ~45 MB, but you will write the framing state machine yourself.
+
+Now the part people miss: **broadcast is O(n) per message.** One message to a 50,000-member room is
+50,000 `send()` calls. At even 2 µs per syscall that is 100 ms of pure syscall time for one message —
+you have blown the p99 budget with a single broadcast. Three mitigations:
+
+1. **Shard by room, not by connection.** Rooms are usually small; the 50,000-member room is the
+   pathological case and should be handled by a fan-out tier, not the socket layer.
+2. **Batch.** Accumulate messages per connection for a few milliseconds and send one combined frame.
+   This trades a few ms of latency for a large reduction in syscalls, and it is what every real chat
+   system does.
+3. **Back-pressure.** A slow consumer must not force you to buffer unboundedly. Cap the per-connection
+   outbound queue (say 1 MB or 1,000 messages) and drop or disconnect beyond it. Without this, one
+   client on a phone in a tunnel gives your server an OOM. In `asyncio` this is what `await
+   writer.drain()` is for — and the bug is writing without ever awaiting `drain`.
+
+**Also plan the horizontal story.** 50,000 connections on one process means one deploy drops 50,000
+connections. Run 8 processes with `SO_REUSEPORT` so the kernel load-balances accepts across them,
+which also gets you multi-core use (relevant in Python, where one event loop is one core).
+
+The complete answer therefore has four numbers in it: memory per connection, syscalls per broadcast,
+the back-pressure limit, and the process count. A candidate who gives only the first has done a
+third of the design.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim carries a measured or cited number. Measurements are Python 3.13.2 on macOS 26.2, Apple
+M3 Pro, on a machine under concurrent load — absolute values are noisy, orderings were stable across
+runs.
+</Warning>
+
+### The C10K problem and what replaced it
+
+Dan Kegel's 1999 "C10K problem" essay asked why a machine with the hardware to handle 10,000
+simultaneous clients could not do it in software. The answer was the readiness APIs.
+
+`select()` and `poll()` are **O(n) per call**: you hand the kernel the entire fd set every time, the
+kernel walks it, and you walk the results. With 10,000 connections of which 10 are active, you copy
+10,000 fds into the kernel and scan 10,000 results to find 10 events, on every iteration.
+`select()` additionally has a hard limit of `FD_SETSIZE` (1024 by default).
+
+`epoll` (Linux 2.5.44, 2002) and `kqueue` (FreeBSD 4.1, 2000) are **O(active)**: you register
+interest once, and the kernel hands you back only the fds that are ready. The cost stops scaling with
+the number of idle connections.
+
+That single algorithmic change is why nginx could serve 10,000 connections on hardware where Apache's
+prefork model could not, and it is why every modern server runtime — Node, Go's netpoller, Netty,
+`asyncio`, Tokio — is built on it. Python's `selectors.DefaultSelector()` picks `epoll` on Linux and
+`kqueue` on macOS automatically, which is why the code above is portable.
+
+`io_uring` (Linux 5.1, 2019) is the next step: instead of "tell me what is ready and then I will do
+a syscall", you submit the *operations themselves* into a shared ring buffer and collect completions,
+which amortises syscall overhead across many operations and can approach zero syscalls per operation
+in polled mode. Reported gains are workload-dependent and largest for small-I/O, high-IOPS workloads.
+
+### Where the time actually goes
+
+Per-message costs on a modern Linux machine, order of magnitude:
+
+| Operation | Cost |
+|---|---|
+| `recv()` / `send()` syscall (no data movement) | ~1–3 µs |
+| Syscall overhead post-Spectre/Meltdown mitigations | measurably higher than pre-2018; page-table isolation adds to every transition |
+| Copy 64 B user↔kernel | negligible |
+| Copy 1 MB user↔kernel | ~50–100 µs |
+| Context switch between threads | ~1–5 µs, plus cache pollution |
+| `epoll_wait` returning 100 events | one syscall for 100 events |
+| Python bytecode overhead per message | ~5–20 µs (this dominates the measurements above) |
+
+Two things follow. First, **in Python the interpreter is the bottleneck, not the kernel** — the
+measured 21.5 µs p50 on loopback is mostly Python, and that is why `uvloop` (a Cython wrapper around
+libuv) gives large improvements without changing the model. Second, **batching syscalls is the
+highest-leverage optimisation** in any language: `writev`/`sendmsg` to send several buffers in one
+call, `recvmmsg` to receive several datagrams, and accumulating frames before writing.
+
+### Zero-copy: `sendfile` and `splice`
+
+Serving a file the naive way copies it four times: disk → kernel page cache → user buffer → kernel
+socket buffer → NIC. `sendfile(out_fd, in_fd, offset, count)` tells the kernel to move it directly
+from the page cache to the socket, removing two copies and two context switches.
+
+```python
+# Python exposes it directly.
+with open("big.bin", "rb") as f:
+    sock.sendfile(f)          # socket.sendfile(), Python 3.5+
+```
+
+For a 1 GB file this removes 2 GB of memory traffic. Measured improvements on file-serving
+benchmarks are typically in the tens of percent for throughput and larger for CPU per byte; the
+canonical use is a static file server or a proxy relaying bytes it does not need to inspect. Note
+what you give up: you cannot transform the data, and TLS breaks the optimisation unless you have
+kernel TLS (kTLS) offload.
+
+`splice()` is the more general form, moving data between two fds through a kernel pipe with no
+userspace copy — the mechanism behind efficient TCP proxies.
+
+### Kernel buffers, and where memory really goes
+
+Each connection has a send and a receive buffer in the kernel. Linux autotunes them within
+`net.ipv4.tcp_rmem` and `tcp_wmem` (min, default, max), commonly 4 KB / 128 KB / 6 MB.
+
+The scary arithmetic: if 10,000 connections each grow their receive buffer to the 6 MB maximum, that
+is **60 GB of kernel memory**. It does not usually happen — buffers grow only when the BDP demands it
+and the application is reading slowly — but a stalled reader on a fast link is exactly the condition
+that makes it happen. `net.ipv4.tcp_mem` provides a global backstop, and the observable is
+`ss -m` (per-socket memory) and `/proc/net/sockstat`.
+
+This is the kernel-side counterpart of application back-pressure, and it is why "just increase the
+buffers" is not free advice.
+
+### Production failure modes
+
+| Failure | Signature | Detection |
+|---|---|---|
+| **fd leak** | `EMFILE` after hours or days; connection count grows monotonically | `lsof -p PID` piped to `wc -l`, or `ls /proc/PID/fd`. Always use `with conn:` or an explicit `finally: close()` |
+| **Backlog overflow** | Clients see connect succeed then time out, only under burst | `nstat -az TcpExtListenOverflows`; `ss -ltn` `Recv-Q` at the max. Raise `somaxconn` and make the accept loop do no work |
+| **Slow-consumer OOM** | Memory grows with one specific client attached | No back-pressure. Bound the outbound queue; in asyncio, actually `await writer.drain()` |
+| **Unbounded frame length** | One request allocates gigabytes | Always bound the length prefix before allocating |
+| **Head-of-line blocking in the event loop** | All connections stall together; the loop's iteration time spikes | One handler did blocking work (a DNS lookup, a `time.sleep`, a CPU-heavy parse). `asyncio` debug mode logs slow callbacks; move the work to a thread pool |
+| **Thundering herd on accept** | Many processes wake for one connection | Use `SO_REUSEPORT` so the kernel picks one, rather than sharing one listening socket |
+| **`TIME_WAIT` exhaustion on an outbound-heavy service** | `EADDRNOTAVAIL` with idle CPU | Pool connections; widen `ip_local_port_range` |
+
+### Frontier and further pointers
+
+- **D. Kegel, "The C10K problem" (1999, maintained for years afterwards).** Takeaway: the barrier to
+  10,000 concurrent connections was `select`/`poll`'s O(n) behaviour and thread-per-connection
+  memory, not hardware — and naming the problem precisely is what produced `epoll` and `kqueue`.
+- **J. Lemon, "Kqueue: A generic and scalable event notification facility," USENIX 2000.**
+  Takeaway: registering interest once and receiving only ready events makes notification cost
+  proportional to activity rather than to connection count, which is the algorithmic core of every
+  modern server.
+- **J. Axboe, "Efficient IO with io_uring" (2019, and the ongoing kernel documentation).**
+  Takeaway: submitting operations through a shared ring rather than issuing a syscall per operation
+  removes per-operation transition cost entirely, which matters most for small, high-rate I/O.
+- **Kernel TLS (kTLS) documentation, `Documentation/networking/tls.rst`.** Takeaway: moving TLS
+  record encryption into the kernel restores `sendfile`-style zero-copy for encrypted traffic, which
+  is otherwise lost the moment you add TLS.
+
+### Stretch challenge
+
+Push one implementation to its actual limit and characterise the failure.
+
+1. Take your best server and drive it to **10,000 concurrent connections** on one machine. You will
+   need to raise `ulimit -n`, widen `ip_local_port_range` on the client side, and probably use
+   multiple client processes or source IPs to avoid ephemeral port exhaustion (recall the ~466
+   connections/second/destination ceiling from Module 2 — plan for it).
+2. Measure, at 1k / 5k / 10k connections: RSS, thread count, p50 and p99 message latency, throughput,
+   and the event loop's iteration time.
+3. Find the knee in the curve and **explain what breaks**. Is it memory, scheduler, syscall rate,
+   the GIL, or the kernel's buffer accounting? Prove it with a counter, not a guess.
+4. Now add back-pressure and re-measure. Show that a deliberately slow consumer no longer grows
+   server memory without bound, and quantify what it costs the well-behaved clients.
+5. Finally, add `SO_REUSEPORT` and run `N` processes where `N` = core count. Does throughput scale
+   linearly? If not, find the shared resource that does not.
+
+There is no single right answer — the interesting artefact is the knee, and your explanation of it.
+
+</Tab>
+
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Implement the same length-prefixed echo server three ways — threads, `selectors`, `asyncio` — and
+benchmark all three to 1,000 concurrent connections. Report memory per connection, thread count,
+throughput, p50 and p99 for each, and write a one-paragraph recommendation.
+</Card>
+
+Reference numbers to compare against (Python 3.13.2, macOS, loaded machine): peak RSS per connection
+35.7 / 0.9 / 6.0 KiB; thread count 1002 / 2 / 2; at 500 connections 26.5k / 41.3k / 15.2k msg/s with
+p99 of 181 / 80 / 267 µs. If your ordering differs, say so and investigate — that is a finding, not
+a mistake.
+
+## The whiteboard
+
+<Tip>
+**Draw it yourself.** Draw the socket lifecycle ladder with the handshake marked inside `connect()`,
+then the framing ribbon with length tags, then the three concurrency panels with your own measured
+numbers written under each.
+[Blank version](/assets/diagrams/p2-w10-m3-blank.svg) · [Editable source](/assets/diagrams/p2-w10-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Implemented a length-prefixed TCP server in three concurrency models
+(thread-per-connection, `selectors`/kqueue, `asyncio`) and benchmarked to 1,000 concurrent
+connections: 1,002 OS threads and 35.7 KiB/connection for threads against 2 threads and 0.9–6.0
+KiB/connection for the event-driven versions, with `selectors` reaching 41,250 msg/s at p99 79.7 µs."
+
+**The story to tell:** the surprising result is that `asyncio` was the *slowest* of the three on this
+workload. Being able to say "asyncio is chosen for writability and library composition, not speed —
+here is my data" is a much stronger position than repeating that async is fast.
+
+**Do not skip the error handling.** In an interview, the follow-up to "I wrote a socket server" is
+always "what happens when the client disappears mid-message?". Have `ECONNRESET`, `EPIPE`, the empty
+`recv`, and the bounded length prefix ready.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Check every socket in your codebase has a timeout.** A blocking socket with no timeout is an
+unbounded resource leak, and TCP's own dead-peer detection takes about two hours by default. Grep for
+`socket(`, `create_connection`, and your HTTP client's constructor.
+
+**2. Bound every length-prefixed read.** If you have a custom protocol — and if you talk to any
+message broker, cache or internal RPC, you do — verify that a maximum message size is enforced before
+allocation. This is a five-minute audit and it closes a trivial denial of service.
+
+**3. When someone proposes rewriting a threaded service as async, ask for the connection count.**
+Below a few thousand connections, threads are fine and the rewrite is unlikely to pay for itself.
+Above tens of thousands they are not. The cliff is memory and scheduler pressure, and the measurement
+that decides it is peak RSS per connection times your target concurrency.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Messages truncated or merged under load | Treating one `recv()` as one message | `recv_exactly` plus a 4-byte length prefix |
+| Server handles one client then hangs | No concurrency; the second client sits in the backlog | Thread, selector or asyncio per connection |
+| Occasional 40 ms latency spikes | `send(header)` then `send(body)` triggering Nagle × delayed ACK | Concatenate and send once; set `TCP_NODELAY` |
+| Server dies on a client crash | `ECONNRESET`/`EPIPE` escaping to the accept loop | Wrap every per-connection operation; never let one connection kill the loop |
+| Memory grows until OOM with one slow client | No back-pressure on the outbound queue | Bound the queue; in asyncio `await writer.drain()` |
+| `Too many open files` after a few hours | fd leak on an error path | `with conn:` or `try/finally`; monitor open fd count |
+| Connections drop under burst although the service is healthy | Backlog smaller than the burst, or `somaxconn` capping your `listen()` | Raise both; do no work in the accept loop |
+| Protocol works locally, breaks between machines | Native-endian `struct` format | Use `!` (network byte order) in every `struct` format string |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="Concept questions (8)">
+1. Why does `accept()` return a new socket? *(The listening socket is a factory and must remain available; each connection needs its own fd and 4-tuple.)*
+2. What does an empty return from `recv()` mean? *(Orderly close by the peer — end of stream, distinct from both an error and a timeout.)*
+3. Write `recv_exactly` in one sentence of prose. *(Loop `recv` accumulating into a buffer until `n` bytes are collected, returning `None` if the peer closes first.)*
+4. Why must a length prefix have a maximum? *(It is attacker-controlled; without a bound, a 4-byte header can request a multi-gigabyte allocation.)*
+5. What is the algorithmic difference between `select` and `epoll`? *(O(n) in total fds versus O(active) — `epoll` registers interest once and returns only ready fds.)*
+6. Give memory per connection for the three models. *(Measured peak RSS growth: 35.7 KiB threads, 0.9 KiB selectors, 6.0 KiB asyncio.)*
+7. What is back-pressure and where does it live in `asyncio`? *(Limiting how much unsent data you buffer for a slow consumer; `await writer.drain()` is the hook, and omitting it is the bug.)*
+8. What does `sendfile` remove? *(Two copies and two context switches by moving data from the page cache straight to the socket — at the cost of not being able to transform the data, and it is lost under TLS without kTLS.)*
+</Accordion>
+<Accordion title="Coding challenge">
+Implement a length-prefixed server that survives an adversarial client: sends a header then
+disconnects; claims a 4 GB length; sends one byte per second; sends 100 MB as fast as possible and
+never reads the response; opens 1,000 connections and sends nothing. Hidden tests assert that server
+memory stays under 200 MB, no fd is leaked, no exception escapes the accept loop, and well-behaved
+clients see p99 under 10 ms throughout.
+</Accordion>
+<Accordion title="Interview questions">
+- **Junior:** "Write an echo server." *(Then be ready for: what if the client sends two messages quickly? What if it disappears mid-message?)*
+- **Mid:** "Your threaded server is fine at 2,000 connections and degrading at 12,000. What is happening and what do you change?" *(Scheduler and memory pressure, not throughput — measure peak RSS per connection and thread count, then move to an event-driven model, choosing the one that preserves the existing handler logic.)*
+- **Senior:** "Design a chat server for 50,000 concurrent connections with p99 broadcast under 100 ms." *(Event-driven for memory; then the real content: broadcast is O(n) syscalls per message, so shard by room, batch writes, bound the per-connection outbound queue, and run one process per core with `SO_REUSEPORT`.)*
+</Accordion>
+<Accordion title="Draw it from memory">
+Draw the socket lifecycle with `accept` producing a new socket, the framing ribbon with length
+prefixes, and the three concurrency panels with memory and p99 written under each. Five minutes.
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+
+- [POSIX / Linux man pages: `socket(2)`, `bind(2)`, `listen(2)`, `accept(2)`, `recv(2)`, `send(2)`,
+  `epoll(7)`, `shutdown(2)`.](https://man7.org/linux/man-pages/man2/socket.2.html) **Read this for:** the exact return-value contracts, especially that
+  `recv` may return fewer bytes than requested and what each `errno` means.
+- [Python 3.13 documentation: `socket`, `selectors`, `asyncio-stream` and `asyncio-protocol`.](https://docs.python.org/3/library/socket.html)
+  **Read this for:** `socket.sendfile`, `selectors.DefaultSelector` platform selection, and the
+  `drain()` back-pressure contract that most asyncio code gets wrong.
+- [Linux `Documentation/networking/ip-sysctl.txt` (`somaxconn`, `tcp_rmem`, `tcp_wmem`) and
+  `Documentation/networking/tls.rst`.](https://docs.kernel.org/networking/ip-sysctl.html) **Read this for:** the buffer autotuning ranges behind the
+  kernel-memory arithmetic in Layer 3.
+
+**Papers**
+
+- [D. Kegel, "The C10K problem" (1999–2014).](http://www.kegel.com/c10k.html) **Takeaway:** the limit on concurrent connections was
+  the O(n) readiness API and per-thread memory, not the hardware — the essay that motivated `epoll`
+  and `kqueue`.
+- [J. Lemon, "Kqueue: A generic and scalable event notification facility," USENIX ATC 2000.](https://people.freebsd.org/~jlemon/papers/kqueue.pdf)
+  **Takeaway:** registering interest once and delivering only ready events makes notification cost
+  proportional to activity, not to connection count.
+- J. Axboe, "Efficient IO with io_uring" (2019). **Takeaway:** a shared submission/completion ring
+  removes the per-operation syscall, which is the dominant cost once the readiness problem is solved.
+
+**Go deeper**
+
+- [W. R. Stevens, B. Fenner and A. Rudoff, *UNIX Network Programming, Volume 1* (3rd ed.),
+  Chapters 4–7 and 16.](https://www.informit.com/store/unix-network-programming-volume-1-the-sockets-networking-9780131411555) **Why:** still the definitive treatment of the socket API's edge cases —
+  partial writes, half-close, `SO_LINGER`, and the exact semantics of every error you will hit.
+- [The `uvloop` and `libuv` source and benchmarks.](https://github.com/MagicStack/uvloop) **Why:** reading a production event loop is the
+  fastest way to understand what `asyncio` is doing per message, and why replacing the loop can give
+  a multiple-fold improvement without changing your code.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p2/week-10/p2-w10-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

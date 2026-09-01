@@ -1,0 +1,129 @@
+---
+title: "scikit-learn: the industry surface"
+description: "Reference solution — Week 17"
+hidden: true
+icon: "lock"
+---
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P3-W17-M5`
+
+The task: write a custom transformer and drop it into a `Pipeline` inside `GridSearchCV` without leaking.
+
+## The transformer
+
+```python
+# scikit-learn 1.9.0, numpy 2.5.2
+import numpy as np
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.utils.validation import check_is_fitted, validate_data, _check_feature_names_in
+
+
+class WinsorizingScaler(TransformerMixin, BaseEstimator):
+    """Clip each column at its TRAINING-set percentiles, then standardise.
+
+    Mixin order is not stylistic: TransformerMixin must come first. See below.
+    """
+
+    def __init__(self, clip_percentile: float = 1.0):
+        self.clip_percentile = clip_percentile          # stored verbatim, nothing else
+
+    def fit(self, X, y=None):
+        X = validate_data(self, X, dtype="numeric", ensure_all_finite=True)
+        p = float(self.clip_percentile)
+        self.lower_ = np.percentile(X, p, axis=0)
+        self.upper_ = np.percentile(X, 100.0 - p, axis=0)
+        Xc = np.clip(X, self.lower_, self.upper_)
+        self.mean_ = Xc.mean(axis=0)
+        self.scale_ = Xc.std(axis=0)
+        self.scale_[self.scale_ == 0.0] = 1.0           # constant column -> no division by zero
+        return self
+
+    def transform(self, X):
+        check_is_fitted(self)
+        X = validate_data(self, X, dtype="numeric", reset=False, ensure_all_finite=True)
+        return (np.clip(X, self.lower_, self.upper_) - self.mean_) / self.scale_
+
+    def get_feature_names_out(self, input_features=None):
+        return _check_feature_names_in(self, input_features)
+```
+
+`check_estimator(WinsorizingScaler())` passes on scikit-learn 1.9.0 (with `check_array_api_input` skipped, because `SCIPY_ARRAY_API` is unset — that skip is expected and not a failure).
+
+## The five things that make it pass
+
+1. **Mixin order.** `class T(TransformerMixin, BaseEstimator)`. Writing `(BaseEstimator, TransformerMixin)` — which is what most tutorials and most of the internet show, and what earlier scikit-learn versions tolerated — raises:
+   `AssertionError: WinsorizingScaler is inheriting from mixins in the wrong order. ... TransformerMixin comes before/left side of BaseEstimator`
+   This is a real, measured failure on 1.9.0. If your transformer was copied from a blog post written before 1.6, this is the first thing to fix.
+2. **`__init__` stores its argument unchanged, under the same name.** No casting, no validation, no derived attributes. `clone()` reconstructs the estimator with `type(est)(**est.get_params())`; any transformation in `__init__` makes the clone a different object, and cross-validation clones for every fold.
+3. **`validate_data(self, X, ..., reset=False)` in `transform`.** `reset=True` (the default, used in `fit`) records `n_features_in_` and `feature_names_in_`. `reset=False` *checks* against them, which is what turns a silently-reordered column at serving time into an exception.
+4. **`fit` returns `self`.** Without it `TransformerMixin.fit_transform` returns `None` and the error surfaces three steps downstream as an unhelpful `TypeError`.
+5. **`get_feature_names_out`.** Without it, `sklearn.set_config(transform_output="pandas")` produces `x0, x1, ...` from this step onward and every downstream feature name is lost. `_check_feature_names_in` is the helper that does the right thing for both named and unnamed input.
+
+## Composing it
+
+```python
+import sklearn
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV
+
+sklearn.set_config(transform_output="pandas")
+
+pipe = Pipeline([
+    ("pre", ColumnTransformer([
+        ("num", WinsorizingScaler(), ["age", "income", "tenure_days"]),
+        ("cat", OneHotEncoder(handle_unknown="infrequent_if_exist",
+                              min_frequency=0.02, sparse_output=False), ["plan", "region"]),
+    ], remainder="drop")),
+    ("clf", LogisticRegression(max_iter=3000)),
+])
+
+search = GridSearchCV(pipe, {
+    "pre__num__clip_percentile": [0.5, 1.0, 5.0],      # tuning YOUR transformer
+    "clf__C": [0.01, 0.1, 1, 10],
+}, cv=5, n_jobs=1)
+```
+
+The path `pre__num__clip_percentile` is the proof that `get_params` works: `pre` (the `ColumnTransformer`), `num` (the branch name), `clip_percentile` (your parameter). If you cannot find the right path, print `sorted(pipe.get_params().keys())`.
+
+## The leakage proof
+
+The acceptance criterion is that the pipeline scores 0.50 ± 0.05 on data with no signal. The reference numbers, over 20 seeds on 200 rows x 10,000 pure-noise features:
+
+```
+leaky  : 0.815 (sd 0.026)      # SelectKBest fitted on all data, then cross-validated
+correct: 0.510 (sd 0.048)      # the same steps inside a Pipeline
+inflation: 30.5 accuracy points
+```
+
+Note the standard deviations. The leaky estimate is *more stable* (0.026) than the correct one (0.048). A "we ran it five times and it was consistent" sanity check makes the wrong answer look better than the right one. Stability is not validity.
+
+## Why this solution and not the obvious one
+
+**The obvious solution computes the percentiles in `__init__` or caches them as plain attributes without trailing underscores, and looks like it works.** It does work, on a single `fit`/`transform`. It breaks silently inside cross-validation, because `clone` produces an estimator whose cached state does not travel — or worse, one where it does travel and the fold's transformer is carrying the previous fold's statistics.
+
+Two more wrong turns:
+
+1. **Using `y` inside `transform`.** It is not in the signature for a reason. Anything that needs labels needs them in `fit`, and then the transformer is leakage-sensitive and *must* be inside the pipeline. Out-of-fold target encoding (Week 20 Module 1) is the canonical example: it uses `y` in `fit`, never in `transform`, and it computes fold-wise statistics internally.
+2. **Skipping `check_estimator` because "it passes my own tests".** The suite catches things your tests will not: clone equivalence, `fit` idempotence, `NotFittedError` on unfitted use, dtype preservation, and behaviour on a single-sample or single-feature input. It takes one line and about four seconds.
+
+## Grading notes
+
+**3/3 looks like:** `check_estimator` passes; the mixin order is correct and commented; `validate_data(..., reset=False)` is used in `transform`; `get_feature_names_out` is implemented and the pipeline output is a DataFrame with meaningful names; a parameter of the custom transformer is tuned via a double-underscore path; and the noise experiment is run *with the custom transformer in the loop* and lands at 0.50 ± 0.05.
+
+**The three most common ways submissions lose points:**
+
+1. **`(BaseEstimator, TransformerMixin)` mixin order.** A hard failure on 1.9.0 with a message that is clear once you read it and baffling if you assume it is your logic.
+2. **Work in `__init__`.** Usually `self.clip_percentile = float(clip_percentile)`. That single `float()` breaks `clone` equivalence and `check_estimator` will tell you so.
+3. **Running the noise experiment without the custom transformer.** The criterion exists to prove *your* code does not leak. Substituting a plain `StandardScaler` proves scikit-learn does not leak, which was never in question.

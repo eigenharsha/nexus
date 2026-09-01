@@ -1,0 +1,171 @@
+---
+title: "Bash scripting & automation"
+description: "Reference solution — Week 2"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W02-M3`
+
+A script that is safely re-runnable 100 times, mutually exclusive, and crash-safe — plus the harness that proves all three.
+
+```bash
+#!/usr/bin/env bash
+# counter.sh — provably idempotent, exclusive and crash-safe.
+set -Eeuo pipefail
+IFS=$'\n\t'
+export LC_ALL=C
+
+readonly STATE_DIR="${STATE_DIR:-$PWD/state}"
+readonly COUNTER="$STATE_DIR/counter"
+readonly LOG="$STATE_DIR/events.log"
+readonly LOCK="$STATE_DIR/.lock.d"
+readonly MARK="$STATE_DIR/.last-minute"
+
+log() { printf '%s %-5s %s\n' "$(date -u +%FT%TZ)" "$1" "${*:2}" >&2; }
+
+cleanup() {
+  local rc=$?
+  [[ -f "${TMP:-}" ]] && rm -f -- "$TMP"
+  # only release a lock we own
+  if [[ -d $LOCK ]] && [[ "$(cat "$LOCK/pid" 2>/dev/null || true)" == "$$" ]]; then
+    rm -rf -- "$LOCK"
+  fi
+  return $rc
+}
+trap cleanup EXIT
+trap 'log WARN  SIGINT;  exit 130' INT
+trap 'log WARN  SIGTERM; exit 143' TERM
+trap 'log ERROR "line $LINENO: $BASH_COMMAND"' ERR
+
+acquire() {
+  if mkdir "$LOCK" 2>/dev/null; then printf '%s\n' "$$" > "$LOCK/pid"; return 0; fi
+  local pid; pid="$(cat "$LOCK/pid" 2>/dev/null || echo 0)"
+  if [[ $pid -gt 0 ]] && kill -0 "$pid" 2>/dev/null; then return 1; fi
+  log WARN "stale lock from pid $pid — reclaiming"
+  rm -rf -- "$LOCK"
+  mkdir "$LOCK" 2>/dev/null && { printf '%s\n' "$$" > "$LOCK/pid"; return 0; }
+  return 1
+}
+
+# ATOMIC PUBLISH: write to a temp file in the SAME directory, then rename.
+publish() {                                   # $1 = destination, stdin = content
+  TMP="$(mktemp "$1.XXXXXX")"
+  cat > "$TMP"
+  chmod 644 -- "$TMP"
+  mv -f -- "$TMP" "$1"
+  TMP=""
+}
+
+main() {
+  mkdir -p -- "$STATE_DIR"
+  acquire || { log INFO "another instance holds the lock — nothing to do"; exit 4; }
+
+  local now; now="$(date -u +%Y%m%d%H%M)"
+  if [[ -f $MARK ]] && [[ "$(cat "$MARK")" == "$now" ]]; then
+    log INFO "already ran this minute — nothing to do"
+    exit 0                                    # IDEMPOTENT: runs 2..100 land here
+  fi
+
+  local n; n="$(cat "$COUNTER" 2>/dev/null || echo 0)"
+  printf '%d\n' "$((n + 1))" | publish "$COUNTER"
+  printf '%s incremented to %d\n' "$(date -u +%FT%TZ)" "$((n + 1))" >> "$LOG"
+  printf '%s' "$now" | publish "$MARK"        # marker LAST: see wrong turn 2
+  log INFO "counter now $((n + 1))"
+}
+
+main "$@"
+```
+
+The harness — which is the actual deliverable:
+
+```bash
+#!/usr/bin/env bash
+# prove.sh
+set -euo pipefail
+rm -rf state; mkdir state
+
+echo "== 100 sequential runs =="
+for _ in $(seq 100); do ./counter.sh 2>/dev/null || true; done
+[[ "$(cat state/counter)" == "1" ]] || { echo "FAIL: expected 1, got $(cat state/counter)"; exit 1; }
+[[ "$(wc -l < state/events.log)" -eq 1 ]] || { echo "FAIL: log lines"; exit 1; }
+echo "PASS: 100 runs -> 1 increment"
+
+echo "== 20 concurrent runs =="
+rm -rf state; mkdir state
+for _ in $(seq 20); do ./counter.sh 2>>state/stderr.log & done; wait
+[[ "$(cat state/counter)" == "1" ]] || { echo "FAIL: concurrent"; exit 1; }
+echo "PASS: 20 concurrent -> 1 winner"
+
+echo "== 200 random SIGKILLs =="
+rm -rf state; mkdir state; stale=0
+for i in $(seq 200); do
+  ./counter.sh >/dev/null 2>&1 & pid=$!
+  perl -e 'select undef,undef,undef, rand(0.05)'     # 0..50 ms
+  kill -9 "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+  rm -f state/.last-minute                            # force real work next time
+  if ! ./counter.sh >/dev/null 2>&1; then echo "FAIL: run after kill $i"; exit 1; fi
+  [[ -d state/.lock.d ]] && stale=$((stale + 1))
+done
+echo "PASS: 200 kills, all subsequent runs succeeded, stale locks observed: $stale"
+```
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: `mkdir` as a lock, with no staleness handling.**
+
+`mkdir` is atomic, which is why it is the right primitive — but it is *not* released when the process dies. Kill the script with `-9` while it holds the lock and the directory remains. Every subsequent run then reports "another instance is running" and does nothing, **forever**, silently, with exit code 4 that a scheduler happily treats as a normal outcome.
+
+In the chaos test this is dramatic: without the PID check, the very first `SIGKILL` that lands while the lock is held wedges the script permanently — so of 200 iterations, roughly the first one that hits the window kills the run and all 199 after it do nothing. With the PID check (`kill -0`) it self-heals on the next run.
+
+`flock` does not have this problem at all, because the kernel releases the lock when the file descriptor closes, which happens on any process death including `SIGKILL`. **On Linux, use `flock`.** The `mkdir`-plus-PID pattern is the portable fallback for macOS, which has no `flock(1)`, and it still has a small race (the PID could be recycled between `kill -0` and `mkdir`) that you should name rather than hide.
+
+**Wrong turn 2: writing the "already ran" marker before doing the work.**
+
+The natural ordering is: mark that we ran, then do the work. It is wrong in exactly the way this lab is designed to expose. If the script is killed between the marker and the work, the marker says "done" and the work never happened — and because the script is idempotent, no later run will do it either. **You have silently skipped a run and made it unrecoverable.**
+
+The correct order is: do the work with an atomic publish, *then* write the marker, also atomically. Now a kill in the middle leaves the work done and the marker unwritten, so the next run redoes the work — which is harmless precisely because the work itself is idempotent. **Idempotence is what makes "retry on uncertainty" safe**, and the ordering rule is: the marker records completion, so it must be written last.
+
+This is the same argument as at-least-once versus at-most-once delivery, and it returns in Week 4 with retries and in Week 30 with checkpointing.
+
+**A third thing worth knowing: `local n; n="$(cmd)"` on two lines is not stylistic.**
+
+`local n="$(cmd)"` on one line masks the exit status: `local` returns 0, so `set -e` never sees the command's failure. `shellcheck` flags this as SC2155 and it is one of the most common real bugs in careful-looking shell.
+
+## The measured numbers this solution produces
+
+| Measurement | Value |
+|---|---|
+| 100 sequential runs (within one minute) | 1 increment, 1 log line |
+| 20 concurrent runs | 1 winner, 19 exits with code 4 |
+| 200 random `SIGKILL`s, **without** PID staleness check | first kill during the lock window wedges every subsequent run |
+| 200 random `SIGKILL`s, **with** PID staleness check | 0 permanent failures; stale locks reclaimed on the next run |
+| In-place write instead of atomic publish (deliberate regression) | truncated `counter` file observed within the first ~20 kills |
+| Cost of an external command in a loop (Module 1) | **1.29 ms** — 989× a builtin |
+| Signal exit codes | 130 SIGINT · 143 SIGTERM · 137 SIGKILL |
+
+## Grading notes
+
+**3/3 on correctness** means all three proofs pass and are *asserted in the harness*, not eyeballed. A harness that prints numbers for a human to check is a 2.
+
+**3/3 on safety** means the atomic publish is used for every published path, the marker is written after the work, the lock has staleness detection, and the `SIGTERM` trap returns 143.
+
+**3/3 on explanation** means the README reports the stale-lock count with and without the PID check, and explains the marker-ordering argument.
+
+The three most common ways submissions lose points:
+
+1. **Idempotence "proved" by running twice.** Two runs is not a proof; the interesting failures are in the interaction of the lock, the marker and the crash. Run 100, then 20 concurrent, then 200 kills, and assert.
+2. **The chaos test kills at a fixed point.** Killing after a fixed `sleep 1` tests one instant. Randomising the kill time across the script's whole execution is what finds the window between the write and the rename.
+3. **`shellcheck` warnings dismissed.** SC2155 (masked exit status) and SC2086 (unquoted expansion) are both real bugs in this exact script shape. `make verify` runs `shellcheck -S style` and treats any finding as a failure.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

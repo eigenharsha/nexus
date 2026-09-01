@@ -1,0 +1,176 @@
+---
+title: "Python's model: objects, names & memory"
+description: "Reference solution — Week 3"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W03-M1`
+
+Measure a million records seven ways, in a fresh process each time.
+
+```python
+"""memcmp.py — run one variant per process: python3 memcmp.py slots"""
+from __future__ import annotations
+
+import array
+import gc
+import resource
+import sys
+import tracemalloc
+from dataclasses import dataclass
+from typing import NamedTuple
+
+N = 1_000_000
+
+
+def rss_mb() -> float:
+    """ru_maxrss is BYTES on macOS, KILOBYTES on Linux. Getting this wrong is a 1024x error."""
+    r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return r / (1024 * 1024) if sys.platform == "darwin" else r / 1024
+
+
+class Plain:
+    def __init__(self, uid: int, name: str, score: float) -> None:
+        self.uid, self.name, self.score = uid, name, score
+
+
+class Slotted:
+    __slots__ = ("uid", "name", "score")
+    def __init__(self, uid: int, name: str, score: float) -> None:
+        self.uid, self.name, self.score = uid, name, score
+
+
+@dataclass
+class DC:
+    uid: int; name: str; score: float
+
+
+@dataclass(slots=True)
+class DCSlots:
+    uid: int; name: str; score: float
+
+
+class NT(NamedTuple):
+    uid: int; name: str; score: float
+
+
+def build(kind: str, names: list[str]):
+    if kind == "dict":        return [{"uid": i, "name": names[i % 1000], "score": i * 0.5} for i in range(N)]
+    if kind == "class":       return [Plain(i, names[i % 1000], i * 0.5) for i in range(N)]
+    if kind == "slots":       return [Slotted(i, names[i % 1000], i * 0.5) for i in range(N)]
+    if kind == "dataclass":   return [DC(i, names[i % 1000], i * 0.5) for i in range(N)]
+    if kind == "dc_slots":    return [DCSlots(i, names[i % 1000], i * 0.5) for i in range(N)]
+    if kind == "namedtuple":  return [NT(i, names[i % 1000], i * 0.5) for i in range(N)]
+    if kind == "tuple":       return [(i, names[i % 1000], i * 0.5) for i in range(N)]
+    if kind == "columnar":
+        return (array.array("q", range(N)),
+                array.array("d", (i * 0.5 for i in range(N))),
+                [names[i % 1000] for i in range(N)])
+    raise SystemExit(f"unknown kind {kind}")
+
+
+def main() -> None:
+    kind = sys.argv[1]
+    # SHARED name pool: identical string storage across all variants, so the
+    # comparison isolates the CONTAINER cost and nothing else.
+    names = [f"user{i:07d}" for i in range(1000)]
+    gc.collect()
+    base = rss_mb()
+    tracemalloc.start()
+    data = build(kind, names)
+    gc.collect()
+    _, tm_peak = tracemalloc.get_traced_memory()
+    peak = rss_mb()
+    print(f"{kind:12s} rss_delta={peak - base:7.1f} MB  per_rec={((peak - base) * 1048576 / N):6.0f} B"
+          f"  tracemalloc_peak={tm_peak / 1e6:8.1f} MB")
+    del data
+
+
+if __name__ == "__main__":
+    main()
+```
+
+```bash
+for k in dict class slots dataclass dc_slots namedtuple tuple columnar; do python3 memcmp.py $k; done
+```
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: measuring all variants in one process.**
+
+The natural harness builds each representation in turn inside one script and records RSS after each. It produces nonsense, for two compounding reasons.
+
+**RSS is a high-water mark that never comes down.** `ru_maxrss` is *peak* resident size for the process's lifetime. After the first variant allocates 255 MB, every later measurement reads at least 255 MB, so the second variant appears to cost nothing and the eighth appears free.
+
+**Freeing does not return memory to the OS.** Even measuring current RSS rather than peak, CPython's allocator holds freed arenas for reuse. Deleting the dict list and building the slots list mostly reuses the same pages, so the delta is meaningless.
+
+One process per variant, baseline subtracted, is the only measurement that means anything. It is also why the reference harness takes a command-line argument rather than looping.
+
+**Wrong turn 2: a different name pool per variant.**
+
+If each variant generates its own strings — `f"user{i}"` inside the comprehension — you create a million distinct string objects per variant and you are measuring string storage, not container overhead. Worse, some variants will interleave allocation differently and the numbers will not be comparable at all.
+
+The shared 1,000-name pool means every variant holds the *same* 1,000 string objects, referenced a thousand times each. The remaining difference is exactly what the module claims to measure: the cost of the container plus the per-record int and float.
+
+**A third thing worth knowing: `ru_maxrss` under-reports on macOS.**
+
+Compare the two columns the harness prints. For the streaming benchmark in Module 2, `tracemalloc` reported 2,600.9 MB where `ru_maxrss` reported 698.5 MB — **3.7× low** — because macOS compresses inactive pages and JSON text compresses extremely well. For the record-representation benchmark the two agree closely, because the data is pointers and small objects rather than compressible text.
+
+Report both. State which you used. A memory number without its measurement method is not reproducible, and the discrepancy is itself a finding worth a paragraph.
+
+## The measured numbers this solution produces
+
+CPython 3.13.2, Apple M3 Pro, macOS 15, N = 1,000,000, shared 1,000-name pool, fresh process per variant:
+
+| Representation | RSS delta | **Bytes/record** | vs dict |
+|---|---|---|---|
+| `dict` | 255.3 MB | **268** | 1.00× |
+| plain class | 162.9 MB | **171** | 1.57× smaller |
+| `@dataclass` | 163.1 MB | 171 | 1.57× |
+| `NamedTuple` | 145.0 MB | 152 | 1.76× |
+| plain `tuple` | 132.5 MB | 139 | 1.93× |
+| `__slots__` class | 132.3 MB | **139** | **1.93×** |
+| `@dataclass(slots=True)` | 132.3 MB | 139 | 1.93× |
+| columnar (`array.array` + shared strings) | 27.2 MB | **28** | **9.6×** |
+
+Supporting `sys.getsizeof` figures:
+
+| Object | Bytes |
+|---|---|
+| small `int` (`0`, `1`) | 28 |
+| `2**30` / `2**100` | 32 / 40 |
+| `float` | 24 |
+| `[]` / `list(range(10))` | 56 / 136 |
+| `&#123;&#125;` / one-item dict | 64 / **184** |
+| `()` / `(1,2,3)` | 40 / 64 |
+| `set()` | 216 |
+
+Attribute-access cost (Module 4's benchmark, same box): plain 4.6 ns, `__slots__` 4.4 ns, `@property` 12.8 ns, Python descriptor 49.6 ns.
+
+## Grading notes
+
+**3/3 on correctness** means one process per variant, baseline subtracted, and a shared name pool. A harness that loops in one process is a 0 on this row regardless of how good the write-up is, because the numbers are wrong.
+
+**3/3 on performance** means both `tracemalloc` and `ru_maxrss` reported, with the platform unit handled and any discrepancy explained.
+
+**3/3 on explanation** means the write-up states which representation you would pick at 10⁴, 10⁶ and 10⁸ records and why — and the answers should differ. At 10⁴ the container cost is irrelevant and readability wins; at 10⁶ `slots=True` is free money; at 10⁸ you are columnar or you are in a database.
+
+The four most common ways submissions lose points:
+
+1. **All variants measured in one process.** The single most common error, and it produces a monotonically-increasing table that looks plausible.
+2. **`ru_maxrss` unit wrong.** A submission reporting 261,000 MB or 0.25 MB has this bug. Branch on `sys.platform`.
+3. **`@dataclass` reported as heavier than a plain class.** It is not — measured at exactly 171 B for both, because `@dataclass` only generates methods. If your numbers differ, something else changed between the runs.
+4. **The 9.6× columnar result stated without its caveat.** Columnar wins on memory and on field-wise access, and loses on "give me one whole record" and on readability. A write-up that only celebrates the number has missed the trade-off, which is the actual deliverable.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

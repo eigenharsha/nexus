@@ -1,0 +1,151 @@
+---
+title: "Why orchestration exists"
+description: "Reference solution — Week 24"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P3-W24-M1`
+
+The hands-on was: break a Pod five ways and diagnose each from `kubectl` output alone.
+
+### The five signatures
+
+Each break, what it looks like, and the one line that gives it away.
+
+| # | Break | `STATUS` | Diagnostic command | The line | Exit code |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `image: bloodcell:nope` | `ImagePullBackOff` | `describe` → Events | `Failed to pull image "bloodcell:nope"` | — |
+| 2 | `limits.memory: 64Mi` | `CrashLoopBackOff`, restarts climbing | `describe` → Last State | `Reason: OOMKilled` | **137** |
+| 3 | readiness path `/nope` | `Running`, `0/1 Ready` | `describe` → Events | `Readiness probe failed: HTTP probe failed with statuscode: 404` | — |
+| 4 | `envFrom` a missing ConfigMap | `CreateContainerConfigError` | `describe` → Events | `configmap "bloodcell-config" not found` | — |
+| 5 | `requests.cpu: "64"` | `Pending` | `describe` → Events | `0/4 nodes are available: 4 Insufficient cpu` | — |
+
+Three of the five produce **no logs at all**, which is why `describe` comes first:
+
+- **#4 and #5** never create a container, so `kubectl logs` returns `container "api" in pod ... is waiting to start`.
+- **#2** is SIGKILLed with no chance to write anything, so `logs --previous` shows the last few lines of normal startup and nothing about the death. The evidence lives in `Last State`.
+
+### Timings worth knowing
+
+| Behaviour | Measured |
+| --- | --- |
+| `ImagePullBackOff` retry interval | 10 s, 20 s, 40 s, 80 s, 160 s, then capped at 300 s |
+| `CrashLoopBackOff` restart interval | identical backoff |
+| Recovery after fixing the image tag | **up to 5 minutes** — or immediate with `kubectl delete pod` |
+| `apply` → `Running` (image cached) | 2.1 s |
+| `apply` → `Ready` (probe passed, warm-up done) | **5.4 s** |
+
+**3.3 s of the 5.4 s is your application starting**, not Kubernetes. Worth measuring once so you can answer "is Kubernetes slow to deploy?" with a decomposition rather than an opinion.
+
+### `kdebug`
+
+```bash
+#!/usr/bin/env bash
+# kdebug — diagnose a pod from the API alone. One line of output.
+set -euo pipefail
+POD="${1:?usage: kdebug <pod> [namespace]}"
+NS="${2:-$(kubectl config view --minify -o jsonpath='{..namespace}')}"
+NS="${NS:-default}"
+J() { kubectl get pod "$POD" -n "$NS" -o jsonpath="$1" 2>/dev/null; }
+
+PHASE=$(J '{.status.phase}')
+
+# 1. Never scheduled? It is a scheduling problem and there are no logs.
+if [ "$PHASE" = "Pending" ] && [ -z "$(J '{.spec.nodeName}')" ]; then
+  MSG=$(kubectl get events -n "$NS" --field-selector "involvedObject.name=$POD" \
+        -o jsonpath='{range .items[?(@.reason=="FailedScheduling")]}{.message}{end}')
+  echo "PENDING (not scheduled): ${MSG:-no FailedScheduling event yet}"
+  exit 0
+fi
+
+# 2. Container waiting? The reason string is the diagnosis.
+WAIT_R=$(J '{.status.containerStatuses[0].state.waiting.reason}')
+WAIT_M=$(J '{.status.containerStatuses[0].state.waiting.message}')
+if [ -n "$WAIT_R" ]; then
+  echo "WAITING: $WAIT_R — ${WAIT_M:-see kubectl describe events}"
+  exit 0
+fi
+
+# 3. Previously terminated? Exit 137 is OOM; anything else is the app.
+LAST_R=$(J '{.status.containerStatuses[0].lastState.terminated.reason}')
+LAST_C=$(J '{.status.containerStatuses[0].lastState.terminated.exitCode}')
+RESTARTS=$(J '{.status.containerStatuses[0].restartCount}')
+if [ -n "$LAST_R" ]; then
+  HINT=""
+  [ "$LAST_C" = "137" ] && HINT=" (SIGKILL — raise limits.memory)"
+  [ "$LAST_C" = "143" ] && HINT=" (SIGTERM — normal shutdown)"
+  echo "RESTARTED x$RESTARTS: last exit $LAST_C $LAST_R$HINT"
+  echo "  -> kubectl logs $POD -n $NS --previous"
+  exit 0
+fi
+
+# 4. Running but not ready? The probe is the story.
+READY=$(J '{.status.containerStatuses[0].ready}')
+if [ "$READY" != "true" ]; then
+  echo "RUNNING but NOT READY — readiness probe failing:"
+  kubectl get events -n "$NS" --field-selector "involvedObject.name=$POD" \
+    -o jsonpath='{range .items[?(@.reason=="Unhealthy")]}  {.message}{"\n"}{end}' | tail -2
+  exit 0
+fi
+
+# 5. Ready but getting no traffic? The Service selector is the usual cause.
+LABELS=$(J '{.metadata.labels}')
+echo "READY. If it is receiving no traffic, check the Service selector against: $LABELS"
+echo "  -> kubectl get endpointslices -n $NS -l kubernetes.io/service-name=<svc>"
+```
+
+Output on the five broken pods:
+
+```
+PENDING (not scheduled): 0/4 nodes are available: 4 Insufficient cpu.
+WAITING: ImagePullBackOff — Back-off pulling image "bloodcell:nope"
+WAITING: CreateContainerConfigError — configmap "bloodcell-config" not found
+RESTARTED x7: last exit 137 OOMKilled (SIGKILL — raise limits.memory)
+RUNNING but NOT READY — readiness probe failing:
+  Readiness probe failed: HTTP probe failed with statuscode: 404
+```
+
+## Why this solution and not the obvious one
+
+**Why the order of checks matters.** Scheduling first, because a `Pending` pod has no container, no logs, and no probe — every other check would return empty and confuse you. Then `waiting.reason`, which is a machine-readable diagnosis the API hands you. Then `lastState`, then readiness, then routing. **Each step is only meaningful if the previous ones passed**, which is exactly why `describe` before `logs` is the rule.
+
+**Why key on `exitCode` rather than the log.** 137 means SIGKILL and, in a container context, essentially always OOM. 143 means SIGTERM, i.e. a normal shutdown that someone is misreading as a crash. Both are available from the API in a field, and neither appears in the logs.
+
+**Why the last branch mentions the Service selector.** "Pod is Running and Ready but gets no traffic" is the sixth failure mode and it is not a pod problem at all — which is why a pod-focused tool has to say so explicitly rather than printing "OK" and leaving you stuck.
+
+## The two wrong turns worth knowing about
+
+**1. Reaching for `kubectl logs` first.** Three of the five produce no logs. People spend minutes wondering why the output is empty before discovering the container never started. `describe`'s Events section answers "did we get as far as running your code?" in one command.
+
+**2. Assuming a fix takes effect immediately.** After correcting the image tag, the pod stays in `ImagePullBackOff` for up to five minutes because the backoff has already grown. People conclude their fix did not work and change something else. `kubectl delete pod` forces a fresh attempt — and knowing this saves a genuinely confusing ten minutes.
+
+## Grading notes
+
+**3/3 on Correctness** — all five signatures produced, each diagnosed through `describe` and events rather than logs, with the exit codes recorded where they exist.
+
+**3/3 on Code quality** — `kdebug` checks in the right order, keys on API fields rather than parsing human-readable output, and handles the "ready but no traffic" case.
+
+**3/3 on Explanation** — you can say which of the five produce no logs and why, and you wrote down the backoff behaviour.
+
+**The three most common ways submissions lose points**
+
+1. **Diagnosing from logs.** It works for one of the five and teaches the wrong reflex for a cluster where you cannot read every pod's logs.
+2. **`kdebug` that greps `describe`'s text output.** It breaks on the next Kubernetes version, and the structured fields are right there in `-o jsonpath`.
+3. **No exit codes recorded.** 137 versus 143 is the difference between "the kernel killed it" and "it shut down normally", and it is the fastest disambiguation available.
+
+<Card title="Back to the module" icon="arrow-left" href="/curriculum/p3/week-24/1-why-orchestration-exists" horizontal>
+  Keep `kdebug`. It is genuinely useful and it is a good portfolio artifact.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

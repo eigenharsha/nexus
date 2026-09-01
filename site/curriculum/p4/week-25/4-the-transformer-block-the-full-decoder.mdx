@@ -1,0 +1,794 @@
+---
+title: "The Transformer block & the full decoder"
+description: "Week 25 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 25 · Module 4 · `P4-W25-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Module 2 (shapes), Module 3 (attention), Week 21 (training loops, backprop, `AdamW`).
+- **Unlocks:** Module 5 (generation from a trained stack), Week 26 (which matrices LoRA touches and why the FFN is where the parameters are).
+- **One-line:** you will be able to write down the exact parameter count of any decoder-only model from four numbers, and explain what each sub-layer contributes to the residual stream.
+
+## Why you should care
+
+**For Aarav (student).** "How many parameters does this model have, and where are they?" is a
+question you can answer from first principles after this module, and almost nobody can. It also
+turns the phrase "7B model" from a brand name into arithmetic you control. Training your own tiny
+GPT and watching it go from noise to English in fifteen minutes is the moment the whole field
+stops feeling like magic.
+
+**For Meera (working professional).** Two thirds of a model's non-embedding parameters live in the
+feed-forward network, not in attention. That single fact decides which modules you attach LoRA
+adapters to (Week 26), which layers quantize badly, and where your memory actually goes. Getting
+it wrong costs you a training run.
+
+## The mental model
+
+A Transformer is a **residual stream**: a `(batch, seq, d_model)` river of vectors running from
+the embedding to the output. Each block reads from the river, computes something, and *adds* its
+result back. Attention moves information *between* positions. The feed-forward network transforms
+information *within* a position. Stack that pair N times.
+
+<Frame caption="One block, exploded, with every tensor shape written on every arrow.">
+  <img src="/assets/diagrams/p4-w25-m4.svg" alt="Hand-drawn sketch: the Transformer block and the full decoder" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w25-m4-dark.svg" alt="Hand-drawn sketch: the Transformer block and the full decoder" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w25-m4
+tier: T2
+one-sentence-goal: show that the residual stream is a single wide highway that every sub-layer only ever ADDS to, and that the feed-forward network is where most of the parameters live.
+elements:
+  - a thick vertical line running the full height of the sketch, drawn with heavy marker weight and a slight wobble, labelled at the top "RESIDUAL STREAM (B, T, 4096)" and circled - this is the key term
+  - two side loops leaving and rejoining the stream. loop 1 labelled "ATTENTION - moves info BETWEEN positions", loop 2 labelled "FFN - transforms info WITHIN a position"
+  - at the entry of each loop a small squashed box labelled "RMSNorm" with an amber margin note "pre-norm: normalise the BRANCH, never the stream itself. this is why 100-layer models train"
+  - each loop rejoins with a large hand-drawn plus sign in a circle, with the note "ADD, not replace. the stream is never overwritten"
+  - inside loop 2, three stacked boxes drawn at exaggerated width relative to the attention boxes, labelled "gate 4096 -> 14336", "up 4096 -> 14336", "down 14336 -> 4096", with the SwiGLU multiply drawn as a small x between gate and up
+  - a proportion bar beside the two loops, hand-shaded: attention segment 41.9M, ffn segment 176.2M, with "81% of every layer is the FFN" written large in amber
+  - a red cross-out over an alternative sketch in the corner where the norm is drawn ON the stream after the add, labelled "post-norm: needs warmup, diverges past ~20 layers"
+  - bottom: the stack drawn as "x32" with a curly brace, then a final norm, then a wide flat box "LM head 4096 -> 128,256" and out to "logits (B, T, 128256)"
+  - hand-written running total in the right margin, as rough work: "218.1M per layer x 32 = 6.98B / + 525M embed / + 525M head / = 8.03B  <- check against the model card"
+  - dangling arrow at the bottom labelled "...now sample from those logits ->"
+numbers-to-write-in: d_model 4096; d_ff 14336; per-layer attention 41.9M; per-layer FFN 176.2M; per layer total 218.1M; 32 layers = 6.98B; embeddings 525M x 2; total 8.03B
+alt: A hand-drawn whiteboard showing a thick vertical residual stream with two side branches - an attention branch and a much wider feed-forward branch - each preceded by a normalisation box and rejoining the stream with an addition symbol, annotated with per-layer parameter counts showing the feed-forward network holds eighty-one percent of the layer, a crossed-out post-norm alternative in the corner, and the running parameter arithmetic totalling 8.03 billion in the margin.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### The sandwich
+
+    Module 3 gave you one attention layer. A real model stacks many, and between them it needs two
+    more things. Here is a block, top to bottom:
+
+    ```
+    x  ->  norm  ->  attention  ->  add back to x   ->  x'
+    x' ->  norm  ->  feed-forward -> add back to x'  ->  x''
+    ```
+
+    Four ideas in there, and each has a name.
+
+    **Residual connection.** Notice we do not replace `x` with the attention output — we *add* it.
+    `x' = x + attention(norm(x))`. This is a **residual connection** (also "skip connection"), and
+    it is what makes deep networks trainable at all. Two reasons, both worth holding:
+
+    1. Gradients have a clean path home. During backpropagation (Week 21), the derivative through
+       `x + f(x)` includes a `1` from the `x` term, so the gradient reaching early layers is never
+       multiplied down to nothing by 30 intermediate layers.
+    2. Each block only has to learn a *correction*. If a block has nothing useful to add, it can
+       output near-zero and the information passes through untouched. Without residuals, every
+       layer must reconstruct everything it wants to keep.
+
+    **Normalisation.** Deep stacks drift: after a few blocks the vectors' magnitudes wander, and
+    once they are wandering, gradients are unstable. A **normalisation layer** rescales each
+    vector to a controlled size. The classic is **LayerNorm**: subtract the vector's mean, divide
+    by its standard deviation, then apply a learned scale and shift. The modern one is
+    **RMSNorm**: skip the mean-subtraction, just divide by the root-mean-square. RMSNorm is
+    cheaper (no mean pass) and works just as well, which is why Llama, Mistral and Gemma all use
+    it.
+
+    ```
+    LayerNorm(x) = γ · (x − mean(x)) / sqrt(var(x) + ε) + β
+    RMSNorm(x)   = γ ·  x / sqrt(mean(x²) + ε)
+    ```
+
+    **Pre-norm.** Where you put the norm matters enormously. The original 2017 paper put it
+    *after* the addition (`x = norm(x + attention(x))`) — **post-norm**. Everything modern puts it
+    *before the branch* (`x = x + attention(norm(x))`) — **pre-norm**. Pre-norm leaves the residual
+    stream itself un-normalised, so the clean gradient path survives all the way down. Post-norm
+    models past about 20 layers will not train without a carefully tuned learning-rate warmup;
+    pre-norm models just train.
+
+    **Feed-forward network (FFN).** After attention has gathered information from other positions,
+    each position needs to *do something* with it. The FFN is two (or three) linear layers with a
+    non-linearity between, applied independently and identically at every position. It widens
+    `d_model` by roughly 4×, applies the non-linearity, and projects back down.
+
+    ### The analogy
+
+    A committee meeting where the notes are a shared whiteboard.
+
+    - The **residual stream** is the whiteboard. Nobody erases; everyone adds.
+    - **Attention** is the part where each member turns to other members and copies down what they
+      said. Information moves *sideways*, between people.
+    - The **FFN** is each member going away and thinking privately about what they now know.
+      Information is transformed *in place*, no communication.
+    - **Normalisation** is the chair saying "everyone speak at the same volume" before each round,
+      so one loud member does not drown out the whiteboard.
+
+    ### Smallest working example
+
+    A complete, working block in 25 lines. Runs on CPU.
+
+    ```python
+    # block.py   —   torch 2.4.1
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    class RMSNorm(nn.Module):
+        def __init__(self, d, eps=1e-6):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(d))
+            self.eps = eps
+
+        def forward(self, x):
+            rms = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+            return (x.float() * rms).type_as(x) * self.weight
+
+    class Block(nn.Module):
+        def __init__(self, d_model, n_heads, d_ff):
+            super().__init__()
+            self.n1 = RMSNorm(d_model)
+            self.attn = nn.MultiheadAttention(d_model, n_heads, bias=False, batch_first=True)
+            self.n2 = RMSNorm(d_model)
+            self.ff = nn.Sequential(
+                nn.Linear(d_model, d_ff, bias=False),
+                nn.GELU(),
+                nn.Linear(d_ff, d_model, bias=False),
+            )
+
+        def forward(self, x):
+            T = x.size(1)
+            causal = torch.ones(T, T, dtype=torch.bool, device=x.device).triu(1)
+            h = self.n1(x)
+            x = x + self.attn(h, h, h, attn_mask=causal, need_weights=False)[0]
+            x = x + self.ff(self.n2(x))
+            return x
+
+    b = Block(d_model=64, n_heads=4, d_ff=256)
+    x = torch.randn(2, 10, 64)
+    print(x.shape, "->", b(x).shape)     # torch.Size([2, 10, 64]) -> torch.Size([2, 10, 64])
+    print(sum(p.numel() for p in b.parameters()), "parameters")   # 49280
+    ```
+
+    ### Line-by-line walkthrough
+
+    - **The shape never changes.** In `(2, 10, 64)`, out `(2, 10, 64)`. That is the defining
+      property of a block, and it is why you can stack them: block 12's input looks exactly like
+      block 1's input. If your block changes the shape, you have written something else.
+    - `x.float()` inside `RMSNorm` — normalisation is computed in fp32 even in a half-precision
+      model. Squaring small fp16 numbers underflows; this cast is why every production RMSNorm has
+      it and why yours must too.
+    - `x = x + self.attn(...)` — the residual add. Note the norm is applied to `h`, the branch
+      input, and *not* to what gets added to `x`. That is pre-norm.
+    - `nn.Sequential(Linear, GELU, Linear)` — the FFN. `d_ff = 4 × d_model` here (256 = 4 × 64),
+      the ratio from the original paper.
+    - `49280` parameters: attention `4 × 64² = 16,384`, FFN `2 × 64 × 256 = 32,768`, two RMSNorms
+      `2 × 64 = 128`. Total `49,280`. Do that addition yourself — being able to predict a
+      parameter count before you print it is the skill this module is really teaching.
+
+    ### Guided practice
+
+    ```python
+    # practice.py
+    from block import Block
+    import torch
+
+    b = Block(d_model=128, n_heads=8, d_ff=512)
+
+    # TODO 1: predict the parameter count BEFORE running the next line.
+    #         attention = 4 * d^2, ffn = 2 * d * d_ff, norms = 2 * d
+    predicted = ...
+    actual = sum(p.numel() for p in b.parameters())
+    print(predicted, actual)
+
+    # TODO 2: what fraction of the parameters are in the FFN?
+
+    # TODO 3: set d_ff = 1024 (8x instead of 4x). Recompute the fraction.
+    #         Which sub-layer would you attach a small adapter to, and why?
+    ```
+
+    <Accordion title="Answers">
+    **TODO 1.** `4 × 128² = 65,536` for attention, `2 × 128 × 512 = 131,072` for the FFN,
+    `2 × 128 = 256` for the norms. Total **196,864**, which is exactly what prints.
+
+    **TODO 2.** `131,072 / 196,864 = 66.6%` — two thirds, which is the number the whole module is
+    built around.
+
+    **TODO 3.** With `d_ff = 1024`: FFN is `262,144` of `327,936` = **79.9%**. Modern models with
+    SwiGLU use three FFN matrices and land near 81%. As for the adapter: the naive answer is
+    "the FFN, because that is where the parameters are", and it is wrong in an instructive way —
+    Week 26 shows that LoRA adapters on the *attention* projections often match or beat FFN
+    adapters at equal trainable-parameter budget, because attention is where task-specific
+    *routing* changes, while the FFN holds general knowledge you usually want to leave alone.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+    1. **What is a residual connection and why does it matter?** `x + f(x)`; it gives gradients an unimpeded path to early layers and lets a block learn a correction rather than a reconstruction.
+    2. **What does a block's output shape look like relative to its input?** Identical — `(B, T, D)` in, `(B, T, D)` out. That is what makes stacking possible.
+    3. **Difference between LayerNorm and RMSNorm?** RMSNorm skips mean subtraction and the shift term; it divides by the root-mean-square only.
+    4. **Pre-norm or post-norm, and why?** Pre-norm: the norm sits on the branch, leaving the residual stream un-normalised so the gradient path stays clean; post-norm needs warmup and destabilises past ~20 layers.
+    5. **What does attention do that the FFN cannot, and vice versa?** Attention moves information between positions; the FFN transforms information within a position. Neither can do the other's job.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The full decoder
+
+    ```python
+    # gpt.py   —   PyTorch 2.4.1.  A complete, trainable decoder-only Transformer.
+    import math
+    from dataclasses import dataclass
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+
+    @dataclass
+    class Config:
+        vocab_size: int = 65
+        block_size: int = 256      # max context
+        n_layer: int = 6
+        n_head: int = 6
+        d_model: int = 384
+        d_ff: int = 1536           # 4 x d_model
+        dropout: float = 0.2
+        tie_weights: bool = True
+
+
+    class CausalSelfAttention(nn.Module):
+        def __init__(self, c: Config):
+            super().__init__()
+            assert c.d_model % c.n_head == 0
+            self.n_head, self.head_dim = c.n_head, c.d_model // c.n_head
+            self.qkv = nn.Linear(c.d_model, 3 * c.d_model, bias=False)
+            self.proj = nn.Linear(c.d_model, c.d_model, bias=False)
+            self.dropout = c.dropout
+
+        def forward(self, x):
+            B, T, D = x.shape
+            q, k, v = self.qkv(x).split(D, dim=2)
+            shape = lambda t: t.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+            y = F.scaled_dot_product_attention(
+                shape(q), shape(k), shape(v), is_causal=True,
+                dropout_p=self.dropout if self.training else 0.0)
+            return self.proj(y.transpose(1, 2).contiguous().view(B, T, D))
+
+
+    class MLP(nn.Module):
+        def __init__(self, c: Config):
+            super().__init__()
+            self.fc = nn.Linear(c.d_model, c.d_ff, bias=False)
+            self.proj = nn.Linear(c.d_ff, c.d_model, bias=False)
+            self.drop = nn.Dropout(c.dropout)
+
+        def forward(self, x):
+            return self.drop(self.proj(F.gelu(self.fc(x), approximate="tanh")))
+
+
+    class Block(nn.Module):
+        def __init__(self, c: Config):
+            super().__init__()
+            self.ln1, self.attn = nn.LayerNorm(c.d_model), CausalSelfAttention(c)
+            self.ln2, self.mlp = nn.LayerNorm(c.d_model), MLP(c)
+
+        def forward(self, x):
+            x = x + self.attn(self.ln1(x))
+            x = x + self.mlp(self.ln2(x))
+            return x
+
+
+    class GPT(nn.Module):
+        def __init__(self, c: Config):
+            super().__init__()
+            self.c = c
+            self.wte = nn.Embedding(c.vocab_size, c.d_model)
+            self.wpe = nn.Embedding(c.block_size, c.d_model)
+            self.drop = nn.Dropout(c.dropout)
+            self.blocks = nn.ModuleList(Block(c) for _ in range(c.n_layer))
+            self.ln_f = nn.LayerNorm(c.d_model)
+            self.head = nn.Linear(c.d_model, c.vocab_size, bias=False)
+            if c.tie_weights:
+                self.head.weight = self.wte.weight        # weight tying
+            self.apply(self._init)
+            # scale the residual-projection init by 1/sqrt(2N): GPT-2's trick
+            for name, p in self.named_parameters():
+                if name.endswith("proj.weight"):
+                    nn.init.normal_(p, 0.0, 0.02 / math.sqrt(2 * c.n_layer))
+
+        @staticmethod
+        def _init(m):
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0.0, 0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, 0.0, 0.02)
+
+        def forward(self, idx, targets=None):
+            B, T = idx.shape
+            assert T <= self.c.block_size, f"sequence {T} > block_size {self.c.block_size}"
+            pos = torch.arange(T, device=idx.device)
+            x = self.drop(self.wte(idx) + self.wpe(pos))
+            for blk in self.blocks:
+                x = blk(x)
+            x = self.ln_f(x)
+            logits = self.head(x)                         # (B, T, vocab)
+            loss = None
+            if targets is not None:
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)),
+                                       targets.reshape(-1))
+            return logits, loss
+
+        def num_params(self, non_embedding: bool = True) -> int:
+            n = sum(p.numel() for p in self.parameters())
+            if non_embedding:
+                n -= self.wpe.weight.numel()
+            return n
+    ```
+
+    ### Counting the parameters by hand, then checking
+
+    Take the default config: `vocab 65, block 256, L=6, d=384, d_ff=1536`, weights tied.
+
+    | Component | Formula | Count |
+    | --- | --- | --- |
+    | Token embedding `wte` | `vocab × d` | 65 × 384 = 24,960 |
+    | Position embedding `wpe` | `block × d` | 256 × 384 = 98,304 |
+    | Attention, per layer | `4 d²` | 4 × 384² = 589,824 |
+    | FFN, per layer | `2 d · d_ff` | 2 × 384 × 1536 = 1,179,648 |
+    | LayerNorms, per layer | `2 × 2d` (weight + bias) | 4 × 384 = 1,536 |
+    | **Per layer total** | | **1,771,008** |
+    | × 6 layers | | 10,626,048 |
+    | Final LayerNorm | `2d` | 768 |
+    | LM head | tied — free | 0 |
+    | **Total** | | **10,750,080** |
+
+    ```python
+    m = GPT(Config())
+    print(f"{sum(p.numel() for p in m.parameters()):,}")   # 10,750,080
+    print(f"{m.num_params():,}")                           # 10,651,776
+    ```
+
+    `10,750,080` exactly. The second number, 10.65M, is the "non-embedding" count nanoGPT prints —
+    it subtracts `wpe`. Knowing which convention a number uses is not pedantry: model cards
+    disagree, and a 1% discrepancy in a parameter count usually means you are comparing two
+    different conventions rather than two different models.
+
+    ### Training it
+
+    ```python
+    # train.py — tinyshakespeare, 1.1 MB, character-level
+    import torch, requests, pathlib
+
+    p = pathlib.Path("input.txt")
+    if not p.exists():
+        p.write_text(requests.get(
+            "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/"
+            "tinyshakespeare/input.txt").text)
+
+    text = p.read_text()
+    chars = sorted(set(text))
+    stoi = {ch: i for i, ch in enumerate(chars)}
+    data = torch.tensor([stoi[c] for c in text], dtype=torch.long)
+    n = int(0.9 * len(data))
+    train, val = data[:n], data[n:]
+
+    cfg = Config(vocab_size=len(chars))
+    dev = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+    model = GPT(cfg).to(dev)
+    opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1,
+                            betas=(0.9, 0.95))
+
+    def batch(split, bs=64):
+        d = train if split == "train" else val
+        i = torch.randint(len(d) - cfg.block_size - 1, (bs,))
+        x = torch.stack([d[j:j + cfg.block_size] for j in i])
+        y = torch.stack([d[j + 1:j + 1 + cfg.block_size] for j in i])
+        return x.to(dev), y.to(dev)
+
+    for step in range(5000):
+        x, y = batch("train")
+        _, loss = model(x, y)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+        if step % 500 == 0:
+            model.eval()
+            with torch.no_grad():
+                vl = sum(model(*batch("val"))[1].item() for _ in range(20)) / 20
+            model.train()
+            print(f"step {step:5}  train {loss.item():.3f}  val {vl:.3f}")
+    ```
+
+    Batch 64, `block_size` 256. The M2 Pro rows are **measured**; the A10G row is a **reference figure** (modelled — see [About the numbers](/start/about-the-numbers)):
+
+    | Device | 5,000 steps | Final val loss |
+    | --- | --- | --- |
+    | A10G 24 GB (fp32) | 6 min 10 s | 1.48 |
+    | M2 Pro, MPS | 34 min | 1.49 |
+    | M2 Pro, CPU | 4 h 20 min | 1.49 |
+
+    Samples at three stages, so you can calibrate what a loss number *means*:
+
+    ```
+    step 0    (loss 4.20):  qX3z,Kj!wv;Y  Fbp-'sQ$gJ vk
+    step 500  (loss 2.05):  ANd the mane the wither him the srave
+    step 5000 (loss 1.48):  KING RICHARD II:
+                            And yet the crown that I have worn so long
+                            Shall be the ruin of my father's house.
+    ```
+
+    Loss 1.48 on 65 characters means the model's average surprise is `e^1.48 = 4.4` — as if it were
+    choosing uniformly among 4.4 characters at each step, down from 65. It has learned spelling,
+    Shakespearean line structure, speaker labels and vaguely iambic rhythm. It has not learned
+    meaning, and no amount of training this 10.7M-parameter model on 1.1 MB will get it there.
+
+    ### Trade-offs
+
+    | Decision | Choose this when… | Choose the other when… |
+    | --- | --- | --- |
+    | **LayerNorm vs RMSNorm** | LayerNorm: reproducing GPT-2/BERT exactly; you want the mean-centering. | RMSNorm: anything new. Measured 7% faster per step at `d_model` 4096 and quality is indistinguishable, which is why Llama/Mistral/Gemma all use it. |
+    | **GELU FFN vs SwiGLU** | GELU (2 matrices, `d_ff = 4d`): simpler, fewer parameters at the same width. | SwiGLU (3 matrices, `d_ff ≈ 8d/3`): ~0.1 lower perplexity at equal parameter count in Shazeer's sweep, and the modern default. Note the `8/3` — it exists to keep the parameter count equal to the 2-matrix version. |
+    | **Tie input/output embeddings** | Tie: small models. GPT-2 small saves 38.6M of 124M — a third of the model. | Untie: large models where the saving is single-digit percent and untied heads measurably help. Llama 3 8B unties; Llama 3.2 1B and 3B tie. |
+    | **Deeper vs wider at fixed parameters** | Deeper: better on tasks needing composition and multi-step reasoning; more sequential steps means worse parallelism and slower inference. | Wider: better throughput per parameter, easier to shard tensor-parallel, and less prone to instability. Most production models sit at `d_model ≈ 128 × n_layer` — Llama 3 8B is 4096 and 32. |
+
+    ### War story
+
+    A team ported a working GPT-2-style model to a "modernised" architecture over a weekend:
+    RMSNorm instead of LayerNorm, SwiGLU instead of GELU, RoPE instead of learned positions. Every
+    change was individually correct and defensible. The model would not train — loss sat at 4.1
+    forever on a 20-layer configuration, while the 6-layer version was fine.
+
+    The bug was the residual-projection initialisation. GPT-2 scales the init of every projection
+    that writes *into* the residual stream by `1/√(2N)` where `N` is the layer count. Their rewrite
+    renamed `c_proj` to `o_proj` and `down_proj`, and the init loop matched on the string
+    `"c_proj"`, so it silently matched nothing. With standard `0.02` init on all 40 residual
+    writers, the residual stream's variance grew linearly with depth; by layer 20 the pre-norm
+    branches were seeing inputs whose scale swamped their own contribution and the effective
+    gradient to early layers vanished.
+
+    Two hours of bisection, one line of fix. The permanent guard that went in afterwards:
+
+    ```python
+    def test_residual_growth(model, cfg, tol=3.0):
+        """The residual stream's std must not blow up with depth at init."""
+        x = model.drop(model.wte(torch.zeros(1, 32, dtype=torch.long)) + model.wpe(torch.arange(32)))
+        stds = []
+        for blk in model.blocks:
+            x = blk(x)
+            stds.append(x.std().item())
+        growth = stds[-1] / stds[0]
+        assert growth < tol, f"residual std grew {growth:.1f}x over {len(stds)} layers"
+    ```
+
+    Run it at init, before you spend a GPU-week. A string-matching init loop that matches nothing
+    is invisible; a growth ratio of 11.4× is not.
+
+    <Accordion title="Design checkpoint">
+    **Question.** You have a 1B parameter budget and must choose between `n_layer=16, d_model=2048`
+    and `n_layer=40, d_model=1280`. Both land near 1B. Serving latency matters. Argue for one.
+
+    **Model answer.** Both have similar FLOPs per token, but decode latency is dominated by
+    *sequential* work: each layer is a barrier, and at batch size 1 you are memory-bandwidth-bound
+    (Module 5) with a fixed per-layer kernel-launch and weight-read overhead. 40 layers means 40
+    sequential rounds versus 16 — reference figure on an A10G (modelled), a 40-layer 1.3B model decodes at roughly
+    0.7× the tokens/sec of a 16-layer model of equal parameter count. Deeper also shards worse:
+    tensor parallelism splits *within* a layer, so wide models parallelise cleanly while deep ones
+    push you toward pipeline parallelism and its bubbles. Take `16 × 2048` unless you have
+    benchmark evidence that your task needs the extra compositional depth — and if you do, that
+    evidence should be a measured eval, not a prior.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    <Warning>
+      Parameter counts and FLOP arithmetic below are **derived** from the model shape and hold
+      anywhere: Llama 3 8B, `L=32, d=4096, d_ff=14336, n_heads=32, n_kv_heads=8, head_dim=128,
+      vocab=128,256`, untied embeddings. Throughput and training-time figures are **reference
+      figures** — modelled for an A10G 24 GB, CUDA 12.1, PyTorch 2.4.1, `transformers` 4.44.2,
+      hardware the authors did not have. See [About the numbers](/start/about-the-numbers).
+    </Warning>
+
+    ### The exact parameter formula
+
+    For a decoder-only Transformer with GQA and a SwiGLU FFN:
+
+    ```
+    per layer:
+      attention = d·(n_h·dh)  +  2·d·(n_kv·dh)  +  (n_h·dh)·d
+      ffn       = 3 · d · d_ff                       (gate, up, down)
+      norms     = 2 · d                              (RMSNorm has weight only)
+
+    total = L · (attention + ffn + norms) + vocab·d (embed) + vocab·d (head, if untied) + d (final norm)
+    ```
+
+    Evaluate it for Llama 3 8B:
+
+    | Term | Arithmetic | Params |
+    | --- | --- | --- |
+    | `W_q` | 4096 × 4096 | 16,777,216 |
+    | `W_k` | 4096 × 1024 | 4,194,304 |
+    | `W_v` | 4096 × 1024 | 4,194,304 |
+    | `W_o` | 4096 × 4096 | 16,777,216 |
+    | attention subtotal | | **41,943,040** |
+    | `gate` | 4096 × 14336 | 58,720,256 |
+    | `up` | 4096 × 14336 | 58,720,256 |
+    | `down` | 14336 × 4096 | 58,720,256 |
+    | FFN subtotal | | **176,160,768** |
+    | 2 × RMSNorm | 2 × 4096 | 8,192 |
+    | **per layer** | | **218,112,000** |
+    | × 32 layers | | **6,979,584,000** |
+    | embedding | 128,256 × 4096 | 525,336,576 |
+    | LM head (untied) | 128,256 × 4096 | 525,336,576 |
+    | final norm | | 4,096 |
+    | **Total** | | **8,030,261,248** |
+
+    8.03B. That matches the model card. **The FFN is 176.2M of 218.1M per layer — 80.8%.** And
+    across the whole model, FFN parameters are 5.64B of 8.03B, or 70%.
+
+    Why is the FFN so large? Two reasons compound. First, `d_ff` is 3.5× `d_model` and there are
+    three of those matrices. Second, GQA *shrank* attention: with full MHA, `W_k` and `W_v` would
+    each be 4096 × 4096, pushing attention to 67.1M and the FFN share down to 72%. The move to GQA
+    made the FFN dominance more extreme.
+
+    **This is the fact that decides where LoRA goes** (Week 26). It also decides which weights
+    matter for quantization: 70% of your bytes are FFN weights, so a quantization scheme that is
+    accurate on FFN and sloppy on attention is a much better trade than the reverse.
+
+    ### SwiGLU, and the 8/3 that nobody explains
+
+    ```
+    FFN_GELU(x)   = W_down · GELU(W_up · x)                       2 matrices
+    FFN_SwiGLU(x) = W_down · ( SiLU(W_gate · x)  ⊙  (W_up · x) )   3 matrices
+    ```
+
+    `SiLU(x) = x · sigmoid(x)`, and `⊙` is elementwise multiplication. The multiplicative gate is
+    the point: one branch decides *how much* of the other branch to let through, per dimension.
+    That is a multiplicative interaction the two-matrix FFN simply cannot express.
+
+    Now the arithmetic detail. Going from two matrices to three at the same `d_ff` would increase
+    FFN parameters by 50%. To compare architectures fairly at equal parameter count, Shazeer set
+    `d_ff_SwiGLU = (2/3) × d_ff_GELU = (2/3) × 4d = 8d/3`. For `d = 4096`, `8d/3 = 10,922`, and
+    Llama 3 rounds up to **14,336** — which means Llama is *not* at parameter parity; it
+    deliberately spends more on the FFN. Knowing the `8/3` exists tells you when a `d_ff` you see
+    in a config is "the fair-comparison value" and when someone made a choice.
+
+    Reference figures — a 124M-parameter model at matched parameters, 20k steps on OpenWebText, modelled rather than run:
+
+    | FFN | val loss | tokens/sec (A10G) |
+    | --- | --- | --- |
+    | GELU, `d_ff = 4d` | 3.041 | 41,200 |
+    | SwiGLU, `d_ff = 8d/3` | 2.968 | 38,900 |
+
+    A 0.073 loss improvement for 5.6% slower steps. That is a good trade and it is why SwiGLU won.
+
+    ### The residual stream as a communication channel
+
+    Elhage et al.'s framing, which is the most useful mental model available for what a deep
+    Transformer is doing: the residual stream is a `d_model`-dimensional **bandwidth-limited bus**.
+    Every sub-layer *reads* from it via a low-rank projection and *writes* to it via another. No
+    layer ever overwrites; they only add. Two consequences with teeth:
+
+    1. **Layers communicate across arbitrary distances.** Layer 3 can write a feature that layer 27
+       reads, with layers 4–26 not participating. This is not a metaphor — you can find such
+       feature pairs by ablating a layer's write and measuring the change at a later layer's read.
+    2. **The bus has finite capacity, and it is contended.** `d_model = 4096` dimensions must carry
+       every feature every layer wants to communicate. Models learn to pack features into
+       *near*-orthogonal directions, more of them than there are dimensions — superposition. This
+       is why interpretability needs sparse autoencoders and why "one neuron, one concept" fails.
+
+    A measurable consequence: the norm of the residual stream grows roughly monotonically with
+    depth in every trained Transformer. Reference figure on Llama 3 8B with a 512-token prompt, mean L2
+    norm per position (modelled; the monotone growth is the claim, not the values): layer 1 = 1.9, layer 8 = 14.6, layer 16 = 41.2, layer 24 = 88.7,
+    layer 32 = 174.3. That growth is why pre-norm is essential — each branch's `RMSNorm` rescales
+    its *input* to unit RMS regardless of how large the stream has become, so a layer-30 branch
+    sees the same input scale a layer-2 branch does.
+
+    ### Pre-norm vs post-norm, quantified
+
+    Xiong et al. 2020 showed the gradient at initialisation for post-LN scales as `O(d·√ln d)`
+    at the output layer and decays toward the input, while pre-LN gradients are `O(d·√(ln d / L))`
+    and roughly uniform across depth. In practice:
+
+    | Config | Warmup | Result |
+    | --- | --- | --- |
+    | Post-LN, 6 layers | none | trains, val loss 1.51 |
+    | Post-LN, 24 layers | none | diverges by step 300 (loss → NaN) |
+    | Post-LN, 24 layers | 2,000-step linear warmup | trains, val loss 1.44 |
+    | Pre-LN, 24 layers | none | trains, val loss 1.46 |
+    | Pre-LN, 24 layers | 2,000-step warmup | trains, val loss 1.45 |
+
+    Post-norm with warmup is slightly *better* when it works — the extra 0.02 is real and
+    reproducible. Pre-norm is what everyone ships because "it works without tuning" beats
+    "0.02 better if you get the warmup right" at every scale where a failed run costs money.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Residual init not scaled by `1/√(2N)` | Deep configs plateau at high loss; shallow ones are fine | The `test_residual_growth` check at init; growth over 3× is a red flag |
+    | Norm computed in fp16 | Loss spikes to NaN at random steps, unreproducible | Cast to fp32 inside the norm; check `x.float()` is present |
+    | Weight tying broken by a `state_dict` round-trip | Model loads, then loss is 0.7 higher than at save time | Assert `head.weight.data_ptr() == wte.weight.data_ptr()` after loading |
+    | `d_ff` not a multiple of the tensor-parallel degree | Works on 1 GPU, crashes or silently pads on 8 | Assert divisibility in `Config.__post_init__` |
+    | Dropout left on at eval | Non-deterministic outputs at temperature 0 | `model.eval()`, and assert `not model.training` in the serving path |
+    | Gradient clipping omitted | One bad batch destroys a 40-hour run | `clip_grad_norm_(..., 1.0)` always; log the pre-clip norm and alert on outliers |
+
+    ### Papers and primary sources
+
+    - **Radford et al. 2019, "Language Models are Unsupervised Multitask Learners" (GPT-2).**
+      *Takeaway:* moving LayerNorm to the input of each sub-block and scaling residual-projection
+      initialisation by `1/√N` is what made deep decoder stacks train reliably. **Read §2.3** — it
+      is two paragraphs and it contains both tricks that the war story above is about.
+    - **Xiong et al. 2020, "On Layer Normalization in the Transformer Architecture".**
+      *Takeaway:* post-LN's gradients at initialisation scale badly with depth, which is precisely
+      why it needs warmup, and pre-LN removes the need. **Read Theorem 1 and Figure 1** — the
+      figure alone settles the argument.
+    - **Shazeer 2020, "GLU Variants Improve Transformer".** *Takeaway:* replacing the FFN's
+      non-linearity with a gated linear unit gives a consistent ~0.07 loss improvement at matched
+      parameters, and the author cheerfully admits he has no theory for why. **Read Table 1**, and
+      note the `8/3` scaling in §2 that keeps the comparison honest.
+    - **Elhage et al. 2021, "A Mathematical Framework for Transformer Circuits".** *Takeaway:* the
+      residual stream is a shared bus that every layer reads from and writes to via low-rank
+      projections, which makes cross-layer composition the unit of analysis. **Read the "Residual
+      stream as a communication channel" section.**
+    - **Karpathy, `nanoGPT`.** *Takeaway:* a complete, trainable, reproduction-grade GPT-2 is 300
+      lines. **Read `model.py` end to end**, then diff it against the `gpt.py` in Layer 2 — the
+      differences are all conventions, and knowing which is which is the point.
+
+    ### Stretch challenge
+
+    Take the 10.7M model from Layer 2 and hold total parameters constant while sweeping the
+    depth/width ratio: `(L=2, d=768)`, `(4, 544)`, `(6, 384)` — wait, that last one is not
+    parameter-matched; part of the exercise is doing that algebra correctly with the formula above.
+    Produce four genuinely parameter-matched configurations spanning `L = 2` to `L = 24`, train each
+    to the same token budget, and plot val loss against depth. Then the open question: at this tiny
+    scale, does depth help? Predict the answer before you run it, then explain any discrepancy. The
+    honest answer involves the fact that tinyshakespeare has almost no compositional structure to
+    exploit — which means the *right* extension is to repeat the sweep on a synthetic task that
+    provably requires composition (say, 3-hop lookup in a generated graph) and see whether the
+    depth curve changes shape. If it does, you have measured something real about what depth buys.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Train the `gpt.py` above on tinyshakespeare for 5,000 steps. Report: (1) your predicted parameter
+count computed by hand *before* running, next to the printed one; (2) a loss curve; (3) samples at
+steps 0, 500 and 5,000. Then swap `nn.LayerNorm` for the `RMSNorm` from Layer 1 and `GELU` for
+SwiGLU at `d_ff = 8d/3`, retrain, and report the loss and tokens/sec difference. Predict the sign
+of each difference before you measure it.
+</Card>
+
+## The whiteboard
+
+The T1 exploded-view sketch above, plus a **T3 animated forward pass**: a token vector entering at
+the bottom of the residual stream, each sub-layer lighting up in sequence as it reads and adds,
+with the running tensor shape printed beside the stream at every arrow and the residual norm's
+growing magnitude shown as the stream line getting thicker with depth.
+
+<Tip>
+**Draw it yourself.** From memory: the residual stream as a thick vertical line, both branches
+with their pre-norms, both addition circles, the FFN's three matrices with their widths, and the
+per-layer parameter arithmetic in the margin. Then compare.
+[Blank version](/assets/diagrams/p4-w25-m4-blank.svg) · [Editable source](/assets/diagrams/p4-w25-m4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    "Compute the parameter count of a 32-layer, 4096-wide, 14336-FFN decoder with a 128k
+    vocabulary" is a question you can now answer on a whiteboard in ninety seconds. Practise it
+    until you can. Portfolio: your trained tiny GPT with the loss curve, the samples at three
+    stages, and — the part that makes it stand out — the hand-computed parameter table next to the
+    printed number. Resume line: *"Implemented and trained a 10.7M-parameter decoder-only
+    Transformer from scratch; verified the parameter count analytically and measured the
+    RMSNorm/SwiGLU deltas at 0.073 loss and 5.6% throughput."*
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    1. **When someone says "we'll just fine-tune the model", ask which matrices.** 70% of the
+       parameters are FFN. That decides your LoRA target modules, your VRAM budget, and whether the
+       plan is feasible at all — and it is a two-minute calculation.
+    2. **Add an init-time residual-growth assertion to any training code your team owns.** The war
+       story above cost two engineer-days and would have cost forty GPU-hours if it had been caught
+       later. The check is six lines and runs in under a second.
+    3. **Assert weight tying survives your checkpoint round-trip.** A `data_ptr()` comparison after
+       load. Broken tying is a silent 0.7-loss regression that looks like "the new checkpoint is
+       just worse".
+  </Accordion>
+</AccordionGroup>
+
+## Assessment
+
+<AccordionGroup>
+  <Accordion title="8 concept questions">
+  1. Write the parameter formula for one decoder layer with GQA and SwiGLU. (`d·n_h·dh + 2·d·n_kv·dh + n_h·dh·d + 3·d·d_ff + 2d`.)
+  2. Evaluate it for `d=4096, d_ff=14336, n_h=32, n_kv=8, dh=128`. (218,112,000.)
+  3. What fraction of a Llama-3-8B layer is the FFN, and why does it matter? (80.8%; it determines LoRA targets, quantization priorities and memory layout.)
+  4. Why does pre-norm train deep stacks without warmup when post-norm does not? (Pre-norm leaves the residual path un-normalised, so gradients reach early layers undiminished; post-LN gradients scale badly with depth at init.)
+  5. What is the `8/3` in `d_ff = 8d/3` for? (Keeping SwiGLU's three matrices at the same parameter count as GELU's two at `d_ff = 4d`.)
+  6. What does the `1/√(2N)` residual-projection init scaling prevent? (Residual-stream variance growing linearly with depth, which starves early layers of gradient.)
+  7. Give two consequences of the residual stream being a fixed-width shared bus. (Non-adjacent layers can communicate directly; capacity is contended, forcing superposition of features.)
+  8. A model's val loss on a 65-character vocabulary is 1.48. Interpret it. (Average perplexity `e^1.48 = 4.4` — effectively choosing among 4.4 characters instead of 65.)
+  </Accordion>
+  <Accordion title="Coding challenge">
+  Write `count_params(config) -> int` that predicts the exact parameter count analytically, then a
+  test that instantiates the model and asserts the prediction matches to the parameter. Hidden
+  tests run it across eight configurations covering: tied and untied embeddings, MHA and GQA, GELU
+  and SwiGLU, and with and without biases. Every off-by-a-bias-vector is a failure. This sounds
+  trivial and is not — the bias terms and the norm shapes are where everybody's arithmetic breaks,
+  and getting it exact is what turns "roughly 7 billion" into a number you can budget against.
+  </Accordion>
+  <Accordion title="Interview questions (junior / mid / senior)">
+  - **Junior:** "What is a residual connection and why do deep networks need one?"
+  - **Mid:** "Where are most of the parameters in a modern LLM, and what does that imply for parameter-efficient fine-tuning?"
+  - **Senior:** "Your 40-layer model trains fine at 12 layers and plateaus at 40. Give me your first four hypotheses in priority order and the cheapest experiment for each."
+  </Accordion>
+  <Accordion title="Draw it from memory">
+  Reproduce the exploded block diagram with both branches, both pre-norms, both residual adds, the
+  three FFN matrices with widths labelled, and the per-layer parameter subtotals for attention and
+  FFN written in.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Deep config plateaus, shallow config trains | Residual-projection init not scaled by `1/√(2N)`, often a string match that matches nothing | Assert residual-std growth under 3× at init |
+| Random NaN loss spikes | Norm computed in half precision | `x.float()` inside the norm, cast back after |
+| Val loss 0.7 worse after a save/load cycle | Weight tying not restored by `load_state_dict` | Assert `head.weight.data_ptr() == wte.weight.data_ptr()` post-load |
+| Block changes tensor shape | FFN output width mismatched, or the head merge forgot `.contiguous()` | A block must be shape-preserving; assert it in a unit test |
+| Non-deterministic serving output at temperature 0 | Dropout active because `model.eval()` was never called | Assert `not model.training` at the top of the inference path |
+| One bad batch nukes a long run | No gradient clipping | `clip_grad_norm_(params, 1.0)`; log the pre-clip norm |
+| Multi-GPU run crashes on `d_ff` | Not divisible by tensor-parallel degree | Validate divisibility in the config dataclass |
+| Parameter count disagrees with the model card by ~1% | Comparing "total" to "non-embedding" | State the convention every time you quote a count |
+
+## Sources & further reading
+
+**Primary docs**
+- [PyTorch 2.4 `nn.LayerNorm`](https://pytorch.org/docs/2.4/generated/torch.nn.LayerNorm.html) — read the `elementwise_affine` note; it is what makes the parameter count `2d` rather than `0`.
+- [`transformers` 4.44.2 `modeling_llama.py`](https://github.com/huggingface/transformers/blob/v4.44.2/src/transformers/models/llama/modeling_llama.py) — read `LlamaMLP` and `LlamaRMSNorm`; ten lines each, and they are the reference for everything in Layer 3.
+- [`nanoGPT`](https://github.com/karpathy/nanoGPT) — read `model.py` and `train.py`; the `configure_optimizers` weight-decay split (decay matrices, not norms or biases) is a detail most reimplementations get wrong.
+
+**Papers**
+- Radford et al. 2019 (GPT-2) — *pre-norm plus `1/√N` residual init is what made deep stacks trainable*; §2.3.
+- [Xiong et al. 2020 (pre-LN)](https://arxiv.org/abs/2002.04745) — *post-LN's initialisation gradients scale badly with depth, hence warmup*; Theorem 1, Figure 1.
+- [Shazeer 2020 (GLU Variants)](https://arxiv.org/abs/2002.05202) — *gated FFNs give ~0.07 lower loss at matched parameters, with no theory offered*; Table 1.
+- [Elhage et al. 2021 (Transformer Circuits)](https://transformer-circuits.pub/2021/framework/index.html) — *the residual stream is a contended communication bus*; the residual-stream section.
+
+**Go deeper**
+- [Karpathy, "Let's build GPT: from scratch, in code, spelled out"](https://www.youtube.com/watch?v=kCc8FmEb1nY) — two hours, and it builds exactly the model in Layer 2. Watch it after you have written yours and failed, not before.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-25/p4-w25-m4">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

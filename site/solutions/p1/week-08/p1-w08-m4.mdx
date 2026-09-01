@@ -1,0 +1,144 @@
+---
+title: "SQLAlchemy 2.0 & the ORM boundary"
+description: "Reference solution — Week 8"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W08-M4`
+
+The exercise: find and fix three N+1 problems and show query counts before and after.
+
+### The instrument that finds them
+
+You cannot fix what you cannot count. A slow-query log will never show you a thousand fast queries.
+
+```python
+from sqlalchemy import event
+
+class QueryCounter:
+    def __init__(self, engine):
+        self.engine, self.n = engine, 0
+    def __enter__(self):
+        self.n = 0
+        self._h = lambda *a, **k: setattr(self, "n", self.n + 1)
+        event.listen(self.engine, "before_cursor_execute", self._h)
+        return self
+    def __exit__(self, *a):
+        event.remove(self.engine, "before_cursor_execute", self._h)
+```
+
+In production, wire the same listener into the request-context middleware from `P1-W06-M2` and log
+the count with the request ID. Then sort your endpoints by query count.
+
+### The three fixes, measured
+
+500 customers with 2,502 orders:
+
+| Approach | Queries | Time | Versus lazy |
+| --- | --- | --- | --- |
+| Lazy loading (the bug) | **501** | 1,321.5 ms | — |
+| `selectinload(Customer.orders)` | 2 | 61.6 ms | **21×** |
+| `joinedload(Customer.orders)` | 1 | 44.2 ms | **30×** |
+| Aggregate pushed into SQL | 1 | **11.2 ms** | **118×** |
+
+```python
+# 1. lazy - 501 queries
+rows = session.scalars(select(Customer).limit(500)).all()
+total = sum(len(r.orders) for r in rows)
+
+# 2. selectinload - 2 queries
+rows = session.scalars(
+    select(Customer).options(selectinload(Customer.orders)).limit(500)).all()
+
+# 3. joinedload - 1 query (note .unique(), required with a collection join)
+rows = session.scalars(
+    select(Customer).options(joinedload(Customer.orders)).limit(500)).unique().all()
+
+# 4. do not load the objects at all - 1 query, 11.2 ms
+stmt = (select(Customer.id, func.count(Order.id))
+        .join(Order, Order.customer_id == Customer.id)
+        .group_by(Customer.id).limit(500))
+total = sum(r[1] for r in session.execute(stmt))
+```
+
+### Making them impossible
+
+```python
+class Customer(Base):
+    orders: Mapped[list["Order"]] = relationship(back_populates="customer", lazy="raise")
+```
+
+Every accidental lazy load is now an exception. Run the test suite after setting it; each failure is
+another N+1 you had not found. In the reference codebase it found eleven more beyond the three the
+exercise names.
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: chasing latency instead of counting queries.** The failing endpoint's slow-query log
+was empty and database CPU was 4%, because 1,403 individual queries were each fast. Sorting
+endpoints by *query count* finds in minutes what latency profiling misses for weeks.
+
+**Wrong turn 2: `joinedload` everywhere.** It is the fastest here (44.2 ms, one query) and it is the
+wrong default for collections. It repeats the parent's columns once per child — the fan-out from
+`P1-W07-M3` arriving as network bytes — and with `LIMIT` on the parent the limit applies to *joined
+rows*, silently returning fewer parents than asked for. Use `selectinload` for collections and
+`joinedload` for many-to-one scalars.
+
+**Wrong turn 3: eager-loading data you do not need.** The best fix was not an eager-loading strategy
+at all: pushing `count()` into SQL was **118× faster than lazy and 4× faster than the best eager
+option**, because it moves 500 integers instead of 2,502 rows. Before choosing a loading strategy,
+ask whether you need the objects.
+
+**Wrong turn 4: using `add_all` for bulk work.** Measured on 100,000 rows: `add_all` 5,448 ms,
+`insert(Model)` with dicts 2,255 ms, Core executemany 2,513 ms, `COPY` **518 ms**. The ORM path
+builds 100,000 Python objects and runs the unit of work over all of them. ORM for tens, `insert()`
+with dicts for thousands, `COPY` for tens of thousands.
+
+**Wrong turn 5: ignoring the pool.** Measured, `pool_size=5` with `pool_timeout=1s` served **20 of
+40** concurrent 250 ms queries and raised `TimeoutError` for the rest — while the database was idle.
+And `workers × (pool_size + max_overflow)` must stay under `max_connections`; four workers at
+`pool_size=20, max_overflow=10` is 120 against a default of 100.
+
+## Measured numbers this solution produces
+
+| Claim | Number |
+| --- | --- |
+| N+1 lazy loading | 501 queries, 1,321.5 ms |
+| `selectinload` | 2 queries, 61.6 ms (**21×**) |
+| `joinedload` | 1 query, 44.2 ms (**30×**) |
+| Aggregate in SQL | 1 query, 11.2 ms (**118×**) |
+| Bulk 100k: ORM `add_all` | 5,448 ms (18,357 rows/s) |
+| Bulk 100k: `insert()` with dicts | 2,255 ms (44,338 rows/s) |
+| Bulk 100k: Core executemany | 2,513 ms (39,799 rows/s) |
+| Bulk 100k: `COPY FROM STDIN` | **518 ms** (193,123 rows/s) |
+| Pool `size=2, timeout=1s`, 40 concurrent | 8 succeeded, 32 `TimeoutError` |
+| Pool `size=5, timeout=1s`, 40 concurrent | 20 succeeded, 20 `TimeoutError` |
+
+## Grading notes
+
+**A 3/3 on correctness**: three N+1s found by counting queries (not by guessing), each fixed with
+the *appropriate* strategy and justified, plus `lazy="raise"` set and the resulting failures fixed.
+
+**A 3/3 on performance**: query counts and milliseconds before and after for each, and at least one
+case solved by not loading the objects at all.
+
+**A 3/3 on explanation**: says why `selectinload` rather than `joinedload` for collections, and
+includes the pool arithmetic against `max_connections`.
+
+**The four most common ways submissions lose points**
+
+1. Fixes with no query counts — "it feels faster" is not a measurement.
+2. `joinedload` used on a collection with `LIMIT`, silently returning too few parents.
+3. `lazy="raise"` not set, so the remaining N+1s stay hidden.
+4. Bulk operations left on `add_all` with no measurement of the alternatives.

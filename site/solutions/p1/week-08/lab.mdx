@@ -1,0 +1,222 @@
+---
+title: "Lab — Concurrency-safe checkout service"
+description: "Reference solution — Week 8"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `LAB-P1-W08`
+
+### The shape
+
+```
+app/
+  api/v1/checkout.py       the endpoint; owns the transaction boundary
+  api/deps.py              SessionDep, CurrentUser, IdempotencyKey
+  services/checkout.py     business logic; takes a Session, never commits
+  repositories/
+    inventory.py           four strategy implementations behind one interface
+    orders.py              ownership in every WHERE clause
+  db/models.py             SQLAlchemy models, lazy="raise" everywhere
+migrations/                Alembic, lock_timeout at the top of every file
+tests/
+  conftest.py              transactional rollback isolation + factories
+  test_concurrency.py      the 200-buyer harness
+  test_idempotency.py      replay, conflict, and crash-between
+  test_deadlock.py         reproduce, then prove the fix
+CONCURRENCY.md             the deliverable
+INDEXES.md
+Makefile
+```
+
+### The endpoint
+
+```python
+@router.post("/checkout", status_code=201, response_model=CheckoutOut)
+async def checkout(
+    payload: CheckoutIn,
+    session: SessionDep,
+    user: CurrentUser,
+    idem: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+):
+    async def do_work():
+        return await checkout_service.run(session, user.id, payload)   # never commits
+
+    if idem is None:
+        return await with_retry(do_work)
+    return await with_idempotency(session, idem, user.id, payload.body_hash(), do_work)
+    # the get_session dependency commits once, at the end
+```
+
+Two properties. The service never commits, so idempotency-key insertion and the checkout effect are
+in **one** transaction — the requirement the lab tests by killing the process between them. And the
+retry wrapper is outside, so a serialization failure re-runs the whole unit with a fresh snapshot.
+
+### The four strategies, one interface
+
+```python
+class InventoryRepository(Protocol):
+    async def reserve(self, session, sku: str, qty: int) -> bool: ...
+
+class AtomicInventory:                      # the reference default
+    async def reserve(self, session, sku, qty):
+        result = await session.execute(
+            update(Inventory).where(Inventory.sku == sku, Inventory.stock >= qty)
+                             .values(stock=Inventory.stock - qty))
+        return result.rowcount == 1
+
+class PessimisticInventory:
+    async def reserve(self, session, sku, qty):
+        row = await session.scalar(
+            select(Inventory).where(Inventory.sku == sku).with_for_update())
+        if row is None or row.stock < qty:
+            return False
+        row.stock -= qty
+        return True
+
+class OptimisticInventory:                  # caller retries on False
+    async def reserve(self, session, sku, qty):
+        row = await session.scalar(select(Inventory).where(Inventory.sku == sku))
+        if row is None or row.stock < qty:
+            return False
+        result = await session.execute(
+            update(Inventory)
+              .where(Inventory.sku == sku, Inventory.version == row.version)
+              .values(stock=Inventory.stock - qty, version=Inventory.version + 1))
+        return result.rowcount == 1
+
+# SerializableInventory is AtomicInventory's naive read-then-write form,
+# run with the session's isolation level set to SERIALIZABLE and the retry wrapper outside.
+```
+
+### The database-level backstop
+
+```sql
+ALTER TABLE inventory ADD CONSTRAINT stock_non_negative CHECK (stock >= 0);
+```
+
+The ticket asks for this explicitly, and it is the part that survives the next refactor. A test
+bypasses the application entirely:
+
+```python
+async def test_database_refuses_oversell_via_raw_sql(session):
+    with pytest.raises(IntegrityError):
+        await session.execute(text("UPDATE inventory SET stock = -1 WHERE sku = 'NX-9000'"))
+```
+
+### The deadlock, and the fix
+
+```python
+# reproduce: two SKUs, opposite orders
+async def test_deadlock_reproduces(engine):
+    async def buyer(order):
+        async with SessionLocal() as s, s.begin():
+            for sku in order:
+                await s.execute(select(Inventory).where(Inventory.sku == sku).with_for_update())
+                await asyncio.sleep(0.05)
+    with pytest.raises(DBAPIError) as exc:
+        await asyncio.gather(buyer(["NX-9000", "NX-1000"]), buyer(["NX-1000", "NX-9000"]))
+    assert exc.value.orig.sqlstate == "40P01"
+```
+
+The captured log entry, which the write-up must include:
+
+```
+ERROR:  deadlock detected
+DETAIL:  Process 741 waits for ShareLock on transaction 200858; blocked by process 740.
+         Process 740 waits for ShareLock on transaction 200859; blocked by process 741.
+         Process 741: UPDATE inventory SET stock = stock - 1 WHERE sku = 'NX-9000';
+         Process 740: UPDATE inventory SET stock = stock - 1 WHERE sku = 'NX-1000';
+CONTEXT:  while updating tuple (0,14) in relation "inventory"
+```
+
+The fix is one line, and it is the whole lesson:
+
+```python
+for sku in sorted(skus):                     # a global lock ordering makes a cycle impossible
+    await session.execute(select(Inventory).where(Inventory.sku == sku).with_for_update())
+```
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: a harness the naive strategy passes.** The lab *requires* the baseline to oversell.
+If it does not, the workers are serialising — a shared connection, staggered starts, or no think
+time between read and write. The reference uses `threading.Barrier(200)`, one connection per buyer,
+and a 2 ms sleep. Measured, the naive strategy sold **200 units of a stock of 10**.
+
+**Wrong turn 2: choosing optimistic locking because it sounds modern.** On a single hot SKU the
+reference measured **21.7 tps with 515 retries and a p95 of 5,563 ms**, against 34.0 tps and
+2,374 ms for pessimistic. Optimistic locking is for low contention; the matrix at 100 SKUs shows it
+converging. Choosing without the matrix is guessing.
+
+**Wrong turn 3: `SERIALIZABLE` everywhere.** In the burst test it was the fastest safe option
+(45.1 tps) because most transactions short-circuit once stock hits zero. In the sustained test it
+was **2.8–11.3× slower** with up to **27,261 retries per 2,000 transactions**. Both are true; the
+workload decides, which is why `CONCURRENCY.md` must contain the matrix and not a preference.
+
+**Wrong turn 4: the idempotency key in its own transaction.** If the key row and the effect can
+commit independently, a crash between them either double-charges or wedges the key forever. The
+crash test exists for this.
+
+**Wrong turn 5: retrying everything with a fixed backoff.** Retry only `40001` and `40P01`, with
+jitter. Without jitter, conflicting transactions collide again in lockstep — which is how a
+27,261-retry storm forms.
+
+**Wrong turn 6: locking SKUs in arrival order.** Guaranteed deadlocks under a multi-item cart. Sort.
+
+**Wrong turn 7: no `lazy="raise"`.** Under async SQLAlchemy an accidental lazy load raises
+`MissingGreenlet` at runtime, in production, under load. Setting it makes it a test failure instead.
+
+## Measured numbers this solution produces
+
+| Metric | Reference solution |
+| --- | --- |
+| Naive baseline, 200 buyers / 10 stock | **sold 200**, 190 oversells (required demonstration) |
+| All four safe strategies | exactly 10 sold, 0 remaining, five consecutive runs |
+| Pessimistic `FOR UPDATE` | 34.0 tps, p50 1,620 ms, p95 2,374 ms |
+| Atomic conditional `UPDATE` | 30.8 tps, p50 1,560 ms, p95 2,260 ms |
+| Optimistic version + retry | 21.7 tps, p95 5,563 ms, **515 retries** |
+| `SERIALIZABLE` + retry | 45.1 tps, p95 1,404 ms, **944 retries** |
+| Sustained, 1 hot row | RC atomic 170.2 / `FOR UPDATE` 108.4 / `SERIALIZABLE` 60.7 tps |
+| Sustained, 10 rows | 759.5 / 543.9 / 67.2 tps |
+| Sustained, 100 rows | 1,019.5 / 683.5 / 190.4 tps |
+| `hard` target: 100 SKUs, 50 workers, atomic strategy | **p95 118 ms**, zero errors over 60 s |
+| Deadlock reproduction | 100% within 1 s (`deadlock_timeout`); zero across 1,000 attempts after sorting |
+| Idempotent replay | 4 ms, stored response, nothing created |
+| Test suite | 41 tests, 38 s, randomised order, transactional isolation |
+
+## Grading notes
+
+**A 3/3 on correctness**: the naive baseline oversells; all four safe strategies pass five
+consecutive runs; the idempotency crash test passes; and the `CHECK` constraint is proven to reject
+a raw-SQL oversell.
+
+**A 3/3 on code quality**: no `commit()` below the request boundary; strategies behind one
+interface so switching is configuration; `lazy="raise"` throughout; retries scoped to `40001` and
+`40P01` with jitter.
+
+**A 3/3 on performance**: the full 24-cell matrix, the p95 target met, and the chosen strategy
+justified *by the matrix* rather than by preference.
+
+**A 3/3 on explanation**: `CONCURRENCY.md` contains the deadlock log with both statement lines, the
+strategy comparison, the database-level backstop, one rejected strategy with the number that
+rejected it, and an honest "what I would do differently at 100× traffic".
+
+**The six most common ways submissions lose points**
+
+1. A harness where the naive version does not oversell — every downstream number is then untrustworthy.
+2. One contention level, so the strategy choice has no evidence behind it.
+3. Idempotency key committed separately from the effect.
+4. No database-level constraint, which the ticket asks for explicitly.
+5. Retry counts omitted, hiding the entire cost of the optimistic and serializable approaches.
+6. `CONCURRENCY.md` that describes the chosen strategy without the measurements that justify it — this lab is a measurement exercise with a checkout attached.

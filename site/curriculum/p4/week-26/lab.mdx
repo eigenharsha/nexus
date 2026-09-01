@@ -1,0 +1,257 @@
+---
+title: "Lab — QLoRA fine-tune for strict structured output"
+description: "Week 26 lab · three tracks · self-graded"
+icon: "flask-conical"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**`LAB-P4-W26`** — one lab, three tracks. Beginners start at `basic` and climb.
+Working professionals start at `standard`. `hard` is where the interview stories come from.
+</Note>
+
+## The ticket
+
+> **NEX-4288 · Document intake · P1**
+>
+> Ops spends 6 hours a day re-keying supplier invoices into the ERP. We tried a hosted model with a
+> prompt; it returns unparseable output on about 12% of documents and gets the line-item totals
+> wrong often enough that ops now checks all of them, which was the thing we were trying to remove.
+>
+> Two constraints. Finance will not send supplier documents to a third-party API — this has to run
+> on our own hardware. And the extraction has to be *schema-valid every time*, because the ERP
+> importer is a batch job that fails the whole file on one bad record.
+>
+> Build it. We have one A10G. Tell us what it costs to run, and tell us honestly whether we should
+> have just paid for the API.
+
+**Time box, honestly:** `basic` 3–4 hours. `standard` 14–18 hours, of which 8 is dataset work.
+`hard` a further 10–12 hours. The dataset is the long pole and it always is.
+
+**Hardware:** `standard` needs a CUDA GPU with 16 GB for the QLoRA run — a Colab T4 free tier
+completes it in 38 minutes. Everything else, including serving with Ollama and the whole of
+Module 4's constrained decoding, runs on a 16 GB laptop. `hard`'s serving benchmarks need a real
+24 GB card for about 90 minutes (roughly $1.50 on `g5.xlarge`).
+
+## Repository layout
+
+```
+labs/p4/week-26/
+├── README.md
+├── requirements.txt      # torch==2.4.1 transformers==4.44.2 peft==0.13.0 trl==0.9.6
+│                         # bitsandbytes==0.43.3 accelerate==0.33.0 outlines==0.0.46
+│                         # pydantic==2.8.2 vllm==0.6.2 datasets==2.21.0 pytest==8.3.2
+├── Makefile              # make verify | make train | make serve | make bench
+├── data/
+│   ├── raw/              # 1,400 candidate documents (provided)
+│   └── gold/             # 200 hand-labelled held-out documents (provided)
+├── starter/
+│   ├── schema.py         # Pydantic models — TODOs marked
+│   ├── build_dataset.py  # dedup / rubric / split — TODOs marked
+│   ├── train_qlora.py    # TODOs marked
+│   ├── extract.py        # the four mechanisms behind one interface — TODOs marked
+│   └── bench.py          # concurrency sweep + cost model — TODOs marked
+├── solution/
+└── tests/
+    ├── test_schema.py  test_dataset.py  test_extract.py  test_capacity.py
+```
+
+<Tabs>
+  <Tab title="basic">
+    **Scaffolded. About 60% is written for you; every gap is marked `# TODO`.**
+
+    1. **Run a provided QLoRA config and verify it loads.** `starter/train_qlora.py` ships complete
+       except for the `LoraConfig`. Fill in `r`, `lora_alpha` and `target_modules`, run 200 steps on
+       the 300 provided examples, and confirm `print_trainable_parameters()` reports under 1%.
+       Record the number and reconcile it against your own hand arithmetic from the model's shapes.
+    2. **Generate from the adapter and from the base**, on the same 20 documents, and count how many
+       parse as JSON in each case. Two numbers, one paragraph.
+    3. **Add constrained decoding** with the provided `Invoice` schema and re-run. Report
+       schema-valid rate for all three (base, adapter, adapter + constrained) and say which of your
+       remaining errors are syntactic and which are semantic.
+
+    <Info>
+    Acceptance: `make verify TRACK=basic` green. Roughly 30 lines of your own code, plus one
+    paragraph of analysis that must correctly distinguish the two error classes.
+    </Info>
+  </Tab>
+
+  <Tab title="standard">
+    **Spec and tests only. You write the implementation.**
+
+    <Steps>
+      <Step title="Build the eval set first">
+        Before any training data: 100 documents with hand-checked gold extractions from
+        `data/gold/`, plus your scoring script. Metrics: schema-valid rate, per-field exact-match
+        F1, and **groundedness** (fraction of extracted values appearing verbatim in the source).
+        Measure the base model on it. **This baseline number goes in your README** — everything
+        later is a delta against it.
+      </Step>
+      <Step title="Build a 500+ example training set">
+        From `data/raw/`. Required: a written quality rubric applied before collection, exact and
+        near-duplicate removal (0.95 cosine), a 500/100/100 split with no near-duplicate crossing a
+        boundary, and at least 15% of examples where at least one field is legitimately absent and
+        the correct answer is `null`. Report the count at every stage of the funnel.
+      </Step>
+      <Step title="Design the schema">
+        Pydantic, with `Optional` for everything the real world permits to be absent, a free-text
+        `reasoning` field first, `Field` patterns on the formatted fields, and at least one
+        cross-field validator that no JSON Schema can express. Field order must be justified in a
+        comment.
+      </Step>
+      <Step title="QLoRA fine-tune a 3B model">
+        NF4 base, double quantization, paged 8-bit optimizer, right padding, gradient checkpointing.
+        Validation each epoch with `load_best_model_at_end`. Run the pre-flight check from Module 3
+        before training — token-length distribution against `max_seq_length`, padding side, and
+        trainable-parameter percentage.
+      </Step>
+      <Step title="Reach &gt;99% schema-valid on the held-out set">
+        Report the path you took: fine-tune alone, fine-tune plus constrained decoding, or
+        fine-tune plus repair. Show the number for each; the requirement is 99%, the deliverable is
+        the comparison.
+      </Step>
+      <Step title="Merge, serve, integrate">
+        Merge from the **bf16** base (not the NF4 one — Module 3 explains why, and the test checks
+        it), serve with vLLM 0.6.2 behind an OpenAI-compatible endpoint, and call it from the
+        Week 6 FastAPI service with a `/readyz` that actually generates a token.
+      </Step>
+    </Steps>
+
+    <Info>
+    Acceptance: `make verify` green, `RESULTS.md` showing baseline and final on the same 100-item
+    eval with paired bootstrap CIs, and a running endpoint that `make smoke` can hit.
+    </Info>
+  </Tab>
+
+  <Tab title="hard">
+    **A constraint the `standard` solution fails.**
+
+    Beat the base model plus constrained decoding on **both accuracy and cost**, and prove it.
+
+    1. **The rank sweep.** `r = 4, 8, 16, 64`. Report trainable parameters (hand-computed *and*
+       printed), peak VRAM, training time, task F1 with paired bootstrap CIs, and a general
+       benchmark (MMLU or IFEval) to show the forgetting. Choose a default and justify it against
+       the plateau *and* the forgetting column.
+    2. **The quantization Pareto plot.** Serve your merged model at 4 quantization levels; plot task
+       F1 against GB with CIs as error bars and tokens/sec as point size. State which differences
+       your eval size can resolve.
+    3. **The serve-versus-API cost analysis.** Concurrency sweep on your own hardware, the
+       concurrency that meets a p95 TTFT SLO you state up front, the `$/M tokens` curve against
+       utilisation, and the break-even volume. Then answer the ticket's last question honestly.
+    4. **The constraint:** your system must beat `base model + constrained decoding` on field F1 by
+       a margin whose paired bootstrap CI excludes zero, **and** cost less per thousand documents at
+       your projected volume. If your honest answer is that the API wins, that is an acceptable
+       submission — but you must show the arithmetic, and you must show the accuracy gap that the
+       cost saving is being traded against.
+
+    <Warning>
+    The `hard` track's real difficulty is that it can legitimately conclude "we should have paid for
+    the API". A submission that reaches that conclusion with sound arithmetic scores higher than one
+    that reaches the opposite conclusion by assuming 100% GPU utilisation.
+    </Warning>
+  </Tab>
+</Tabs>
+
+## Verify yourself
+
+```bash
+cd labs/p4/week-26
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+make verify
+make train                  # ~40 min on a T4, ~12 min on an A10G
+make serve &                # vLLM on :8000
+make bench                  # concurrency sweep + cost model
+```
+
+What `make verify` runs:
+
+```
+tests/test_schema.py::test_optional_fields_allow_null              PASSED
+tests/test_schema.py::test_reasoning_field_is_first                PASSED
+tests/test_schema.py::test_cross_field_validator_rejects_bad_total PASSED
+tests/test_dataset.py::test_no_near_duplicates_across_splits       PASSED
+tests/test_dataset.py::test_absent_field_coverage_at_least_15pct   PASSED
+tests/test_dataset.py::test_no_example_exceeds_max_seq_length      PASSED
+tests/test_dataset.py::test_rendered_format_matches_chat_template  PASSED
+tests/test_extract.py::test_constrained_never_raises_parse_error   PASSED
+tests/test_extract.py::test_repair_loop_terminates_and_raises      PASSED
+tests/test_extract.py::test_validator_failure_repairs_even_when_constrained PASSED
+tests/test_extract.py::test_merged_from_bf16_not_nf4               PASSED
+tests/test_capacity.py::test_kv_bytes_per_token_matches_config     PASSED
+tests/test_capacity.py::test_halving_max_len_doubles_concurrency   PASSED
+```
+
+Two of those deserve a note. `test_validator_failure_repairs_even_when_constrained` catches the
+belief that constraining removes the need to validate — it does not, because cross-field arithmetic
+is not expressible as a grammar. And `test_merged_from_bf16_not_nf4` catches the 0.05-F1 silent
+regression from merging into a quantized base.
+
+## Ship it
+
+<Card title="This is the part people skip" icon="rocket" horizontal>
+A **model card** and the **adapter** on Hugging Face, plus a reproducible training script. The model
+card must state: base model and revision hash, dataset size and construction method, the rubric,
+the eval set and metrics, measured lift with confidence intervals, the general-benchmark
+regression, known failure modes, and the exact command that reproduces the run.
+</Card>
+
+A model card that reports only the wins is marketing. The one that gets you hired reports the MMLU
+drop and the failure modes, because that is what a colleague needs in order to use your adapter
+safely. Include the CPU/Colab fallback path in the README — the `standard` track must be completable
+for $0.
+
+## Rubric
+
+| Dimension | 0 | 1 | 2 | 3 |
+| --- | --- | --- | --- | --- |
+| **Correctness** | tests fail | `basic` passes | `standard` passes, &gt;99% schema-valid on held-out, merged and served | `hard` passes: rank sweep, Pareto plot, cost model, and a CI-backed win over the constrained baseline |
+| **Code quality** | works | readable | config-driven, pinned versions, pre-flight checks, no magic constants | a reviewer would approve unchanged; assertions carry diagnostics; the retry and timeout policy is explicit |
+| **Performance** | untested | trained once | VRAM, throughput and latency measured against a stated SLO | capacity plan derived from the KV formula and validated against a real run, with the prediction error reported |
+| **Explanation** | none | a README | decisions documented, baseline and delta reported | every number has a CI; the model card names the regressions; the API-versus-self-host conclusion is defended with arithmetic |
+
+**What a 3/3 on Explanation looks like:** you state which differences your eval cannot resolve. A
+report that says "we cannot distinguish `q5_K_M` from `q4_K_M` at n=100; here is the sample size we
+would need" demonstrates more statistical maturity than any point estimate, and it is the single
+rarest thing in published quantization comparisons.
+
+## If you get stuck
+
+<AccordionGroup>
+  <Accordion title="Training runs but the model barely changes">
+    In order: learning rate copied from full fine-tuning (needs 1e-4 to 3e-4, not 2e-5); training
+    format not matching the chat template (print the tokenized string and diff it); base not
+    actually frozen so you are silently doing something else; `max_seq_length` truncating most of
+    your examples.
+  </Accordion>
+  <Accordion title="Schema-valid rate is high but F1 is bad">
+    That is the expected result of constrained decoding alone, and it is the module's thesis rather
+    than a bug. Your remaining errors are semantic. Check field order (does anything have to be
+    emitted before its inputs?), add a `reasoning` field first, and look at whether the wrong values
+    are fabrications for absent fields — measure groundedness.
+  </Accordion>
+  <Accordion title="OOM during training on a 24 GB card">
+    Check `print_trainable_parameters()` first — if it is not under 1%, the base is not frozen and
+    that is the whole problem. Then: `gradient_checkpointing=True`, `per_device_train_batch_size`
+    down with `gradient_accumulation_steps` up to compensate, `optim="paged_adamw_8bit"`, and
+    `max_seq_length` set from your measured p99 rather than a round number.
+  </Accordion>
+  <Accordion title="vLLM serves but the adapter output is wrong">
+    Base revision drift is the usual cause — pin it and assert it. Then check you are requesting the
+    adapter name in `model=`, not the base name; requesting the base silently serves the base with
+    no error and no warning.
+  </Accordion>
+  <Accordion title="The cost model says self-hosting is worse">
+    Then that is your finding, and it is a good one. Check your utilisation assumption is realistic
+    (the war story in Module 5 is exactly this), report the accuracy gap that the cost saving trades
+    against, and make the recommendation. Reaching an uncomfortable conclusion with sound arithmetic
+    is the point of the `hard` track.
+  </Accordion>
+</AccordionGroup>
+
+<Card title="Reference solution" icon="lock" href="/solutions/p4/week-26/lab">
+  Hidden page. Open it after you have a failing attempt of your own.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

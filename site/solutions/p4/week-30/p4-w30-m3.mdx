@@ -1,0 +1,103 @@
+---
+title: "Durable execution: checkpoint & resume"
+description: "Reference solution — Week 30"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails.</Note>
+
+## Reference solution — `P4-W30-M3`
+
+### The one thing to get right
+
+```python
+NAMESPACE = uuid.UUID("6f1d6b6e-5f6a-4a0b-9a9b-0c2b7f1d0e11")   # fixed, in source
+
+def idempotency_key(thread_id: str, order_id: str, amount_pence: int) -> str:
+    return str(uuid.uuid5(NAMESPACE, f"{thread_id}|{order_id}|{amount_pence}"))
+```
+
+Everything else in this module is scaffolding around that function. A `uuid4()` in its place
+protects against in-process retries and nothing else: when the process dies and a new one replays
+the node, it generates a fresh random key and the provider's deduplication sees a new request. In
+our chaos harness both the "no key" and "random key" designs produced **6 double charges in 20
+kills**. Derived keys produced zero.
+
+The namespace UUID is a constant in source, not generated at import. That is not pedantry — a
+namespace regenerated per process makes the derived key non-deterministic across processes, which
+reintroduces exactly the bug you were fixing.
+
+### The chaos harness
+
+```python
+# tests/chaos.py — sketch
+def one_trial(seed: int) -> dict:
+    proc = subprocess.Popen([sys.executable, "run_agent.py", "--thread", f"chaos-{seed}"])
+    time.sleep(random.Random(seed).uniform(0.5, 25.0))    # uniform over the run
+    proc.kill()                                            # SIGKILL, not SIGTERM
+    proc.wait()
+    resumed = subprocess.run([sys.executable, "run_agent.py", "--thread", f"chaos-{seed}"])
+    return {
+        "settled_charges": count_settled(f"chaos-{seed}"),      # must be exactly 1
+        "completed": resumed.returncode == 0,
+        "usd": total_cost(f"chaos-{seed}"),
+    }
+```
+
+Use `SIGKILL`, not `SIGTERM`. A `SIGTERM` handler that flushes state is a nice thing to have and it
+is not what you are testing; the pod eviction you are defending against does not always let you
+clean up.
+
+### Reference numbers
+
+| | Value |
+| --- | --- |
+| Checkpoint write p50, same AZ | 4.7 ms |
+| Per-run durability overhead | 42 ms, 0.12% of a 34 s run |
+| Replay cost overhead under chaos | 11.3% |
+| Double charges: no key / `uuid4` / derived / outbox | 6 / 6 / 0 / 0 in 20 kills |
+| Checkpoint storage, typed state | 41 KB per run, 63 GB per year at 4,200 runs/day |
+| After retention policy | 8.4 GB per year |
+
+## Why this solution and not the obvious one
+
+**Obvious:** wrap the node in a try/except and set a `charged=True` flag in the state. This does not
+work and it is worth understanding why: the flag is written when the node *completes*, and the crash
+happened *inside* the node, after the API call and before the return. The checkpoint never saw the
+flag. There is no way to atomically update remote state and local state without a key or a
+transaction — that is the whole reason the outbox exists.
+
+**Obvious:** use `SIGTERM` and flush on shutdown. It handles the polite case and none of the
+important ones. OOM kills, spot reclaims and node failures do not send `SIGTERM`.
+
+**Obvious:** make the checkpointer write more often so less is replayed. The checkpoint boundary is
+the superstep and it is not tunable; and even if it were, finer checkpoints would not help, because
+the problem is not *how much* is replayed but that *anything effectful* is.
+
+## The two wrong turns worth knowing about
+
+1. **`PostgresSaver.from_conn_string` per request.** Fine in the tutorial, a connection per run in a service. Combined with transactions held open across model calls, we exhausted the pool at 40 concurrent runs. `autocommit=True`, `prepare_threshold=0`, one pool at startup.
+2. **Effectful work before an `interrupt()` in the same node.** Resuming re-runs the node from its first line, so the pre-interrupt work happens twice. Build the proposal there (pure, cheap); do nothing that touches the world.
+
+## Grading notes
+
+**3/3 on Durability** requires the chaos harness output committed: 20 kills, `duplicate_effects: 0`,
+`lost_runs: 0`, and the replay cost overhead stated as a number.
+
+**Anything below 2 on Durability fails the lab**, because a system that repeats side effects is not
+a system.
+
+**Common losses:**
+- A random idempotency key. The most common single error in the week, and it looks correct.
+- No reconciliation queries. You must be able to detect the duplicates you did not prevent.
+- No retention policy, so the checkpoint table is presented as free. It is 63 GB/year at modest volume.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

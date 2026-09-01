@@ -1,0 +1,174 @@
+---
+title: "Lab — Concurrency-safe checkout service"
+description: "Week 8 lab · three tracks · self-graded"
+icon: "flask-conical"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**`LAB-P1-W08`** — one lab, three tracks. Beginners start at `basic` and climb.
+Working professionals start at `standard`. `hard` is where the interview stories come from.
+
+This is the flagship lab of Phase 1. Budget the time.
+</Note>
+
+## The ticket
+
+> **NEX-402 · Backend · P0 — incident follow-up**
+>
+> **Reporter:** Nisha (Head of Growth) · **Assignee:** you
+>
+> Friday's flash sale oversold the NX-9000 by 40 units. We had 200 in stock and shipped
+> confirmation emails for 240. Support spent the weekend on it and finance has questions.
+>
+> The code reads the stock, checks it is above zero, and writes the new value. It passes every test
+> we have. It passed the load test at 50 virtual users.
+>
+> I need three things:
+>
+> 1. A checkout that **cannot** oversell, proven under at least 200 concurrent buyers.
+> 2. A written comparison of the strategies you considered, with throughput numbers, so that when
+>    someone proposes changing it in six months there is a document to argue with.
+> 3. Something in the database itself that makes an oversell impossible even if the application code
+>    is wrong again.
+>
+> Retries are acceptable. Slower is acceptable within reason. Overselling is not.
+
+**Time box.** `basic` 4 h · `standard` 14 h · `hard` 10 h more. This is the longest lab in Phase 1
+and the one most worth finishing.
+
+<Tabs>
+  <Tab title="basic">
+    A transactional checkout endpoint passing the provided single-user tests.
+
+    <Info>~60% of the code is written for you. TODOs are marked. Answers in the solution page.</Info>
+
+    **Acceptance criteria**
+
+    1. `POST /v1/checkout` accepts `{"sku": "...", "qty": n}` and, in **one transaction**, decrements inventory, creates an order, and creates its order line.
+    2. Insufficient stock returns `409` with an error envelope naming the SKU and the available quantity, and changes nothing.
+    3. A `CHECK (stock >= 0)` constraint exists on the inventory table. A test proves that a direct SQL update attempting to go negative fails.
+    4. Any exception inside the handler leaves the database untouched — verified by a test that raises after the decrement and asserts the stock is unchanged.
+    5. Ten single-user tests pass in under 5 seconds using transactional rollback isolation.
+    6. No `commit()` inside any service or repository — the transaction boundary is the request.
+
+    **Verify**
+
+    ```bash
+    cd labs/p1/week-08
+    make db-up && make migrate && make seed
+    make verify TRACK=basic
+    ```
+  </Tab>
+
+  <Tab title="standard">
+    FastAPI plus async SQLAlchemy: payment verification and inventory decrement in one transaction,
+    optimistic locking, idempotency keys, Alembic migrations, and a concurrency test suite proving
+    zero oversells with 200 concurrent buyers.
+
+    <Info>Spec and tests only. You write the implementation.</Info>
+
+    **Acceptance criteria**
+
+    1. **Zero oversells.** `make concurrency-test` runs 200 concurrent buyers against a stock of 10 and asserts **exactly 10** sales rows and a final stock of exactly 0. It runs five times; all five must pass.
+    2. **The naive baseline must fail.** `make concurrency-test STRATEGY=naive` must oversell, and its output is recorded in your write-up. If it does not oversell, your threads are not actually concurrent — fix the harness before trusting anything else.
+    3. **Four strategies implemented**, selectable by configuration: pessimistic (`SELECT ... FOR UPDATE`), atomic conditional `UPDATE`, optimistic version column with retry, and `SERIALIZABLE` with retry. All four must pass criterion 1.
+    4. **Idempotency.** `POST /v1/checkout` honours `Idempotency-Key`. A replay with the same key and body returns the stored response and creates nothing; the key row and the effect commit in the **same** transaction. A test kills the process between them and asserts no orphan.
+    5. **Async throughout.** Async SQLAlchemy with an async driver. `lazy="raise"` on every relationship. No blocking call inside any `async def`.
+    6. **Migrations.** Alembic from an empty database to the full schema, with `downgrade()` implemented and tested. Every index is created `CONCURRENTLY` where the table is non-empty, and every migration sets `lock_timeout`.
+    7. **Database-level backstop.** A `CHECK (stock >= 0)` constraint, plus a test that bypasses the application entirely with raw SQL and confirms the database refuses.
+    8. **Retry handling.** Only `40001` and `40P01` are retried, with exponential backoff **and jitter**, capped. A constraint violation is not retried — there is a test for that.
+    9. **Test suite.** 30+ tests in under 60 seconds, passing in randomised order, using transactional rollback isolation.
+
+    **Verify**
+
+    ```bash
+    cd labs/p1/week-08
+    make verify TRACK=standard
+    make concurrency-test              # the important one; runs 5 times
+    make concurrency-test STRATEGY=naive   # must oversell
+    ```
+  </Tab>
+
+  <Tab title="hard">
+    Sustain a target RPS with p95 under 150 ms under contention. Deliver a measured comparison of
+    pessimistic, optimistic and serializable strategies, plus a deadlock reproduction and its fix.
+
+    <Warning>
+      The `standard` solution will not hit the p95 target on the hot-SKU workload. One of the four
+      strategies is dramatically worse under contention than the others — the reference measured
+      optimistic locking at 21.7 tps with 515 retries where pessimistic managed 34.0 — and finding
+      out which, on your hardware, is the exercise.
+    </Warning>
+
+    **Acceptance criteria**
+
+    1. **Throughput matrix.** Measure all four safe strategies at three contention levels (1, 10 and 100 distinct SKUs) and two concurrency levels (50 and 200 workers). Report tps, p50, p95, p99, retry count and error count for all 24 cells.
+    2. **Latency target.** On the 100-SKU workload at 50 concurrent buyers, sustain **p95 under 150 ms** with zero errors over a 60-second run, using whichever strategy your matrix justifies.
+    3. **Deadlock reproduction.** A test that deterministically produces a deadlock by acquiring two SKUs in opposite orders, captures the PostgreSQL log entry including both `Process NNN:` statement lines, and asserts the error is `40P01`.
+    4. **Deadlock fix.** Sort keys before locking, and prove it: the same test with the fix applied must not deadlock across 1,000 attempts.
+    5. **Indexing.** Meet the targets with a justified index set. `INDEXES.md` gives each index its serving query, before and after timings, size, and the measured insert-throughput penalty for the set.
+    6. **Pool sizing.** Show your arithmetic: `pool_size` derived from `rps × query_seconds / workers`, and a check that `workers × (pool_size + max_overflow)` is below the database's `max_connections`. Include a run with a deliberately under-sized pool showing the `TimeoutError`s.
+    7. **`CONCURRENCY.md`.** The deliverable: the strategy you chose, the matrix that justifies it, the deadlock and its fix, the database-level backstop, and one strategy you rejected with the number that rejected it.
+
+    **Verify**
+
+    ```bash
+    cd labs/p1/week-08
+    make matrix          # the 24-cell sweep; writes reports/matrix.json
+    make verify TRACK=hard
+    make deadlock-test
+    ```
+  </Tab>
+</Tabs>
+
+## Ship it
+
+<Card title="This is the part people skip" icon="rocket" horizontal>
+A public repo with `CONCURRENCY.md` at its root, the throughput matrix, the deadlock log, the
+migrations, and the concurrency test that anyone can run with `make concurrency-test`. This is a
+genuinely strong interview artifact for both a student and a working engineer — it is the rare
+portfolio piece that proves correctness under load rather than asserting it.
+</Card>
+
+**`CONCURRENCY.md` must contain**, in this order: the problem in two sentences; the four strategies
+with a one-line description each; the measured matrix; the strategy you chose and why; the
+database-level backstop; the deadlock reproduction with its log; and one paragraph titled "what I
+would do differently at 100× the traffic".
+
+## Verify yourself
+
+```bash
+cd labs/p1/week-08
+make db-up migrate seed
+make verify                        # everything applicable
+make concurrency-test              # 200 buyers, 10 items, 5 runs, must be exact
+make concurrency-test STRATEGY=naive   # must oversell - this is a required demonstration
+make matrix                        # the 24-cell sweep (hard track)
+make deadlock-test                 # reproduce, then prove the fix
+```
+
+## Rubric
+
+| Dimension | 0 | 1 | 2 | 3 |
+| --- | --- | --- | --- | --- |
+| Correctness | oversells | one strategy works | all four safe strategies pass five consecutive runs; idempotency replay proven; a database-level backstop exists | survives adversarial conditions: process killed mid-transaction, deliberate deadlocks, pool exhaustion, a replayed idempotency key during an in-flight original |
+| Code quality | works | readable | repository owns queries; no `commit()` below the request boundary; retries scoped to `40001`/`40P01` with jitter | a reviewer would approve unchanged; the unsafe version of each pattern is not expressible in the codebase |
+| Performance | untested | one measurement | the p95 target met with evidence | the full 24-cell matrix, the chosen strategy justified by it, and one strategy rejected with the number that rejected it |
+| Explanation | none | a README | `CONCURRENCY.md` with the matrix and reasoning | trade-offs defended, the deadlock explained with its log, and an honest account of something that did not work |
+
+## Common ways this lab goes wrong
+
+- **A concurrency test that is not concurrent.** If the naive strategy does not oversell, your workers are serialising — usually a shared connection, a lock in the harness, or threads started and joined one at a time. The reference harness uses a `threading.Barrier` so all 200 start together. Fix this first; every other measurement is meaningless until the baseline fails.
+- **Idempotency key committed separately from the effect.** The most common serious defect. If they can commit independently, a crash between them either double-charges or wedges the key permanently.
+- **Retrying everything.** Retrying a `CHECK` violation loops until the cap and then fails identically. Retry `40001` and `40P01`, and nothing else.
+- **Retrying without jitter.** Conflicting transactions collide again in lockstep. The reference measured 27,261 retries for 2,000 transactions under `SERIALIZABLE` — a fixed backoff makes it worse.
+- **Choosing optimistic locking for a hot SKU.** It is the right tool for *low* contention. On one hot row the reference measured 21.7 tps with 515 retries, against 34.0 tps for pessimistic. The matrix exists so you choose with numbers.
+- **No database-level backstop.** The ticket asks for it explicitly. Application logic can be wrong again; `CHECK (stock >= 0)` cannot.
+- **Locking two SKUs in whatever order they arrive.** That is a deadlock generator. Sort the keys.
+- **`lazy="raise"` not set.** Async SQLAlchemy will surface these as `MissingGreenlet` at the worst moment; setting it makes them test failures instead.
+
+<Card title="Reference solution" icon="lock" href="/solutions/p1/week-08/lab">
+  Hidden page. Open it after you have a failing attempt of your own.
+</Card>

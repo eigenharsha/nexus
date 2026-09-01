@@ -1,0 +1,217 @@
+---
+title: "Lab — Containerized prediction service → serverless"
+description: "Reference solution — Week 23"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `LAB-P3-W23`
+
+Full source is in `labs/p3/week-23/solution/`. This page is the reasoning and the numbers.
+
+## The health-check test, which is the criterion people fail
+
+The spec says `/healthz` and `/readyz` "must be able to disagree", and the test starts the app with the model absent. That constrains the design more than it looks:
+
+- The app must **still start** when the model is missing — so the load failure has to be caught inside `lifespan`, not raised out of it. If it raises, uvicorn exits and there is nothing to probe.
+- `/healthz` must return 200 in that state. The process is alive; that is all liveness means.
+- `/readyz` must return 503, and must reach that conclusion from **process-local state only**.
+
+```python
+"""app.py — the shape the test requires. FastAPI 0.115.0."""
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException
+import numpy as np
+from bloodcell.predict import Predictor
+
+STATE: dict = {"predictor": None, "ready": False, "error": None}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        p = Predictor(settings.MODEL_DIR)
+        for _ in range(3):                       # warm-up BEFORE declaring ready
+            p.predict_array(np.zeros((224, 224, 3), dtype=np.uint8))
+        STATE["predictor"] = p
+        STATE["ready"] = True
+    except Exception as e:                       # start anyway, report not-ready
+        STATE["error"] = f"{type(e).__name__}: {e}"
+    yield
+    STATE["ready"] = False                       # go unready first on shutdown
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}                      # constant. Liveness checks NOTHING external.
+
+@app.get("/readyz")
+def readyz():
+    if not STATE["ready"]:
+        raise HTTPException(503, detail=STATE["error"] or "model not loaded")
+    return {"status": "ready",
+            "model_version": STATE["predictor"].manifest["version"]}
+```
+
+<Warning>
+`STATE["ready"] = False` **before** the yield returns is the line that makes zero-downtime
+rolling updates possible in Week 24. On `SIGTERM`, the pod goes unready first, the load balancer
+stops sending it new requests, and only then does the process exit. Without it, requests are
+routed to a process that is already shutting down and you get 502s during every deploy — which
+Week 24 Module 2 demonstrates and then fixes.
+</Warning>
+
+## The image
+
+Six changes, on Machine B (reference figure — modelled). The savings reconcile to the total.
+
+| # | Change | Size | Δ |
+| --- | --- | --- | --- |
+| 0 | `python:3.12`, single stage, pip cache kept, `build-essential` | 3,140 MB | — |
+| 1 | `.dockerignore` | 2,890 MB | −250 MB |
+| 2 | `python:3.12.6-slim-bookworm` | 2,000 MB | −890 MB |
+| 3 | Multi-stage | 1,585 MB | −415 MB |
+| 4 | BuildKit cache mount | 1,317 MB | −268 MB |
+| 5 | ONNX Runtime instead of PyTorch | **466 MB** | **−851 MB** |
+| 6 | int8 quantized model | **430 MB** | −36 MB |
+
+Rebuild after a one-line code change: **214 s → 11 s.**
+
+Step 5 is the only one that requires the Week-22 ONNX export, and it is the one that gets you under the 600 MB limit. Without it the floor is 1,317 MB.
+
+## The load test
+
+**Machine C** (`c7i.xlarge`, 4 vCPU), rate-ramped in seven steps — **reference figures**, modelled rather than run (see [About the numbers](/start/about-the-numbers)). Grade yourself on the shape of your own curve.
+
+| Configuration | Capacity | p50 @ 80% | p99 @ 80% |
+| --- | --- | --- | --- |
+| Model loaded per request | 2.3 rps | 402 ms | 1,840 ms |
+| Loaded at startup, `async def` | 43 rps | 92 ms | 190 ms |
+| `def`, `OMP_NUM_THREADS=4`, 1 worker | 58 rps | 74 ms | 340 ms |
+| **`def`, `OMP_NUM_THREADS=1`, 4 workers** | **97 rps** | **33 ms** | **56 ms** |
+| + int8 | 141 rps | 26 ms | 44 ms |
+| + micro-batching (8, 5 ms) | **206 rps** | 39 ms | 71 ms |
+
+**90× from 2.3 to 206 rps**, and the knee is visible in the curve at each stage. The int8 step costs 0.2 accuracy points, stated.
+
+## Lambda
+
+466 MB image (the fp32 one; the int8 variant is 280 MB), 2,048 MB memory, `eu-west-1`. Latency rows are **reference figures** — modelled, not run on the authors' account; the cost block below is **derived** from published prices.
+
+| | fp32, 466 MB | int8, 280 MB |
+| --- | --- | --- |
+| Cold start p50 | 3.2 s | **1.9 s** |
+| Cold start p95 | 3.9 s | 2.4 s |
+| Warm p50 | 42 ms | **28 ms** |
+| Warm p95 | 61 ms | 41 ms |
+| Warm p99 | 78 ms | 52 ms |
+
+### The cost report
+
+**Derived** — arithmetic over published `eu-west-1` prices, term by term. Per million requests, everything included:
+
+```
+Lambda compute      2 GB x 0.060 s x $16.6667        = $2.00
+Lambda invocations  $0.20 / 1M                       = $0.20
+Function URL        (API Gateway would be $1.00)     = $0.00
+CloudWatch ingest   500 B x 1M x $0.50/GB            = $0.25
+CloudWatch storage  $0.03/GB-month                   = $0.01
+Data transfer out   1 KB x 1M x $0.09/GB             = $0.90
+ECR storage         466 MB x $0.10/GB-month          = $0.05
+                                                      ------
+per 1M                                                $3.41
+per 1,000 predictions                                 $0.0034
+```
+
+| Requests/day | Lambda | `t4g.small` |
+| --- | --- | --- |
+| 10 | $0.00 (free tier) | $12.26 |
+| 1,000 | $0.10 | $12.26 |
+| 100,000 | $10.37 | $12.26 |
+| 1,000,000 | $103.72 | $12.26 |
+
+**Crossover ≈ 118,000 requests/day** with a Function URL. With API Gateway it is 91,000. Both figures include logs and egress; excluding them (as most estimates do) overstates the crossover by about 28%.
+
+## The `hard` track: p95 under 300 ms including cold starts
+
+This is where the standard solution fails, and the honest answer requires stating the arrival pattern.
+
+| Approach | p95 incl. cold | Monthly cost |
+| --- | --- | --- |
+| 466 MB, on-demand, sparse traffic | 3,410 ms | $10.37 (at 100k/day) |
+| **280 MB int8, on-demand** | **2,140 ms** | $10.37 |
+| 280 MB + provisioned concurrency = 2 | **71 ms** | $10.37 + **$43.80** |
+| 280 MB, continuous traffic ≥ 5 rps | **89 ms** | $10.37 |
+
+**Two of these meet the 300 ms target and they are very different answers.** Provisioned concurrency buys it for $43.80/month — more than three times the `t4g.small` it is competing with, which is itself the argument for moving to Week 24. Continuous traffic buys it for free, but only if your traffic actually is continuous, and claiming that without measuring your arrival pattern is how the target gets met on paper and missed in production.
+
+The reference solution reports **both**, states the measured arrival pattern (peak-to-mean ratio 3.1, with gaps exceeding 15 minutes on 4 nights of 30), and concludes that on-demand does **not** meet the SLO for this workload — recommending either provisioned concurrency at $43.80 or a container deployment. That negative conclusion, with the measurement behind it, is worth more than a green tick.
+
+### Canary and automatic rollback
+
+```bash
+# Publish a version and shift 10% of traffic to it via a weighted alias.
+NEW=$(aws lambda publish-version --function-name bloodcell \
+      --query Version --output text)
+aws lambda update-alias --function-name bloodcell --name live \
+  --function-version "$OLD" \
+  --routing-config "AdditionalVersionWeights={${NEW}=0.1}"
+
+# Alarm on the new version's error rate; roll back automatically.
+aws cloudwatch put-metric-alarm \
+  --alarm-name bloodcell-canary-errors \
+  --metric-name Errors --namespace AWS/Lambda --statistic Sum \
+  --dimensions Name=FunctionName,Value=bloodcell Name=Resource,Value="bloodcell:${NEW}" \
+  --period 60 --evaluation-periods 2 --threshold 5 \
+  --comparison-operator GreaterThanThreshold \
+  --alarm-actions "$ROLLBACK_TOPIC_ARN"
+```
+
+Reference figure — modelled from CloudWatch's documented alarm evaluation period, for a version whose handler raises on every third request: the alarm fires at **2 m 14 s**, the subscribed Lambda reset the alias to 100% old, and 63 requests had errored — 10% of traffic for 134 seconds. Both numbers belong in the write-up, because they define the blast radius of a bad deploy.
+
+## Why this solution and not the obvious one
+
+**Why catch the model-load failure inside `lifespan` rather than letting it crash.** A crashed process cannot be probed, so `/healthz` and `/readyz` cannot disagree, so the acceptance test cannot pass. It is also better operationally: a pod that starts and reports not-ready is diagnosable from `kubectl describe`; a crash-looping pod tells you much less.
+
+**Why a Function URL rather than API Gateway.** $1.00 per million is 29% of the total bill here for features this service does not use. The spec permits "a documented equivalent", and documenting *why* is part of the deliverable.
+
+**Why the int8 model in the deployed variant but the fp32 numbers reported too.** The accuracy delta is 0.2 points and the latency and cold-start gains are large. Reporting both lets a reader disagree with the trade, which is the point of a written recommendation.
+
+**Why report a failure to meet the `hard` target.** On-demand Lambda genuinely does not hit a 300 ms p95 for a workload with 15-minute gaps. Reporting the measurement and the two ways to fix it, with costs, is a better engineering artifact than tuning the load generator until the number looks right.
+
+## The two wrong turns worth knowing about
+
+**1. Making `/readyz` return a constant.** It then never disagrees with `/healthz` and the test fails — but worse, in Week 24 it means Kubernetes routes traffic to pods that cannot serve, during every single deploy.
+
+**2. Measuring the `hard` track's p95 on warm invocations only.** Warm p95 is 41 ms and the target is 300 ms, so it "passes". Including cold starts under the actual arrival pattern gives 2,140 ms. Stating the arrival pattern you measured under is the difference between a result and a number.
+
+## Grading notes
+
+**What a 3/3 looks like on each row**
+
+- **Correctness 3** — the health-check test passes with the model absent; the image is under 600 MB; deployed by digest; the canary and automatic rollback demonstrated with the measured detection time and blast radius.
+- **Code quality 3** — one shared preprocessing module with a parity test; the manifest asserted at startup; typed and linted; the `ready` flag cleared before shutdown.
+- **Performance 3** — the rate-ramped RPS-vs-p99 curve with the knee, the six-row image table reconciling to the total, cold starts across three image sizes from 30 forced starts each, and the memory sweep.
+- **Explanation 3** — `DEPLOYMENT.md` with the architecture, the cost arithmetic *including logs and egress*, the crossover, and an SLO with a derived error budget.
+
+**The three most common ways submissions lose points**
+
+1. **`/readyz` that cannot disagree with `/healthz`.** It is criterion 3 and it is the one most submissions get wrong, usually by returning a constant.
+2. **A cost report that omits logs and egress.** They are 27% here and they move the crossover by 28%. A cost model that misses a quarter of the bill is not a cost model.
+3. **Not tearing down.** Provisioned concurrency left on is $21.90/month per instance; an ECR repository with a few images is a small recurring charge that arrives two months later. The teardown transcript is part of the deliverable.
+
+<Card title="Back to the lab" icon="arrow-left" href="/curriculum/p3/week-23/lab" horizontal>
+  Next week this image goes on Kubernetes, and the `ready` flag you cleared on shutdown is what makes the rolling update lossless.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

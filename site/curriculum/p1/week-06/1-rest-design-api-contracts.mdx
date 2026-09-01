@@ -1,0 +1,560 @@
+---
+title: "REST design & API contracts"
+description: "Week 6 · Module 1 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 6 · Module 1 · `P1-W06-M1`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Design the URL, method and status table for a resource *before* writing a line of code, and defend every cell.
+2. Return one error shape across the whole API so clients need one error handler, not twelve.
+3. Choose cursor pagination over offset and justify it with the measured cost at depth.
+4. Make a `POST` safe to retry with idempotency keys.
+5. Review an API spec and produce a corrected version with reasons, which is a real task you will be given in your first month at a job.
+
+## Where this sits
+
+| | |
+| --- | --- |
+| **Prereqs** | `P1-W05-M1` (methods, status codes, caching are not re-taught here) |
+| **Unlocks** | `P1-W06-M2` (FastAPI implements this design), the whole Week 6 lab |
+| **One-line** | After this you can design an API contract that survives its second client. |
+
+## Why you should care
+
+### For Aarav (student)
+
+- API design is the most common take-home exercise for backend roles. It is also the one most candidates fail, because they write code before writing the contract.
+- Every choice here is defensible in an interview with a sentence and a number. "Cursor pagination, because offset at 500,000 rows measured 694 ms against 1.7 ms" ends the discussion.
+- Designing on paper first is a habit that makes you look two years more experienced than you are.
+
+### For Meera (working professional)
+
+- You have inherited an API where `GET /users/list`, `POST /getUser` and `PUT /user-update` all exist. This module is the vocabulary for fixing it without a rewrite.
+- This shows up in your job as: "the mobile team says our pagination skips records". It does — offset pagination genuinely skips and duplicates rows when the underlying data changes between pages.
+- The error-envelope decision is the one that saves the most engineering hours per line of design, across every client you will ever have.
+
+## The mental model
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p1-w06-m1.svg" alt="Hand-drawn sketch: REST resource design and the pagination trade-off" className="block dark:hidden" />
+  <img src="/assets/diagrams/p1-w06-m1-dark.svg" alt="Hand-drawn sketch: REST resource design and the pagination trade-off" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p1-w06-m1
+tier: T2
+one-sentence-goal: Show that a REST API is a table of nouns crossed with a fixed set of verbs, and that offset pagination re-reads everything it skips while a cursor jumps straight to its place.
+elements:
+  - top-left: a grid with rows "collection /orders" and "item /orders/:id" and columns GET POST PATCH DELETE, cells filled with status codes 200/201/204/404/409, and a red cross-out over an invented cell "POST /getOrder"
+  - top-right: an error envelope box drawn as a JSON card with fields type, title, status, detail, errors[] and an amber note "ONE shape, every endpoint, forever"
+  - bottom-left: offset pagination drawn as a long row of boxes with the first 500,000 crossed out in red and an arrow labelled "read and discard" pointing at the discarded region
+  - bottom-right: cursor pagination drawn as the same row with an arrow labelled "index seek" landing directly on the 500,001st box
+  - amber margin note between them: "same page of 20 rows - 694 ms vs 1.7 ms"
+  - circled key term "idempotency key"
+  - a dangling arrow labelled "...and what happens if the client retries?"
+numbers-to-write-in: OFFSET 500,000 LIMIT 20 = 693.9 ms; keyset = 1.7 ms; 408x; OFFSET 100,000 spills 11 MB to disk; full representation 26,454 B vs sparse 5,257 B (5.0x over-fetch); gzip 12.6x
+alt: A hand-drawn REST design sketch showing a resource-by-method grid with status codes, a single error envelope card, and a comparison of offset pagination reading and discarding half a million rows against a cursor seeking directly to its position, with measured timings written in.
+*/}
+
+A REST API is a small set of **nouns** (resources, addressed by URL) crossed with a fixed set of
+**verbs** (the HTTP methods), returning a fixed set of **outcomes** (status codes). Your design
+work is choosing the nouns. Everything else is already decided by the protocol, and inventing
+your own verbs is how APIs become unlearnable.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Plain English
+
+    A **resource** is a thing your system has: a to-do, a user, an order. A **URL** is that thing's
+    address. **REST** (Representational State Transfer) is a style where you name the things with
+    URLs and act on them with the standard HTTP methods, rather than inventing an operation name
+    for every action.
+
+    Two kinds of URL, and almost every API is built from these two:
+
+    - A **collection**: `/todos` — all of them.
+    - An **item**: `/todos/42` — one specific one, identified in the path.
+
+    Rules that come free once you accept that:
+
+    - URLs name **nouns**, not verbs. `/todos`, not `/getTodos`. The verb is the HTTP method.
+    - Collections are **plural**. `/todos/42`, never `/todo/42`. One rule, applied everywhere,
+      means nobody has to remember which.
+    - Hierarchy expresses **containment**: `/todos/42/comments` are the comments belonging to
+      to-do 42.
+    - Filtering, sorting and paging are **query parameters**, not path segments:
+      `/todos?status=open&sort=-created_at&limit=20`.
+
+    ### The analogy
+
+    A library. The shelf location is the URL — it identifies the book, and it does not change
+    depending on what you want to do with the book. Borrow, return, reserve, check the cover: those
+    are the verbs, and there is a fixed short list of them. A library where "borrow" and "return"
+    each required a *different shelf address for the same book* would be unusable. That is what
+    `POST /getUser` does to your API.
+
+    ### Smallest working example: design before code
+
+    Here is the entire design step for a to-do API. Do this on paper. It takes ten minutes and it
+    is the highest-value ten minutes of the week.
+
+    | Method + path | Does | Success | Errors |
+    | --- | --- | --- | --- |
+    | `GET /todos` | list, paged and filtered | `200` + array | `400` bad query |
+    | `POST /todos` | create one | `201` + body + `Location` header | `422` validation |
+    | `GET /todos/{id}` | fetch one | `200` | `404` |
+    | `PATCH /todos/{id}` | update some fields | `200` + updated body | `404`, `422`, `409` version conflict |
+    | `PUT /todos/{id}` | replace entirely | `200` | `404`, `422` |
+    | `DELETE /todos/{id}` | remove | `204` no body | `404` |
+    | `POST /todos/{id}/complete` | mark done | `200` | `404`, `409` already complete |
+
+    That last row deserves attention. `complete` is a verb, and I just said URLs are nouns. It is
+    still the right design, because "complete" is a *state transition* with its own rules, not a
+    field assignment — it may send an email, write an audit row, and be illegal from some states.
+    Expressing it as `PATCH /todos/42 {"status":"done"}` hides all of that behind a field write.
+    **The rule is: nouns by default; a sub-resource action when the operation is a transition with
+    its own preconditions.**
+
+    ### Line by line
+
+    - `201` for create, with a `Location: /todos/42` header — the client learns the new URL without
+      parsing your body format.
+    - `204` for delete — there is nothing meaningful to return, and returning `{"ok":true}` invites
+      clients to depend on it.
+    - `404` rather than `200` with `{"found": false}` — the status code is the machine-readable
+      part; putting the outcome only in the body makes every client parse the body to find out
+      whether the call worked.
+    - `422` for validation — the request was well-formed JSON, so it is not `400`; it just says
+      something impossible.
+    - `409` for a conflict — "you tried to complete a to-do that is already complete", or "your
+      version is stale". Distinct from `422` because retrying with the *same* body may succeed
+      later.
+
+    ### Guided practice
+
+    Design the table for a bookmarks API. It has: bookmarks with a URL, title and tags; tags shared
+    across bookmarks; and an "archive" action. Fill in the eight rows before reading the answer.
+
+    <Accordion title="Answer">
+      | Method + path | Success | Notes |
+      | --- | --- | --- |
+      | `GET /bookmarks?tag=python&limit=20&cursor=…` | `200` | filter and page with query params |
+      | `POST /bookmarks` | `201` + `Location` | `409` if the URL already exists for this user |
+      | `GET /bookmarks/{id}` | `200` | `404` |
+      | `PATCH /bookmarks/{id}` | `200` | partial update of title or tags |
+      | `DELETE /bookmarks/{id}` | `204` | idempotent — a second delete is `404` and that is fine |
+      | `POST /bookmarks/{id}/archive` | `200` | a transition, not a field write |
+      | `GET /tags` | `200` | tags are a resource in their own right |
+      | `PUT /bookmarks/{id}/tags` | `200` | replace the whole tag set — `PUT` because the client sends all of it |
+
+      The two decisions worth arguing about: `PUT` on the tags sub-collection (correct, because the
+      client owns the full list and replacement is idempotent), and `409` on duplicate creation
+      (correct, because it is a state conflict, not malformed input).
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+      **1. Why `/todos` and not `/getTodos`?**
+      The method is the verb. Encoding it in the path duplicates it, and then nothing stops you
+      from having three spellings of the same operation.
+
+      **2. What does `201` promise that `200` does not?**
+      That something was created, and that the `Location` header names it.
+
+      **3. When is `409` right instead of `422`?**
+      When the request is valid but conflicts with current state — stale version, duplicate,
+      illegal transition. `422` means the content itself is impossible.
+
+      **4. Why should `DELETE` be idempotent?**
+      So a client that times out can retry safely. The second call finding nothing to delete is a
+      normal outcome, not an error condition to be avoided.
+
+      **5. Where do filters go?**
+      Query parameters. Path segments identify *what*; query parameters describe *which subset and
+      in what order*.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The real theory: pagination is a correctness problem, not a UX one
+
+    **Offset pagination** — `LIMIT 20 OFFSET 500000` — has two failures. It is slow, because the
+    database must produce and discard everything it skips. And it is *wrong* under concurrent
+    writes: if a row is inserted before your position between page 3 and page 4, every subsequent
+    page shifts by one, so the client sees one record twice and never sees another.
+
+    **Cursor (keyset) pagination** encodes the last row's sort key and asks for rows after it:
+
+    ```sql
+    -- page 1
+    SELECT id, placed_at FROM orders ORDER BY placed_at, id LIMIT 20;
+    -- page N: cursor carries the last row's (placed_at, id)
+    SELECT id, placed_at FROM orders
+    WHERE (placed_at, id) > ('2025-08-01 00:00:00+00', 900000)
+    ORDER BY placed_at, id LIMIT 20;
+    ```
+
+    The row-value comparison `(a, b) > (x, y)` is the part people get wrong; writing
+    `placed_at > x OR (placed_at = x AND id > y)` is equivalent but the planner handles the
+    row-value form more reliably as an index condition. The tiebreaker column is mandatory: without
+    a unique tiebreaker, rows sharing a timestamp are skipped or repeated.
+
+    Measured on 1,000,000 orders in PostgreSQL 16.14:
+
+    | Query | Time | What happened |
+    | --- | --- | --- |
+    | `OFFSET 0 LIMIT 20` | 463 ms cold / 65 ms warm | top-N heapsort over the whole table |
+    | `OFFSET 10000 LIMIT 20` | 64.8 ms | still sorting everything |
+    | `OFFSET 100000 LIMIT 20` | 211.0 ms | **sort spilled 11 MB to disk** |
+    | `OFFSET 500000 LIMIT 20` | 581.7 ms | spilled 14 MB |
+    | `OFFSET 500000 LIMIT 20` *with* the index | 693.9 ms | index scan reading 500,020 rows to discard 500,000 |
+    | **Keyset, page 1** | **1.4 ms** | index scan, 20 rows |
+    | **Keyset at position 500,000** | **2.1 ms** | index scan, 20 rows |
+    | **Keyset at position 900,000** | **1.7 ms** | index scan, 20 rows |
+
+    **408× at depth**, and flat rather than linear. Note the index does not save offset pagination:
+    it changes *how* the rows are produced but not the fact that half a million of them are
+    produced and thrown away.
+
+    The API shape:
+
+    ```json
+    {
+      "data": [ { "id": 900001, "status": "paid" } ],
+      "page": {
+        "next_cursor": "eyJwbGFjZWRfYXQiOiIyMDI1LTA4LTAxVDAwOjAwOjAwWiIsImlkIjo5MDAwMjB9",
+        "has_more": true
+      }
+    }
+    ```
+
+    The cursor is opaque base64 of the sort key. Opaque matters: clients must not construct it, so
+    you can change the sort key later without breaking them. Sign it if leaking the key would
+    reveal anything.
+
+    ### The production surface: one error envelope
+
+    Adopt RFC 9457 (`application/problem+json`) or something shaped like it, and use it everywhere:
+
+    ```json
+    {
+      "type": "https://api.example.com/errors/validation",
+      "title": "Validation failed",
+      "status": 422,
+      "detail": "2 fields are invalid",
+      "instance": "/v1/orders",
+      "request_id": "01J9X2K7QP3M",
+      "errors": [
+        { "field": "qty",  "code": "greater_than_equal", "message": "must be at least 1" },
+        { "field": "sku",  "code": "pattern",            "message": "must match SKU-000000" }
+      ]
+    }
+    ```
+
+    Three properties are what make this worth the effort. `type` is a stable machine-readable
+    identifier so clients branch on a URI rather than on English prose. `errors[]` is *always* an
+    array, even for one error, so clients need one code path. And `request_id` is echoed from your
+    logs, so a user can paste it into a support ticket and you can find the exact request. Send it
+    as a response header too, and remember `Access-Control-Expose-Headers` or the browser cannot
+    read it.
+
+    ### Trade-offs
+
+    | Decision | Choose the first when… | Choose the second when… |
+    | --- | --- | --- |
+    | **Cursor vs offset pagination** | The dataset is large, changes while being read, or is ordered by time — measured 408× faster at depth 500,000. | Users must jump to page 47, or the dataset is small and static (a settings list). Then say so in the docs. |
+    | **`PATCH` vs `PUT`** | The client holds part of the object, or several clients edit different fields. Add `If-Match` with an ETag so stale writes get a `409`. | The client owns the whole representation and retries must be safe. |
+    | **URL versioning (`/v1/`) vs header versioning** | You want the version visible in logs, curl commands and bug reports — which is nearly always worth more than purity. | You are running a large multi-tenant platform with per-tenant negotiated versions. |
+    | **Sparse fieldsets (`?fields=`) vs fixed representations** | Mobile clients on slow links; measured 26,454 B versus 5,257 B for the same 100 orders — **5.0× over-fetch**. | The API is internal and on a fast network; then caching a single stable shape is worth more than the bytes. |
+    | **Sub-resource action vs field write** | The operation is a transition with preconditions and side effects: `POST /orders/{id}/refund`. | It is genuinely just a field: `PATCH /orders/{id} {"note": "..."}`. |
+
+    ### Reference implementation: idempotency keys
+
+    ```http
+    POST /v1/payments HTTP/1.1
+    Idempotency-Key: 8f2c4b1e-3a17-4a2b-9d02-7c6b5e9f1a44
+    Content-Type: application/json
+
+    {"order_id": 42, "amount_cents": 4999, "currency": "INR"}
+    ```
+
+    Server side, the whole algorithm in one transaction:
+
+    ```sql
+    CREATE TABLE idempotency_keys (
+      key            text PRIMARY KEY,
+      user_id        bigint NOT NULL,
+      request_hash   text NOT NULL,          -- so the same key with a different body is rejected
+      response_status int,
+      response_body  jsonb,
+      created_at     timestamptz NOT NULL DEFAULT now(),
+      completed_at   timestamptz
+    );
+    ```
+
+    1. `INSERT` the key. A unique violation means this is a replay.
+    2. On replay with a **matching** `request_hash`: if `completed_at` is set, return the stored
+       status and body verbatim. If it is not, the original is still running — return `409` and let
+       the client retry shortly.
+    3. On replay with a **different** `request_hash`: return `422`. The same key with different
+       content is a client bug, and quietly returning the first response would hide a real problem.
+    4. Do the work and store the response in the same transaction that created the key.
+
+    Point 4 is the one people skip, and it is the whole point: if the charge commits but the key
+    row does not, a retry charges twice. You will build this against real transactions in
+    `P1-W08-M1`.
+
+    Expire keys after 24 hours. Keeping them forever turns a hot table into an unbounded one.
+
+    ### What breaks in the real world
+
+    A partner integration broke on a Tuesday with no deploy on either side. The API returned a list
+    endpoint's results as a bare JSON array — `[{...}, {...}]` — and had done so for two years. That
+    Tuesday the team added pagination metadata by changing the response to
+    `{"data": [...], "next_cursor": "..."}`. Every client that did `for (const x of response)` broke
+    at once.
+
+    The fix was to restore the array and add the metadata in `Link` headers, then ship the envelope
+    behind `/v2/` with a 90-day deprecation window and `Sunset` headers on `/v1/`. The lesson has
+    two halves, and the second is the important one. **Never return a bare array from a list
+    endpoint** — you have no room to add anything later, and you will always need to add something.
+    And **anything a client can observe is part of your contract**, including field order if some
+    client parses by position, and the presence of a field a client checks for `undefined`. The
+    only reliable defence is contract tests generated from your OpenAPI schema, run against every
+    build, which is exactly what `P1-W06-M5` sets up.
+
+    <Accordion title="Design checkpoint — model answer inside">
+      **Question.** Your `GET /orders` returns 200 orders per page and mobile complains it is slow.
+      A colleague proposes adding a `?full=false` flag that returns fewer fields. What do you do?
+
+      **Model answer.** A boolean flag is the wrong axis: it has exactly two settings, and the
+      second client will want a third. Use a sparse fieldset — `?fields=id,status,total_cents` —
+      with a documented default and a maximum page size. Measured on 100 real orders, the full
+      representation was 26,454 bytes and the three-field projection 5,257 bytes: **5.0× less**,
+      and after gzip 2,107 versus 539 bytes. Two caveats to state in the design review. Sparse
+      fieldsets fragment your cache key, so include `fields` in `Vary` or in the cache key
+      explicitly. And validate the field list against an allowlist — passing it into the SQL
+      projection is an injection hole, and letting clients select expensive computed fields moves
+      your cost model into their hands.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    ### REST vs GraphQL vs gRPC: a decision framework with numbers
+
+    The three differ on three measurable axes: round trips, payload size, and coupling cost.
+
+    **Round trips.** Fetching 100 orders plus each order's customer is 101 requests in a naive REST
+    client, 1 in GraphQL, and 1 in REST with an `?expand=customer` parameter. At a 150 ms RTT that
+    is 15.15 s versus 150 ms. But the REST fix is one query parameter, so "GraphQL solves N+1" is
+    only true against REST APIs that declined to.
+
+    **Payload.** Measured on 100 orders from a real table: the full representation with embedded
+    customer and HATEOAS links was 26,454 bytes; a three-field projection was 5,257 bytes — a
+    **5.0× over-fetch factor**. After gzip: 2,107 versus 539 bytes, a 12.6× compression ratio on
+    the full document. Two conclusions. Over-fetching costs about 4× *after compression*, not the
+    5× you would guess from raw size, because repeated JSON keys compress extremely well. And any
+    argument about JSON verbosity that ignores gzip is off by an order of magnitude — an
+    uncompressed API is the bug, not the format.
+
+    **Coupling.** gRPC's advantage is a compiled schema: field numbering makes wire-compatible
+    evolution a checkable property rather than a discipline. Its cost is that browsers cannot speak
+    it without a proxy (grpc-web), and every debugging tool you own works on text.
+
+    | | REST + JSON | GraphQL | gRPC + protobuf |
+    | --- | --- | --- | --- |
+    | Round trips for a nested read | 1 with `expand`, else 1+N | 1 | 1 |
+    | Over-fetch control | sparse fieldsets | per-query, by construction | per-message |
+    | Payload (100 orders, measured) | 26 KB raw / 2.1 KB gzip | similar JSON, smaller if selected | ~40–60% of JSON before compression |
+    | Cacheable by CDN | yes, per URL | no, one POST URL | no |
+    | Browser-native | yes | yes | no (needs grpc-web) |
+    | Debuggable with `curl` | yes | awkward | no |
+    | Schema evolution safety | conventions + tests | schema + deprecations | field numbers, checkable |
+
+    **Choose REST** for public APIs, anything a CDN should cache, and anything third parties
+    integrate with. **Choose GraphQL** when many different clients need many different shapes of
+    the same graph and you can afford the server-side complexity (query cost limiting, persisted
+    queries, per-field authorisation). **Choose gRPC** for internal service-to-service calls where
+    both ends deploy together, latency budgets are tight and you want generated clients.
+
+    ### The HATEOAS reality check
+
+    Full REST as Fielding defined it requires hypermedia controls: responses carry links telling
+    the client what it may do next, so URLs are not hard-coded. Almost nobody does this, and it is
+    worth being precise about why. It costs bytes — the `links` object was 27% of the full
+    representation measured above. It requires clients written to *discover* rather than to know,
+    and every generated client, every mobile app and every integration partner hard-codes URLs
+    anyway. And it does not deliver its promised benefit: you still cannot change a URL, because
+    someone has cached it, bookmarked it, or written it into a webhook config.
+
+    Where hypermedia does pay: the `next_cursor`/`Link` header for pagination (the client genuinely
+    should not construct it), and state-dependent action links (`"actions": {"refund": "/orders/42/refund"}`)
+    which let the server express *what is currently allowed* instead of forcing the client to
+    reimplement your state machine. Take those two and skip the rest.
+
+    ### Backward compatibility: the rules, and how you break clients
+
+    **Safe** (additive): a new optional request field; a new response field; a new endpoint; a new
+    optional query parameter; a new enum value *in a request* your server accepts.
+
+    **Breaking** (needs a version): removing or renaming any response field; changing a type
+    (`"42"` to `42` — and note JSON numbers over 2⁵³ break JavaScript clients silently); making an
+    optional request field required; narrowing a validation rule; changing a status code for an
+    existing condition; **adding an enum value to a response** — because clients wrote
+    `switch` statements without a default; and changing default sort order, because someone depends
+    on it whether or not you documented it.
+
+    That enum case is the one that surprises people. Adding `status: "partially_refunded"` to an
+    order looks additive and is not: existing clients fall through their `switch` and render blank,
+    or throw. Mitigations: document from day one that clients must tolerate unknown enum values,
+    and ship a `status_group` field with a small closed set alongside the open-ended one.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Offset pagination skipping records | "The report is missing rows" and it is not reproducible | Inserts landing before the read position. Switch to keyset; measured 408× faster as a bonus |
+    | Idempotency key stored outside the transaction | Duplicate charges at a low, steady rate | The key row and the effect must commit together — audit for two `commit()` calls |
+    | Unbounded page size | One client passes `limit=100000` and the database stalls for everyone | Cap it server-side and return the cap in the response so clients can see it |
+    | Enum added to a response | A partner's UI shows blanks after your minor release | Contract tests against a recorded client fixture, not just your own schema |
+    | `type` field missing from errors | Clients string-match on error messages, and your copy edit breaks them | Add stable `type` URIs; treat `title` and `detail` as human-facing prose |
+    | Bare array from a list endpoint | Cannot add pagination without breaking everyone | Envelope from day one, or `Link` headers |
+
+    ### Frontier and primary sources
+
+    - **RFC 9457, *Problem Details for HTTP APIs* (2023).** *Takeaway:* a standard error shape with
+      a machine-readable `type` URI, so clients branch on identifiers rather than on prose.
+    - **RFC 8288, *Web Linking*.** *Takeaway:* `Link: <...>; rel="next"` is the standard,
+      cache-friendly way to paginate without inventing an envelope.
+    - **RFC 9110 §9.2 (method properties).** *Takeaway:* idempotency is a protocol-level contract
+      clients and proxies will actually rely on, which is why violating it produces bugs you cannot
+      see from your own logs.
+    - **Fielding, *Architectural Styles and the Design of Network-based Software Architectures*
+      (2000), chapter 5.** *Takeaway:* REST's constraints — statelessness, cacheability, uniform
+      interface — are what buy scalability; what most people call REST keeps three of six.
+    - **OpenAPI Specification 3.1.** *Takeaway:* aligning with JSON Schema 2020-12 means one schema
+      document can drive validation, client generation and contract tests — the same mechanism you
+      will use in Week 26 for LLM structured output.
+
+    ### Stretch challenge
+
+    Take a public API you use — Stripe, GitHub, Shopify — and write its compatibility policy from
+    the outside. Which fields have they never removed? What did they version, and what did they add
+    behind a header instead? Find one endpoint whose design you would fail in review and write the
+    correction plus the migration path that would not break their existing clients. Then find the
+    counter-argument: the reason the "wrong" design might be right at their scale. The interesting
+    ones are usually about caching, mobile clients on old versions, or a partner contract you can
+    infer but not see. That last step — arguing the other side convincingly — is what makes the
+    exercise worth doing.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Take the deliberately bad spec in `labs/p1/week-06/bad-api.yaml` and produce a corrected OpenAPI
+3.1 document. For every change, add a one-line justification comment. There are 14 defects; a good
+submission finds at least 11 and does not invent problems that are not there.
+</Card>
+
+## The whiteboard
+
+T1 is the resource-by-method grid plus the pagination comparison. The T2 build-up frames are:
+(1) the nouns, (2) the methods crossed with them, (3) the status codes filled in, (4) the error
+envelope shared by every cell.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p1-w06-m1-blank.svg) · [Editable source](/assets/diagrams/p1-w06-m1.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    In a take-home, spend the first fifteen minutes producing the resource table and the error
+    envelope, and put both at the top of the README before any code. Reviewers read the README.
+    A candidate who submits a design and then an implementation that matches it is rarer, and more
+    convincing, than one who submits more endpoints. Add one sentence with a number: "cursor
+    pagination, because offset at depth 500,000 measured 694 ms versus 1.7 ms on 1M rows."
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **One:** grep your API for list endpoints returning bare arrays — each is a change you cannot
+    make later. **Two:** find every `OFFSET` in a paginated query and check the depth your clients
+    actually reach; anything past a few thousand rows is worth converting to keyset. **Three:**
+    count the distinct error shapes your API returns — most teams find four or five — and pick one,
+    then add the others behind a translation layer so clients can migrate at their own pace.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Clients string-match on error messages | Errors have no stable machine-readable code | Add a `type` URI or `code` field; treat prose as prose |
+| Reports miss rows intermittently | Offset pagination over data that is being written | Keyset pagination with a unique tiebreaker |
+| Deep pages time out | `OFFSET` produces and discards everything it skips | Keyset; measured 693.9 ms → 1.7 ms at depth 500,000 |
+| Duplicate charges after client retries | `POST` with no idempotency key | Idempotency key with a unique constraint, stored in the same transaction as the effect |
+| Cannot add a field to a list response | Endpoint returns a bare array | Envelope (`data` + `page`) from the start |
+| Partner breaks on a "minor" release | New enum value in a response | Document unknown-value tolerance; ship a closed-set `*_group` field alongside |
+| `PATCH` overwrites a concurrent edit | No optimistic concurrency | `ETag` + `If-Match`, return `409` on mismatch |
+| Mobile is slow on a fast API | Over-fetching — 5.0× measured on a real payload | Sparse fieldsets with an allowlist, plus gzip |
+
+## Assessment
+
+**Concept questions**
+
+1. Why is `POST /getUser` wrong even though it works? *(It duplicates the verb into the path, so the same operation gains many spellings and nothing is cacheable or idempotent by contract.)*
+2. When do you return `409` rather than `422`? *(Valid request, conflicting state — stale version, duplicate, illegal transition.)*
+3. Why is offset pagination *incorrect*, not just slow? *(Concurrent inserts shift positions, so a client sees duplicates and misses rows.)*
+4. What must a cursor contain? *(The full sort key including a unique tiebreaker; opaque to the client.)*
+5. Where must the idempotency key be written relative to the effect? *(In the same transaction, or a crash between them causes a double effect.)*
+6. Name three changes that look additive but break clients. *(New response enum value; changing a numeric type or precision; changing default sort order.)*
+7. When is GraphQL the right answer? *(Many clients needing many shapes of one graph, and you can afford cost limiting, persisted queries and per-field authorisation.)*
+8. What does `Location` on a `201` save the client? *(Constructing the new resource's URL from your body format — which would couple them to it.)*
+
+**Coding challenge.** Implement keyset pagination over a 1,000,000-row table with an opaque signed cursor. Hidden tests: page boundaries are exact under concurrent inserts; a tampered cursor is rejected; the same page requested twice returns identical rows; p95 latency at depth 500,000 is under 10 ms.
+
+**Interview questions**
+
+- *Junior:* "Design the endpoints for a to-do app. Which status codes do you return?"
+- *Mid:* "Our list endpoint is slow at page 500. Walk me through the fix and its trade-offs."
+- *Senior:* "We need to add a field to a response consumed by 40 partners, some of whom have not deployed in a year. How do you do it?"
+
+**Draw it from memory.** Draw the resource-by-method grid with status codes filled in, then the two pagination strategies side by side with their measured timings.
+
+## Sources & further reading
+
+**Primary docs**
+
+- [RFC 9457 — Problem Details for HTTP APIs](https://www.rfc-editor.org/rfc/rfc9457) — read §3 and copy the field names exactly; a standard error shape you did not invent is one less thing to argue about.
+- [OpenAPI Specification 3.1](https://spec.openapis.org/oas/v3.1.0.html) — read the "Schema Object" section; 3.1's alignment with JSON Schema is what makes generated clients trustworthy.
+- [RFC 8288 — Web Linking](https://www.rfc-editor.org/rfc/rfc8288) — read this before inventing your own pagination envelope.
+
+**Papers and their takeaways**
+
+- **[Fielding (2000), chapter 5.](https://ics.uci.edu/~fielding/pubs/dissertation/rest_arch_style.htm)** *Takeaway:* REST is a set of constraints chosen for network-scale properties, not a URL naming convention; knowing which constraints you dropped is the useful part.
+- **[RFC 9110 §9.2.](https://www.rfc-editor.org/rfc/rfc9110)** *Takeaway:* safety and idempotency are contracts that intermediaries rely on, so violating them causes failures you cannot observe from your own service.
+- **[Google API Improvement Proposals (AIPs).](https://google.aip.dev/)** *Takeaway:* a large, opinionated, internally consistent design corpus — AIP-158 (pagination) and AIP-193 (errors) are worth reading even if you disagree.
+
+**Go deeper**
+
+- [Stripe's public API reference and their versioning documentation](https://docs.stripe.com/api) — read how they add fields without breaking anyone, and how per-account version pinning lets them evolve for a decade. It is the best worked example of API compatibility in public.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-06/p1-w06-m1">
+  Attempt the lab first. Seriously.
+</Card>

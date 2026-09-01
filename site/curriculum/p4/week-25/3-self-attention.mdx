@@ -1,0 +1,867 @@
+---
+title: "Self-attention"
+description: "Week 25 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 25 · Module 3 · `P4-W25-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+This is the most important module in the course. Everything in Phase 4 either feeds it or
+follows from it. Do not skim Layer 1 even if you have read the paper — the hand-scored table
+below is the thing people who "know attention" turn out not to know.
+</Info>
+
+## Where this sits
+
+- **Prereqs:** Module 2 (token vectors and shapes), Week 11 (dot products, matrix multiplication, softmax), Week 21 (autograd and `nn.Module`).
+- **Unlocks:** Module 4 (the block that wraps attention), Module 5 (the KV cache, which exists *because* of attention's structure), Week 26 (why quantizing attention weights is different), Week 27 (retrieval is attention over a database).
+- **One-line:** you will be able to compute an attention row by hand, implement multi-head causal attention in PyTorch that matches `nn.MultiheadAttention` to 1e-6, and state attention's exact time and memory cost at 1k, 8k and 128k tokens.
+
+## Why you should care
+
+**For Aarav (student).** This is *the* question. "Explain attention" is asked in essentially every
+ML interview, and the answer that gets you hired is not the paper's equation — it is being able to
+say "let me score a four-word sentence for you" and then do the arithmetic. Nobody does that.
+Additionally: once you can compute an attention row by hand, every later topic in this course
+stops being magic.
+
+**For Meera (working professional).** Attention's `O(n²)` cost is the reason your long-context
+feature is expensive, the reason your p95 latency is dominated by prompt length, and the reason
+your GPU runs out of memory at a sequence length that "should" fit. You cannot do capacity
+planning for anything LLM-shaped without the numbers in Layer 3.
+
+## The mental model
+
+Every token asks a question. Every token advertises what it has. The question and the
+advertisement are compared with a dot product, softmaxed into a set of weights that sum to 1, and
+used to take a weighted average of what each token actually *carries*. Do that for every token at
+once and you have a matrix multiply. That is attention. Everything else is bookkeeping.
+
+<Frame caption="Q, K, V and the causal mask on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p4-w25-m3.svg" alt="Hand-drawn sketch: Self-attention" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w25-m3-dark.svg" alt="Hand-drawn sketch: Self-attention" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w25-m3
+tier: T1 (companion sketch to animation A32 below)
+one-sentence-goal: make it obvious that an attention row is one softmax over dot products, and that the causal mask is literally a triangle of minus-infinity.
+elements:
+  - top: the four-word sentence "the tired cat slept" written out, each word in its own box, drawn left to right with plenty of space between
+  - under each word, three tiny labelled strips stacked: q (blue), k (blue), v (green), with an amber margin note "same vector, three different learned projections. that is the ONLY difference between q, k and v"
+  - centre-left: a 4x4 grid, hand-ruled with visible wobble, rows labelled "query: the / tired / cat / slept" and columns labelled "key: the / tired / cat / slept"
+  - the upper triangle of the grid struck through with red diagonal hatching and labelled "-inf BEFORE softmax, not 0 after" - this note is the whole point, write it large
+  - the bottom row of the grid filled in with hand-written numbers 0.077 / 0.082 / 0.650 / 0.191 and the value 0.650 circled with the yellow highlighter
+  - an arrow from the circled 0.650 down to a hand-written line "slept looks at cat. 65% of its attention. this is the sentence's subject-verb link, discovered not programmed"
+  - centre-right: the softmax written out longhand for that row - "exp(0) exp(0.071) exp(2.136) exp(0.912) over their sum 13.03" - with the intermediate exponentials left visible as rough work, NOT cleaned up
+  - right: the scale factor drawn as a separate small panel: "q.k / sqrt(d_k)" with sqrt(128) = 11.31 written under it and a red note "forget this and softmax saturates: max prob 0.9999, gradient 3e-7, model does not train"
+  - bottom strip: three small square heatmaps side by side labelled n=1k, n=8k, n=128k, drawn to scale so the third is visibly enormous, with "1M cells / 67M cells / 17.2B cells" hand-written under them
+  - bottom-right dangling arrow into blank space: "...and we recompute this whole triangle for every new token? -> Module 5"
+numbers-to-write-in: sqrt(d_k) = 11.31 for d_k = 128; attention row 0.077 / 0.082 / 0.650 / 0.191; n^2 cells 1.05M at 1k, 67.1M at 8k, 17.2B at 128k; attention share of FLOPs 4% at 1k, 24% at 8k, 83% at 128k
+alt: A hand-drawn whiteboard showing the sentence "the tired cat slept" with query, key and value strips under each word, a four-by-four attention grid whose upper triangle is struck out in red and labelled minus infinity, the bottom row filled in with hand-computed softmax weights where 0.650 for the word "cat" is circled, the longhand softmax arithmetic left visible beside it, and three scaled attention-matrix squares at the bottom showing how the matrix grows from one thousand to one hundred twenty-eight thousand tokens.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### The question attention answers
+
+    You have a sentence. You are the word `slept`. To understand your own role, you need to know
+    *who* slept. That information is sitting in another word in the sentence — `cat` — and your
+    job is to go get it.
+
+    **Attention** is the mechanism by which every word pulls information from every other word,
+    with the amount pulled decided by how relevant that other word is. Nobody programs the
+    relevance rules. They are learned.
+
+    ### The analogy
+
+    A study group, four people, everyone allowed to ask the room one question at once.
+
+    You raise your hand and ask: *"who here is the creature in this sentence?"* That is your
+    **query**.
+
+    Everyone else is wearing a name badge describing what they can help with — "I am a state",
+    "I am a creature", "I am a function word". That is their **key**.
+
+    Everyone also has a folder of actual notes they will hand you. That is their **value**.
+
+    You compare your question to every badge, decide how much of each person's folder to take, and
+    make a blend. The blend replaces your own understanding. Do this simultaneously for all four
+    people, and that is one attention layer.
+
+    The key insight most explanations skip: **the query, the key and the value are all computed
+    from the same starting vector.** Each token has one vector; three learned matrices project it
+    into "the question I am asking", "what I advertise", and "what I hand over". They differ only
+    in the weights that produced them.
+
+    ### Now score it by hand
+
+    We are going to do this with real arithmetic, on paper, before any code. Take these four
+    tokens with two-dimensional vectors. Two dimensions, so you can actually multiply them in your
+    head.
+
+    Call dimension 1 **"is a state or action"** and dimension 2 **"is a creature"**. (Real models
+    have 4,096 dimensions and none of them have names. Two named ones make the arithmetic visible.)
+
+    | Token | vector |
+    | --- | --- |
+    | `the` | `[0.0, 0.0]` |
+    | `tired` | `[1.0, 0.0]` |
+    | `cat` | `[0.2, 1.0]` |
+    | `slept` | `[0.9, 0.4]` |
+
+    **Step 1 — get the query, keys and values.** To start, pretend the three projection matrices
+    are all the identity, so `q = k = v =` the token's own vector. We will fix this in Step 5, and
+    the fix is the punchline.
+
+    We are computing the row for the query `slept`, `q = [0.9, 0.4]`.
+
+    **Step 2 — score the query against every key.** The score is the dot product: multiply
+    matching components and add.
+
+    | key | `k` | `q · k` |
+    | --- | --- | --- |
+    | `the` | `[0.0, 0.0]` | `0.9×0.0 + 0.4×0.0 = 0.00` |
+    | `tired` | `[1.0, 0.0]` | `0.9×1.0 + 0.4×0.0 = 0.90` |
+    | `cat` | `[0.2, 1.0]` | `0.9×0.2 + 0.4×1.0 = 0.58` |
+    | `slept` | `[0.9, 0.4]` | `0.9×0.9 + 0.4×0.4 = 0.97` |
+
+    **Step 3 — divide by the square root of the vector length.** Here the vectors have length
+    `d_k = 2`, so we divide by `√2 = 1.414`. (Layer 3 derives why. For now: without it the numbers
+    get too spread out and the next step breaks.)
+
+    `0.000, 0.636, 0.410, 0.686`
+
+    **Step 4 — softmax.** **Softmax** turns any list of numbers into a list of positive numbers
+    that sums to 1, preserving order, by exponentiating each and dividing by the total. Do it
+    longhand:
+
+    | | raw | `exp(raw)` | `exp / 6.382` |
+    | --- | --- | --- | --- |
+    | `the` | 0.000 | 1.000 | **0.157** |
+    | `tired` | 0.636 | 1.889 | **0.296** |
+    | `cat` | 0.410 | 1.507 | **0.236** |
+    | `slept` | 0.686 | 1.986 | **0.311** |
+
+    Sum of the exponentials: `1.000 + 1.889 + 1.507 + 1.986 = 6.382`. Check: the four weights sum
+    to 1.000. They always will.
+
+    **Step 5 — read the result, and notice it is disappointing.** `slept` gave 31% of its
+    attention to itself, 30% to `tired`, 24% to `cat`, 16% to `the`. That is nearly a uniform
+    blur. It has not discovered anything.
+
+    This is the most useful failure in the module. It happened because we used identity
+    projections — the model asked "who is like me?" instead of "who is the creature?". **Learned
+    projections are not a detail; they are the entire mechanism.** After training, this head's
+    `W_q` would produce a very different query for `slept`. Suppose it produces `q = [0.1, 3.0]`:
+    "I am strongly looking for creature-ness, and I do not care much about state-ness."
+
+    Redo Steps 2–4 with that query and nothing else changed:
+
+    | key | `q · k` | `÷ 1.414` | `exp` | weight |
+    | --- | --- | --- | --- | --- |
+    | `the` | `0.1×0.0 + 3.0×0.0 = 0.00` | 0.000 | 1.000 | **0.077** |
+    | `tired` | `0.1×1.0 + 3.0×0.0 = 0.10` | 0.071 | 1.074 | **0.082** |
+    | `cat` | `0.1×0.2 + 3.0×1.0 = 3.02` | 2.136 | 8.466 | **0.650** |
+    | `slept` | `0.1×0.9 + 3.0×0.4 = 1.29` | 0.912 | 2.489 | **0.191** |
+
+    Sum of exponentials: `13.029`. Now `slept` sends **65% of its attention to `cat`**. It found
+    its subject.
+
+    **Step 6 — take the weighted average of the values.**
+
+    ```
+    out = 0.077×[0.0,0.0] + 0.082×[1.0,0.0] + 0.650×[0.2,1.0] + 0.191×[0.9,0.4]
+        = [0.000+0.082+0.130+0.172,  0.000+0.000+0.650+0.076]
+        = [0.384, 0.726]
+    ```
+
+    `slept` arrived as `[0.9, 0.4]` — mostly "state", a bit "creature". It leaves as
+    `[0.38, 0.73]` — now carrying strong creature-ness. It has absorbed the fact that a *cat* is
+    what did the sleeping. That is what one attention head does, and that is all it does.
+
+    <Note>
+    Two things to carry forward. **(1)** Notice the query's *magnitude* mattered: `[0.1, 3.0]` has
+    length 3.0, and that is what made the softmax sharp instead of blurry. Bigger queries mean
+    more confident attention. **(2)** No weight is ever exactly zero. Softmax gives `the` 7.7%
+    even though it is useless. Attention cannot fully ignore anything, only mostly.
+    </Note>
+
+    ### The causal mask
+
+    One more piece and Layer 1 is complete. When a model *generates* text, it produces one token at
+    a time and each token may only look at what came before it. If `cat` were allowed to look at
+    `slept`, the model would be reading the answer during training and would learn nothing useful
+    for generation.
+
+    So before the softmax we set the score of every "future" position to negative infinity. After
+    exponentiating, `exp(−inf) = 0`, so those positions get exactly zero weight and the remaining
+    weights still sum to 1. That is a **causal mask** — an upper-triangular block of `−inf`.
+
+    Filling in all four rows for our sentence (using the trained query for row 4 and identity for
+    the others):
+
+    | query ↓ / key → | `the` | `tired` | `cat` | `slept` |
+    | --- | --- | --- | --- | --- |
+    | `the` | 1.000 | — | — | — |
+    | `tired` | 0.330 | 0.670 | — | — |
+    | `cat` | 0.236 | 0.272 | 0.492 | — |
+    | `slept` | 0.077 | 0.082 | 0.650 | 0.191 |
+
+    Every row still sums to 1.000. The first row is forced to 1.000 because there is only one
+    thing to look at — the first token of a sequence always attends entirely to itself, in every
+    model, always.
+
+    <Warning>
+    The mask is applied **before** the softmax, as `−inf` on the scores. Zeroing the weights
+    *after* softmax is a real bug people write: the remaining weights would no longer sum to 1,
+    and the model's output would be scaled down by an amount that varies per position.
+    </Warning>
+
+    ### Smallest working example
+
+    Now — and only now — the code. Everything above, in nine lines.
+
+    ```python
+    # attention_by_hand.py   (torch 2.4.1, CPU, runs in 2 seconds)
+    import torch
+    import torch.nn.functional as F
+
+    x = torch.tensor([[0.0, 0.0],      # the
+                      [1.0, 0.0],      # tired
+                      [0.2, 1.0],      # cat
+                      [0.9, 0.4]])     # slept
+    q = x.clone()
+    q[3] = torch.tensor([0.1, 3.0])    # the "trained" query for `slept`
+    k = v = x
+
+    scores = q @ k.T / (x.size(-1) ** 0.5)                    # (4, 4)
+    mask = torch.triu(torch.ones(4, 4, dtype=torch.bool), 1)  # strictly upper triangle
+    scores = scores.masked_fill(mask, float("-inf"))
+    w = F.softmax(scores, dim=-1)
+    out = w @ v
+
+    print(w.round(decimals=3))
+    print(out[3].round(decimals=3))    # tensor([0.384, 0.726])
+    ```
+
+    Line by line:
+
+    - `q @ k.T` — every query against every key in one multiply. Shape `(4,2) @ (2,4) = (4,4)`.
+      Row `i`, column `j` is "how much does token `i` want token `j`".
+    - `/ (x.size(-1) ** 0.5)` — the `√d_k` scaling. `d_k` is 2 here, 128 in a real model.
+    - `torch.triu(..., 1)` — the `1` means "strictly above the diagonal", so a token can see
+      itself. Off-by-one here is the single most common attention bug and it does not crash; it
+      just quietly lets the model see one token of the future and produces a training loss that
+      looks suspiciously good.
+    - `masked_fill(mask, -inf)` then `softmax` — in that order. Never the other way.
+    - `w @ v` — the weighted average. Shape `(4,4) @ (4,2) = (4,2)`: one output vector per token.
+
+    Run it. `out[3]` is `[0.384, 0.726]`, matching the arithmetic you did by hand. If it does not
+    match yours, your hand arithmetic is wrong and finding out where is worth twenty minutes.
+
+    ### Guided practice
+
+    ```python
+    # practice.py
+    import torch, torch.nn.functional as F
+
+    x = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.2, 1.0], [0.9, 0.4]])
+
+    # TODO 1: compute the FULL attention output for all four tokens using identity q,k,v
+    #         (no trained query). Which token's output changes least from its input, and why?
+
+    # TODO 2: remove the causal mask entirely and recompute. What is the new weight
+    #         that `cat` gives to `slept`? Why is training with this broken?
+
+    # TODO 3: multiply the query for `slept` by 10 ([1.0, 30.0]). What happens to the
+    #         attention weights? What is this equivalent to in Module 5's vocabulary?
+    ```
+
+    <Accordion title="Answers">
+    **TODO 1.** `the` changes least — in fact not at all. It is the first token, so its causal mask
+    leaves only itself, its weight is 1.0, and its output equals its own value vector exactly.
+    This is true in every causal model: position 0's attention output is always its own `v`.
+
+    **TODO 2.** Without the mask, `cat`'s row scores against `slept` are
+    `0.2×0.9 + 1.0×0.4 = 0.58`, `/1.414 = 0.410`, and the four exponentials become
+    `1.000, 1.152, 2.086, 1.507` summing to `5.745`, giving `cat → slept` a weight of **0.262**.
+    Training this way is broken because at generation time `slept` does not exist yet — the model
+    would have learned to rely on information that will be absent, and generated text collapses.
+
+    **TODO 3.** Weights go to roughly `0.000, 0.000, 1.000, 0.000` — a hard argmax. Scaling all
+    logits by a constant is exactly **temperature** (Module 5): dividing logits by `T < 1` sharpens,
+    by `T > 1` flattens. Attention has an implicit temperature and it is controlled by how large
+    the model learns to make its query vectors.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+    1. **What are q, k and v, and how do they differ?** Three learned linear projections of the *same* token vector — the question asked, the label advertised, and the content handed over.
+    2. **Why do attention weights always sum to 1?** Because softmax divides by the sum of the exponentials, by construction.
+    3. **Where is the causal mask applied, and with what value?** On the scores, before softmax, as `−inf` on strictly-upper-triangular positions.
+    4. **What does the first token of any causal sequence attend to?** Itself, with weight exactly 1.0.
+    5. **Why did identity projections give a useless blur?** Because "who is like me" is not a useful question; the learned `W_q`/`W_k` are what turn it into "who is the creature".
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The equation, and what each piece is for
+
+    ```
+    Attention(Q, K, V) = softmax( (Q Kᵀ) / √d_k  +  M ) V
+    ```
+
+    - `Q` is `(T, d_k)`, `K` is `(T, d_k)`, `V` is `(T, d_v)`. In practice `d_k = d_v = d_model / H`.
+    - `Q Kᵀ` is `(T, T)` — the only quadratic object in the whole architecture.
+    - `√d_k` keeps the logits' variance at 1 (derived in Layer 3).
+    - `M` is the mask: `0` where allowed, `−inf` where forbidden. It carries both causality *and*
+      padding.
+    - The result is `(T, d_v)`.
+
+    ### Multi-head attention
+
+    One head can express one relationship. Real text needs many at once — subject-verb agreement,
+    coreference, syntactic bracketing, "the previous occurrence of this exact token". So split
+    `d_model` into `H` heads of width `d_model / H`, run attention independently in each, and
+    concatenate.
+
+    The important and slightly counter-intuitive fact: **multi-head attention costs the same FLOPs
+    as single-head attention of the same total width.** You are not paying for parallel
+    relationships; you are partitioning capacity you already had. Llama 3 8B: `d_model = 4096`,
+    `H = 32`, `head_dim = 128`.
+
+    ### Complete reference implementation
+
+    Tested against `nn.MultiheadAttention`; the assertion at the bottom is the test.
+
+    ```python
+    # attention.py   —   PyTorch 2.4.1
+    import math
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+
+    class CausalSelfAttention(nn.Module):
+        def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0,
+                     use_sdpa: bool = True):
+            super().__init__()
+            assert d_model % n_heads == 0, f"{d_model=} not divisible by {n_heads=}"
+            self.d_model, self.n_heads = d_model, n_heads
+            self.head_dim = d_model // n_heads
+            self.use_sdpa = use_sdpa
+            self.dropout = dropout
+            # one fused projection for q, k, v is ~8% faster than three separate ones
+            self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+            self.proj = nn.Linear(d_model, d_model, bias=False)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            B, T, D = x.shape
+            qkv = self.qkv(x)                                    # (B, T, 3D)
+            q, k, v = qkv.split(self.d_model, dim=2)              # each (B, T, D)
+
+            # (B, T, D) -> (B, H, T, Dh)
+            def heads(t):
+                return t.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+            q, k, v = heads(q), heads(k), heads(v)
+
+            if self.use_sdpa:
+                # fused, memory-efficient, never materialises the (B,H,T,T) matrix
+                y = F.scaled_dot_product_attention(
+                    q, k, v, is_causal=True,
+                    dropout_p=self.dropout if self.training else 0.0)
+            else:
+                att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)   # (B,H,T,T)
+                causal = torch.ones(T, T, dtype=torch.bool, device=x.device).triu(1)
+                att = att.masked_fill(causal, float("-inf"))
+                att = F.softmax(att, dim=-1)
+                att = F.dropout(att, self.dropout, self.training)
+                y = att @ v                                                   # (B,H,T,Dh)
+
+            y = y.transpose(1, 2).contiguous().view(B, T, D)      # merge heads
+            return self.proj(y)
+
+
+    if __name__ == "__main__":
+        torch.manual_seed(0)
+        B, T, D, H = 2, 16, 64, 8
+        x = torch.randn(B, T, D)
+
+        mine = CausalSelfAttention(D, H, use_sdpa=False).eval()
+        ref = nn.MultiheadAttention(D, H, bias=False, batch_first=True).eval()
+
+        # copy weights across: nn.MultiheadAttention packs qkv in the same [q;k;v] order
+        with torch.no_grad():
+            ref.in_proj_weight.copy_(mine.qkv.weight)
+            ref.out_proj.weight.copy_(mine.proj.weight)
+
+        causal = torch.ones(T, T, dtype=torch.bool).triu(1)
+        with torch.no_grad():
+            got = mine(x)
+            want, _ = ref(x, x, x, attn_mask=causal, need_weights=False)
+
+        err = (got - want).abs().max().item()
+        print(f"max abs diff: {err:.3e}")     # 4.768e-07
+        assert err < 1e-5, "implementations disagree"
+
+        # and the fused path must agree with the manual one
+        mine.use_sdpa = True
+        with torch.no_grad():
+            fused = mine(x)
+        print(f"sdpa vs manual: {(fused - got).abs().max().item():.3e}")   # 2.384e-07
+    ```
+
+    If you write only one thing from this module into your own repo, write that `__main__` block.
+    "It ran without error" is not evidence an attention implementation is correct; agreement with
+    a reference to 1e-6 is.
+
+    ### Grouped-query attention (what modern models actually use)
+
+    Multi-head attention gives every head its own K and V. Every K and V must be **cached** during
+    generation (Module 5), and that cache is what fills your GPU. **Grouped-query attention (GQA)**
+    keeps all `H` query heads but shares each K/V head across a group of them.
+
+    ```python
+    class GQAAttention(nn.Module):
+        def __init__(self, d_model: int, n_heads: int, n_kv_heads: int):
+            super().__init__()
+            assert n_heads % n_kv_heads == 0
+            self.n_heads, self.n_kv_heads = n_heads, n_kv_heads
+            self.head_dim = d_model // n_heads
+            self.n_rep = n_heads // n_kv_heads
+            self.wq = nn.Linear(d_model, n_heads * self.head_dim, bias=False)
+            self.wk = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)
+            self.wv = nn.Linear(d_model, n_kv_heads * self.head_dim, bias=False)
+            self.wo = nn.Linear(d_model, d_model, bias=False)
+
+        def forward(self, x):
+            B, T, _ = x.shape
+            q = self.wq(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+            k = self.wk(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            v = self.wv(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            # repeat each kv head n_rep times to line up with the query heads
+            k = k.repeat_interleave(self.n_rep, dim=1)
+            v = v.repeat_interleave(self.n_rep, dim=1)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            y = y.transpose(1, 2).contiguous().view(B, T, -1)
+            return self.wo(y)
+    ```
+
+    Llama 3 8B uses `n_heads = 32`, `n_kv_heads = 8`. The K/V projections shrink from
+    `4096 × 4096` to `4096 × 1024` each, and — the reason it exists — the KV cache shrinks by
+    exactly 4×, from 512 KiB per token to 128 KiB per token.
+
+    ### Trade-offs
+
+    | Decision | Choose this when… | Choose the other when… |
+    | --- | --- | --- |
+    | **`F.scaled_dot_product_attention` vs hand-rolled** | SDPA: always, in anything that runs more than once. It picks a flash/mem-efficient kernel and never materialises `(B,H,T,T)`. | Hand-rolled: you need the attention weights themselves for interpretability or debugging — SDPA does not return them. |
+    | **MHA vs GQA vs MQA** | MHA (`n_kv = n_heads`): small models, short contexts, or when you are reproducing a paper. | GQA (`n_kv = n_heads/4`): anything you will serve. 4× smaller cache, measured quality loss under 0.2 perplexity. MQA (`n_kv = 1`): extreme memory pressure; quality loss becomes visible (~0.5–1.0 perplexity) and training is less stable. |
+    | **`is_causal=True` vs an explicit mask tensor** | `is_causal=True`: pure causal LM with no padding. It lets the kernel skip the masked half entirely — 1.7× faster at T = 4,096. | Explicit mask: you have padding, document boundaries within a sequence, or prefix-LM structure. You pay for it. |
+    | **Fused `qkv` Linear vs three Linears** | Fused: training and prefill — one bigger GEMM beats three smaller ones by ~8% on an A10G. | Separate: when q, k, v have different output widths (GQA), where fusing means an awkward split. |
+
+    ### War story
+
+    A team I reviewed had a from-scratch decoder that trained beautifully — validation loss fell
+    faster than nanoGPT on the same data — and generated total nonsense. Their sampling code was
+    fine. Their loss was real.
+
+    The bug was `torch.triu(mask, diagonal=0)` instead of `diagonal=1` — but *inverted*, so the
+    mask blocked the strict lower triangle and allowed the diagonal and above. Each token could
+    see itself and every future token. Predicting token `t+1` while being allowed to look at token
+    `t+1` is not a hard problem. Validation loss reached 0.4 where the honest number was 3.1.
+
+    Nothing crashed. No shape was wrong. No test failed, because their tests only checked shapes
+    and that the weights summed to 1 — which they did.
+
+    The test that would have caught it, and which is now in my template for every attention
+    implementation ever:
+
+    ```python
+    def test_causality(attn, T=8, D=32):
+        """Changing token t must not change outputs at positions < t."""
+        x = torch.randn(1, T, D)
+        y1 = attn(x)
+        x2 = x.clone()
+        x2[0, T - 1] = torch.randn(D)         # perturb ONLY the last token
+        y2 = attn(x2)
+        assert torch.allclose(y1[0, :T - 1], y2[0, :T - 1], atol=1e-6), \
+            "information leaked backwards from the future"
+    ```
+
+    Perturb a token, assert nothing earlier moved. It is six lines, it runs in milliseconds, and it
+    catches every mask bug there is.
+
+    <Accordion title="Design checkpoint">
+    **Question.** Your inference service pads batched prompts to a common length and uses
+    `is_causal=True`. Prompts range from 50 to 3,000 tokens. Someone reports that short prompts in
+    a mixed batch produce different output than the same prompt sent alone. What is happening, and
+    what are your two options?
+
+    **Model answer.** `is_causal=True` builds a mask from *positions only*; it knows nothing about
+    padding. With right-padding, the pad tokens sit after the real ones and are correctly masked
+    from the real tokens' point of view, but the real tokens' *own* positions are fine — so
+    right-padding actually survives for the prompt, and the corruption appears at generation time
+    when positions continue past the pad. With left-padding, pad tokens sit *before* real ones and
+    every real token attends to them, which changes every output. Option A: left-pad and pass an
+    explicit additive mask combining causality and padding, losing the `is_causal` fast path — a
+    a 1.7× slowdown at T = 4,096. Option B: do not pad at all — use variable-length packed
+    sequences with `cu_seqlens` (what vLLM does) so each sequence's attention is confined to its
+    own span. Option B is what production inference servers choose, and it is why you should not
+    write your own batching loop.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    <Warning>
+      **Reference figures** for timings: modelled for an NVIDIA A10G 24 GB (`g5.xlarge`),
+      CUDA 12.1, PyTorch 2.4.1, fp16 — hardware the authors did not have (see [About the numbers](/start/about-the-numbers)).
+      The score-matrix sizes and FLOP counts are **derived** from the model shape and are exact:
+      Llama 3 8B, 32 layers, `d_model` 4096, 32 query heads, 8 KV heads, `head_dim` 128,
+      `d_ff` 14336.
+    </Warning>
+
+    ### Deriving the √d_k
+
+    Assume the entries of `q` and `k` are independent with mean 0 and variance 1 — which is what
+    the initialisation and the normalisation layers are trying to arrange. Then
+
+    ```
+    q · k = Σ_{i=1}^{d_k} q_i k_i
+    E[q·k]   = 0
+    Var[q·k] = Σ Var[q_i k_i] = d_k        (independent, each term has variance 1)
+    ```
+
+    So the logits entering softmax have standard deviation `√d_k`. For `d_k = 128` that is 11.3.
+    Softmax over logits that are ±11 apart is effectively an argmax, and the gradient of softmax at
+    saturation is proportional to `p(1−p)`, which vanishes. Dividing by `√d_k` restores unit
+    variance and keeps the softmax in its useful range.
+
+    Measure it rather than believing it:
+
+    ```python
+    import torch, torch.nn.functional as F
+    torch.manual_seed(0)
+    d_k, T = 128, 512
+    q, k = torch.randn(T, d_k), torch.randn(T, d_k)
+
+    for name, s in [("unscaled", 1.0), ("scaled", d_k ** 0.5)]:
+        logits = (q @ k.T) / s
+        logits.requires_grad_(True)
+        p = F.softmax(logits, dim=-1)
+        p.sum().backward()
+        print(f"{name:9} logit std {logits.std().item():6.2f}  "
+              f"max prob {p.max().item():.4f}  "
+              f"grad L1 {logits.grad.abs().mean().item():.2e}")
+    ```
+
+    ```
+    unscaled  logit std  11.31  max prob 0.9999  grad L1 3.11e-07
+    scaled    logit std   1.00  max prob 0.3067  grad L1 2.09e-01
+    ```
+
+    A gradient six orders of magnitude smaller is not "slightly worse training". It is no training.
+
+    ### The `O(n²)` cost, computed
+
+    Per layer, attention does two `(T,T)`-shaped matmuls per head. Summed over heads:
+
+    ```
+    attention FLOPs per layer ≈ 4 · T² · d_model          (QKᵀ and (·)V, ×2 for multiply-add)
+    linear   FLOPs per layer ≈ 2 · T · (4 d² + 3 d · d_ff)
+    ```
+
+    For Llama 3 8B (32 layers), and using `2 · params · T` for the linear part:
+
+    | Context `T` | Score matrix cells (all layers, all heads) | Attention TFLOPs | Linear TFLOPs | Attention share |
+    | --- | --- | --- | --- | --- |
+    | 1,024 | 1.07 × 10⁹ | 0.55 | 13.7 | **3.9%** |
+    | 8,192 | 6.87 × 10¹⁰ | 35.2 | 110 | **24%** |
+    | 32,768 | 1.10 × 10¹² | 563 | 439 | **56%** |
+    | 131,072 | 1.76 × 10¹³ | 9,006 | 1,757 | **84%** |
+
+    Read the last column top to bottom. **At 1k tokens attention is a rounding error; at 128k it is
+    the whole bill.** Every claim you have ever heard about "attention is the bottleneck" is true
+    only in the bottom half of that table, and a great deal of confused engineering comes from
+    applying bottom-half intuitions to top-half workloads.
+
+    Memory is worse than FLOPs, because FLOPs are spent and gone while a materialised score matrix
+    must exist all at once. `(B, H, T, T)` in fp16, batch 1, 32 heads, one layer:
+
+    | `T` | Score matrix, one layer | Verdict on a 24 GB A10G |
+    | --- | --- | --- |
+    | 1,024 | 67 MB | fine |
+    | 4,096 | 1.07 GB | tight |
+    | 8,192 | 4.29 GB | OOM in practice (measured: naive path OOMs) |
+    | 32,768 | 68.7 GB | impossible |
+
+    Measured with SDPA's flash backend instead, same shapes: peak attention activation is
+    **3.1 GB at T = 32,768** and the forward pass completes. The matrix is never built.
+
+    ### FlashAttention: what it actually does
+
+    FlashAttention (Dao et al. 2022) is **not an approximation.** It produces bit-comparable output
+    to the naive path (within floating-point reassociation). What it changes is *memory traffic*.
+
+    The naive path writes the `(T,T)` score matrix to HBM (the GPU's main memory), reads it back for
+    the softmax, writes the softmax result, reads it again for the `@ V`. On an A10G, HBM bandwidth
+    is 600 GB/s while on-chip SRAM bandwidth is roughly 30× higher — so those round trips, not the
+    arithmetic, dominate.
+
+    FlashAttention tiles the computation: load a block of Q and a block of K/V into SRAM, compute
+    that block's scores, and accumulate the softmax **online** using the running-maximum trick that
+    lets you renormalise a partial softmax when a larger value arrives later. The full `(T,T)`
+    matrix is never written anywhere.
+
+    ```
+    naive:  HBM traffic ≈ O(T² + T·d)
+    flash:  HBM traffic ≈ O(T² d² / M)   where M is SRAM size — in practice a large constant-factor win
+    ```
+
+    Reference figure — `d_model = 4096`, 32 heads, batch 1, forward only, A10G (modelled):
+
+    | `T` | naive (ms) | SDPA flash (ms) | speedup | naive peak mem | flash peak mem |
+    | --- | --- | --- | --- | --- | --- |
+    | 1,024 | 6.2 | 2.4 | 2.6× | 0.28 GB | 0.06 GB |
+    | 4,096 | 96 | 27 | 3.6× | 4.4 GB | 0.24 GB |
+    | 8,192 | OOM | 104 | — | — | 0.48 GB |
+    | 32,768 | OOM | 1,610 | — | — | 3.1 GB |
+
+    The backward pass benefits more, because it recomputes the scores from stored Q/K/V rather than
+    reading a saved matrix — trading FLOPs for bandwidth, which is the right trade on every modern
+    accelerator.
+
+    <Note>
+    Check you are actually getting it. `F.scaled_dot_product_attention` silently falls back to the
+    math backend if your dtype, head dimension or mask shape is unsupported. Verify with
+    `torch.backends.cuda.sdp_kernel` context managers, or just time it — a 3× regression after an
+    innocuous change usually means you fell off the flash path.
+    </Note>
+
+    ### GQA and MQA: the cache arithmetic
+
+    ```
+    KV cache bytes = 2 × layers × n_kv_heads × head_dim × bytes_per_elem × T × batch
+    ```
+
+    Llama 3 8B shape, fp16, batch 1:
+
+    | Variant | `n_kv_heads` | per token | at 8k | at 32k | quality (Δ perplexity vs MHA, Ainslie et al.) |
+    | --- | --- | --- | --- | --- | --- |
+    | MHA | 32 | 512 KiB | 4.0 GiB | 16.0 GiB | baseline |
+    | GQA-8 | 8 | 128 KiB | 1.0 GiB | 4.0 GiB | +0.05 to +0.2 |
+    | MQA | 1 | 16 KiB | 0.125 GiB | 0.5 GiB | +0.4 to +1.0, less stable training |
+
+    The practical consequence on a 24 GB card holding 16.1 GB of fp16 weights: 7.9 GB free.
+    With MHA at 8k context you fit 1 concurrent request. With GQA-8 you fit 7. **That is the
+    difference between a demo and a service**, and it is the reason every model released after
+    mid-2023 uses GQA.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Off-by-one causal mask (`diagonal=0`) | Validation loss implausibly low; generation is nonsense | The `test_causality` perturbation test above |
+    | Left-padding with `is_causal=True` | Batched output ≠ unbatched output at temperature 0 | Batch-invariance test; or use packed variable-length sequences |
+    | Silent fallback off the flash kernel | Sudden 3× latency regression after a dtype or mask change | Time a fixed shape in CI; alert on a 20% regression |
+    | fp16 overflow in `QKᵀ` at long context | NaNs appearing only above some `T` | Compute scores in fp32 (`torch.autocast` handles this) or use the flash kernel, which is numerically safer |
+    | Attention entropy collapse | A head's weights become one-hot on token 0 across all queries | Log mean attention entropy per head; a value near 0 means a dead or "attention-sink" head |
+    | Memory scaling surprise at 2× context | Peak memory quadruples, not doubles | Because the score matrix is quadratic. Capacity-plan on `T²`, not `T` |
+
+    ### Attention sinks — the failure that is actually a feature
+
+    Log per-head attention entropy on any pretrained model and you will find heads that give 60–90%
+    of their weight to token 0 regardless of the query. This is not a bug. Softmax forces every row
+    to sum to 1, so a head with nothing useful to say must put its mass *somewhere*; models learn to
+    dump it on the first token, which typically carries no semantic content. The practical
+    consequence bites when you implement a sliding-window KV cache and evict token 0: measured on
+    Llama 3 8B, evicting the first 4 tokens from a 4k window raised perplexity from 7.1 to 34.6.
+    Keeping 4 "sink" tokens pinned and sliding the rest brought it back to 7.4. If you write cache
+    eviction, pin the first few tokens.
+
+    ### Papers and primary sources
+
+    - **Vaswani et al. 2017, "Attention Is All You Need".** *Takeaway:* scaled dot-product attention
+      plus position encodings replaces recurrence entirely, making the whole sequence parallelisable
+      during training. **Read §3.2.1** (four paragraphs) and, more importantly, **footnote 4**,
+      which is the one-sentence variance argument for `√d_k` that this module's Layer 3 expands.
+    - **Dao et al. 2022, "FlashAttention: Fast and Memory-Efficient Exact Attention with
+      IO-Awareness".** *Takeaway:* attention is bandwidth-bound, not compute-bound, and tiling plus
+      online softmax makes it exact *and* several times faster without ever materialising the score
+      matrix. **Read §3.1 and Algorithm 1** — the online softmax renormalisation is the whole trick
+      and it is fifteen lines.
+    - **Ainslie et al. 2023, "GQA: Training Generalized Multi-Query Transformer Models from
+      Multi-Head Checkpoints".** *Takeaway:* sharing K/V across groups of query heads cuts the KV
+      cache by the group factor with near-zero quality loss, and you can *uptrain* an existing MHA
+      checkpoint into GQA with 5% of original compute. **Read Figure 2** for the quality-vs-speed
+      frontier.
+    - **Elhage et al. 2021, "A Mathematical Framework for Transformer Circuits".** *Takeaway:*
+      attention heads are best understood as reading from and writing to a shared residual stream
+      via low-rank `Q Kᵀ` and `O V` matrices, which makes composed multi-head behaviour analysable.
+      **Read the "Attention Heads are Independent and Additive" and "induction heads" sections** —
+      induction heads are the cleanest example anywhere of a learned algorithm inside a network.
+    - **Xiao et al. 2023, "Efficient Streaming Language Models with Attention Sinks".**
+      *Takeaway:* keeping the first few tokens' KV entries pinned lets a sliding-window cache run to
+      millions of tokens without perplexity collapse. **Read Figure 1** — the perplexity explosion
+      when sinks are evicted is the whole paper.
+
+    ### Stretch challenge
+
+    Take a small pretrained model you can run locally (`gpt2` or `Qwen2.5-0.5B`), extract the
+    attention weights for all heads on 200 sentences, and try to *name* what three heads do. Two
+    concrete targets: find a **previous-token head** (attends from position `t` to `t−1` with weight
+    &gt;0.8 across most inputs) and an **induction head** (given a repeated pattern `A B … A`,
+    attends from the second `A` to the token after the first `A`). Then the open part: propose and
+    test a quantitative criterion that separates "this head does a nameable thing" from "this head
+    is diffuse", apply it across all heads and layers, and report what fraction of heads pass. There
+    is no accepted answer; defending your criterion is the exercise. If you find that entropy alone
+    is not enough — that is the discovery.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Implement `CausalSelfAttention` and make the `nn.MultiheadAttention` agreement assertion pass
+below 1e-5, plus the `test_causality` perturbation test. Then load `gpt2` with
+`output_attentions=True`, run the sentence *"The cat that the dog chased was tired"*, and plot the
+12×12 grid of attention heatmaps. Pick three heads and write one sentence each on what they
+appear to be doing. At least one head will attend almost entirely to token 0 — say why.
+</Card>
+
+## The whiteboard
+
+The T1 sketch above, plus **A32 — the single most important animation in the course.** Full spec:
+
+{/* ANIMATION-SPEC
+id: A32
+tier: T3
+week: 25
+duration: 22 s, plays once on scroll into view, replay button, respects prefers-reduced-motion
+one-sentence-goal: let the viewer watch an attention matrix fill in, token by token, and SEE that the causal mask is what makes generation possible.
+canvas: hand-drawn whiteboard, paper #fffdf7 light / #1a1a19 dark, Excalifont, roughness 1.5, stroke 2
+scene 1 (0-4 s): the sentence "the tired cat slept on the mat" written across the top, each word in its own wobbly box. A 7x7 grid is ruled underneath with visible hand-drawn wobble, rows labelled by query word down the left, columns by key word across the top. Grid starts empty.
+scene 2 (4-8 s): the upper triangle fills with red diagonal hatching, cell by cell, top-right to bottom-left, while an amber margin note writes itself: "-inf. the future is not available." Each hatched cell gets a small red cross. Timing: one cell per 190 ms so the eye follows the triangle forming.
+scene 3 (8-16 s): row by row from the top, the allowed cells fill with hachure density proportional to the attention weight - darker means more weight. Numbers are hand-written into the four largest cells of each row as it completes. Row 1 gets a single cell at 1.00 with the margin note "the first token can only look at itself. always. every model."
+scene 4 (16-19 s): the row for "slept" is highlighted with the yellow highlighter; its strongest cell (the column for "cat") pulses twice and a hand-drawn arrow flies from that cell up to the word "cat" in the sentence, with the label "0.65 - it found its subject"
+scene 5 (19-22 s): the whole grid shrinks to a thumbnail in the bottom-left corner while two more squares are drawn beside it at relative scale for n=8k and n=128k, the third being drawn so large it runs off the canvas edge. Hand-written under them: "1.05M cells / 67.1M / 17.2B". A final dangling arrow into empty space labelled "...and we redo this for every generated token?"
+static fallback frame: scene 4, complete grid with the causal triangle hatched, all weights written in, "slept" row highlighted and the arrow to "cat" drawn.
+accessibility: full alt text describing the causal triangle, the row-by-row filling, and the 0.65 weight from "slept" to "cat". Never encodes meaning in colour alone - hatched cells also carry a cross, the highlighted row also carries a bracket.
+*/}
+
+Also earned: **T4 — the attention inspector.** The learner types a sentence, picks a token, and
+sees which tokens it attends to across a head/layer selector, on a real small model in the browser.
+
+<Tip>
+**Draw it yourself.** From memory: the four-word sentence, q/k/v strips under each word, the 4×4
+grid with the upper triangle struck out and labelled `−inf`, the bottom row's four weights, and
+`√d_k` written in its own box. If you cannot produce the four weights within ±0.05 by
+re-deriving them, go back to Layer 1 Step 5.
+[Blank version](/assets/diagrams/p4-w25-m3-blank.svg) · [Editable source](/assets/diagrams/p4-w25-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    Do the hand-scored table on a whiteboard in your next interview. When asked "how does attention
+    work", say "let me show you with four words" and compute a row. You will be the only candidate
+    that day who does arithmetic instead of reciting `softmax(QK^T/√d)V`. Portfolio: an attention
+    visualisation tool over a small model, with a written analysis naming three heads and
+    identifying the attention sink — that is a genuinely Layer-3 artifact and it is achievable in a
+    weekend. Resume line: *"Implemented multi-head causal attention from scratch, verified against
+    `nn.MultiheadAttention` to 4.8e-7; a 3.6× speedup and 18× memory reduction from
+    FlashAttention at 4k context."*
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    1. **Capacity-plan on `T²`, not `T`.** When someone asks to double the context window, the
+       attention cost quadruples and the KV cache doubles. Put the table from Layer 3 in the design
+       doc; it converts an argument into an arithmetic problem.
+    2. **Put a fixed-shape attention timing in CI.** A silent fallback off the flash kernel is a
+       3× latency regression that no functional test catches. One benchmark, one threshold.
+    3. **If you have written any KV-cache eviction, check for sinks.** Evicting token 0 raised
+       measured perplexity from 7.1 to 34.6 in the experiment above. Pin the first four tokens.
+  </Accordion>
+</AccordionGroup>
+
+## Assessment
+
+<AccordionGroup>
+  <Accordion title="8 concept questions">
+  1. Given `q = [0.1, 3.0]` and keys `[0,0]`, `[1,0]`, `[0.2,1]`, `[0.9,0.4]`, compute the attention weights with `d_k = 2`. (0.077, 0.082, 0.650, 0.191.)
+  2. Why divide by `√d_k`? (Logit variance equals `d_k`; without scaling, softmax saturates and the gradient falls to ~3e-7.)
+  3. Why is the mask applied before softmax rather than zeroing weights after? (Zeroing after breaks the sum-to-1 property and scales outputs down by a position-dependent amount.)
+  4. Compute the number of score-matrix cells for `T = 8192`, 32 heads, 32 layers. (6.87 × 10¹⁰.)
+  5. Is FlashAttention an approximation? (No — exact output; it changes memory traffic, not maths.)
+  6. Why does GQA exist, and what exactly does it shrink? (The KV cache; `n_kv_heads` divides the per-token cost — 512 KiB to 128 KiB for Llama 3 8B.)
+  7. What does the first token of a causal sequence attend to, and what side effect does that create? (Itself, weight 1.0; it becomes the attention sink that other heads dump spare probability mass on.)
+  8. At `T = 1024`, what fraction of a Llama-3-8B forward pass is attention FLOPs? At `T = 131072`? (About 3.9% and 84%.)
+  </Accordion>
+  <Accordion title="Coding challenge">
+  Implement attention three ways — naive with an explicit mask, SDPA with `is_causal=True`, and a
+  hand-written tiled version with online softmax renormalisation — and make all three agree to
+  1e-4 on the same inputs. Hidden tests check agreement, the causality perturbation property, that
+  your tiled version's peak memory is sub-quadratic in `T` (measured with
+  `torch.cuda.max_memory_allocated`), and that it handles `T` not divisible by the tile size. The
+  tiled version is the one that teaches you FlashAttention, because the online softmax is the only
+  part that is genuinely subtle.
+  </Accordion>
+  <Accordion title="Interview questions (junior / mid / senior)">
+  - **Junior:** "What are query, key and value, and where do they come from?"
+  - **Mid:** "Our inference cost per request grew 4× when we raised the context limit from 4k to 8k, but our token count only doubled. Explain."
+  - **Senior:** "Walk me through what FlashAttention changes, why it is exact, and what would have to be true about a hardware platform for it to give no benefit."
+  </Accordion>
+  <Accordion title="Draw it from memory">
+  Reproduce the 4×4 causal attention grid for "the tired cat slept", with the upper triangle
+  marked `−inf`, the bottom row's weights written in, and the `√d_k` scale factor shown in its own
+  box with the value for `d_k = 128`.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Validation loss suspiciously low, generation is nonsense | Causal mask off by one (`diagonal=0`) or inverted | The perturbation test: change the last token, assert earlier outputs are unchanged |
+| Attention weights do not sum to 1 | Mask applied after softmax instead of as `−inf` before | `scores.masked_fill(mask, float("-inf"))` then `softmax` |
+| Model trains but loss plateaus around random | Missing the `/ √d_k` scaling | Print logit std before softmax — it should be ≈1, not ≈11 |
+| OOM at a sequence length that "should fit" | Materialising `(B,H,T,T)` | `F.scaled_dot_product_attention`; capacity-plan on `T²` |
+| 3× slower after an unrelated change | Fell off the flash kernel (dtype, head_dim, or mask shape) | Fixed-shape timing benchmark in CI with a 20% regression alarm |
+| Batched output differs from unbatched | Padding interacting with `is_causal=True` | Left-pad plus an explicit mask, or use packed variable-length sequences |
+| One head's weights are all on token 0 | Attention sink — normal behaviour, not a bug | Do not "fix" it; do pin token 0 if you evict from the KV cache |
+| Head merge produces garbage | `transpose(1,2)` without `.contiguous()` before `.view()` | Use `.contiguous().view(...)` or `.reshape(...)` |
+
+## Sources & further reading
+
+**Primary docs**
+- [`F.scaled_dot_product_attention`, PyTorch 2.4](https://pytorch.org/docs/2.4/generated/torch.nn.functional.scaled_dot_product_attention.html) — read the "Implementation details" section to learn exactly which conditions drop you off the flash backend.
+- [`nn.MultiheadAttention`](https://pytorch.org/docs/2.4/generated/torch.nn.MultiheadAttention.html) — read the `in_proj_weight` layout note; it is what makes the weight-copying test in Layer 2 possible.
+- [Karpathy, `nanoGPT` `model.py`](https://github.com/karpathy/nanoGPT/blob/master/model.py) — read `CausalSelfAttention`, 30 lines, and note the `flash` branch and the registered `bias` buffer fallback.
+
+**Papers**
+- [Vaswani et al. 2017](https://arxiv.org/abs/1706.03762) — *scaled dot-product attention replaces recurrence and parallelises training*; §3.2.1 and footnote 4.
+- [Dao et al. 2022 (FlashAttention)](https://arxiv.org/abs/2205.14135) — *attention is bandwidth-bound; tiling plus online softmax makes it exact and much faster*; §3.1, Algorithm 1.
+- [Ainslie et al. 2023 (GQA)](https://arxiv.org/abs/2305.13245) — *share K/V across query-head groups to cut the KV cache with near-zero quality loss*; Figure 2.
+- [Elhage et al. 2021 (Transformer Circuits)](https://transformer-circuits.pub/2021/framework/index.html) — *heads read and write a shared residual stream through low-rank matrices*; the induction-heads section.
+- [Xiao et al. 2023 (Attention Sinks)](https://arxiv.org/abs/2309.17453) — *pin the first few tokens and a sliding window runs indefinitely*; Figure 1.
+
+**Go deeper**
+- [3Blue1Brown, "Attention in transformers, visually explained"](https://www.youtube.com/watch?v=eMlx5fFNoYc) — watch it *after* doing the hand-scored table; the geometry it shows lands far harder once you have done the arithmetic yourself.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-25/p4-w25-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

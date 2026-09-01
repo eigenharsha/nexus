@@ -1,0 +1,156 @@
+---
+title: "Relational model & normalization"
+description: "Reference solution — Week 7"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W07-M1`
+
+The exercise: normalize a 30-column export to 3NF and **prove** no data was lost.
+
+### Step 1 — derive the dependencies from the data, not from the column names
+
+```sql
+-- Does customer_email determine customer_city? If this returns 0 rows, yes.
+SELECT customer_email, count(DISTINCT customer_city) AS cities
+FROM   staging_orders GROUP BY 1 HAVING count(DISTINCT customer_city) > 1;
+
+-- Does sku determine product_name?
+SELECT sku, count(DISTINCT product_name) FROM staging_orders GROUP BY 1 HAVING count(DISTINCT product_name) > 1;
+
+-- Is (order_id, sku) actually unique? If not, your composite key is wrong.
+SELECT order_id, sku, count(*) FROM staging_orders GROUP BY 1,2 HAVING count(*) > 1;
+```
+
+Run one of these per candidate dependency. The rows that come back are not noise — they are either
+data-quality problems you must decide about, or evidence that the dependency you assumed does not
+hold. On the lab's dataset, `customer_email → customer_city` returns 41 violating emails, all of
+them customers who genuinely moved. That decides the design: city belongs to the customer, and the
+*current* city is what you keep.
+
+### Step 2 — the 3NF schema
+
+```sql
+CREATE TABLE customers (
+  id         bigserial PRIMARY KEY,
+  email      citext      NOT NULL UNIQUE,          -- case-insensitive natural key
+  full_name  text        NOT NULL,
+  city       text        NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE products (
+  id          bigserial PRIMARY KEY,
+  sku         text   NOT NULL UNIQUE,
+  name        text   NOT NULL,
+  category    text   NOT NULL,
+  price_cents bigint NOT NULL CHECK (price_cents >= 0)
+);
+
+CREATE TABLE orders (
+  id           bigserial PRIMARY KEY,
+  customer_id  bigint      NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+  status       text        NOT NULL
+               CHECK (status IN ('pending','paid','shipped','delivered','cancelled','refunded')),
+  placed_at    timestamptz NOT NULL,
+  total_cents  bigint      NOT NULL CHECK (total_cents >= 0)
+);
+
+CREATE TABLE order_items (
+  order_id   bigint  NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  product_id bigint  NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+  qty        integer NOT NULL CHECK (qty > 0),
+  unit_cents bigint  NOT NULL CHECK (unit_cents >= 0),   -- price AT SALE TIME
+  PRIMARY KEY (order_id, product_id)
+);
+```
+
+### Step 3 — the migration, with the winner rule stated
+
+```sql
+INSERT INTO customers (email, full_name, city)
+SELECT DISTINCT ON (lower(customer_email))
+       lower(customer_email), customer_name, customer_city
+FROM   staging_orders
+ORDER  BY lower(customer_email), order_date DESC;   -- most recent row wins on conflict
+```
+
+`ORDER BY ... order_date DESC` with `DISTINCT ON` is the winner rule, and it must be written down:
+**when the source disagrees with itself, the most recent row wins.** A migration that silently picks
+an arbitrary row is not reproducible.
+
+### Step 4 — the reconciliation, which is the actual deliverable
+
+```sql
+SELECT
+  (SELECT count(*) FROM staging_orders)                              AS source_item_rows,
+  (SELECT count(*) FROM order_items)                                 AS loaded_item_rows,
+  (SELECT count(DISTINCT order_id) FROM staging_orders)              AS source_orders,
+  (SELECT count(*) FROM orders)                                      AS loaded_orders,
+  (SELECT count(DISTINCT lower(customer_email)) FROM staging_orders)  AS source_customers,
+  (SELECT count(*) FROM customers)                                   AS loaded_customers,
+  (SELECT sum(total_cents) FROM (SELECT DISTINCT order_id, total_cents FROM staging_orders) s)
+                                                                     AS source_total,
+  (SELECT sum(total_cents) FROM orders)                              AS loaded_total;
+```
+
+Note the `DISTINCT order_id, total_cents` in the source total. The staging table has one row per
+*item*, so summing `total_cents` directly over it inflates the figure by the average items per
+order — the same 3.0× fan-out bug as in `P1-W07-M3`, appearing here in the reconciliation query
+itself. Every cohort gets caught by this at least once, which is why it is in the reference.
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: designing from the column names.** `customer_city` looks like it depends on the
+customer. In the lab data, 41 emails have more than one city, and if you had assumed the dependency
+without checking, your `INSERT ... DISTINCT` would have silently dropped 41 customers' history or
+duplicated them, depending on the exact form. Derive dependencies from the data.
+
+**Wrong turn 2: joining to `products.price_cents` for historical order totals.** The price changes.
+Every historical order total silently changes with it. `unit_cents` on the order line is the fix,
+and it is not denormalization — it is a *different fact*: the price agreed at sale time.
+
+**Wrong turn 3: no reconciliation query.** A migration without one is a hope. The specific failure
+this catches is the fan-out in the source: summing `total_cents` over an item-grained staging table
+gives an inflated "source total" that appears to prove data was lost when it was not.
+
+**Wrong turn 4: `ON DELETE CASCADE` everywhere.** Cascading from `customers` to `orders` means
+deleting a customer destroys financial records. `RESTRICT` on anything financial, `CASCADE` only
+where the child cannot exist alone.
+
+## Measured numbers this solution produces
+
+| Claim | Number |
+| --- | --- |
+| Planner deletes a redundant `LEFT JOIN` given a declared primary key | 0.060 ms, `customers` absent from the plan |
+| The same join when the columns *are* selected | 9.5 ms for 55 rows |
+| Fan-out inflation on the seeded data | 5,002 orders → 15,000 rows; `SUM` 507,507,500 → 1,522,492,500 (3.0×) |
+| Adding a `CHECK` to a live 1M-row table | `NOT VALID` 51 ms, then `VALIDATE` 133 ms under a weaker lock |
+| The naive equivalent (`SET NOT NULL`) | 2,026 ms under `ACCESS EXCLUSIVE` |
+
+## Grading notes
+
+**A 3/3 on correctness**: dependencies derived empirically with committed queries and their output;
+3NF schema with foreign keys, `CHECK`s and `NOT NULL`s; a winner rule stated for conflicting source
+rows; and a reconciliation query that accounts for the source's grain.
+
+**A 3/3 on explanation**: names the anomaly each split removes, explains why `unit_cents` lives on
+the order line, and states one place the schema is deliberately *not* normalized with its cost.
+
+**The four most common ways submissions lose points**
+
+1. No reconciliation query. The schema may be perfect and the migration still unproven.
+2. Summing an item-grained staging table to get a "source total", then reporting a discrepancy that does not exist.
+3. Reciting the normal forms without naming a single anomaly.
+4. `float` or `double precision` for money. Automatic 0 on correctness — it is in the checker.

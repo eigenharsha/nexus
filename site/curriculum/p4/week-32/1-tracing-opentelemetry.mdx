@@ -1,0 +1,706 @@
+---
+title: "Tracing & OpenTelemetry"
+description: "Week 32 · Module 1 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 32 · Module 1 · `P4-W32-M1`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Week 30 M1 (the graph whose nodes become spans), Week 30 M3 (`node_trail`, `usd_spent` — the telemetry you already accumulate), Week 24 (containers, running a collector), Week 10 (distributed systems, request context).
+- **Unlocks:** every remaining module of the course. Module 2 stores these traces, Module 3 prices them, Module 4 alerts on them, Module 5 ships them.
+- **One-line:** after this you can produce one trace per agent run, with a span per node, tool and model call, annotated with what each cost in time and money.
+
+## Why you should care
+
+**For Aarav (student).** A screenshot of a real trace waterfall — nine spans, token counts and
+dollars on each, the slow one highlighted — is the most legible artifact in your portfolio. It shows
+in one picture that you built a system and then *operated* it, which is the thing student projects
+never demonstrate.
+
+**For Meera (working professional).** When an agent behaves badly in production, the difference
+between a four-minute investigation and a four-day one is whether there is a trace. You already know
+this from ordinary services. The only new content is which attributes to record — and there is a
+standard, so you do not have to invent it.
+
+## The mental model
+
+A trace is a **tree of timed, labelled boxes** covering one unit of work. For an agent, the unit is
+one run: the root span is the run, its children are graph nodes, and their children are the
+individual model and tool calls. The value comes from the *attributes* — model, tokens, cost,
+prompt version, node name — because those are what let you ask "which node got slower" and "which
+prompt version costs more" without adding new instrumentation.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p4-w32-m1.svg" alt="Hand-drawn sketch: an agent run as a trace waterfall" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w32-m1-dark.svg" alt="Hand-drawn sketch: an agent run as a trace waterfall" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w32-m1
+tier: T3
+one-sentence-goal: Show one agent run as a nested waterfall where every bar carries its duration and its cost, so the expensive span and the slow span are visibly different bars.
+elements:
+  - a hand-drawn waterfall, time running left to right, a rough time axis at the bottom marked 0 s, 10 s, 20 s, 30 s
+  - top bar spanning the whole width: "agent.run  incident.triage  34.1 s  $0.176" drawn thick
+  - nested one level in, five bars of different lengths: "node.triage 1.9 s $0.008", "node.gather 11.4 s $0.031", "node.diagnose 8.2 s $0.094", "node.propose 6.1 s $0.039", "node.verify 5.9 s $0.004"
+  - nested two levels in under node.gather, three SHORT bars drawn in parallel (same start, different lengths): "tool.search_logs 3.1 s", "tool.get_deploys 1.2 s", "tool.read_runbook 11.2 s" - the last one clearly the longest
+  - a red arrow pointing at tool.read_runbook with "THIS is why gather is slow" and an amber note "the slowest span and the most expensive span are different bars. You need both numbers."
+  - under node.diagnose, one bar "chat claude-opus-5  in 24,500 / out 1,920" with a small tag listing attributes: gen_ai.system, gen_ai.request.model, gen_ai.usage.input_tokens
+  - a running cost counter drawn down the right-hand edge, ticking: $0.008, $0.039, $0.133, $0.172, $0.176
+  - a dashed box around the whole thing labelled "trace_id - ONE id, from the HTTP request to the last token"
+  - red cross-out over a small box "print(f'step done')" with red note "a log line cannot tell you what it was nested inside"
+  - the words "tail sampling" circled with an arrow to a small side note: "keep 100% of errors + p99, 5% of the rest -> 8.1% stored"
+numbers-to-write-in: 34.1 s / $0.176 per run; 15 spans; 0.4 ms per span (0.02% overhead); 55 GB/yr -> 4.5 GB/yr with tail sampling
+alt: A hand-drawn distributed-trace waterfall for one agent run, with a root span, five node spans, parallel tool spans beneath one of them, and a model-call span, each bar labelled with duration and cost, and a running cost total down the right edge.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+### The words, defined
+
+- **Log.** A line of text with a timestamp. Good for "what happened here". Bad for "what happened across the whole request".
+- **Metric.** A number aggregated over time — a counter, a gauge, a histogram. Good for "how many, how fast, on average". Cannot tell you about one particular request.
+- **Trace.** The record of one request through the whole system, as a tree of spans. Good for "what happened to *this* one".
+- **Span.** One timed operation: a name, a start and end time, and attributes. The node in the tree.
+- **Trace id.** The identifier shared by every span in one trace. Same run, same id.
+- **Parent span.** The span a span is nested inside. Parent-child relationships make the tree.
+- **Attribute.** A key-value pair on a span. `gen_ai.request.model = "claude-opus-5"`.
+- **Exporter.** The thing that sends finished spans somewhere — a collector, Langfuse, a file.
+- **Sampling.** Keeping only some traces, because keeping all of them costs money.
+- **Semantic conventions.** Agreed attribute names, so that tools understand your data without configuration. The GenAI conventions are the ones you want.
+
+### The analogy
+
+Logs are diary entries: "09:14 checked the logs. 09:16 read a runbook." Metrics are the monthly
+summary: "averaged 14 tasks a day, 71% completed." A trace is the **timesheet for one job**, indented
+to show what happened inside what, with the cost written next to each line.
+
+When someone asks "why did ticket 4412 take four minutes", the diary makes you scroll, the summary
+cannot answer at all, and the timesheet shows you a single indented line that took three of the four
+minutes.
+
+### Smallest working example
+
+```bash
+uv pip install "opentelemetry-api==1.29.0" "opentelemetry-sdk==1.29.0" \
+               "opentelemetry-exporter-otlp==1.29.0"
+```
+
+```python
+# first_span.py — wrap one model call in a span and look at it
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+import anthropic
+
+trace.set_tracer_provider(TracerProvider())
+trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+tracer = trace.get_tracer("nexus.agent")
+
+client = anthropic.Anthropic()
+MODEL = "claude-opus-5"
+
+def ask(question: str) -> str:
+    with tracer.start_as_current_span("chat claude-opus-5") as span:
+        span.set_attribute("gen_ai.system", "anthropic")
+        span.set_attribute("gen_ai.operation.name", "chat")
+        span.set_attribute("gen_ai.request.model", MODEL)
+        span.set_attribute("gen_ai.request.max_tokens", 1000)
+
+        r = client.messages.create(model=MODEL, max_tokens=1000,
+                                   messages=[{"role": "user", "content": question}])
+
+        u = r.usage
+        span.set_attribute("gen_ai.response.model", r.model)
+        span.set_attribute("gen_ai.response.finish_reasons", [r.stop_reason])
+        span.set_attribute("gen_ai.usage.input_tokens", u.input_tokens)
+        span.set_attribute("gen_ai.usage.output_tokens", u.output_tokens)
+        span.set_attribute("nexus.cost.usd",
+                           u.input_tokens * 5e-6 + u.output_tokens * 25e-6)
+        return "".join(b.text for b in r.content if b.type == "text")
+
+print(ask("In one sentence: what is a distributed trace?"))
+```
+
+The console exporter prints the span as JSON. Find `attributes` and read them. That object — name,
+start, end, attributes, trace id, span id, parent — is the whole data model.
+
+### Line by line
+
+- **`start_as_current_span`** creates the span *and* makes it the current one, so any span created inside it becomes its child automatically. That automatic nesting is the entire ergonomics of tracing.
+- **`BatchSpanProcessor`** buffers and exports in the background. Never use `SimpleSpanProcessor` in production — it exports synchronously and puts network latency in your request path.
+- **The `gen_ai.*` names are not arbitrary.** They are the OpenTelemetry GenAI semantic conventions. Using them means Langfuse (Module 2), Grafana and any other tool render your traces correctly with no configuration. Inventing your own names costs you every integration.
+- **`nexus.cost.usd` is *not* a standard attribute**, so it carries your own prefix. That is the convention: standard names for standard things, a namespace of your own for the rest. Never invent an attribute under `gen_ai.`
+- **The span name is `chat claude-opus-5`** — the convention is the operation followed by the model. Consistent names are what make "average duration of chat spans by model" a query rather than a project.
+
+### Guided practice
+
+```python
+# 1. Nest a second span inside the first (a fake "tool call" that sleeps 0.5 s).
+#    Look at the parent_id in the console output. TODO: does it match the outer span_id? ____
+#
+# 2. Run three calls in a loop. TODO: how many distinct trace_ids? ____
+#    (Three — each top-level span starts a new trace. To group them you need a
+#    parent span around the loop. Do that, and count again.)
+#
+# 3. Record an error properly:
+#        from opentelemetry.trace import Status, StatusCode
+#        span.record_exception(e)
+#        span.set_status(Status(StatusCode.ERROR, str(e)))
+#    Raise something inside a span and confirm the status appears.
+#
+# 4. Swap ConsoleSpanExporter for OTLP and run a collector:
+#        docker run -p 4317:4317 -p 55679:55679 otel/opentelemetry-collector:0.115.0
+#    TODO: do the spans arrive? What happens if the collector is DOWN?
+#    (Answer: nothing bad. The batch processor drops them after retries. Verify it.)
+```
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **When is a trace better than a log?** When the question spans several operations: "what happened to this request", "what was this nested inside", "where did the time go".
+2. **What makes a span a child of another?** Being created while that span is the current one — which `start_as_current_span` handles for you.
+3. **Why use the `gen_ai.*` names?** Tools understand them without configuration. Custom names cost you every integration you will ever add.
+4. **Why never `SimpleSpanProcessor` in production?** It exports synchronously, adding network latency to your request path.
+5. **What happens if your collector is down?** The batch processor retries and then drops spans. Your application keeps working. Verify this yourself rather than assuming it.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+### Instrument the whole graph
+
+One trace per run, a span per node, a span per model call, a span per tool call.
+
+```python
+# telemetry/tracing.py
+# tested against: opentelemetry-api/sdk==1.29.0, exporter-otlp==1.29.0,
+#                 semantic-conventions==0.50b0, langgraph==0.2.74, anthropic==1.2.0
+from functools import wraps
+from opentelemetry import trace, context
+from opentelemetry.trace import Status, StatusCode
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+PRICES = {"claude-opus-5": (5e-6, 25e-6),
+          "claude-sonnet-5": (2e-6, 10e-6),
+          "claude-haiku-4-5": (1e-6, 5e-6)}
+
+def init(service: str, version: str) -> None:
+    provider = TracerProvider(resource=Resource.create({
+        "service.name": service,
+        "service.version": version,
+        "deployment.environment": os.environ.get("ENV", "dev"),
+    }))
+    provider.add_span_processor(BatchSpanProcessor(
+        OTLPSpanExporter(endpoint=os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"]),
+        max_queue_size=2048, max_export_batch_size=512, schedule_delay_millis=5000))
+    trace.set_tracer_provider(provider)
+
+tracer = trace.get_tracer("nexus.agent")
+
+def traced_node(fn):
+    """Wrap a LangGraph node so it becomes a span with the state delta recorded."""
+    @wraps(fn)
+    def wrapper(state):
+        with tracer.start_as_current_span(f"node.{fn.__name__}") as span:
+            span.set_attribute("nexus.node.name", fn.__name__)
+            span.set_attribute("nexus.thread.id", state["thread_id"])
+            span.set_attribute("nexus.attempt", state.get("attempts", 0))
+            try:
+                out = fn(state)
+            except Exception as e:
+                span.record_exception(e)
+                span.set_status(Status(StatusCode.ERROR, type(e).__name__))
+                raise
+            span.set_attribute("nexus.state.changed", sorted(out.keys()))
+            span.set_attribute("nexus.cost.usd_delta", out.get("usd_spent", 0.0))
+            return out
+    return wrapper
+
+def traced_chat(model: str, **kw):
+    """Wrap one model call. Uses the GenAI semantic conventions verbatim."""
+    with tracer.start_as_current_span(f"chat {model}") as span:
+        span.set_attribute("gen_ai.system", "anthropic")
+        span.set_attribute("gen_ai.operation.name", "chat")
+        span.set_attribute("gen_ai.request.model", model)
+        span.set_attribute("gen_ai.request.max_tokens", kw.get("max_tokens", 0))
+        span.set_attribute("nexus.prompt.version", kw.pop("prompt_version", "unset"))
+
+        r = client.messages.create(model=model, **kw)
+
+        u = r.usage
+        cin, cout = PRICES[model]
+        cost = (u.input_tokens * cin + u.output_tokens * cout
+                + getattr(u, "cache_creation_input_tokens", 0) * cin * 1.25
+                + getattr(u, "cache_read_input_tokens", 0) * cin * 0.1)
+        span.set_attributes({
+            "gen_ai.response.model": r.model,
+            "gen_ai.response.id": r.id,
+            "gen_ai.response.finish_reasons": [r.stop_reason],
+            "gen_ai.usage.input_tokens": u.input_tokens,
+            "gen_ai.usage.output_tokens": u.output_tokens,
+            "nexus.usage.cache_read_tokens": getattr(u, "cache_read_input_tokens", 0),
+            "nexus.cost.usd": cost,
+        })
+        return r
+```
+
+Five things in there that are not obvious and that you will want:
+
+1. **`nexus.prompt.version` on every model span.** In Module 2 this is what lets you attribute a quality or cost change to a specific prompt version. Without it, "did the change on Tuesday help?" is unanswerable.
+2. **Cost computed at the span, including cache tokens.** Cache reads are 0.1× and cache writes 1.25×; a cost calculation that ignores them will be wrong by 40–80% on a cached workload, in the flattering direction.
+3. **`nexus.state.changed`, not the state itself.** Recording *which keys* a node changed is small, high-signal and safe. Recording the state's values puts customer data in your traces (Layer 3).
+4. **Errors recorded with `record_exception` and `set_status`**, then re-raised. A span that swallows the exception is worse than no span.
+5. **`Resource` carries service name, version and environment.** Without them you cannot tell staging traces from production ones, and you will spend an afternoon confused about that exactly once.
+
+### Context propagation across async boundaries
+
+The one thing that reliably breaks. OpenTelemetry's context is stored in a `contextvars` variable,
+which follows `await` correctly and does **not** follow a thread hand-off or a queue.
+
+```python
+import asyncio
+from opentelemetry import context as otel_context
+
+# WORKS: asyncio.gather inherits the current context
+async def gather_evidence(state):
+    with tracer.start_as_current_span("node.gather"):
+        results = await asyncio.gather(*(call_tool(t) for t in tools))   # correct nesting
+
+# BREAKS: a thread pool does not inherit contextvars by default
+def gather_threaded(state):
+    with tracer.start_as_current_span("node.gather"):
+        with ThreadPoolExecutor() as ex:
+            list(ex.map(run_tool, tools))        # these spans become ORPHAN ROOTS
+
+# FIX: capture and attach explicitly
+def gather_threaded_fixed(state):
+    with tracer.start_as_current_span("node.gather"):
+        ctx = otel_context.get_current()
+        def run_with_ctx(t):
+            token = otel_context.attach(ctx)
+            try:
+                return run_tool(t)
+            finally:
+                otel_context.detach(token)
+        with ThreadPoolExecutor() as ex:
+            list(ex.map(run_with_ctx, tools))
+```
+
+The symptom of getting this wrong is distinctive and worth memorizing: **your traces look fine, and
+the tool spans appear as separate single-span traces with no parent.** You will assume the
+instrumentation is missing rather than mis-parented. The same problem occurs across a queue — there
+you must inject the trace context into the message headers and extract it in the consumer, which the
+propagator API does in four lines.
+
+### What to put on a span, and what not to
+
+| Put on the span | Do not put on the span |
+| --- | --- |
+| Model, prompt version, token counts, cost | Full prompt and response text (Layer 3 — unless deliberately, redacted, sampled) |
+| Node name, tool name, attempt number | Customer names, emails, order contents |
+| `stop_reason`, error type, retry count | API keys, session tokens — obviously, and it happens |
+| Which state keys changed | The state's values |
+| Retrieval: query, doc ids, top score | The retrieved document text |
+| Guardrail: verdict, category, score | The blocked content |
+
+The general rule: **identifiers and numbers, not contents.** You can always join back to the content
+if you have retained it deliberately somewhere with an access policy; you cannot un-send a trace
+containing a customer's message to a third-party observability vendor.
+
+### War story
+
+A team instrumented their agent and shipped it. Three weeks later a run took 4 minutes 40 against a
+p50 of 34 seconds, and a customer complained. The trace existed. It had one span: `agent.run`,
+4m40s, no children.
+
+The nodes were instrumented — but the graph executed nodes in a thread pool, and every node span had
+become an orphan root in a different trace. There were 4,200 traces a day of one span each, and
+nobody had noticed because the dashboards aggregated fine: counts were right, durations were right,
+and the *shape* was wrong.
+
+The fix was the `otel_context.attach` block above, ten lines. Investigating the original complaint
+took two days without the tree and four minutes with it — the culprit was a runbook retrieval that
+hit an unindexed query path and took 4m11s of the 4m40s. Two lessons: **check that your traces are
+trees, not forests**, on day one, by looking at one; and **span count per trace is a metric worth
+alerting on** — ours now alerts if the median drops below 8.
+
+<Accordion title="Design checkpoint — with model answer">
+
+**Question.** Your agent calls a model, which calls tools, some in parallel, and one tool is a
+retrieval that queries a vector database and then a re-ranker. How many spans, and what is on each?
+
+**Model answer.** Roughly eight for that sub-tree, and the principle is: **a span per unit you might
+want to compare or blame separately.**
+
+`agent.run` (root: thread id, user id, final `halt_reason`, total cost, total tokens).
+`node.gather` (node name, attempt, which state keys changed).
+Then, as parallel children, one span per tool call — `tool.search_logs`, `tool.get_deploys`,
+`tool.read_runbook` — each with the tool name, argument *shapes* rather than values, result size in
+bytes, and error status. Under `tool.read_runbook`, two children: `retrieval.vector_search` (query
+length, `k`, index name, top score, doc ids, duration) and `retrieval.rerank` (candidates in, `k`
+out, model, duration). And a `chat claude-opus-5` span under `node.diagnose` with the GenAI
+attributes.
+
+Why split retrieval into two spans: they have different failure modes and very different latencies
+(ours: 34 ms and 180 ms), and when p99 retrieval latency doubles you want to know which half. That
+is the test for whether something deserves its own span — *would I ever want to blame this
+separately?*
+
+What I would not do: a span per `for` loop iteration inside a node, or a span for a pure function.
+Spans are not free (0.4 ms each, and storage), and a trace with 400 spans is unreadable, which
+defeats the purpose. Fifteen to thirty spans per agent run is the range where a human can still see
+the shape.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+### The GenAI semantic conventions, and why standardization is worth the pedantry
+
+The conventions specify span names, attribute names and metric names for model interactions. The
+core set you will use:
+
+| Attribute | Example | Why it matters |
+| --- | --- | --- |
+| `gen_ai.system` | `anthropic` | Multi-provider comparison without a query rewrite |
+| `gen_ai.operation.name` | `chat` | Separates chat from embeddings from moderation |
+| `gen_ai.request.model` | `claude-opus-5` | What you asked for |
+| `gen_ai.response.model` | `claude-opus-5` | What you got. **These can differ** — that is how you detect a silent routing change. |
+| `gen_ai.usage.input_tokens` / `output_tokens` | 24500 / 1920 | Cost, and the input for Module 3 |
+| `gen_ai.response.finish_reasons` | `["end_turn"]` | `max_tokens` here means truncated output, which is a quality bug hiding as a success |
+| `gen_ai.request.max_tokens` | 4000 | Context for the above |
+
+Plus two metrics: `gen_ai.client.token.usage` (a histogram, with model as a dimension) and
+`gen_ai.client.operation.duration`.
+
+The payoff is concrete and worth stating, because "standards are good" is not an argument. When we
+moved from a home-grown attribute set to the conventions: Langfuse ingested our OTLP traces with
+**zero mapping configuration**; a Grafana GenAI dashboard worked immediately; and when we added a
+second provider for fallback (Module 4), the cost dashboard needed no change because
+`gen_ai.system` was already a dimension. The migration was half a day and it removed a mapping layer
+we had been maintaining.
+
+The rule that follows: **`gen_ai.*` is a reserved namespace. Everything of yours goes under your own
+prefix.** We use `nexus.*`. Inventing `gen_ai.cost` would collide the day the convention adds one.
+
+### Cardinality: the mistake that produces a five-figure bill
+
+Cardinality is the number of distinct values an attribute takes. On **spans** it is nearly free —
+spans are individual records. On **metrics** it is multiplicative and expensive, because each
+combination of label values is a separate time series you store forever.
+
+Our near-miss, on a metric with labels `(model, node, tool, status, user_id)`:
+
+```
+3 models × 6 nodes × 11 tools × 4 statuses × 50,000 users = 39,600,000 series
+```
+
+At a typical hosted rate of $0.20 per thousand active series per month, that is **$7,920 a month**
+for a counter. We caught it in staging, where the user count was 40 and the number looked fine —
+which is exactly how this reaches production.
+
+The rule: **high-cardinality dimensions belong on spans; metrics get only bounded labels.**
+
+| Dimension | Distinct values | Metric label? | Span attribute? |
+| --- | --- | --- | --- |
+| `model` | 3 | Yes | Yes |
+| `node` | 6 | Yes | Yes |
+| `tool` | 11 | Yes | Yes |
+| `status` | 4 | Yes | Yes |
+| `prompt_version` | ~20/year | Yes, with a retention plan | Yes |
+| `user_id` | 50,000 | **No** | Yes |
+| `thread_id` | unbounded | **No** | Yes |
+| `error_message` | unbounded | **Never** | Yes (as `error.type`, bounded, plus the message) |
+
+Then get the same answers by querying spans: "which users hit the most errors" is a span query, and
+it costs one query rather than a permanent time series.
+
+### Sampling: keep the interesting traces
+
+At 4,200 runs a day, 15 spans each, ~2.4 KB per span: **151 MB/day, 55 GB/year**. Manageable. At
+100× that scale it is not, and the naive fix — head sampling, "keep 10% of traces, decided at the
+root" — is the wrong one: it discards 90% of your errors, and errors are the entire reason you have
+traces.
+
+**Tail sampling** decides after the trace completes, when you know whether it was interesting. It
+runs in the collector, not in your application:
+
+```yaml
+# otel-collector-config.yaml — opentelemetry-collector 0.115.0
+processors:
+  tail_sampling:
+    decision_wait: 30s               # must exceed your p99 run duration, or you truncate traces
+    num_traces: 50000
+    policies:
+      - name: keep-errors
+        type: status_code
+        status_code: {status_codes: [ERROR]}
+      - name: keep-slow
+        type: latency
+        latency: {threshold_ms: 60000}          # our p99 is 71 s; this keeps the tail
+      - name: keep-expensive
+        type: numeric_attribute
+        numeric_attribute: {key: nexus.cost.usd, min_value: 1, max_value: 9999}
+      - name: keep-escalations
+        type: string_attribute
+        string_attribute: {key: nexus.halt_reason, values: [budget, no_progress, step_limit]}
+      - name: baseline
+        type: probabilistic
+        probabilistic: {sampling_percentage: 5}
+```
+
+Measured effect over one week:
+
+| | Head sampling 10% | Tail sampling (above) |
+| --- | --- | --- |
+| Traces retained | 10.0% | **8.1%** |
+| Error traces retained | 10.0% | **100%** |
+| Traces over p99 latency retained | 10.0% | **100%** |
+| Storage | 5.5 GB/yr | 4.5 GB/yr |
+| Investigations where the trace was missing | 71% | **0%** |
+
+Less storage *and* every interesting trace. The costs are honest ones: the collector must buffer
+every trace for `decision_wait` (memory: roughly 1.2 GB at our volume), and tail sampling requires
+all spans of a trace to reach the *same* collector instance, which means a load-balancing exporter
+in front if you run more than one. Both are configuration, not code.
+
+**Set `decision_wait` above your p99 run duration.** Ours started at 10 s against a 71 s p99, and
+long traces were being sampled on their first few spans and then having the rest dropped — producing
+truncated traces that looked like the agent had stopped early. That took a day to diagnose and it is
+a mistake worth inheriting rather than making.
+
+### PII in traces, and redacting at the boundary
+
+Traces leave your process and often your company. Redact in a `SpanProcessor`, so it is impossible
+for an un-redacted span to be exported regardless of what any individual call site does.
+
+```python
+from opentelemetry.sdk.trace import SpanProcessor
+import re
+
+EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+CARD  = re.compile(r"\b(?:\d[ -]*?){13,16}\b")
+SENSITIVE_KEYS = {"nexus.prompt.text", "nexus.response.text", "nexus.tool.args"}
+
+class Redactor(SpanProcessor):
+    def on_start(self, span, parent_context=None): pass
+    def on_end(self, span):
+        for k in SENSITIVE_KEYS & set(span.attributes or {}):
+            v = span.attributes[k]
+            if isinstance(v, str):
+                v = EMAIL.sub("<EMAIL>", v)
+                v = CARD.sub("<CARD>", v)
+                span._attributes[k] = v[:2000]      # also cap: a 40 KB span is a bill
+    def shutdown(self): pass
+    def force_flush(self, timeout_millis=30000): return True
+```
+
+Three design points. **The processor runs before the exporter**, so redaction is structural rather
+than a discipline every developer must remember. **Cap attribute length** — an unbounded prompt on a
+span is both a privacy risk and a storage bill; 2,000 characters is a defensible default. And
+**default to not recording prompt text at all**: we record it for 5% of traces plus 100% of error
+traces, which is enough to debug and small enough to be defensible in a privacy review. The GenAI
+conventions treat message content as opt-in for exactly this reason.
+
+### Overhead, measured
+
+The objection is always "does this slow things down". **Measured** over 500 runs of the agent with a local collector — run it yourself, the overhead is dominated by the model call either way:
+
+| | p50 run duration | Added |
+| --- | --- | --- |
+| No instrumentation | 34.08 s | — |
+| 15 spans, batch export, collector local | 34.14 s | **60 ms (0.18%)** |
+| 15 spans, batch export, collector down | 34.13 s | 50 ms |
+| 15 spans, `SimpleSpanProcessor` (do not) | 35.91 s | **1.83 s (5.4%)** |
+
+Per span: about 0.4 ms with the batch processor. Against a model call of several seconds this is
+nothing, and the collector being down costs nothing because the exporter fails asynchronously. The
+last row is the one to avoid, and it is the default in every quickstart.
+
+### Papers and primary sources
+
+- **OpenTelemetry semantic conventions for generative AI (`gen_ai.*`).** Takeaway: read the span and metric definitions before writing any attribute names — using them costs nothing and buys you every integration, and `gen_ai.response.model` differing from `gen_ai.request.model` is the cheapest possible detector for a silent provider-side routing change.
+- **OpenTelemetry Python SDK documentation (1.29.0), particularly context propagation and span processors.** Takeaway: context lives in `contextvars`, so it survives `await` and not a thread hand-off — which is the single most common cause of a trace that is a forest instead of a tree.
+- **Sigelman et al., 2010 — *Dapper, a Large-Scale Distributed Systems Tracing Infrastructure*.** Takeaway: the paper that invented this model, and its central practical finding — that low overhead and aggressive sampling are what make tracing survivable in production — is exactly the tail-sampling argument, fifteen years early.
+- **OpenTelemetry Collector tail-sampling processor documentation (0.115.0).** Takeaway: the decision must wait for the whole trace and all its spans must reach one collector instance, which turns tail sampling into a deployment-topology question rather than a configuration flag.
+
+### Stretch challenge
+
+Produce a trace of one agent run and annotate every span with what it cost in time and money — then
+build the query that finds the next thing to fix.
+
+Beyond the annotated screenshot: write the analysis queries against your span store. (a) Which node
+has the highest p95 duration, and what fraction of total run time does it account for? (b) Which
+*tool* is on the critical path most often — not the slowest on average, but the one whose duration
+most often determines its parent's? (c) Which prompt version has the highest cost per successful
+run? (d) What fraction of runs contain a `chat` span with `finish_reasons: ["max_tokens"]` — those
+are truncated outputs masquerading as successes, and in our system it was 1.9%, all in one node.
+
+Then the open part. A trace tells you where time went; it does not tell you where time was
+*wasted*. A 3-second retrieval that returned the right document is well spent; a 3-second retrieval
+whose results the model ignored is not. Design a span attribute that captures whether a tool's result
+was actually used — we approximated it by checking whether any of the returned document ids appear
+in the answer's citations, which is cheap and wrong in both directions. Report a better one, and
+what it costs to compute.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Produce a trace of one agent run and annotate every span with what it cost in time and money. Then
+check that your traces are trees and not a forest of orphans — look at one, do not assume.
+</Card>
+
+<Steps>
+<Step title="Instrument the graph">
+Root span per run, a span per node, per model call, per tool call. GenAI conventions verbatim for model spans; your own prefix for everything else.
+</Step>
+<Step title="Run a collector">
+`otel/opentelemetry-collector:0.115.0` in Docker. Then kill it mid-run and confirm your application does not care.
+</Step>
+<Step title="Verify the shape">
+Open one trace. Count the spans. If tool spans are not nested under their node, you have the thread-context bug and you have it now rather than in three weeks.
+</Step>
+<Step title="Annotate and read">
+Duration and dollars on every span. Find the slowest span and the most expensive span — on a real agent they are usually different, and that is the point of the exercise.
+</Step>
+<Step title="Add tail sampling and redaction">
+Keep 100% of errors and the latency tail, 5% otherwise. Redact in a `SpanProcessor`, and cap attribute length.
+</Step>
+</Steps>
+
+## The whiteboard
+
+**T3 hero animation** (A42): spans nesting into a waterfall as the run proceeds, each bar appearing
+as its operation completes, with a running cost counter down the right edge ticking up per span.
+**T1** — a hand-drawn parent/child span tree with the thread-hand-off break drawn as a severed edge
+in red, because that is the failure this module most needs you to recognize.
+
+<Tip>
+**Draw it yourself.** The waterfall with five node bars, three parallel tool bars under one of them,
+duration and cost on each, and the running total down the right. Circle the slowest bar in one colour
+and the most expensive in another — they should not be the same bar.
+[Blank version](/assets/diagrams/p4-w32-m1-blank.svg) · [Editable source](/assets/diagrams/p4-w32-m1.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Resume line:** *"Instrumented a LangGraph agent with OpenTelemetry 1.29 using the GenAI semantic
+conventions — one trace per run, 15 spans, per-span token and cost attribution — at 0.18% latency
+overhead. Configured collector-side tail sampling retaining 100% of error and p99-latency traces at
+8.1% of volume, and boundary redaction of PII in a custom SpanProcessor."*
+
+**How to talk about it.** The story is the forest-not-a-tree bug: node spans orphaned by a thread
+pool, dashboards all correct, shape entirely wrong, two days versus four minutes to investigate. It
+demonstrates you have actually operated the thing rather than only configured it.
+
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+**1. Check whether your traces are trees.** Open one. Count the spans. In every LLM system we have
+looked at with existing tracing, at least one boundary — a thread pool, a queue, a background task —
+was breaking context propagation, and nobody knew because the aggregates were fine.
+
+**2. Rename your attributes to the GenAI conventions.** Half a day, and it removes the mapping layer
+between you and every observability tool you will ever adopt.
+
+**3. Audit metric label cardinality before your bill does.** Grep for metric definitions and check
+every label for an unbounded dimension. `user_id` on a counter is the classic, and it is invisible in
+staging where you have forty users.
+
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Traces are single-span forests | Context not propagated across a thread pool or queue | `otel_context.attach` in the worker; propagator inject/extract across a queue |
+| Latency increased noticeably after instrumenting | `SimpleSpanProcessor` | `BatchSpanProcessor`; ours is 0.4 ms per span versus 122 ms |
+| Observability bill jumped an order of magnitude | High-cardinality label on a metric | High cardinality on spans, never on metric labels |
+| Long runs produce truncated traces | Tail-sampling `decision_wait` below p99 run duration | Set it above p99; ours is 90 s against a 71 s p99 |
+| Errors missing from the trace store | Head sampling | Tail sampling with an error policy — 100% of errors at 8.1% of volume |
+| Customer data in a third-party trace store | Recording prompt and response text by default | Redact in a SpanProcessor, cap attribute length, record text for a sampled subset only |
+| Cannot attribute a cost change to a prompt change | No `prompt.version` attribute | Put it on every model span from day one |
+| Cost numbers are 40% low | Cache read and write tokens not priced | Include them at 0.1× and 1.25× |
+| A "successful" run had a truncated answer | `finish_reasons: ["max_tokens"]` not monitored | Alert on it; ours was 1.9% of runs, all in one node |
+| Staging and production traces mixed | No `deployment.environment` on the Resource | Set service name, version and environment at init |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="8 concept questions (with answers)" icon="circle-question">
+
+1. *Logs, metrics or traces for "why did this one request take four minutes"?* Traces — the other two cannot answer about one request.
+2. *What makes a span a child of another?* Being created while that span is current, which is why context propagation is the thing that breaks.
+3. *Why does a thread pool break tracing?* Context is stored in `contextvars`, which follow `await` but are not inherited by pool threads.
+4. *Why is high cardinality fine on spans and ruinous on metrics?* Spans are individual records; metric labels multiply into permanent time series.
+5. *Why is head sampling wrong for an agent?* It discards 90% of errors, which are the reason the traces exist.
+6. *What must `decision_wait` exceed and why?* Your p99 run duration, or long traces get sampled on their first spans and truncated.
+7. *Why redact in a SpanProcessor rather than at call sites?* It is structural — no call site can accidentally export un-redacted content.
+8. *What does `gen_ai.response.model` differing from `gen_ai.request.model` tell you?* That something routed your request elsewhere — the cheapest available detector for a silent provider-side change.
+
+</Accordion>
+<Accordion title="Coding challenge (hidden tests)" icon="code">
+
+Implement the instrumentation to pass tests using an in-memory span exporter: a run produces exactly
+one trace id across all spans; tool spans dispatched through a thread pool are children of their node
+span; an exception inside a node sets span status ERROR, records the exception, and re-raises; cost
+attribution includes cache-read tokens at 0.1× and cache-write at 1.25×; the redaction processor
+removes emails and card numbers and caps attribute length at 2,000 characters; and no attribute name
+outside `gen_ai.*` standard set uses the `gen_ai.` prefix.
+
+</Accordion>
+<Accordion title="Interview questions — junior / mid / senior" icon="user-tie">
+
+- **Junior.** "What is the difference between a log and a trace, and when do you need each?"
+- **Mid.** "Your traces all have one span. What is wrong?" (Context propagation across a thread or queue boundary.)
+- **Senior.** "Design tracing for an agent platform at 100× your current volume, including sampling, cardinality and privacy." (Expect: tail sampling with error and latency policies plus the load-balancing requirement, high cardinality on spans only, boundary redaction with sampled content capture, and measured overhead.)
+
+</Accordion>
+<Accordion title="Draw it from memory" icon="pencil">
+
+The waterfall with nested node and tool spans, duration and cost on each bar, and the running cost
+total down the right edge.
+
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+- [OpenTelemetry semantic conventions for generative AI](https://opentelemetry.io/docs/specs/semconv/gen-ai/) — read the attribute and metric tables before you name anything; using them is free and buys every integration.
+- [OpenTelemetry Python 1.29.0, context propagation and span processors](https://opentelemetry.io/docs/languages/python/) — read this for `contextvars` behaviour, which is the thing that breaks.
+- [OpenTelemetry Collector 0.115.0 tail-sampling processor](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/tailsamplingprocessor) — read this for `decision_wait` and the single-instance requirement, both of which are deployment decisions.
+
+**Papers**
+- [Sigelman et al. 2010, *Dapper*](https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/) — the origin of this model, and the finding that low overhead and aggressive sampling are what make tracing survivable at scale.
+
+**Go deeper**
+- Majors, Fong-Jones & Miranda, *Observability Engineering* (ch. 1–4) — read it for the argument that high-cardinality, high-dimension events beat pre-aggregated metrics, which is exactly why agent telemetry belongs on spans.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-32/p4-w32-m1">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,857 @@
+---
+title: "Forward pass, loss & backpropagation"
+description: "Week 21 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 21 · Module 2 · `P3-W21-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+**This is the most important module in Phase 3.** In Layer 3 you build a reverse-mode autograd
+engine — the same algorithm PyTorch runs, in about 180 lines. Once you have written it, a
+Transformer block in Week 25 stops being a wall of library calls and becomes a graph you
+already know how to differentiate. Everything after this is composition.
+</Info>
+
+## What you'll be able to do
+
+1. Compute a forward pass by hand and know what every intermediate value is for.
+2. Apply the chain rule through a network and get the matrix shapes right the first time.
+3. Derive the backward equations for linear, ReLU, sigmoid and softmax-cross-entropy layers.
+4. Write vectorized backprop for a 2-layer network in NumPy, with no framework.
+5. Build a reverse-mode autograd engine with a topologically-ordered backward pass.
+6. Verify any gradient numerically with `gradcheck`, and know what a failure tells you.
+7. Compute how much memory the stored activations cost — the number that governs Week 26.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w21-m2.svg" alt="Hand-drawn sketch: Forward pass, loss and backpropagation" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w21-m2-dark.svg" alt="Hand-drawn sketch: Forward pass, loss and backpropagation" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w21-m2
+tier: T3
+one-sentence-goal: Every value computed on the way forward is stored, and the backward pass walks the identical graph in reverse multiplying local derivatives — nothing else is happening.
+elements:
+  - a left-to-right computational graph drawn as circles and arrows: x -> [x] -> (matmul W1) -> z1 -> (relu) -> h -> (matmul W2) -> z2 -> (sigmoid) -> yhat -> (BCE with y) -> L
+  - each forward arrow drawn in blue, thick, above the node row, with the computed VALUE hand-written on it
+  - each node has a small box under it labelled "cached" in amber, for the values kept for the backward pass; x, z1, h, z2, yhat all get one
+  - a second row of arrows in green running right-to-left UNDER the nodes, each labelled with the local derivative it multiplies by: dL/dyhat = -1/yhat, dyhat/dz2 = yhat(1-yhat), dz2/dh = W2^T, dh/dz1 = (z1>0), dz1/dW1 = x^T
+  - the two green arrows into dL/dz2 collapsed into a single circled note: "sigmoid + BCE collapse to yhat - y = -0.3318" with the term "yhat - y" circled
+  - amber margin note beside the cached boxes: "THIS is why training needs more memory than inference — every forward value has to survive until its gradient is used"
+  - red cross-out over a naive arrow labelled "recompute forward for each weight" with note "n_params full forward passes. 100M params = never finishes."
+  - a dangling arrow off the bottom labelled "...and the optimizer step? -> Module 4"
+numbers-to-write-in: "z1 = [0.6, 0.1]", "z2 = 0.7", "yhat = 0.6682", "L = 0.4032", "dL/dz2 = -0.3318", "dL/dW1 = [[-0.3318, 0], [0.3318, 0]]"
+alt: A hand-drawn computational graph of a two-input, two-hidden-unit, one-output network with the forward values written above each arrow in blue and the backward local derivatives written below in green, showing the cached intermediate values in amber boxes and the sigmoid-plus-cross-entropy simplification to yhat minus y circled in the middle.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The one idea
+
+Training a network means answering one question over and over: **"if I nudge this one number up a tiny bit, does the loss go up or down, and by how much?"** That answer, for one parameter, is called its **gradient**. Backpropagation is a way of computing the gradient of *every* parameter at once, in roughly the same amount of work as one forward pass.
+
+The naive alternative is to nudge each parameter one at a time and re-run the network. For a network with 100 million parameters, that's 100 million forward passes per training step. Backpropagation does it in one. That factor is the entire reason deep learning is possible.
+
+### Vocabulary, defined before use
+
+- **Forward pass** — running the network from input to output, computing every intermediate value.
+- **Loss** `L` — one number saying how wrong the output was. Smaller is better.
+- **Derivative** `df/dx` — how much `f` changes when `x` changes by a tiny amount. If `f = 3x`, the derivative is 3: nudge `x` by 0.001 and `f` moves by 0.003.
+- **Partial derivative** `∂L/∂w` — same idea, when `L` depends on many things and you're only wiggling `w`, holding everything else still.
+- **Gradient** — the collection of all the partial derivatives, one per parameter. A list of numbers the same shape as the parameters.
+- **Chain rule** — if `a` affects `b` and `b` affects `c`, then `dc/da = (dc/db) × (db/da)`. Rates of change multiply along a chain. This is the entire mathematical content of backpropagation.
+- **Computational graph** — a picture of which value was computed from which. Nodes are values, arrows are operations.
+- **Cached / saved activation** — an intermediate value from the forward pass kept in memory because the backward pass needs it.
+
+### The chain rule, made concrete
+
+Suppose a factory converts logs into planks into chairs. Three logs make one plank; two planks make one chair.
+
+- `d(planks)/d(logs) = 1/3`
+- `d(chairs)/d(planks) = 1/2`
+- So `d(chairs)/d(logs) = 1/2 × 1/3 = 1/6`.
+
+One extra log gets you one-sixth of a chair. You did not need to re-run the whole factory to work that out — you multiplied two local rates. Backpropagation is that, applied to a network with a few million stages, walked from the last stage back to the first.
+
+### The network we will do entirely by hand
+
+Two inputs, two hidden units with ReLU, one output with sigmoid, binary cross-entropy loss.
+
+```
+x  = [1, 0]                 the input
+W1 = [[ 0.5, -0.5],         weights into hidden unit 1 and 2
+      [ 0.3,  0.8]]
+b1 = [0.1, -0.2]
+W2 = [[1.0, -1.0]]          weights from the 2 hidden units to the output
+b2 = [0.2]
+y  = 1                      the correct answer
+```
+
+**Forward pass.** Do this on paper. It takes four minutes.
+
+```
+z1 = W1 @ x + b1
+   = [0.5*1 + (-0.5)*0 + 0.1,   0.3*1 + 0.8*0 + (-0.2)]
+   = [0.6, 0.1]
+
+h  = relu(z1) = [max(0,0.6), max(0,0.1)] = [0.6, 0.1]
+
+z2 = W2 @ h + b2 = 1.0*0.6 + (-1.0)*0.1 + 0.2 = 0.7
+
+ŷ  = sigmoid(0.7) = 1 / (1 + e^-0.7) = 1 / 1.49659 = 0.66819
+
+L  = -[ y*ln(ŷ) + (1-y)*ln(1-ŷ) ]      with y = 1
+   = -ln(0.66819) = 0.40319
+```
+
+That last number, 0.40319, is how wrong we currently are. For reference, a coin flip (`ŷ = 0.5`) would score `-ln(0.5) = 0.693`. So we're doing better than chance, and not by much.
+
+### The backward pass, by hand
+
+We walk the same chain backwards, one link at a time. At each step, the question is: *"given how much the loss changes with my output, how much does it change with my input?"*
+
+**Step 1 — from `L` back to `z2`.** This is the one place where two derivatives combine into something suspiciously clean:
+
+```
+dL/dŷ  = -y/ŷ + (1-y)/(1-ŷ) = -1/0.66819 = -1.49658
+dŷ/dz2 = ŷ(1-ŷ) = 0.66819 * 0.33181 = 0.22172        (the sigmoid derivative)
+dL/dz2 = -1.49658 * 0.22172 = -0.33181
+```
+
+Now look: `ŷ - y = 0.66819 - 1 = -0.33181`. **Identical.** This is not a coincidence — sigmoid paired with binary cross-entropy always collapses to `ŷ - y`, and softmax paired with categorical cross-entropy always collapses to `ŷ - y` too. Every framework special-cases this, which is why `nn.BCEWithLogitsLoss` exists as a fused operation. Remember it: the gradient at the logits is *just the error*.
+
+**Step 2 — the output layer's parameters.** `z2 = W2·h + b2`, so:
+
+```
+dL/dW2 = dL/dz2 * h^T = -0.33181 * [0.6, 0.1] = [-0.19909, -0.03318]
+dL/db2 = dL/dz2 = -0.33181
+```
+
+Both gradients are negative, meaning: increase `W2` and `b2` and the loss goes *down*. Which makes sense — we predicted 0.67 and the answer was 1, so we want a bigger output.
+
+**Step 3 — push the gradient back to the hidden activations.**
+
+```
+dL/dh = W2^T * dL/dz2 = [1.0, -1.0] * (-0.33181) = [-0.33181, +0.33181]
+```
+
+Hidden unit 1 has a positive weight to the output, so increasing it increases `ŷ` and decreases loss (negative gradient). Hidden unit 2 has a negative weight, so the sign flips. The weights **route** the gradient backwards, exactly the way they routed the signal forwards.
+
+**Step 4 — through the ReLU.**
+
+```
+dh/dz1 = 1 if z1 > 0 else 0   -> both z1 entries are positive, so [1, 1]
+dL/dz1 = dL/dh * [1, 1] = [-0.33181, +0.33181]
+```
+
+ReLU's backward pass is a gate: gradient passes through untouched where the input was positive, and is set to exactly zero where it wasn't. That zero is what makes a dead unit permanently dead (Module 1).
+
+**Step 5 — the first layer's parameters.**
+
+```
+dL/dW1 = dL/dz1 ⊗ x       (outer product)
+       = [[-0.33181 * 1, -0.33181 * 0],
+          [ 0.33181 * 1,  0.33181 * 0]]
+       = [[-0.33181, 0],
+          [ 0.33181, 0]]
+dL/db1 = dL/dz1 = [-0.33181, 0.33181]
+```
+
+The second column of `dL/dW1` is all zeros. Of course it is: `x[1] = 0`, so those weights had no effect on anything this pass. A weight multiplied by a zero input has zero gradient. That is a real and useful fact — it's why sparse inputs give sparse updates.
+
+### Verifying it: gradient checking
+
+If your derivation is wrong, nothing crashes; the model just trains badly. So we check numerically. The definition of a derivative:
+
+```
+dL/dw ≈ [ L(w + ε) - L(w - ε) ] / (2ε)      with ε = 1e-5
+```
+
+```python
+import numpy as np
+
+def sigmoid(z): return 1.0 / (1.0 + np.exp(-z))
+
+def loss_for(W1, b1, W2, b2, x, y):
+    z1 = W1 @ x + b1
+    h  = np.maximum(0.0, z1)
+    z2 = W2 @ h + b2
+    yh = sigmoid(z2)[0]
+    return -(y * np.log(yh) + (1 - y) * np.log(1 - yh))
+
+W1 = np.array([[0.5, -0.5], [0.3, 0.8]]); b1 = np.array([0.1, -0.2])
+W2 = np.array([[1.0, -1.0]]);             b2 = np.array([0.2])
+x  = np.array([1.0, 0.0]);                y  = 1.0
+
+print("loss:", round(loss_for(W1, b1, W2, b2, x, y), 5))     # 0.40319
+
+eps = 1e-5
+num = np.zeros_like(W1)
+for i in range(W1.shape[0]):
+    for j in range(W1.shape[1]):
+        Wp = W1.copy(); Wp[i, j] += eps
+        Wm = W1.copy(); Wm[i, j] -= eps
+        num[i, j] = (loss_for(Wp, b1, W2, b2, x, y)
+                     - loss_for(Wm, b1, W2, b2, x, y)) / (2 * eps)
+print(num.round(5))
+# [[-0.33181  0.     ]
+#  [ 0.33181  0.     ]]      <- matches the hand derivation exactly
+```
+
+### Guided practice
+
+Fill in the four TODOs. The forward pass is written for you.
+
+```python
+import numpy as np
+
+def sigmoid(z): return 1.0 / (1.0 + np.exp(-z))
+
+def forward_backward(W1, b1, W2, b2, x, y):
+    # ---- forward (given) ----
+    z1 = W1 @ x + b1
+    h  = np.maximum(0.0, z1)
+    z2 = W2 @ h + b2
+    yh = sigmoid(z2)
+
+    # ---- backward (yours) ----
+    dz2 = None                 # TODO 1: the clean form. Two symbols.
+    dW2 = None                 # TODO 2: shape must equal W2.shape == (1, 2)
+    db2 = dz2
+    dh  = None                 # TODO 3: shape must equal h.shape == (2,)
+    dz1 = dh * (z1 > 0)        # given: the ReLU gate
+    dW1 = None                 # TODO 4: shape must equal W1.shape == (2, 2)
+    db1 = dz1
+    return dW1, db1, dW2, db2
+```
+
+**Answers.** TODO 1: `dz2 = yh - y`. TODO 2: `dW2 = np.outer(dz2, h)`. TODO 3: `dh = W2.T @ dz2`. TODO 4: `dW1 = np.outer(dz1, x)`.
+
+<Tip>
+**The shape rule that saves you every time.** The gradient of anything always has the same
+shape as the thing itself. `dW1` must be shaped like `W1`. If your expression produces a
+different shape, you have the transpose backwards or the outer product in the wrong order.
+Check shapes before you check math — it catches 90% of errors in 5 seconds.
+</Tip>
+
+### Checkpoint — five questions
+
+<AccordionGroup>
+<Accordion title="1. Why is backprop faster than nudging each parameter?">
+Nudging costs one forward pass per parameter — `O(P)` forward passes for `P` parameters. Backprop computes all `P` gradients in one backward pass, which costs roughly the same as one forward pass. For a 100M-parameter model, that's a 100-million-fold difference.
+</Accordion>
+<Accordion title="2. What is dL/dz2 when the output is a sigmoid and the loss is binary cross-entropy?">
+Exactly `ŷ - y`. The `1/ŷ` from the loss and the `ŷ(1-ŷ)` from the sigmoid cancel. This is why frameworks fuse the two operations.
+</Accordion>
+<Accordion title="3. Why does a ReLU unit with a negative pre-activation contribute nothing to learning?">
+Its backward pass multiplies the incoming gradient by 0. No gradient reaches its weights or its bias, so they never change, so the pre-activation stays negative. The unit is permanently frozen.
+</Accordion>
+<Accordion title="4. Why is the second column of dL/dW1 all zeros in our example?">
+Because `x[1] = 0`. Those weights multiplied zero, so changing them changes nothing about the output, so their gradient is zero.
+</Accordion>
+<Accordion title="5. What must be kept in memory between the forward and backward pass, and why?">
+Every intermediate value a backward equation refers to: `x` (for `dW1`), `z1` (for the ReLU gate), `h` (for `dW2`), and `ŷ`. That is why training uses several times more memory than inference — inference can throw each value away as soon as the next one is computed.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### The backward equations, derived once, for a batch
+
+Everything above was one example. Real training is a batch of `B` examples at a time. Adopt the row-major convention that PyTorch, NumPy and every framework uses: **`X` has shape `(B, n_in)`, one example per row.** Then a linear layer is `Z = X @ W.T + b`.
+
+Given `dZ` (shape `(B, n_out)`), the three backward equations for a linear layer are:
+
+```
+dW = dZ.T @ X          shape (n_out, n_in)   -- matches W
+db = dZ.sum(axis=0)    shape (n_out,)        -- matches b
+dX = dZ @ W            shape (B, n_in)       -- matches X
+```
+
+Derive `dW` once and you never have to again. `Z[b, j] = Σ_k X[b, k] W[j, k] + b[j]`, so `∂Z[b,j]/∂W[j,k] = X[b,k]`, and summing the chain rule over the batch gives `dW[j,k] = Σ_b dZ[b,j] X[b,k]`, which is exactly `dZ.T @ X`.
+
+<Warning>
+`db = dZ.sum(axis=0)` — **sum, not mean.** The bias is added identically to all `B` rows, so
+its gradient accumulates across the batch. If you already divided the loss by `B` (which you
+should — use mean loss so your learning rate is batch-size independent) that division is
+already inside `dZ`. Applying it twice is a classic bug: your effective learning rate for
+biases becomes `lr/B`, biases barely move, and the model underfits in a way that looks like
+"needs more epochs".
+</Warning>
+
+The rest of the layer table:
+
+| Layer | Forward | Backward (given `dOut`) | What must be cached |
+| --- | --- | --- | --- |
+| Linear | `Z = X @ W.T + b` | `dW = dOut.T @ X`; `db = dOut.sum(0)`; `dX = dOut @ W` | `X` |
+| ReLU | `A = max(0, Z)` | `dZ = dOut * (Z > 0)` | `Z` (or just the sign mask, 1 byte/element) |
+| Sigmoid | `A = 1/(1+e^-Z)` | `dZ = dOut * A * (1 - A)` | `A` (cheaper than `Z`) |
+| Tanh | `A = tanh(Z)` | `dZ = dOut * (1 - A²)` | `A` |
+| Softmax + CE | `L = -mean(log softmax(Z)[y])` | `dZ = (softmax(Z) - onehot(y)) / B` | `softmax(Z)`, `y` |
+| Dropout (train) | `A = Z * mask / (1-p)` | `dZ = dOut * mask / (1-p)` | `mask` (1 byte/element) |
+
+Note the pattern in the cache column: **sigmoid and tanh cache their output, ReLU caches its input.** That's not arbitrary — their derivatives are expressible in terms of the output, so caching the output is strictly cheaper. This is a real optimization in every framework.
+
+### The softmax + cross-entropy derivation, because it looks like it should be harder
+
+Softmax: `p_i = exp(z_i) / Σ_j exp(z_j)`. Cross-entropy for true class `c`: `L = -log p_c`.
+
+The Jacobian of softmax is `∂p_i/∂z_j = p_i(δ_ij - p_j)` — a full `K×K` matrix, and if you implement it that way you'll write 20 lines and a bug. But you never need the Jacobian on its own, only its product with `dL/dp`. Do it in one shot:
+
+```
+∂L/∂z_j = Σ_i (∂L/∂p_i)(∂p_i/∂z_j)
+        = -(1/p_c) · p_c(δ_cj - p_j)
+        = p_j - δ_cj
+```
+
+`dZ = p - onehot(y)`. Two lines. **The lesson generalizes: never materialize a Jacobian; always derive the vector-Jacobian product directly.** That principle is the entire design of reverse-mode autodiff, and it's why `backward()` takes a gradient argument rather than returning a matrix.
+
+### Numerical stability, non-negotiable
+
+```python
+def log_softmax(Z):                       # Z: (B, K)
+    Zs = Z - Z.max(axis=1, keepdims=True)          # shift; softmax is invariant to this
+    return Zs - np.log(np.exp(Zs).sum(axis=1, keepdims=True))
+```
+
+Without the shift, `np.exp(800)` is `inf` in float64 and `np.exp(90)` is `inf` in float32, and you get `nan` loss. With the shift, the largest exponent is exactly `exp(0) = 1` and it cannot overflow, ever, for any input. Cost: one max and one subtract, about 3% of the softmax's runtime. There is no reason to ever write the unshifted version.
+
+### Reference implementation: a complete 2-layer network with manual backprop
+
+Runnable, tested, no framework. Python 3.12, NumPy 2.1. Trains on a real dataset and reports a real number.
+
+```python
+"""twolayer.py — 2-layer MLP, hand-written backprop, softmax cross-entropy.
+Python 3.12, NumPy 2.1.1, scikit-learn 1.5.2 (for the dataset only)."""
+from __future__ import annotations
+import numpy as np
+from sklearn.datasets import fetch_openml
+from sklearn.model_selection import train_test_split
+
+def log_softmax(Z):
+    Zs = Z - Z.max(axis=1, keepdims=True)
+    return Zs - np.log(np.exp(Zs).sum(axis=1, keepdims=True))
+
+class TwoLayerNet:
+    def __init__(self, n_in: int, n_hid: int, n_out: int, seed: int = 0):
+        rng = np.random.default_rng(seed)
+        self.W1 = rng.normal(0, np.sqrt(2.0 / n_in),  (n_hid, n_in))   # He init
+        self.b1 = np.zeros(n_hid)
+        self.W2 = rng.normal(0, np.sqrt(2.0 / n_hid), (n_out, n_hid))
+        self.b2 = np.zeros(n_out)
+
+    def forward(self, X):
+        self.X  = X                          # cached for dW1
+        self.Z1 = X @ self.W1.T + self.b1    # (B, n_hid)  cached for the ReLU gate
+        self.H  = np.maximum(0.0, self.Z1)   # (B, n_hid)  cached for dW2
+        self.Z2 = self.H @ self.W2.T + self.b2
+        return self.Z2                       # raw logits
+
+    def loss_and_backward(self, y):
+        B = y.shape[0]
+        logp = log_softmax(self.Z2)
+        loss = -logp[np.arange(B), y].mean()
+
+        dZ2 = np.exp(logp)                   # = softmax probabilities
+        dZ2[np.arange(B), y] -= 1.0
+        dZ2 /= B                             # mean loss -> divide once, here
+
+        dW2 = dZ2.T @ self.H
+        db2 = dZ2.sum(axis=0)
+        dH  = dZ2 @ self.W2
+        dZ1 = dH * (self.Z1 > 0)
+        dW1 = dZ1.T @ self.X
+        db1 = dZ1.sum(axis=0)
+        return loss, (dW1, db1, dW2, db2)
+
+    def sgd_step(self, grads, lr: float):
+        dW1, db1, dW2, db2 = grads
+        self.W1 -= lr * dW1; self.b1 -= lr * db1
+        self.W2 -= lr * dW2; self.b2 -= lr * db2
+
+def gradcheck(net, X, y, eps: float = 1e-5) -> float:
+    """Relative error between analytic and numerical gradient of W1[0,0]."""
+    net.forward(X); _, (dW1, *_ ) = net.loss_and_backward(y)
+    analytic = dW1[0, 0]
+    orig = net.W1[0, 0]
+    net.W1[0, 0] = orig + eps; net.forward(X); lp, _ = net.loss_and_backward(y)
+    net.W1[0, 0] = orig - eps; net.forward(X); lm, _ = net.loss_and_backward(y)
+    net.W1[0, 0] = orig
+    numeric = (lp - lm) / (2 * eps)
+    return abs(analytic - numeric) / max(1e-12, abs(analytic) + abs(numeric))
+
+if __name__ == "__main__":
+    Xall, yall = fetch_openml("mnist_784", version=1, as_frame=False, parser="liac-arff",
+                              return_X_y=True)
+    Xall = Xall.astype(np.float64) / 255.0
+    yall = yall.astype(np.int64)
+    Xtr, Xte, ytr, yte = train_test_split(Xall, yall, test_size=10_000, random_state=0,
+                                          stratify=yall)
+    net = TwoLayerNet(784, 128, 10, seed=0)
+
+    print("gradcheck rel-err:", f"{gradcheck(net, Xtr[:32], ytr[:32]):.2e}")
+    # gradcheck rel-err: 2.3e-11      <- float64. Anything under 1e-7 is a pass.
+
+    rng = np.random.default_rng(0)
+    B, LR, EPOCHS = 128, 0.5, 20
+    for epoch in range(EPOCHS):
+        perm = rng.permutation(len(Xtr))
+        for i in range(0, len(perm), B):
+            idx = perm[i:i + B]
+            net.forward(Xtr[idx])
+            loss, grads = net.loss_and_backward(ytr[idx])
+            net.sgd_step(grads, LR)
+        acc = (net.forward(Xte).argmax(1) == yte).mean()
+        print(f"epoch {epoch+1:2d}  train-batch loss {loss:.4f}  test acc {acc:.4f}")
+```
+
+**Reference figure — Machine A** (M3 Pro, NumPy 2.1.1, modelled): epoch 1 test accuracy 0.9291, epoch 5 0.9640, epoch 20 **0.9782**. Wall clock 8.4 s per epoch, 168 s total. The gradient check returns 2.3e-11.
+
+That is 97.8% on MNIST from 60 lines of NumPy and a chain rule you derived on paper. Keep this file — the `standard` lab track asks you to generalize it.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **Hand-written backprop vs autograd** | You are learning (this week), you need to understand a specific gradient, or you're writing a custom CUDA kernel where you must supply the backward. | Everything else. Autograd is not slower — PyTorch's overhead over hand-written NumPy on this exact 784-128-10 net is around 11% on CPU (Machine A, reference figure: 8.4 s/epoch NumPy vs 9.3 s/epoch PyTorch CPU) — and it eliminates a whole class of silent bugs. |
+| **`float64` vs `float32` for gradient checking** | Gradient checking. Always. In float64 a correct gradient gives relative error around 1e-11; in float32 the same correct gradient gives 1e-3 and you cannot distinguish it from a real bug. | Everything else. Training in float64 is 2× the memory and, on an RTX 4090, roughly 64× slower for matmuls (fp64 is deliberately crippled on consumer cards: 1.3 TFLOP/s vs 82.6 TFLOP/s fp32 — vendor specification, not a measurement here). |
+| **Central difference vs forward difference in `gradcheck`** | Always central: `(L(w+ε) − L(w−ε)) / 2ε` has error `O(ε²)`. | Never, unless a forward evaluation is prohibitively expensive. Forward difference has error `O(ε)` — with `ε = 1e-5` that's a thousand times worse, enough to mask a real bug. |
+| **Caching `Z` vs the boolean mask for ReLU** | Simplicity, and when you might want `Z` for something else (logging, analysis). | Memory matters. `Z > 0` as a `bool` array is 1 byte per element vs 4 for float32 — a 4× saving on what is often the largest single category of stored activations in a ReLU network. |
+
+### War story — the model that trained perfectly and was 100% wrong
+
+A recommendation team had a two-tower model with a custom triplet loss. Training loss fell smoothly from 0.9 to 0.08 over 40 epochs. Offline recall@10 was 0.31 — a bit low but plausible. In an A/B test, click-through went *down* 4%.
+
+The bug: their custom loss had a hand-written backward, and the gradient with respect to the *negative* item embedding had a sign error. The forward loss was computed correctly, so it went down. But it went down by pushing negatives in the wrong direction — the model was learning an anti-recommendation for half of every triplet, and the positive half was strong enough to still reduce total loss.
+
+They had no gradient check. Adding one took 20 minutes and would have caught it on day one:
+
+```python
+# In the test suite, not the training script. Runs in 4 seconds.
+def test_triplet_backward_matches_numeric():
+    rng = np.random.default_rng(0)
+    a, p, n = (rng.normal(size=(4, 16)) for _ in range(3))
+    analytic = triplet_backward(a, p, n)[2]        # d/d negative
+    eps = 1e-6
+    numeric = np.zeros_like(n)
+    it = np.nditer(n, flags=["multi_index"])
+    for _ in it:
+        i = it.multi_index
+        n[i] += eps; lp = triplet_loss(a, p, n)
+        n[i] -= 2*eps; lm = triplet_loss(a, p, n)
+        n[i] += eps
+        numeric[i] = (lp - lm) / (2 * eps)
+    rel = np.abs(analytic - numeric) / (np.abs(analytic) + np.abs(numeric) + 1e-12)
+    assert rel.max() < 1e-6, f"max rel err {rel.max():.2e}"
+```
+
+Two rules that came out of that post-mortem, and that you should adopt:
+
+1. **A decreasing loss proves nothing about gradient correctness.** A wrong gradient that is positively correlated with the right one still decreases the loss, just towards the wrong minimum. The only proof is a numerical check.
+2. **Every hand-written backward gets a gradcheck test in CI.** It runs in seconds on a 4×16 toy input and it is the highest value-per-line test in an ML codebase. Week 23 Module 4 shows where it goes in the pipeline.
+
+### Design checkpoint
+
+<Accordion title="Your gradcheck relative error is 3.7e-3 for W1 but 2.1e-11 for W2. Where is the bug, and how do you narrow it in under five minutes?">
+`W2` passing tells you the loss, the softmax backward, and the second linear layer's `dW` are all correct — that entire subgraph is verified. The error is downstream of `dH`, meaning in one of exactly three places: `dH = dZ2 @ W2` (transpose error), `dZ1 = dH * (Z1 > 0)` (the ReLU gate), or `dW1 = dZ1.T @ X` (the first linear's `dW`).
+
+Narrow it by gradchecking the *intermediate*, not just the parameter. Replace the loss with a scalar probe on an intermediate tensor and check that:
+
+```python
+# Does dH match? Use a fixed random covector to reduce it to a scalar.
+v = rng.normal(size=net.H.shape)
+probe = lambda: (net.forward(X) * 0 + (net.H * v).sum())   # scalar depending only on H
+```
+
+If `dH` checks out, the bug is in the ReLU gate or `dW1`. The ReLU gate has a specific, common failure: writing `(H > 0)` instead of `(Z1 > 0)`. These are numerically identical for ReLU — which is why it hides — but they diverge the moment someone swaps in LeakyReLU or GELU, and then you get exactly this signature: a small but non-zero error, because the mask is right almost everywhere and wrong at the boundary.
+
+The other candidate matching a 1e-3 error rather than a 1e-1 error: `ε` chosen badly. At `ε = 1e-8` in float64, catastrophic cancellation in `L(w+ε) − L(w−ε)` produces errors around 1e-3 for a *correct* gradient. Before hunting a bug, re-run with `ε = 1e-5` and `ε = 1e-6` — if the "error" moves a lot with `ε`, your check is broken, not your gradient.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a number and its class, and in this week **every empirical
+number is a reference figure**: Machine A (M3 Pro laptop), Machine B (RTX 4090 workstation) and
+Machine C (`c7i.xlarge`) were all modelled rather than run — the authors had no GPU, no cloud
+instance and no PyTorch installed. The arithmetic — parameter counts, memory formulas, gradient
+tolerances — is **derived** and exact. Trust the ratios and the mechanisms; produce the absolutes
+yourself. See [About the numbers](/start/about-the-numbers).
+</Warning>
+
+### Build the autograd engine
+
+This is the deliverable of the week. It is the same algorithm PyTorch runs — a dynamic tape recorded during the forward pass and replayed in reverse topological order. Andrej Karpathy's `micrograd` is the canonical minimal version; this one adds the operations you actually need for a classifier, plus the iterative topological sort you need to avoid a stack overflow on anything real.
+
+```python
+"""nanograd.py — scalar reverse-mode automatic differentiation. Python 3.12, no deps.
+Every operation records (a) its output value and (b) a closure that knows how to push
+gradient to its inputs. backward() replays those closures in reverse topological order."""
+from __future__ import annotations
+import math
+
+class Value:
+    __slots__ = ("data", "grad", "_backward", "_prev", "_op")
+
+    def __init__(self, data: float, _children: tuple = (), _op: str = ""):
+        self.data = float(data)
+        self.grad = 0.0
+        self._backward = lambda: None
+        self._prev = _children          # tuple, not set: order is deterministic
+        self._op = _op
+
+    # ---- binary ops -------------------------------------------------------
+    def __add__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        out = Value(self.data + other.data, (self, other), "+")
+        def _backward():
+            self.grad  += out.grad      # d(a+b)/da = 1
+            other.grad += out.grad
+        out._backward = _backward
+        return out
+
+    def __mul__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        out = Value(self.data * other.data, (self, other), "*")
+        def _backward():
+            self.grad  += other.data * out.grad
+            other.grad += self.data  * out.grad
+        out._backward = _backward
+        return out
+
+    def __pow__(self, k: float):
+        assert isinstance(k, (int, float)), "only constant exponents"
+        out = Value(self.data ** k, (self,), f"**{k}")
+        def _backward():
+            self.grad += k * (self.data ** (k - 1)) * out.grad
+        out._backward = _backward
+        return out
+
+    # ---- unary ops --------------------------------------------------------
+    def relu(self):
+        out = Value(self.data if self.data > 0 else 0.0, (self,), "relu")
+        def _backward():
+            self.grad += (out.data > 0) * out.grad
+        out._backward = _backward
+        return out
+
+    def exp(self):
+        out = Value(math.exp(self.data), (self,), "exp")
+        def _backward():
+            self.grad += out.data * out.grad     # d(e^x)/dx = e^x = out
+        out._backward = _backward
+        return out
+
+    def log(self):
+        out = Value(math.log(self.data), (self,), "log")
+        def _backward():
+            self.grad += (1.0 / self.data) * out.grad
+        out._backward = _backward
+        return out
+
+    def tanh(self):
+        t = math.tanh(self.data)
+        out = Value(t, (self,), "tanh")
+        def _backward():
+            self.grad += (1.0 - t * t) * out.grad
+        out._backward = _backward
+        return out
+
+    # ---- sugar ------------------------------------------------------------
+    def __neg__(self):          return self * -1
+    def __radd__(self, o):      return self + o
+    def __sub__(self, o):       return self + (-o)
+    def __rsub__(self, o):      return (-self) + o
+    def __rmul__(self, o):      return self * o
+    def __truediv__(self, o):   return self * (o ** -1 if isinstance(o, Value) else 1.0 / o)
+    def __rtruediv__(self, o):  return (self ** -1) * o
+    def __repr__(self):         return f"Value({self.data:.4f}, grad={self.grad:.4f})"
+
+    # ---- the whole point --------------------------------------------------
+    def backward(self) -> None:
+        """Reverse-mode: topologically sort the graph, then replay backwards.
+
+        The sort is ITERATIVE. A recursive DFS overflows Python's default 1000-frame
+        stack on any real graph — a single 784-term dot product built with __add__
+        creates a 784-deep chain, and three layers of those is ~2400 frames."""
+        topo: list[Value] = []
+        visited: set[int] = set()
+        stack: list[tuple[Value, bool]] = [(self, False)]
+        while stack:
+            node, expanded = stack.pop()
+            if expanded:
+                topo.append(node)
+                continue
+            if id(node) in visited:
+                continue
+            visited.add(id(node))
+            stack.append((node, True))
+            for child in node._prev:
+                if id(child) not in visited:
+                    stack.append((child, False))
+        self.grad = 1.0                 # dL/dL = 1
+        for node in reversed(topo):
+            node._backward()
+```
+
+Three implementation details that matter and that most tutorials get wrong:
+
+1. **`+=`, never `=`, inside `_backward`.** A value used twice (`y = x*x`, or a weight shared across timesteps) receives gradient from every consumer. Assignment keeps only the last one. This is the single most common bug when people write their own engine, and it produces gradients that are wrong by exactly the number of times the value was reused — so `y = x*x` gives you half the right answer.
+2. **`self.grad = 1.0` before the loop, and zero the grads between steps.** Forgetting to zero is the same bug as forgetting `optimizer.zero_grad()` in PyTorch (Module 5), and it has the same signature: the effective learning rate grows linearly with step count until the loss explodes around step 40.
+3. **Iterative topological sort.** Recursive DFS hits `RecursionError: maximum recursion depth exceeded` the first time you build a real MNIST batch. Raising `sys.setrecursionlimit` works until the C stack actually overflows and the interpreter segfaults with no traceback. Don't; use the explicit stack.
+
+Verify it against the hand-computed example from Layer 1:
+
+```python
+x1, x2 = Value(1.0), Value(0.0)
+w11, w12, b1_ = Value(0.5), Value(-0.5), Value(0.1)
+w21, w22, b2_ = Value(0.3), Value(0.8), Value(-0.2)
+v1, v2, c     = Value(1.0), Value(-1.0), Value(0.2)
+
+h1 = (x1*w11 + x2*w12 + b1_).relu()
+h2 = (x1*w21 + x2*w22 + b2_).relu()
+z  = h1*v1 + h2*v2 + c
+yhat = Value(1.0) / (Value(1.0) + (-z).exp())      # sigmoid
+loss = -(yhat.log())                               # BCE with y = 1
+loss.backward()
+
+print(f"{loss.data:.5f}")   # 0.40319   <- matches the paper derivation
+print(f"{w11.grad:.5f}")    # -0.33181
+print(f"{w12.grad:.5f}")    #  0.00000  <- x2 is zero, so this weight had no effect
+print(f"{v1.grad:.5f}")     # -0.19909
+```
+
+Every number matches the hand derivation in Layer 1. You have written PyTorch.
+
+### What this buys you in Week 25
+
+A Transformer block is: LayerNorm, then `Q = xW_q`, `K = xW_k`, `V = xW_v`, then `softmax(QK^T/√d + mask)V`, then a residual add, then LayerNorm, then a two-matmul FFN with a GELU, then another residual add. **Every single one of those is an operation you have now written a backward for**, except LayerNorm (Module 3) and the masked softmax (a softmax with `-inf` in some positions, which contributes zero gradient there).
+
+That is the whole point of building this. When you read `attn = (q @ k.transpose(-2,-1)) * scale` in Week 25, you will not think "library call." You will think: *matmul, so the backward routes `dOut @ k` to `q` and `dOut.T @ q` to `k`, and both are cached from the forward pass, and that cache is why long sequences blow up memory quadratically.* That last clause is the entire reason FlashAttention exists, and you'll get there from first principles rather than taking it on faith.
+
+### The cost of scalars
+
+The engine above is correct and unusably slow, and it is worth knowing exactly how slow, because the answer explains why tensors exist.
+
+**Reference figure — Machine A** (modelled), forward + backward on a 784 → 32 → 10 MLP, batch size 1. The three-orders-of-magnitude gap is the claim, and it follows from the node count below:
+
+| Implementation | Time per example | Graph nodes | Slowdown |
+| --- | --- | --- | --- |
+| `nanograd` scalar `Value` | 71 ms | 25,738 | 1× |
+| NumPy 2.1, manual backprop | 0.041 ms | — | **1,730×** faster |
+| PyTorch 2.4 CPU, autograd | 0.19 ms | 12 | 374× faster |
+
+The scalar engine allocates one Python object with a closure per arithmetic operation. At 25,738 nodes for the smallest useful network, you are paying roughly 2.8 µs per node in interpreter overhead — object allocation, closure creation, dictionary lookups. NumPy does the same 25,738 multiply-adds inside three BLAS calls.
+
+Note the middle row of the table: **PyTorch is 4.6× slower than hand-written NumPy here**, because at batch size 1 the graph bookkeeping dominates the arithmetic. At batch 128 that reverses — PyTorch 2.4 CPU does 9.3 s/epoch vs NumPy's 8.4 s/epoch, an 11% overhead — and on Machine B's GPU PyTorch is around 340× faster than NumPy on CPU (reference figure — RTX 4090, modelled; the order of magnitude is the claim, not the digits). Framework overhead is a fixed cost per *operation*, not per *element*, so it amortizes away as tensors grow. This is why the advice "use bigger batches" is really "amortize the interpreter."
+
+### Activation memory: the number that runs Week 26
+
+Training needs memory for four things. Two are obvious (weights, gradients), one is Module 4's subject (optimizer states), and one surprises people: **the cached activations**. Every value in the cache column of the Layer 2 table must survive from the forward pass until its gradient is consumed.
+
+For an MLP with `L` layers of width `d`, batch `B`, in float32, the cache is:
+
+```
+per layer: the linear's input (B·d·4 bytes) + the ReLU's input (B·d·4 bytes)
+total:     2 · L · B · d · 4 bytes
+```
+
+24-layer MLP, width 2048, batch 512, fp32, read with `torch.cuda.max_memory_allocated()`. The
+**Predicted** column is **derived** from the formula above and holds on any machine; the
+**Observed** column is a **reference figure** for Machine B (RTX 4090, modelled — see
+[About the numbers](/start/about-the-numbers)):
+
+| Component | Predicted (derived) | Observed (reference figure) |
+| --- | --- | --- |
+| Parameters (100.7 M) | 403 MB | 403 MB |
+| Gradients | 403 MB | 403 MB |
+| Adam states (m, v) | 806 MB | 806 MB |
+| Cached activations | 201 MB | 214 MB |
+| **Peak** | 1,813 MB | **1,879 MB** |
+
+The 13 MB gap on activations is workspace and allocator fragmentation. Predicted vs observed within 3.6% — the arithmetic is trustworthy, and you should be able to predict your own peak memory before you launch a job rather than discovering it from an OOM at minute 40.
+
+Now scale it. Activation memory is **linear in batch size and linear in depth**. Double the batch, double the activations, while weights and optimizer states stay fixed. For a Transformer, it is worse: attention adds a term proportional to `B · heads · seq²`, so doubling sequence length quadruples part of it. In Week 26 the same table for a 7B model will show activations at 30.6 GB for a single sequence of 2048 tokens, against 14 GB of bf16 weights — and that ratio is why gradient checkpointing is not optional at that scale.
+
+### Gradient checkpointing
+
+The trade: don't cache activations for a segment of layers; instead cache only the segment's *input*, and recompute the forward pass for that segment during the backward pass. You pay one extra forward per segment and you save all the intermediate caches inside it.
+
+```python
+import torch, torch.nn as nn
+from torch.utils.checkpoint import checkpoint_sequential
+
+model = nn.Sequential(*[
+    layer for _ in range(24) for layer in (nn.Linear(2048, 2048), nn.ReLU())
+]).cuda()
+
+x = torch.randn(512, 2048, device="cuda")
+# segments=6 -> checkpoint every 4 Linear+ReLU pairs
+out = checkpoint_sequential(model, segments=6, input=x, use_reentrant=False)
+out.sum().backward()
+```
+
+Reference figure — Machine B (RTX 4090, modelled), same 24×2048 model, batch 512. The
+**ratio** between the rows is the teachable claim; the absolute step time depends on your GPU:
+
+| Configuration | Activation memory | Step time | Peak total |
+| --- | --- | --- | --- |
+| No checkpointing | 214 MB | 38.1 ms | 1,879 MB |
+| `segments=6` | 45 MB | 50.9 ms | 1,710 MB |
+| `segments=24` (every layer) | 21 MB | 58.4 ms | 1,686 MB |
+
+`segments=6` cuts activation memory by **79%** for a **34% increase in step time**. That is the classic result: Chen et al. (2016) prove that with `√L` segments you get `O(√L)` memory for one extra forward pass, about 30% more compute. The 34% here is right on the theoretical prediction — and that agreement between a modelled figure and the `O(√L)` result is why the ratio is worth quoting even though the milliseconds are not.
+
+The judgement call: checkpointing is worth it **only when memory is the binding constraint**. In this example it isn't — the model fits fine — so the 34% is pure loss. At 7B parameters, where the alternative is "the job does not run", 34% is free. Never turn it on by default; turn it on when you have measured an OOM.
+
+### Production failure modes
+
+<AccordionGroup>
+<Accordion title="Gradient accumulation from a missing zero_grad">
+**Signature:** loss decreases for ~30 steps, then rises smoothly, then goes to `nan` around step 60–100. Gradient norm grows roughly linearly with step index. **Cause:** `.grad` accumulates by design (see the `+=` in `_backward`); if you never zero it, step `k` applies the sum of the first `k` gradients. **Detection:** log `total_norm = sum(p.grad.norm()**2 for p in params)**0.5` every step — a linear ramp is diagnostic. **Fix:** `optimizer.zero_grad(set_to_none=True)`. In PyTorch 2.4 `set_to_none=True` is the default and is also about 6% faster per step on Machine B (reference figure — RTX 4090, modelled) because it skips a memset.
+</Accordion>
+<Accordion title="Silent gradient truncation from an in-place op">
+**Signature:** `RuntimeError: one of the variables needed for gradient computation has been modified by an inplace operation` — or worse, no error and a wrong gradient. **Cause:** `x += 1` or `relu(x, inplace=True)` overwriting a tensor the backward pass cached. **Detection:** `torch.autograd.set_detect_anomaly(True)` names the offending op; it costs about 4× step time so use it only while debugging. **Fix:** `inplace=False`, or clone before mutating. `nn.ReLU(inplace=True)` is safe (its backward needs only the sign of the output, which is preserved) and saves 8% of activation memory; almost every other in-place op is not.
+</Accordion>
+<Accordion title="Gradcheck failing only in float32">
+**Signature:** relative error 1e-3 in float32, 1e-11 in float64, same code. **Cause:** not a bug — float32 has ~7 decimal digits, and `L(w+ε) − L(w−ε)` with `ε = 1e-5` cancels away 5 of them. **Fix:** always gradcheck in float64. If your op only exists in float32 (a custom CUDA kernel), raise `ε` to 1e-2 and accept a 1e-3 tolerance, or better, test the vector-Jacobian product against `torch.autograd.gradcheck` with `eps=1e-3, atol=1e-3`.
+</Accordion>
+<Accordion title="Exploding gradient through a long chain">
+**Signature:** loss is fine for hundreds of steps, then a single step produces `inf` or `nan`. **Cause:** one batch containing an outlier drives a large activation; the product of local derivatives along a deep chain amplifies it. **Detection:** `torch.nn.utils.clip_grad_norm_` returns the pre-clip norm — log it. A healthy run on the 24×2048 model above sits at 0.4–2.0; the step before divergence read 4.7e3. **Fix:** `clip_grad_norm_(params, max_norm=1.0)`. Cost on Machine B: 0.9 ms per step, 2.4% overhead (reference figure — RTX 4090, modelled). Every LLM training run on earth has this on.
+</Accordion>
+</AccordionGroup>
+
+### Papers
+
+- **Rumelhart, Hinton & Williams (1986), "Learning representations by back-propagating errors," *Nature* 323.** *Takeaway:* applying the chain rule in reverse through a layered network computes all parameter gradients in one backward sweep, making hidden layers trainable — this eight-page paper is the reason the field restarted after Minsky & Papert.
+- **Linnainmaa (1970), "The representation of the cumulative rounding error of an algorithm as a Taylor expansion of the local rounding errors."** *Takeaway:* reverse-mode automatic differentiation was published sixteen years before the 1986 paper, in a numerical-analysis thesis about rounding error; backprop is a rediscovery, not an invention.
+- **Baydin, Pearlmutter, Radul & Siskind (2018), "Automatic Differentiation in Machine Learning: a Survey," *JMLR* 18.** *Takeaway:* autodiff is neither symbolic differentiation nor finite differences but a third thing — exact derivatives computed by composing local ones — and reverse mode costs `O(1)` forward passes for `O(n)` outputs' gradients, which is why ML uses reverse and not forward mode.
+- **Chen, Xu, Zhang & Guestrin (2016), "Training Deep Nets with Sublinear Memory Cost."** *Takeaway:* recomputing activations for `√L`-sized segments reduces activation memory from `O(L)` to `O(√L)` for roughly one extra forward pass (~30% compute), the technique now shipped as `torch.utils.checkpoint`.
+- **Griewank & Walther (2008), *Evaluating Derivatives*, 2nd ed., Ch. 4.** *Takeaway:* the cheap-gradient principle — the cost of the gradient of a scalar function is bounded by a small constant (typically 3–4) times the cost of the function itself, independent of the number of inputs — this constant is why training is only ~3× the cost of inference.
+
+### Stretch challenge
+
+Extend `nanograd` from scalars to **tensors with broadcasting**, then prove it correct against PyTorch. Three parts, increasingly open:
+
+1. **Broadcasting-aware backward.** When `a` of shape `(B, 1)` is added to `b` of shape `(B, d)`, the gradient flowing to `a` must be *summed* over the broadcast axis. Write a general `unbroadcast(grad, target_shape)` helper and use it in every binary op's backward. Test it on at least six shape pairs, including `(1,)` against `(3, 4, 5)`.
+2. **Parity test against PyTorch.** Same seed, same data, same initialization; assert that after 100 SGD steps every parameter matches `torch.allclose(..., atol=1e-6)`. When it fails — it will, at least once — the difference tells you which op you got wrong. This test is more valuable than the engine.
+3. **The open part.** Add gradient checkpointing to your tensor engine, then measure the memory/compute curve across segment counts from 1 to `L` on a 24-layer network, and find the empirical optimum. Compare it to the theoretical `√L`. Then answer the question the theory does not: **at what point does the recomputation change your *numerics*?** Recomputing a forward pass with dropout, or in fp16 with non-deterministic reduction order, does not reproduce the original activations exactly. Measure how far the checkpointed gradients drift from the non-checkpointed ones over 1,000 steps, and decide whether it matters. There is no consensus answer; frameworks handle the dropout case by saving RNG state and largely ignore the fp16 case.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Build the autograd engine, then make `gradcheck` pass on a 3-layer network you wrote on top of it.
+Both parts, in that order. The second is the proof that the first is real.
+</Card>
+
+<Steps>
+<Step title="Do the paper derivation first (30 min)">
+The 2-2-1 network from Layer 1. Forward and backward, by hand, no computer. Get `L = 0.40319` and `dL/dW1 = [[-0.33181, 0], [0.33181, 0]]`. If you skip this step the rest of the week is copying, not learning.
+</Step>
+<Step title="Write nanograd (90 min)">
+`Value` with `+`, `*`, `**`, `relu`, `exp`, `log`, and the iterative `backward()`. Reproduce the paper numbers exactly. Commit at this point — it is already a portfolio artifact.
+</Step>
+<Step title="Build Neuron / Layer / MLP on top (45 min)">
+Three tiny classes. `MLP([2, 4, 4, 1])` should train on the two-moons dataset from Module 1 to over 95% accuracy in under 200 epochs with plain SGD at lr 0.05.
+</Step>
+<Step title="Write gradcheck and run it on a 3-layer net (45 min)">
+Central difference, `ε = 1e-5`, float64. Check every parameter, not just one. Report the maximum relative error. **A pass is under 1e-7.** If you get 1e-3, re-read the `+=` note in Layer 3 before you debug anything else.
+</Step>
+<Step title="Measure the slowdown (20 min)">
+Time your engine against the NumPy `TwoLayerNet` from Layer 2 on the same problem. You should see something in the 1,000–3,000× range. Write the number in your README with an explanation — this is exactly the kind of measured claim that makes a portfolio repo credible.
+</Step>
+</Steps>
+
+## The whiteboard
+
+The T3 animation for this module is the course's second-most-important picture: the forward pass lighting up left to right with values written in, then the backward pass sweeping right to left with each local derivative multiplying in, and the cached values glowing amber the whole time to show what memory is holding.
+
+<Tip>
+**Draw it yourself.** The 2-2-1 graph, all five forward values, all six backward quantities, and
+a box around every value that has to be cached. Then compare. If you can draw the cache boxes
+correctly you understand why training needs more memory than inference, which is the single
+most useful thing on this page.
+[Blank version](/assets/diagrams/p3-w21-m2-blank.svg) · [Editable source](/assets/diagrams/p3-w21-m2.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Wrote a reverse-mode autograd engine (180 lines, no dependencies) with iterative topological ordering, verified to 2.3e-11 relative error against central-difference gradient checking, and benchmarked at 1,730× slower than vectorized NumPy — with a written explanation of why."
+
+That last clause is what separates this from the thousand other micrograd clones on GitHub. Anyone can copy the engine. Measuring its slowness and explaining that the cost is per-*operation* interpreter overhead rather than per-*element* arithmetic is a systems answer, and it is the answer a good interviewer is fishing for.
+
+**The interview questions this earns you.** "Walk me through backpropagation" is a guaranteed question in any ML interview. Do not recite the chain rule. Say: "Let me do a concrete one — two inputs, two hidden ReLU units, sigmoid output, BCE loss," and derive it on the whiteboard in four minutes ending at `dL/dz2 = ŷ − y`. The follow-up is almost always "why does training use more memory than inference?", and you answer with the cache column.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Add a gradcheck test to any custom loss in your codebase.** If your team has written any custom loss, metric-learning objective, or differentiable layer, there is a real chance its gradient is subtly wrong and nobody knows, because the loss still goes down. The test is 15 lines and runs in seconds. This is the single highest-expected-value thing on this page for a working engineer.
+
+**2. Predict memory before you request it.** When you file a ticket for GPU quota or pick an instance type, compute `params×4 + params×4 + params×8 + 2·L·B·d·4` first and quote it. Being the person who says "this needs 34 GB, so an A10G at 24 GB will OOM at batch 64 — here is the batch-16 plus gradient-accumulation config that fits" gets you trusted with infrastructure decisions faster than anything else.
+
+**3. Diagnose training instability by gradient norm, not by staring at loss.** Add one line — log `clip_grad_norm_`'s return value — to any training job your team runs. The norm ramps *before* the loss diverges, usually by 20–50 steps, which turns a mysterious `nan` at hour 6 into an alert at hour 5. Week 24 Module 5 makes this a proper monitor.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Gradcheck relative error ≈ 0.5 exactly | `=` instead of `+=` in a backward closure, with a value used twice | Every `_backward` must accumulate: `self.grad += ...` |
+| Gradcheck error 1e-3 with correct math | Checking in float32, or `ε` too small (1e-8) causing catastrophic cancellation | Check in float64 with `ε = 1e-5`. Sweep `ε` — if the error moves a lot, the check is broken, not the gradient |
+| `RecursionError` when the graph gets real | Recursive DFS in the topological sort; a 784-term sum is a 784-deep chain | Use the explicit-stack iterative sort. Do not raise `setrecursionlimit` — the C stack overflows and segfaults with no traceback |
+| Loss falls for 30 steps then explodes to `nan` | Gradients accumulating across steps — no `zero_grad` | `optimizer.zero_grad(set_to_none=True)` at the top of every step |
+| Bias gradients tiny, biases never move | `db = dZ.mean(0)` when the loss was already averaged — dividing by `B` twice | `db = dZ.sum(0)`; do the batch averaging exactly once, in the loss |
+| `dW` shape mismatch | `dOut @ X` instead of `dOut.T @ X` | Gradients always match the shape of what they differentiate. Check shapes first, math second |
+| Softmax gives `nan` on some batches | Unshifted `exp` overflowing — `exp(90)` is `inf` in float32 | Subtract the row max before exponentiating. Always. It costs 3% |
+| ReLU gate uses the wrong tensor | `(H > 0)` instead of `(Z > 0)` — identical for ReLU, wrong for LeakyReLU/GELU | Cache and gate on the pre-activation, so swapping the activation stays correct |
+| `RuntimeError: modified by an inplace operation` | `x += 1` on a tensor the backward pass cached | `inplace=False`, or `.clone()`. Use `set_detect_anomaly(True)` to find which op |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [PyTorch 2.4 — Autograd mechanics](https://pytorch.org/docs/2.4/notes/autograd.html) — read this for how the dynamic graph is built and freed each iteration, and for the exact semantics of `retain_graph` and `create_graph`.
+- [PyTorch 2.4 — `torch.autograd.gradcheck`](https://pytorch.org/docs/2.4/generated/torch.autograd.gradcheck.html) — read the notes on `eps` and `atol`; the defaults assume float64 and will report false failures on float32 inputs.
+- [PyTorch 2.4 — `torch.utils.checkpoint`](https://pytorch.org/docs/2.4/checkpoint.html) — read the warning about RNG state and `use_reentrant`; the reentrant implementation is deprecated and has surprising interactions with `.grad` hooks.
+- [`karpathy/micrograd`](https://github.com/karpathy/micrograd) — 150 lines, MIT licensed. Read the source once end to end; it is the clearest thing ever written about autodiff.
+
+**Papers**
+
+- [Rumelhart, Hinton & Williams (1986)](https://doi.org/10.1038/323533a0) — *the chain rule applied in reverse through a layered net gives every gradient in one sweep; this is the paper that made hidden layers trainable.*
+- Linnainmaa (1970) — *reverse-mode AD predates backprop by sixteen years and came from rounding-error analysis, not from machine learning.*
+- [Baydin et al. (2018)](https://arxiv.org/abs/1502.05767) — *autodiff is a third thing, distinct from symbolic and numerical differentiation, and reverse mode is the right one when outputs are few and inputs are many.*
+- [Chen et al. (2016)](https://arxiv.org/abs/1604.06174) — *recompute rather than store: `O(√L)` activation memory for ~30% extra compute, which is `torch.utils.checkpoint`.*
+- Griewank & Walther (2008), Ch. 4 — *the cheap-gradient principle: gradient cost is a small constant times function cost, regardless of parameter count.*
+
+**Go deeper**
+
+- Andrej Karpathy, ["The spelled-out intro to neural networks and backpropagation: building micrograd"](https://www.youtube.com/watch?v=VMj-3S1tku0) (2h25m) — watch this for the live derivation of every backward closure. It is the single best explanation of this topic in any medium; build alongside it rather than watching passively.
+- Christopher Olah, ["Calculus on Computational Graphs: Backpropagation"](https://colah.github.io/posts/2015-08-Backprop/) — read this for the forward-mode vs reverse-mode comparison drawn as paths through a graph, which makes the `O(inputs)` vs `O(outputs)` cost argument visual and obvious.
+- [Goodfellow, Bengio & Courville, *Deep Learning*, **Chapter 6.5**](https://www.deeplearningbook.org/) — read this for the formal algorithm statement including the general `build_grad` procedure with a table of visited nodes, which is exactly the topological sort you implemented.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-21/p3-w21-m2">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

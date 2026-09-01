@@ -1,0 +1,138 @@
+---
+title: "Transactions & ACID for real"
+description: "Reference solution — Week 8"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W08-M1`
+
+The exercise: kill the database mid-transaction and prove recovery leaves no partial write.
+
+### The procedure
+
+```sql
+CREATE TABLE accounts (id int PRIMARY KEY, balance bigint NOT NULL CHECK (balance >= 0));
+INSERT INTO accounts VALUES (1, 100000), (2, 100000);
+```
+
+Session 1, and **do not commit**:
+
+```sql
+BEGIN;
+UPDATE accounts SET balance = balance - 50000 WHERE id = 1;
+UPDATE accounts SET balance = balance + 50000 WHERE id = 2;
+SELECT id, balance FROM accounts ORDER BY id;
+```
+```
+ id | balance
+----+---------
+  1 |   50000
+  2 |  150000
+```
+
+Then, from a second terminal:
+
+```bash
+docker kill -s SIGKILL pg && docker start pg
+```
+
+`SIGKILL`, not `docker stop`. A graceful stop lets PostgreSQL run a shutdown checkpoint, which
+proves nothing about crash recovery.
+
+### The result
+
+```
+LOG:  database system was interrupted; last known up at 2026-08-31 21:47:53 UTC
+LOG:  database system was not properly shut down; automatic recovery in progress
+LOG:  redo starts at 0/191F148
+LOG:  invalid record length at 0/F8B7320: expected at least 24, got 0
+LOG:  redo done at 0/F8B72F8  system usage: CPU: user: 0.58 s, system: 0.68 s, elapsed: 1.26 s
+LOG:  checkpoint starting: end-of-recovery immediate wait
+LOG:  checkpoint complete: wrote 14352 buffers (43.8%); ... distance=228960 kB
+LOG:  database system is ready to accept connections
+```
+
+```
+ id | balance          total
+----+---------        --------
+  1 |  100000          200000
+  2 |  100000
+```
+
+The uncommitted transfer is gone entirely — not half-applied, not partially rolled back. Recovery
+took **1.26 seconds** for 229 MB of WAL distance.
+
+Then run it a second time with a `COMMIT` before the kill, and confirm the new balances survived.
+Two runs, four numbers, and the property is demonstrated in both directions.
+
+### Reading the log
+
+- `redo starts at 0/191F148` — the last checkpoint. Recovery replays only from there, which is why
+  checkpoint frequency trades steady-state I/O against recovery time.
+- `invalid record length ... got 0` — **not an error.** It is how recovery detects the end of valid
+  WAL, which is exactly where the machine died.
+- `elapsed: 1.26 s` — the number to quote when someone asks "how long is our recovery?"
+- `distance=228960 kB` — how much WAL had accumulated since the last checkpoint. Recovery time
+  scales with this, not with database size.
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: `docker stop` instead of `docker kill`.** A graceful stop runs a shutdown
+checkpoint and closes cleanly, so the recovery log says nothing interesting and the demonstration
+proves only that PostgreSQL can shut down. The `SIGKILL` is the whole exercise.
+
+**Wrong turn 2: committing before the kill and being surprised the data is there.** That is the
+*other* half of the test and it should be run second, deliberately, as the control. Both runs
+together demonstrate atomicity and durability; either alone demonstrates half of one.
+
+**Wrong turn 3: concluding `synchronous_commit=off` is nearly free.** I measured 1,167 commits/s
+with it `on` and 1,446 with it `off` — only **1.24×**, where the usual figure is 10–50×. Reporting
+that as "the durability flush is cheap" would be wrong. The measurement is telling me about my
+*storage*: Docker Desktop on macOS virtualizes the filesystem and does not perform a true hardware
+`fsync`, so the cost being measured was never really being paid. A 3/3 answer notices the anomaly,
+explains it, and says the number must be re-measured on the deployment hardware — `pg_test_fsync`
+exists precisely to check whether storage is honest about `fsync`.
+
+**Wrong turn 4: an external call inside the transaction, in the follow-up exercise.** It holds row
+locks for the length of a third party's outage *and* prevents vacuum from removing dead tuples
+across the whole database, because the transaction's snapshot may still need them. The measurable
+symptom is bloat growing during someone else's incident.
+
+## Measured numbers this solution produces
+
+| Claim | Number |
+| --- | --- |
+| Recovery after `SIGKILL` mid-transaction | uncommitted work fully discarded; total preserved at 200,000 |
+| Redo time | **1.26 s** for 228,960 kB of WAL distance |
+| Checkpoint after recovery | 14,352 buffers written (43.8% of shared buffers) |
+| 3,000 commits, `synchronous_commit=on` | 2,571 ms (1,167 commits/s) |
+| Same, `synchronous_commit=off` | 2,074 ms (1,446 commits/s) — only **1.24×**, see the caveat |
+| Same, `local` | 2,420 ms (1,240 commits/s) |
+| 3,000 inserts in **one** transaction | **886 ms** (3,385 rows/s) — 2.9× |
+
+## Grading notes
+
+**A 3/3 on correctness**: both runs performed (uncommitted and committed), the recovery log
+captured, the redo time reported, and the balances shown before and after.
+
+**A 3/3 on explanation**: explains *why* the log record must precede the data page, identifies
+`redo starts at` as the last checkpoint, and — if the `synchronous_commit` numbers look small —
+says so and explains what that reveals about the storage rather than reporting it as a finding.
+
+**The four most common ways submissions lose points**
+
+1. `docker stop` instead of `SIGKILL`, so nothing was actually tested.
+2. Only the uncommitted case, so durability is asserted rather than shown.
+3. `synchronous_commit` numbers reported without noticing that a 1.24× ratio is anomalous.
+4. A retry wrapper that retries every exception rather than only `40001` and `40P01`.

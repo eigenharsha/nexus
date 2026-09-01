@@ -1,0 +1,149 @@
+---
+title: "Lab — Multi-threaded TCP chat server (raw sockets)"
+description: "Reference solution — Week 10"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `LAB-P2-W10`
+
+The module solution pages carry the framing, protocol and TLS code. This page covers the three
+things the lab adds: the module layout, the back-pressure design that satisfies the `hard`
+constraint, and how to read the benchmark.
+
+### Module layout
+
+```
+chat/
+  framing.py     recv_exactly, send_msg, recv_msg, MAX_MESSAGE   -- knows about bytes only
+  protocol.py    message construction, validation, error codes,  -- knows about dicts only
+                 version negotiation, the state machine
+  server_thread.py    thread-per-connection transport
+  server_async.py     asyncio transport
+  rooms.py       Room registry, membership, broadcast             -- knows about neither
+  client.py      reconnect with full jitter, heartbeat
+```
+
+The rule that makes this layout worth the effort: **`rooms.py` must not import `socket`, and
+`framing.py` must not know what a room is.** If they do, you cannot swap the transport, and the
+`hard` track requires exactly that swap. Students who write one 600-line `server.py` are the ones who
+find the `hard` track impossible rather than merely difficult.
+
+### The back-pressure design
+
+This is the part that distinguishes `hard` from `standard`.
+
+```python
+class Session:
+    MAX_QUEUED = 1000              # messages
+    MAX_QUEUED_BYTES = 1 << 20     # 1 MiB
+
+    def __init__(self, writer, nick):
+        self.writer, self.nick = writer, nick
+        self.queue = collections.deque()
+        self.queued_bytes = 0
+        self.dropped = 0
+
+    def enqueue(self, frame: bytes) -> bool:
+        """Returns False if the message was dropped."""
+        if len(self.queue) >= self.MAX_QUEUED or \
+           self.queued_bytes + len(frame) > self.MAX_QUEUED_BYTES:
+            self.dropped += 1
+            return False                       # DROP policy, logged and counted
+        self.queue.append(frame)
+        self.queued_bytes += len(frame)
+        return True
+
+    async def pump(self):
+        while True:
+            frame = await self.next_frame()
+            self.writer.write(frame)
+            self.queued_bytes -= len(frame)
+            await self.writer.drain()          # <- the actual back-pressure
+```
+
+Four decisions worth defending in the write-up:
+
+1. **Bound by both count and bytes.** A thousand 1 MB messages is a gigabyte; a million 10-byte
+   messages is also a problem. Either bound alone is insufficient.
+2. **`await writer.drain()` is the mechanism, not decoration.** Writing without ever draining means
+   `asyncio` buffers unboundedly on your behalf, and the queue you carefully bounded is bypassed.
+   This is the single most common asyncio back-pressure bug.
+3. **Drop, and count the drops.** For chat, dropping messages to a client who cannot keep up is
+   correct — they are already behind and the content is ephemeral. **Say so in `PROTOCOL.md`**, and
+   expose `dropped` as a metric. A silent drop is a bug; a documented, counted drop is a policy.
+4. **Disconnect after sustained dropping.** A client dropping continuously for 30 seconds is not
+   coming back. Disconnect it and let it reconnect with backoff.
+
+### Reading the benchmark
+
+The report should have this shape, with the student's own numbers:
+
+| Connections | Model | RSS | p50 | p99 | msg/s |
+|---|---|---|---|---|---|
+| 100 | threads | | | | |
+| 100 | asyncio | | | | |
+| 500 | threads | | | | |
+| 500 | asyncio | | | | |
+| 1000 | threads | | | | |
+| 1000 | asyncio | | | | |
+
+And then the sentence that earns the mark: **what shape is the curve, and where is the knee?**
+Reference figures from Module 3 (Python 3.13.2, macOS, loaded machine): threads 1,002 OS threads and
+35.7 KiB/connection peak; `selectors` 2 threads and 0.9 KiB; `asyncio` 2 threads and 6.0 KiB. At 500
+connections `selectors` reached 41,250 msg/s at p99 79.7 µs against `asyncio`'s 15,194 msg/s at
+266.7 µs.
+
+Note that `asyncio` being slower than both alternatives is a real result on this workload and a good
+one to report honestly. `asyncio` is chosen for writability and library composition; the `hard`
+track's back-pressure code is dramatically shorter in `asyncio` than in raw `selectors`, and that is
+the actual argument for it.
+
+## Why this solution and not the obvious one
+
+**Framing tested independently of the server.** `tests/test_framing.py` round-trips 10,000 random
+messages through a socket pair with no protocol and no rooms. When the chat server misbehaves you
+then know it is not the framing, which removes the largest source of confusion in this lab.
+
+**The chaos suite is a first-class deliverable, not an afterthought.** SIGKILL mid-message,
+header-then-disconnect, a 4 GB declared length, a slow reader, 1,000 simultaneous reconnects. Each
+one corresponds to a production incident shape, and each one is three lines of test.
+
+**`PROTOCOL.md` reviewed by writing a client from it.** The only reliable test of a specification is
+whether someone can implement against it without asking you a question. Swap documents with another
+learner; the questions they ask are precisely your document's defects.
+
+## Grading notes
+
+**What 3/3 looks like on each rubric row**
+
+- *Correctness* — the full chaos suite passes, and 50 clients × 10,000 messages show zero loss, zero
+  duplication, zero merging.
+- *Code quality* — `rooms.py` does not import `socket`; the same `framing.py` serves both transports;
+  no exception can reach the accept loop.
+- *Performance* — 1,000 connections with bounded memory under an attached slow client, p99 under
+  100 ms, and a benchmark table across at least three concurrency levels.
+- *Explanation* — a peer wrote a working client from `PROTOCOL.md` alone; the drop policy is
+  documented and its metric exposed; the benchmark's curve shape is explained.
+
+**The three most common ways submissions lose points**
+
+1. **Back-pressure asserted rather than demonstrated.** The lab asks for a slow client and a flat
+   memory graph. Without the adversarial client, the bound is theoretical.
+2. **`PROTOCOL.md` written after the code, describing the code.** It reads as documentation rather
+   than as a specification, and the ordering constraints and error cases are missing because the code
+   handles them implicitly.
+3. **One monolithic `server.py`.** Works for `standard`, makes `hard` a rewrite rather than a swap,
+   and is the reason most students who stop at `standard` stop there.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

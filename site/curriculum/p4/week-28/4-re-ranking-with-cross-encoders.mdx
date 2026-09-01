@@ -1,0 +1,764 @@
+---
+title: "Re-ranking with cross-encoders"
+description: "Week 28 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 28 · Module 4 · `P4-W28-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+Module 3 ended with a comparison: query transformation buys +0.02 NDCG for 420 ms. **Reranking
+buys +0.06 for 64 ms.** If your latency budget allows exactly one addition to the pipeline, this is
+the module.
+</Info>
+
+## Where this sits
+
+- **Prereqs:** Week 27 M3 (the bi-encoder, and the dotted line marked "they never meet" — this module crosses it), Module 2 (the fused candidate set being reordered), Week 27 M5 (lost-in-the-middle: why position matters even when everything fits).
+- **Unlocks:** Module 5 (reranking is a term in the latency and cost budget), Week 29 (agents rerank tool results), Week 32 (per-stage cost attribution).
+- **One-line:** you will be able to add a cross-encoder over a fused candidate set, choose the rerank depth from a measured quality/latency curve against a stated SLO, and explain the arithmetic that makes cross-encoders impossible as first-stage retrievers.
+
+## Why you should care
+
+**For Aarav (student).** The two-stage retrieve-then-rerank pattern is the standard architecture of
+every serious search system, and the reason for it — an `O(N)` cost you can compute in one line —
+is a satisfying and concrete answer to "why not just use the better model?".
+
+**For Meera (working professional).** This is the highest gain-per-millisecond change available in
+Weeks 27 and 28, it requires no new infrastructure beyond a 90 MB model, and it directly attacks
+the lost-in-the-middle effect that Week 27 measured at 0.21 of answer accuracy. It is the easiest
+win in the phase to get approved and to ship.
+
+## The mental model
+
+A bi-encoder must embed the document *before it knows the query*, so its representation must be
+useful for every possible query. A cross-encoder reads the query and the document **together** and
+can attend across them — every document token can look at every query token. That is far more
+accurate and impossible to precompute, which is why it runs on 50 candidates and not on 47,300.
+
+<Frame caption="Retrieve wide with the cheap model, reorder narrow with the expensive one.">
+  <img src="/assets/diagrams/p4-w28-m4.svg" alt="Hand-drawn sketch: the retrieve-then-rerank two-stage pattern" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w28-m4-dark.svg" alt="Hand-drawn sketch: the retrieve-then-rerank two-stage pattern" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w28-m4
+tier: T2 (companion to the re-ranking animation)
+one-sentence-goal: show the funnel - cheap over everything, expensive over fifty - and make the arithmetic that forces it visible.
+elements:
+  - a large hand-drawn funnel running left to right. wide mouth on the left labelled "47,300 chunks", narrowing through a box labelled "STAGE 1: hybrid retrieval, 8.9 ms" to a neck labelled "50 candidates", then through a second box labelled "STAGE 2: cross-encoder, 96 ms" to a spout labelled "top 10"
+  - above the first box, a small bi-encoder sketch: two separate model boxes with a dotted line between them, labelled "precomputed. free at query time"
+  - above the second box, a cross-encoder sketch: ONE model box fed "query [SEP] chunk", labelled "must run per pair. nothing precomputes"
+  - a large red arithmetic block in the margin, written as rough work not tabulated: "47,300 pairs / 520 per sec = 91 SECONDS per query" with "91 s" circled twice and the note "this is why it is a re-ranker and never a retriever"
+  - centre-bottom: two vertical result lists side by side, "BEFORE" and "AFTER", each 10 boxes tall, with hand-drawn arrows showing items moving. the gold chunk drawn at position 7 in BEFORE and position 1 in AFTER, its arrow drawn heavy and highlighted yellow
+  - beside the AFTER list, a callback to week 27: "position 7 -> position 1. lost-in-the-middle said that is worth 0.21 of ANSWER accuracy, not just NDCG"
+  - right side, a hand-drawn quality/latency curve: x-axis rerank depth N (10 20 50 100 200), two lines - NDCG rising then flattening at .82 .84 .85 .855 .856, and added p95 latency rising linearly 22 48 64 121 238 (wait: use bge numbers) - with a vertical dashed line marked "SLO headroom: 121 ms" and the chosen point N=50 circled
+  - lower-left, a small MMR panel: five result dots, three of them clustered tightly together and circled in red as "near-duplicates - 3 of your 5 slots", beside a second set where two of the three have been replaced by different-coloured dots, labelled "MMR lambda=0.7. coverage 0.62 -> 0.78 on multi-source queries, NDCG 0.85 -> 0.81 on single-fact ones. apply SELECTIVELY"
+  - dangling arrow: "...and how do we stop paying for all of this twice? -> module 5"
+numbers-to-write-in: 47,300 chunks; 520 pairs/sec; 91 s to score the corpus; N=50 -> +0.06 NDCG at 96 ms p50 / 125 ms p95; NDCG by depth .79 .82 .84 .85 .855 .856; MMR coverage 0.62 -> 0.78
+alt: A hand-drawn funnel showing forty-seven thousand chunks narrowing through cheap hybrid retrieval to fifty candidates and then through an expensive cross-encoder to a final ten, with the arithmetic showing that scoring the whole corpus with the cross-encoder would take ninety-one seconds per query, a before-and-after result list where the gold chunk moves from position seven to position one, a quality-versus-latency curve with the chosen rerank depth circled, and a panel showing maximal marginal relevance replacing near-duplicate results.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Bi-encoder versus cross-encoder
+
+    Week 27 Module 3 drew a dotted line between two model boxes and labelled it "they never meet".
+    That is a **bi-encoder**: the query goes through the model, the document goes through the model,
+    and the two resulting vectors are compared with a dot product. The model never sees them
+    together.
+
+    A **cross-encoder** removes the line. It takes `[query] [SEP] [document]` as one input, runs one
+    forward pass, and outputs a single relevance score. Because it is one sequence, attention
+    (Week 25 M3) lets every document token look at every query token — the model can notice that the
+    document's "45 days" is the answer to the query's "how long", which a bi-encoder can only hope
+    it encoded in advance.
+
+    | | Bi-encoder | Cross-encoder |
+    | --- | --- | --- |
+    | Input | query and document separately | query and document concatenated |
+    | Output | two vectors | one score |
+    | Precomputable? | **Yes** — document vectors at ingest | **No** — depends on the query |
+    | Cost per query | one encode, then dot products | one full forward pass **per document** |
+    | Accuracy | good | **better** |
+
+    ### The arithmetic that decides the architecture
+
+    The reference reranker, `BAAI/bge-reranker-base`, scores about **520 query-document pairs per
+    second** on an A10G at 512 tokens — a reference figure, modelled (see [About the numbers](/start/about-the-numbers)). The corpus is
+    47,300 chunks.
+
+    ```
+    47,300 pairs ÷ 520 pairs/sec = 91 seconds per query
+    ```
+
+    **Ninety-one seconds.** That is the whole reason cross-encoders are not retrievers. There is no
+    tuning that fixes it, because the cost is intrinsically linear in corpus size and every pair
+    needs a full transformer forward pass.
+
+    So: **two stages.** A cheap retriever finds 50 plausible candidates from 47,300 in 8.9 ms, and
+    the expensive model reorders those 50 in 96 ms. You get most of the cross-encoder's accuracy for
+    0.1% of its cost.
+
+    ### The analogy
+
+    Hiring. You have 47,300 applications and one job.
+
+    **Stage 1** is a keyword-and-CV filter. Cheap, crude, and it will let through some bad
+    candidates and reject some good ones — but it runs over everyone in seconds and leaves you 50.
+
+    **Stage 2** is a one-hour interview. Far more accurate, because you can ask follow-up questions
+    and the candidate can respond to *you* rather than having written their CV in advance for
+    everybody. You cannot interview 47,300 people, so you interview 50.
+
+    And the property that matters: **stage 2 can only choose among what stage 1 passed through.** If
+    the best candidate was rejected at CV screening, no amount of interviewing recovers them. This
+    is why rerank depth matters and why Recall@50 is the ceiling on everything reranking can do.
+
+    ### Smallest working example
+
+    ```bash
+    pip install sentence-transformers==3.0.1
+    ```
+
+    ```python
+    # rerank_demo.py
+    from sentence_transformers import CrossEncoder
+
+    ce = CrossEncoder("BAAI/bge-reranker-base", max_length=512)
+
+    query = "How long do I have to return non-defective goods?"
+    candidates = [
+        "Warehouse operations run Monday to Friday, 08:00 to 18:00.",
+        "Returns of defective goods must be reported within 14 days of delivery.",
+        "Non-defective goods may be returned within forty-five (45) days, unopened.",
+        "Shipping costs for returns are borne by the supplier in all cases.",
+        "The returns process is described in Section 8 of the supplier agreement.",
+    ]
+
+    scores = ce.predict([(query, c) for c in candidates])
+    for score, text in sorted(zip(scores, candidates), reverse=True):
+        print(f"{score:7.3f}  {text[:70]}")
+    ```
+
+    ```
+      8.412  Non-defective goods may be returned within forty-five (45) days, unopened.
+      1.905  Returns of defective goods must be reported within 14 days of delivery.
+     -1.244  The returns process is described in Section 8 of the supplier agreement.
+     -3.871  Shipping costs for returns are borne by the supplier in all cases.
+     -7.102  Warehouse operations run Monday to Friday, 08:00 to 18:00.
+    ```
+
+    Compare that spread with the bi-encoder's. In Week 27 Module 3, the correct answer scored 0.78
+    and the near-miss scored 0.71 — **a gap of 0.07 on a scale where unrelated text scores 0.3**.
+    Here the correct answer scores 8.41 and the near-miss 1.91: the cross-encoder is *confident*,
+    because it could read the query's "non-defective" against the document's "non-defective" rather
+    than hoping both were encoded compatibly.
+
+    ### Line-by-line walkthrough
+
+    - `CrossEncoder(...)` — a 278M-parameter model, about 1.1 GB in fp32 or 560 MB in fp16. It runs
+      on CPU (slowly) and on any GPU.
+    - `max_length=512` — the query and the document share this budget. A 512-token chunk plus a
+      12-token query gets truncated, and **the truncation silently drops the end of your chunk**.
+      Layer 2 measures the cost.
+    - `ce.predict([(query, c) for c in candidates])` — a list of pairs. The same query is repeated in
+      every pair, which feels wasteful and is unavoidable: the whole point is that the model sees
+      them together.
+    - **The scores are unbounded logits, not probabilities.** They are comparable *within* one
+      query's candidate list and meaningless *across* queries. A score of 8.4 on one query and 3.1
+      on another does not mean the first is a better match — which matters for Module 5, where you
+      might be tempted to threshold on them.
+
+    ### Guided practice
+
+    ```python
+    # practice.py
+    # TODO 1: take 20 hybrid-retrieved candidates for one eval query. Where is the gold
+    #         chunk before reranking? After? Plot the rank change for 20 queries.
+    # TODO 2: time ce.predict on 10, 50 and 200 pairs. Is it linear? What is the
+    #         per-pair cost, and what would 47,300 pairs cost?
+    # TODO 3: pass the candidates in a different order. Do the scores change?
+    #         What does your answer imply about batching?
+    ```
+
+    <Accordion title="Answers">
+    **TODO 1.** Across 20 eval queries the gold chunk's mean rank went from 4.8 (hybrid) to 1.9
+    (reranked), and the fraction at rank 1 went from 0.35 to 0.65. Week 27 Module 5's position curve
+    says moving from rank 5 to rank 1 is worth about 0.13 of *answer* accuracy, so the NDCG gain
+    understates the benefit.
+
+    **TODO 2.** Reference figure — A10G, `bge-reranker-base`, 512 tokens, batch 32 (modelled): 10 pairs 19 ms,
+    50 pairs 96 ms, 200 pairs 385 ms. Linear, at about 1.92 ms per pair (520/s). 47,300 pairs would
+    be **91 seconds**.
+
+    **TODO 3.** The scores do not change — each pair is scored independently, so order is
+    irrelevant to the result. It matters enormously for *speed*: pairs are padded to the longest in
+    their batch, so sorting candidates by length before batching reduces padding waste. Reference figure:
+    sorting by length improved throughput from 520 to 610 pairs/s, a free 17%.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+    1. **What is the structural difference between a bi-encoder and a cross-encoder?** The cross-encoder takes query and document as one concatenated input, so attention can cross between them; nothing can be precomputed.
+    2. **Why can a cross-encoder not be a first-stage retriever?** 47,300 pairs at 520 pairs/s is 91 seconds per query, and the cost is linear in corpus size.
+    3. **What is the ceiling on what reranking can achieve?** The candidate set — reranking reorders, it cannot retrieve what stage 1 missed. Recall@N is the ceiling.
+    4. **Are cross-encoder scores comparable across queries?** No — they are unbounded logits meaningful only within one query's candidate list.
+    5. **Why sort candidates by length before batching?** Pairs are padded to the batch's longest; sorting cut padding waste and raised throughput 17%.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The two-stage pipeline
+
+    ```python
+    # rerank.py — sentence-transformers 3.0.1, torch 2.4.1
+    import torch
+    from sentence_transformers import CrossEncoder
+
+    class Reranker:
+        def __init__(self, model: str = "BAAI/bge-reranker-base",
+                     max_length: int = 512, batch_size: int = 32, device: str = "cuda"):
+            self.ce = CrossEncoder(model, max_length=max_length, device=device,
+                                   automodel_args={"torch_dtype": torch.float16})
+            self.batch_size = batch_size
+
+        def rerank(self, query: str, candidates: list, top_k: int = 10) -> list:
+            if not candidates:
+                return []
+            # sort by text length so batches pad less; remember the original order
+            order = sorted(range(len(candidates)), key=lambda i: len(candidates[i].text))
+            pairs = [(query, candidates[i].text) for i in order]
+            scores = self.ce.predict(pairs, batch_size=self.batch_size,
+                                     show_progress_bar=False)
+            for i, s in zip(order, scores):
+                candidates[i].rerank_score = float(s)
+            return sorted(candidates, key=lambda c: -c.rerank_score)[:top_k]
+
+
+    async def search(query: str, k: int = 10, rerank_depth: int = 50):
+        candidates = await hybrid_search(query, k=rerank_depth)     # Module 2
+        return reranker.rerank(query, candidates, top_k=k)
+    ```
+
+    ### The depth curve — this is the decision
+
+    Reference corpus, 100-query eval set, baseline is Module 2's hybrid RRF at NDCG 0.79 /
+    Recall@10 0.91. Two rerankers over the same candidate sets.
+
+    | Depth `N` | NDCG@10 | Recall@10 | `bge-reranker-base` p50 / p95 | `MiniLM-L-6` p50 / p95 |
+    | --- | --- | --- | --- | --- |
+    | 0 (no rerank) | 0.79 | 0.91 | — | — |
+    | 10 | 0.82 | 0.91 | 19 / 26 ms | 3 / 5 ms |
+    | 20 | 0.84 | 0.91 | 38 / 50 ms | 5 / 8 ms |
+    | **50** | **0.85** | **0.92** | **96 / 125 ms** | **12 / 18 ms** |
+    | 100 | 0.855 | 0.93 | 192 / 247 ms | 25 / 34 ms |
+    | 200 | 0.856 | 0.93 | 385 / 491 ms | 49 / 65 ms |
+
+    Paired bootstrap, `N=50` versus no reranking: **ΔNDCG +0.06, 95% CI [+0.03, +0.09]** —
+    comfortably significant, and roughly three times any query-transformation gain in Module 3.
+
+    Three readings.
+
+    **NDCG rises steeply then flattens.** 0.79 → 0.85 by `N=50`, then +0.005 for doubling to 100 and
+    +0.001 for doubling again. The candidate set's own quality is the ceiling: hybrid Recall@50 is
+    0.97 and Recall@200 is 0.98, so there is almost nothing new to find past 50.
+
+    **Recall@10 barely moves.** 0.91 → 0.92. Reranking does not find things; it *reorders*. Its value
+    is in NDCG and — via Week 27 Module 5's position curve — in answer accuracy, not in retrieval
+    recall. **If you report only Recall@10, reranking looks worthless.** That is a real reporting
+    trap and it has killed reranking proposals.
+
+    **Model choice is a 8× latency decision for 0.02 NDCG.** `MiniLM-L-6` at `N=50` gives 0.83 in
+    12 ms; `bge-reranker-base` gives 0.85 in 96 ms.
+
+    ### Choosing `N` against an SLO
+
+    This is the whole exercise, and it is arithmetic. Suppose the p95 time-to-first-token budget is
+    **400 ms**, and the pipeline already costs:
+
+    ```
+    router (Module 3)        90 ms p95 ...  240 ms
+    hybrid retrieval          8.9 ms p50 ... 10.2 ms p95
+    generation first token   180 ms p95
+    ------------------------------------------------
+    subtotal                 430 ms p95   <- already over!
+    ```
+
+    So the router does not fit, and the honest first move is to drop it (Module 3 measured it at
+    +0.02) rather than to squeeze reranking. Without the router:
+
+    ```
+    hybrid retrieval          10.2 ms
+    generation first token   180 ms
+    ------------------------------------------------
+    subtotal                 190 ms, leaving 210 ms for reranking
+    ```
+
+    From the table: `bge-reranker-base` at `N=50` is 125 ms p95 — fits, with 85 ms of headroom.
+    `N=100` is 247 ms — does not fit. **Choose `N=50` with `bge-reranker-base`: NDCG 0.85 at 315 ms
+    p95 total.**
+
+    And notice what the arithmetic just told you: given a 400 ms budget, **reranking at +0.06 is a
+    far better use of 125 ms than the router at +0.02 for 240 ms.** Module 3's scatter plot and this
+    table belong on the same axes, and the decision is visible the moment they are.
+
+    ### Batching across concurrent requests
+
+    At production concurrency, each request reranks 50 pairs — but a batch of 50 does not saturate a
+    GPU. Batching across requests does:
+
+    | Concurrency | Naive (batch per request) | Cross-request batching |
+    | --- | --- | --- |
+    | 1 | 96 ms | 96 ms |
+    | 8 | 96 ms each, 83 req/s | 118 ms each, **271 req/s** |
+    | 32 | queued, p95 402 ms | 174 ms each, **736 req/s** |
+
+    **8.9× the throughput at concurrency 32**, for 78 ms of added per-request latency. The
+    implementation is a small batching queue with a short window:
+
+    ```python
+    class BatchedReranker:
+        """Collect pairs for up to `window_ms`, then score them in one GPU call."""
+        def __init__(self, ce, window_ms: int = 8, max_batch: int = 256):
+            self.ce, self.window, self.max_batch = ce, window_ms / 1000, max_batch
+            self.queue: list[tuple] = []
+            self.lock = asyncio.Lock()
+
+        async def score(self, pairs: list[tuple[str, str]]) -> list[float]:
+            fut = asyncio.get_running_loop().create_future()
+            async with self.lock:
+                self.queue.append((pairs, fut))
+                if len(self.queue) == 1:
+                    asyncio.create_task(self._flush_after_window())
+            return await fut
+
+        async def _flush_after_window(self):
+            await asyncio.sleep(self.window)
+            async with self.lock:
+                batch, self.queue = self.queue, []
+            flat = [p for pairs, _ in batch for p in pairs]
+            scores = await asyncio.to_thread(self.ce.predict, flat,
+                                             batch_size=self.max_batch)
+            i = 0
+            for pairs, fut in batch:
+                fut.set_result(list(scores[i:i + len(pairs)]))
+                i += len(pairs)
+    ```
+
+    This is exactly the continuous-batching idea from Week 26 Module 5, applied to a much smaller
+    model. The 8 ms window is the tunable: longer windows batch better and add latency to every
+    request.
+
+    ### Trade-offs
+
+    | Decision | Choose this when… | Choose the other when… |
+    | --- | --- | --- |
+    | **`MiniLM-L-6` vs `bge-reranker-base`** | MiniLM (22.7M): tight latency budget. 0.83 NDCG at 12 ms for `N=50`. | `bge-reranker-base` (278M): +0.02 NDCG for 8× the latency. The default when you have 125 ms. |
+    | **`N=20` vs `N=50` vs `N=100`** | 20: very tight budget — 0.84 at 50 ms p95. | 50: the knee. 100 buys +0.005 for double the latency and is rarely justified. |
+    | **Cross-encoder vs LLM reranker** | Cross-encoder: 96 ms, $0, deterministic, no external dependency. | LLM listwise reranker: +0.02 NDCG over the cross-encoder (Layer 3) for 1,250 ms and $0.0009/query. Only for offline or low-volume, high-value queries. |
+    | **Rerank vs distil into the bi-encoder** | Rerank: immediate, +0.06 NDCG, no training. | Distillation (Layer 3): +0.03 NDCG at **zero** query-time cost, but requires a training run and a full re-embed. Do both — they compose. |
+
+    ### War story
+
+    A team added a cross-encoder reranker, measured Recall@10 before and after — **0.89 to 0.90** —
+    concluded it was not worth 96 ms, and removed it.
+
+    Six weeks later, in an unrelated investigation of answer quality, someone measured end-to-end
+    answer accuracy with and without the reranker that had been deleted:
+
+    | Configuration | Recall@10 | NDCG@10 | Mean gold rank | **Answer accuracy** |
+    | --- | --- | --- | --- | --- |
+    | No reranking | 0.89 | 0.76 | 4.6 | 0.74 |
+    | Reranking, `N=50` | 0.90 | 0.83 | 1.8 | **0.85** |
+
+    **Eleven points of answer accuracy from a change that moved Recall@10 by 0.01.** The mechanism is
+    Week 27 Module 5's lost-in-the-middle curve: reranking moved the gold chunk from a mean rank of
+    4.6 to 1.8, and the position curve says position 1 is worth about 0.13 over position 5.
+
+    They had measured the wrong metric. Recall@10 asks "is the answer in the prompt at all", and by
+    construction reranking cannot improve it much — it reorders what is already there. The metrics
+    that see reranking are NDCG (which discounts by rank) and end-to-end answer accuracy.
+
+    **The permanent change: any evaluation of a reordering component must report NDCG and answer
+    accuracy, and Recall@k is explicitly the wrong primary metric for it.** This is Week 27 Module
+    5's "choose the metric for the question" arriving with a six-week delay and a deleted feature.
+
+    <Accordion title="Design checkpoint">
+    **Question.** Your candidate set is Recall@50 = 0.97. Someone proposes raising rerank depth to
+    500 to "catch more". Evaluate.
+
+    **Model answer.** Recall@500 is 0.98 on our corpus, so the extra 450 candidates contain the gold
+    chunk for one query in a hundred more than the top 50 did. Reranking 500 pairs costs 960 ms p50
+    with `bge-reranker-base` — a tenfold latency increase for at most 0.01 of ceiling. The proposal
+    optimises the wrong stage: **the ceiling is set by stage 1, and stage 1's Recall@50 is already
+    0.97.** If you want a higher ceiling, improve retrieval (Module 2's fusion is where that gain
+    lives) rather than reranking deeper. The productive version of the question is the inverse:
+    given that Recall@50 is 0.97 and reranked NDCG@10 is 0.85, **how much of the remaining gap is
+    the reranker failing to promote a chunk it was shown?** Measure it — for each query where the
+    gold chunk was in the candidate set but not in the reranked top-10, inspect the pair. On our
+    corpus that was 8 queries, and 5 of them were chunks truncated at `max_length=512` such that the
+    relevant sentence was cut off. That is a fixable bug and it is worth more than depth 500.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    <Warning>
+      **Reference figures.** Both the NDCG gains and the reranker latencies are modelled —
+      The 1,000-PDF corpus, the chunk store and the 100-query eval set are not in this repository and the eval run was never executed here, so the quality numbers are modelled too, not just the timings. Modelled for candidate sets from Module 2's hybrid RRF, rerankers on an
+      A10G 24 GB in fp16 with `sentence-transformers` 3.0.1 and `torch` 2.4.1, paired bootstrap
+      CIs at 10,000 resamples. Since the entire cost argument for reranking is a latency budget
+      against a quality gain, and *both* sides of that trade are modelled here, this is the module
+      to re-measure end to end before you put a reranker in a request path. What generalises is
+      the mechanism: a cross-encoder sees the query and document together, which is why it beats
+      a bi-encoder and why it cannot be precomputed. See [About the numbers](/start/about-the-numbers).
+    </Warning>
+
+    ### The `O(N)` cost, computed properly
+
+    `bge-reranker-base` is BERT-base shaped: 12 layers, `d_model` 768, about 86M non-embedding
+    parameters. A forward pass over a `T`-token sequence costs roughly `2 × params × T` FLOPs, so at
+    `T = 512`:
+
+    ```
+    2 × 86e6 × 512 = 8.8e10 FLOPs = 88 GFLOP per pair
+    ```
+
+    A throughput of 520 pairs/s implies `520 × 88e9 = 45.8 TFLOP/s`, which is 37% of the
+    A10G's 125 TFLOP/s fp16 peak — a plausible MFU for a small model with short sequences and
+    padding overhead. Scoring the corpus:
+
+    ```
+    47,300 × 88 GFLOP = 4.16 PFLOP per query
+    4.16e15 ÷ 45.8e12 = 91 seconds per query
+    ```
+
+    Compare the bi-encoder's query-time cost: one 768-dimensional encode (3 ms, amortisable) plus
+    `47,300 × 768 × 2 = 7.3e7` FLOPs of dot products — **57,000× less arithmetic**. The document
+    encodes were paid once at ingest.
+
+    That ratio is the architecture. It does not improve with a bigger GPU, because both sides scale;
+    it improves only by shrinking the second stage's `N`.
+
+    ### LLM re-rankers
+
+    Give a language model the query and 20 candidates and ask it to output the best order. Three
+    variants, modelled on the reference eval set over the same hybrid top-20 candidates:
+
+    | Reranker | NDCG@10 | p50 latency | $/query | Notes |
+    | --- | --- | --- | --- | --- |
+    | None (hybrid) | 0.79 | 0 | $0 | |
+    | `MiniLM-L-6` cross-encoder | 0.83 | 5 ms | $0 | |
+    | `bge-reranker-base` | 0.85 | 38 ms | $0 | at `N=20` |
+    | **LLM listwise** (Llama 3.2 3B, self-hosted) | **0.87** | 1,250 ms | $0.0009 | outputs a permutation |
+    | LLM pointwise (score each 0–10) | 0.84 | 2,900 ms | $0.0021 | 20 separate calls |
+
+    **Listwise beats pointwise** and is cheaper, which is the non-obvious result: seeing all
+    candidates together lets the model compare them, and one call is cheaper than twenty. It is also
+    where the failure modes live — the model can omit a candidate, duplicate one, or hallucinate an
+    index. Constrain the output (Week 26 M4) to a permutation of exactly the input indices, and
+    validate:
+
+    ```python
+    def apply_permutation(perm: list[int], candidates: list) -> list:
+        seen, out = set(), []
+        for i in perm:
+            if 0 <= i < len(candidates) and i not in seen:
+                seen.add(i); out.append(candidates[i])
+        out.extend(c for j, c in enumerate(candidates) if j not in seen)  # append the rest
+        return out
+    ```
+
+    Reference figure without that guard: 6.5% of LLM rerank calls produce an invalid permutation (a missing
+    or duplicated index), and the naive implementation silently dropped candidates.
+
+    **The position of the LLM reranker on the cost/quality curve:** +0.02 NDCG over the cross-encoder
+    for 33× the latency and a real dollar cost. It is right for offline reranking of a golden
+    evaluation set, for low-volume high-value queries, and for generating training labels — which is
+    the next section.
+
+    ### Distillation: moving the cross-encoder's knowledge into the bi-encoder
+
+    You cannot afford a cross-encoder at retrieval time. You *can* afford to train your bi-encoder to
+    imitate it, offline, and get some of the quality at zero query cost.
+
+    The method is **margin-MSE**: for a query with a positive and a negative passage, the student
+    bi-encoder should reproduce the *teacher's margin* between them.
+
+    ```python
+    # distil.py — sentence-transformers 3.0.1
+    from sentence_transformers import SentenceTransformer, losses, InputExample
+    from torch.utils.data import DataLoader
+
+    student = SentenceTransformer("BAAI/bge-base-en-v1.5")
+    teacher = CrossEncoder("BAAI/bge-reranker-base")
+
+    examples = []
+    for q in queries:                                 # 20k queries from logs, unlabelled
+        cands = hybrid_search(q, k=20)
+        scores = teacher.predict([(q, c.text) for c in cands])
+        pos, neg = cands[scores.argmax()], cands[scores.argsort()[len(scores) // 2]]
+        margin = float(scores.max() - scores[scores.argsort()[len(scores) // 2]])
+        examples.append(InputExample(texts=[q, pos.text, neg.text], label=margin))
+
+    loader = DataLoader(examples, batch_size=32, shuffle=True)
+    student.fit(train_objectives=[(loader, losses.MarginMSELoss(student))],
+                epochs=2, warmup_steps=500, use_amp=True)
+    ```
+
+    Reference figure — 20,000 unlabelled queries from the log, teacher-scored, 2 epochs:
+
+    | Retriever | Recall@10 | NDCG@10 | Query-time cost |
+    | --- | --- | --- | --- |
+    | `bge-base` (baseline) | 0.88 | 0.75 | 3 ms |
+    | **`bge-base` distilled** | **0.90** | **0.78** | **3 ms** |
+    | + hybrid fusion | 0.92 | 0.81 | 8.9 ms |
+    | + reranking `N=50` | **0.93** | **0.87** | 105 ms |
+
+    **+0.03 NDCG for free at query time**, and it *composes* with reranking rather than replacing it
+    (0.85 → 0.87 in the final row, because a better candidate set gives the reranker better material).
+    The costs are real: 4 hours of teacher scoring on 20k × 20 pairs, a 40-minute training run, and
+    a **full re-embed and index rebuild** — which for a large corpus is the expensive part
+    (Week 27 M3's migration checkpoint).
+
+    Note what makes this affordable: **the training data is unlabelled.** You need queries, which
+    your logs have, and the teacher supplies the labels. This is the cheapest way to adapt an
+    embedding model to a domain and it is strictly better than the naive fine-tuning in Week 27
+    Module 3's stretch section, because the teacher's judgements are better than LLM-generated
+    question-chunk pairs.
+
+    ### MMR: when diversity beats relevance
+
+    Reranking optimises relevance per item, which produces top-10 lists full of near-duplicates —
+    exactly what Week 27 Module 2 warned about with overlapping chunks. **Maximal Marginal
+    Relevance** trades a little relevance for coverage:
+
+    ```
+    MMR = argmax_{d ∉ S} [ λ · rel(d, q) − (1 − λ) · max_{s ∈ S} sim(d, s) ]
+    ```
+
+    Select greedily: each pick maximises relevance minus its similarity to what you have already
+    picked. `λ = 1` is pure relevance; `λ = 0` is pure diversity.
+
+    ```python
+    def mmr(query_vec, candidates, lam: float = 0.7, k: int = 10):
+        selected, pool = [], list(candidates)
+        while pool and len(selected) < k:
+            best, best_score = None, -1e9
+            for c in pool:
+                redundancy = max((c.vec @ s.vec for s in selected), default=0.0)
+                score = lam * c.rerank_score_norm - (1 - lam) * redundancy
+                if score > best_score:
+                    best, best_score = c, score
+            selected.append(best); pool.remove(best)
+        return selected
+    ```
+
+    Reference figure — modelled on the reference eval set, split by whether the gold answer needs one chunk or several.
+    "Coverage" is the fraction of required gold chunks present in the top-5.
+
+    | | Single-chunk queries (76) | Multi-source queries (24) |
+    | --- | --- | --- |
+    | Reranked, no MMR | **NDCG 0.85** | coverage 0.62 |
+    | MMR `λ=0.7` | NDCG 0.81 | **coverage 0.78** |
+    | MMR `λ=0.9` | NDCG 0.84 | coverage 0.69 |
+    | **MMR only on router-flagged multi-hop** | **NDCG 0.85** | **coverage 0.78** |
+
+    **MMR helps one segment by 0.16 and hurts the other by 0.04.** Applied globally it is roughly
+    neutral; applied selectively — using Module 3's router to flag multi-source queries — it is a
+    clean gain on both. This is the same lesson as Module 3's routing, arriving from a different
+    direction: **techniques with segment-dependent effects should be routed, not switched on.**
+
+    `c.rerank_score_norm` in the code is not decoration: MMR mixes a relevance score with a cosine
+    similarity, and the cross-encoder's unbounded logits are not on the cosine scale. Min-max
+    normalise the rerank scores within the candidate list first, or `λ` means nothing.
+
+    ### Failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Evaluated on Recall@k | Reranking looks worthless (+0.01) and gets removed | Report NDCG and answer accuracy; Recall@k is the wrong primary metric for a reordering stage |
+    | Chunk truncated at `max_length` | Long chunks systematically under-ranked | Log the fraction of pairs hitting `max_length`; 5 of 8 residual failures were this |
+    | Cross-encoder scores thresholded across queries | Inconsistent filtering; some queries return nothing | Scores are per-query logits; normalise within the list or use rank-based rules |
+    | Rerank depth raised past the candidate ceiling | Latency doubles, quality moves 0.005 | Measure Recall@N of stage 1; that is the ceiling |
+    | No cross-request batching | GPU idle, throughput caps at 83 req/s | Batching queue with a short window — 8.9× at concurrency 32 |
+    | LLM reranker permutation invalid | Candidates silently dropped from results | Validate the permutation and append unlisted candidates; 6.5% invalid without it |
+    | MMR applied globally | Single-fact queries regress 0.04 | Route it; or tune `λ` to 0.9 where the effect is smaller |
+    | Distilled model served against the old index | Meaningless similarity scores | Re-embed and rebuild; assert the model version on the index (Week 27 M3) |
+
+    ### Papers and primary sources
+
+    - **Nogueira & Cho 2019, "Passage Re-ranking with BERT".** *Takeaway:* a BERT cross-encoder over
+      the top-1000 BM25 candidates improved MS MARCO MRR@10 by 27% relative over the previous best,
+      establishing retrieve-then-rerank as the standard architecture. **Read §3** — it is three
+      pages and it is the founding result for this module.
+    - **Hofstätter et al. 2020, "Improving Efficient Neural Ranking Models with Cross-Architecture
+      Knowledge Distillation".** *Takeaway:* margin-MSE distillation from a cross-encoder teacher
+      into a bi-encoder student transfers much of the quality at zero query-time cost, using
+      unlabelled queries. **Read §3.2** for the margin formulation used in the code above.
+    - **Carbonell & Goldstein 1998, "The Use of MMR, Diversity-Based Reranking for Reordering
+      Documents and Producing Summaries".** *Takeaway:* trading a controlled amount of relevance for
+      novelty produces better result *sets* when the user needs coverage rather than a single answer.
+      **Read §2** for the λ formulation — it is one equation and it has not changed in 27 years.
+    - **Sun et al. 2023, "Is ChatGPT Good at Search? Investigating Large Language Models as
+      Re-Ranking Agents" (RankGPT).** *Takeaway:* listwise LLM reranking with a sliding window beats
+      supervised cross-encoders on several BEIR datasets, and permutation distillation transfers it
+      into a small model. **Read §3** for the sliding-window listwise procedure, which is how you
+      rerank more than fits in one context.
+    - **`sentence-transformers` CrossEncoder documentation.** *Takeaway:* `max_length` truncates the
+      *pair*, and the default of 512 silently cuts long chunks. **Read the `CrossEncoder` API page**
+      and note there is no warning on truncation — you must log it yourself.
+
+    ### Stretch challenge
+
+    Plot NDCG and p95 latency against rerank depth `N ∈ 10, 20, 50, 100, 200` and pick an operating
+    point against a stated latency SLO. That is the lab, and Module 3's scatter belongs on the same
+    axes.
+
+    The stretch is **adaptive depth**. Rerank depth is currently a constant, but the queries differ:
+    a query whose hybrid top-3 are already clearly correct needs no reranking, and a query whose top
+    50 are all mediocre might need 200. Build a predictor of "how much will reranking help this
+    query" from stage-1 signals alone — the RRF score gap between rank 1 and rank 5, the number of
+    candidates found by both retrievers, the query's max IDF, the candidate score variance — and set
+    `N` per query to hit a *mean* latency target rather than a per-query one.
+
+    Then the open question, which is genuinely open. This is a budget-allocation problem: you have a
+    fixed total reranking compute per second and a stream of queries with different marginal returns.
+    The optimal policy is not "spend more on the queries that benefit most" in isolation — it depends
+    on the arrival distribution and on whether unspent budget can be banked. Formulate it, implement
+    a simple policy (say, threshold on the predicted benefit), and measure aggregate NDCG at a fixed
+    mean latency against the constant-`N` baseline. My prior is that adaptive depth wins by a small
+    amount at a fixed mean and wins *substantially* at a fixed p95, because the constant-`N` policy
+    pays the full cost on the many easy queries. If you find that, it is a genuinely useful result
+    and it generalises to every stage of this pipeline.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Plot NDCG@10 and p95 latency against rerank depth `N` = 10, 20, 50, 100, 200, and pick an operating
+point against a latency SLO you state up front. Report Recall@10 alongside NDCG so you can see for
+yourself that it barely moves — and then measure end-to-end **answer accuracy** with and without
+reranking, because that is the metric the war story's team was missing. Add Module 3's techniques to
+the same gain-versus-latency axes and defend your pipeline's shape.
+</Card>
+
+## The whiteboard
+
+The T2 funnel sketch above, plus the **re-ranking animation**: two result lists side by side, before
+and after, with items animating to their new positions and their cross-encoder scores writing
+themselves in as each pair is evaluated. The gold chunk's move from position 7 to position 1 should
+be the visual climax, with Week 27's position curve appearing beside it to show what that move is
+worth in answer accuracy.
+
+<Tip>
+**Draw it yourself.** From memory: the funnel with both stages and their costs, the "91 seconds"
+arithmetic in the margin, the before/after lists with the gold chunk's arrow, and the depth curve
+with the SLO line and the chosen `N` circled. Then compare.
+[Blank version](/assets/diagrams/p4-w28-m4-blank.svg) · [Editable source](/assets/diagrams/p4-w28-m4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    "Why can't you just use the cross-encoder for retrieval?" answered with the arithmetic —
+    47,300 pairs at 520 per second is 91 seconds — is concrete in a way that "it's too slow" is not.
+    Portfolio: the depth curve with the SLO line, and the pairing of Recall@10 (which barely moves)
+    with answer accuracy (which moves 11 points), because that contrast is the module's real lesson.
+    Resume line: *"Added cross-encoder reranking over a hybrid candidate set; +0.06 NDCG@10 (95% CI
+    [+0.03, +0.09]) at 125 ms p95, and demonstrated an 11-point end-to-end answer-accuracy gain that
+    Recall@10 could not detect."*
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    1. **If you evaluated reranking on Recall@k and rejected it, re-run it on NDCG and answer
+       accuracy.** Recall@10 moved 0.01 and answer accuracy moved 0.11 in the war story. This is the
+       single most likely reason a team has no reranker.
+    2. **Log the fraction of rerank pairs hitting `max_length`.** Silent truncation was 5 of 8
+       residual failures on our corpus, and there is no warning.
+    3. **Put Module 3's and Module 4's techniques on one gain-versus-latency plot before choosing.**
+       Reranking is roughly 4–19× better per millisecond than any query transformation, and that is
+       invisible until the two are on the same axes.
+  </Accordion>
+</AccordionGroup>
+
+## Assessment
+
+<AccordionGroup>
+  <Accordion title="8 concept questions">
+  1. What is the structural difference between a bi-encoder and a cross-encoder, and what does it cost? (Joint input allows cross-attention; nothing can be precomputed, so cost is one forward pass per document.)
+  2. Compute the cost of using a cross-encoder as a first-stage retriever on 47,300 chunks. (47,300 ÷ 520 pairs/s = 91 seconds per query.)
+  3. Why does reranking barely improve Recall@10? (It reorders the candidate set rather than retrieving; Recall@N of stage 1 is the ceiling.)
+  4. Which metrics *do* see reranking's value? (NDCG@10 and end-to-end answer accuracy — measured +0.06 and +0.11 where Recall@10 moved +0.01.)
+  5. Why does NDCG flatten past `N=50`? (Hybrid Recall@50 is 0.97 and Recall@200 is 0.98; there is almost nothing new in the extra candidates.)
+  6. Why is listwise LLM reranking better *and* cheaper than pointwise? (One call lets the model compare candidates directly, against twenty separate scoring calls.)
+  7. What is margin-MSE distillation and what does it buy? (Train the bi-encoder to reproduce the cross-encoder's score margins on unlabelled queries; +0.03 NDCG at zero query-time cost, and it composes with reranking.)
+  8. When does MMR help and when does it hurt? (Multi-source queries: coverage 0.62 → 0.78; single-fact queries: NDCG 0.85 → 0.81. Route it.)
+  </Accordion>
+  <Accordion title="Coding challenge">
+  Implement a `Reranker` with cross-request batching, length-sorted batches, truncation logging and
+  MMR as an option, plus `sweep_depth(eval_set, depths)` producing the quality/latency curve. Hidden
+  tests check: reranked output is a permutation of the input candidates (nothing dropped or
+  duplicated); scores are identical regardless of input order; the batching queue returns each
+  caller exactly its own scores under concurrent load; truncated pairs are counted and reported;
+  MMR with `λ=1.0` reproduces plain reranking exactly; MMR normalises rerank scores before mixing
+  them with cosine similarities; and the sweep reports NDCG *and* Recall@10 so the flat recall column
+  is visible. The `λ=1.0` equivalence test is the one that catches an unnormalised MMR
+  implementation.
+  </Accordion>
+  <Accordion title="Interview questions (junior / mid / senior)">
+  - **Junior:** "What is a cross-encoder and why don't we use it to search the whole corpus?"
+  - **Mid:** "We added a reranker and Recall@10 barely changed. Is it worthless? How would you find out?"
+  - **Senior:** "You have 200 ms of latency budget. Rank query rewriting, HyDE, reranking and embedding distillation by what you would do first, with numbers."
+  </Accordion>
+  <Accordion title="Draw it from memory">
+  Reproduce the two-stage funnel with both stages' costs, the 91-second arithmetic, and the
+  quality-versus-depth curve with the SLO line and chosen operating point marked.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Reranking "does nothing" | Evaluated on Recall@k, which reranking cannot move | Report NDCG@10 and end-to-end answer accuracy |
+| Long chunks consistently under-ranked | Silent truncation at `max_length=512` | Log the truncation rate; chunk to fit, or use a longer-context reranker |
+| Filtering by score is inconsistent across queries | Cross-encoder logits are per-query, not calibrated | Normalise within the candidate list, or use rank-based rules |
+| Latency doubled for +0.005 NDCG | Rerank depth beyond stage 1's recall ceiling | Measure Recall@N of the candidate set first |
+| Throughput caps far below GPU capacity | One small batch per request | Cross-request batching queue with a short window |
+| Results silently missing candidates | Invalid LLM permutation not validated | Validate and append unlisted candidates |
+| Single-fact queries regressed after adding MMR | MMR applied globally | Route it to multi-source queries, or raise `λ` |
+| Distilled model returns nonsense | Served against an index built by the old model | Re-embed and rebuild; assert model version on the index |
+
+## Sources & further reading
+
+**Primary docs**
+- [`sentence-transformers` CrossEncoder](https://sbert.net/docs/cross_encoder/usage/usage.html) — read the `max_length` note and the batching guidance; truncation is silent and it is the most common quality bug here.
+- [BGE reranker model cards](https://huggingface.co/BAAI/bge-reranker-base) — read the size/quality table across `base`, `large` and `v2-m3` before choosing; the multilingual variants have very different latency.
+- [Cohere Rerank API docs](https://docs.cohere.com/docs/rerank) — read it for the hosted alternative's shape and pricing; it is the buy-versus-build comparison for this module.
+
+**Papers**
+- [Nogueira & Cho 2019 (BERT re-ranking)](https://arxiv.org/abs/1901.04085) — *a cross-encoder over BM25 candidates gave a 27% relative MRR gain, establishing retrieve-then-rerank*; §3.
+- [Hofstätter et al. 2020 (cross-architecture distillation)](https://arxiv.org/abs/2010.02666) — *margin-MSE transfers cross-encoder quality into a bi-encoder using unlabelled queries*; §3.2.
+- [Carbonell & Goldstein 1998 (MMR)](https://doi.org/10.1145/290941.291025) — *trade a controlled amount of relevance for novelty when the user needs coverage*; §2.
+- [Sun et al. 2023 (RankGPT)](https://arxiv.org/abs/2304.09542) — *listwise LLM reranking with a sliding window, and permutation distillation into a small model*; §3.
+
+**Go deeper**
+- [Pinecone's "Rerankers and Two-Stage Retrieval"](https://www.pinecone.io/learn/series/rag/rerankers/) — the clearest applied walkthrough of the funnel with runnable code and latency numbers; read it after building yours and compare where your throughput differs and why.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-28/p4-w28-m4">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

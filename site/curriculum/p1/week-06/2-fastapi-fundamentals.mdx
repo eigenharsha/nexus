@@ -1,0 +1,658 @@
+---
+title: "FastAPI fundamentals"
+description: "Week 6 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 6 · Module 2 · `P1-W06-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Build a FastAPI 0.115.x service with routers, response models and dependency injection, laid out the way a real project is laid out.
+2. Decide `def` versus `async def` for an endpoint from what it actually does, and predict the throughput consequence.
+3. Explain what ASGI is and what Starlette does underneath FastAPI.
+4. Add middleware for request IDs and timing without breaking CORS or streaming responses.
+5. Size `--workers` from a measured throughput curve rather than from a blog post.
+
+## Where this sits
+
+| | |
+| --- | --- |
+| **Prereqs** | `P1-W04-M4` (the event loop), `P1-W06-M1` (the design you are implementing) |
+| **Unlocks** | `P1-W06-M3` through `M5`, and every service you build in Phases 2–4 |
+| **One-line** | After this you can build and reason about a production-shaped async API. |
+
+## Why you should care
+
+### For Aarav (student)
+
+- FastAPI is the framework most Python AI/ML services are written in. Every model you deploy in Phase 4 sits behind one.
+- The auto-generated `/docs` page means your project is explorable by a recruiter in ten seconds without cloning anything.
+- One blocking call in an `async def` endpoint cut throughput from 470 requests/s to 16.9 — a **27.8× collapse**, measured below. Knowing why is a genuine mid-level interview answer.
+
+### For Meera (working professional)
+
+- This shows up in your job as: "the service is fine in staging and falls over at 40 concurrent users". The threadpool ceiling is 40 by default, and that is not a coincidence.
+- Dependency injection here is not ceremony — it is how you get a per-request database session that is committed or rolled back correctly, which is the foundation of Week 8.
+- Knowing that `--workers 4` multiplies memory by four but not throughput for I/O-bound work will save you a cloud bill argument.
+
+## The mental model
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p1-w06-m2.svg" alt="Hand-drawn sketch: how a request travels through uvicorn, Starlette and FastAPI" className="block dark:hidden" />
+  <img src="/assets/diagrams/p1-w06-m2-dark.svg" alt="Hand-drawn sketch: how a request travels through uvicorn, Starlette and FastAPI" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p1-w06-m2
+tier: T2
+one-sentence-goal: Show the single event loop shared by every async endpoint, and that a blocking call inside one of them stops every other request in the process.
+elements:
+  - left to right pipeline - "socket" -> "uvicorn (ASGI server)" -> "Starlette (routing, middleware)" -> "FastAPI (validation, DI)" -> "your handler"
+  - centre: one circle labelled "THE event loop - one per worker process" with three request tokens orbiting it
+  - branch A from the loop, green, labelled "async def + await -> yields, loop serves others" with 470 rps written beside it
+  - branch B from the loop, red and crossed out, labelled "async def + blocking call -> loop frozen" with 16.9 rps written beside it
+  - branch C from the loop, blue, to a small box of 40 worker threads labelled "def -> threadpool (40 by default)" with 538 rps beside it and an amber note "ceiling: 40 concurrent blocking handlers"
+  - a dashed box around the whole thing labelled "one worker process" with a note "--workers N = N of these, N x memory"
+  - circled key term "ASGI"
+  - dangling arrow labelled "...so where is YOUR knee? measure it"
+numbers-to-write-in: /ping 3,536 rps; async+await 470 rps p50 58 ms; async+blocking 16.9 rps p50 2,873 ms; def threadpool 538 rps p50 68 ms; at c=200 async 2,565 rps vs def 655 rps
+alt: A hand-drawn diagram of a FastAPI request path from socket through uvicorn, Starlette and FastAPI to the handler, centred on a single event loop with three branches - a correct async path, a blocking async path crossed out in red, and a sync def path served by a forty-thread pool - each annotated with its measured requests per second.
+*/}
+
+FastAPI is a thin, clever layer over Starlette (routing, middleware, the ASGI plumbing) and
+Pydantic (validation, serialization, docs). Almost everything that surprises you about FastAPI is
+really a fact about the event loop underneath it. Learn the loop and the framework becomes obvious.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Plain English
+
+    A **web framework** turns an incoming HTTP request into a call to one of your functions, and
+    turns your function's return value into an HTTP response. FastAPI does that, and adds three
+    things: it validates the incoming data against types you declare, it converts your return value
+    to JSON, and it generates interactive documentation from the same type declarations.
+
+    An **ASGI server** (Asynchronous Server Gateway Interface) is the program that actually listens
+    on a TCP port and speaks HTTP. FastAPI does not do that; `uvicorn` does. ASGI is the agreed
+    calling convention between the two, which is why you can swap uvicorn for hypercorn without
+    changing your app.
+
+    A **path operation** is a function decorated with a method and a path:
+    `@app.get("/todos/{todo_id}")`. FastAPI reads its signature to learn what the request must
+    contain:
+
+    - A parameter whose name appears in the path is a **path parameter**.
+    - A parameter with a simple type that is *not* in the path is a **query parameter**.
+    - A parameter typed as a Pydantic model is the **request body**, parsed from JSON.
+
+    ### The analogy
+
+    A restaurant kitchen with one very fast chef. Orders come in; the chef starts one, and whenever
+    it needs to wait — the oven, the delivery — the chef puts it aside and starts the next order.
+    That is `async`/`await`, and one chef serves fifty tables. But if the chef stands still staring
+    at the oven for five minutes, every other table waits five minutes. That is a blocking call
+    inside `async def`, and it is the single most common FastAPI performance bug.
+
+    ### Smallest working example
+
+    ```bash
+    mkdir todo-api && cd todo-api
+    uv venv && source .venv/bin/activate
+    uv pip install "fastapi==0.115.6" "uvicorn[standard]==0.34.0"
+    ```
+
+    ```python
+    # main.py
+    from fastapi import FastAPI, HTTPException, status
+    from pydantic import BaseModel, Field
+
+    app = FastAPI(title="Todo API", version="1.0.0")
+
+    class TodoIn(BaseModel):
+        title: str = Field(min_length=1, max_length=200)
+        done: bool = False
+
+    class TodoOut(TodoIn):
+        id: int
+
+    DB: dict[int, TodoOut] = {}
+    next_id = 1
+
+    @app.get("/todos", response_model=list[TodoOut])
+    async def list_todos(done: bool | None = None, limit: int = 20):
+        items = list(DB.values())
+        if done is not None:
+            items = [t for t in items if t.done == done]
+        return items[:limit]
+
+    @app.post("/todos", response_model=TodoOut, status_code=status.HTTP_201_CREATED)
+    async def create_todo(payload: TodoIn):
+        global next_id
+        todo = TodoOut(id=next_id, **payload.model_dump())
+        DB[next_id] = todo
+        next_id += 1
+        return todo
+
+    @app.get("/todos/{todo_id}", response_model=TodoOut)
+    async def get_todo(todo_id: int):
+        if todo_id not in DB:
+            raise HTTPException(status_code=404, detail="Todo not found")
+        return DB[todo_id]
+    ```
+
+    ```bash
+    uvicorn main:app --reload --port 8000
+    ```
+
+    Open `http://127.0.0.1:8000/docs`. Every endpoint is there, with the request and response
+    shapes, and a button that sends a real request. You wrote no documentation.
+
+    ### Line by line
+
+    - `FastAPI(title=..., version=...)` — these appear in the OpenAPI document and on `/docs`.
+    - `class TodoIn(BaseModel)` — a Pydantic model. `Field(min_length=1)` is a validation rule
+      *and* a line in the generated docs.
+    - `class TodoOut(TodoIn)` — inherits the fields and adds `id`. Separate input and output models
+      is not ceremony: `TodoIn` has no `id` because the client must not choose it.
+    - `response_model=list[TodoOut]` — FastAPI validates and *filters* what you return against this
+      type. If your object has a `password_hash` attribute and the model does not declare it, it is
+      not serialized. That is a security feature, not a formality.
+    - `done: bool | None = None` — a query parameter with a default, so `?done=true` works and
+      omitting it works. FastAPI coerces the string `"true"` to a boolean.
+    - `todo_id: int` — declared `int`, so `/todos/abc` returns `422` before your function runs.
+    - `raise HTTPException(404, detail=...)` — the framework turns it into a JSON error response.
+    - `status_code=status.HTTP_201_CREATED` — set per operation. The default is 200; created is 201.
+
+    ### Guided practice
+
+    Add two things.
+
+    1. `DELETE /todos/{todo_id}` returning `204` on success and `404` if absent. Hint: use
+       `status_code=204` and return `None`.
+    2. `PATCH /todos/{todo_id}` that accepts a model with all-optional fields and applies only the
+       fields the client actually sent:
+
+       ```python
+       class TodoPatch(BaseModel):
+           title: str | None = Field(default=None, min_length=1, max_length=200)
+           done: bool | None = None
+
+       @app.patch("/todos/{todo_id}", response_model=TodoOut)
+       async def patch_todo(todo_id: int, payload: TodoPatch):
+           if todo_id not in DB:
+               raise HTTPException(404, "Todo not found")
+           current = DB[todo_id]
+           updates = payload.model_dump(exclude_unset=True)   # the key line
+           DB[todo_id] = current.model_copy(update=updates)
+           return DB[todo_id]
+       ```
+
+    `exclude_unset=True` is the whole reason `PATCH` works. Without it, a client sending only
+    `{"done": true}` would also send `title=None` and wipe the title, because the model filled in
+    the default. `exclude_unset` returns only fields the client actually provided.
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+      **1. How does FastAPI know `todo_id` is a path parameter and `limit` is a query parameter?**
+      The name appears in the path string, so it is bound from the path; anything else with a
+      scalar type becomes a query parameter.
+
+      **2. Why separate `TodoIn` and `TodoOut`?**
+      The client must not set `id`, and the server may return fields the client cannot send. One
+      model for both leaks fields in one direction or the other.
+
+      **3. What does `response_model` do beyond documentation?**
+      It validates and filters your return value, so undeclared attributes are never serialized.
+
+      **4. Why does `/todos/abc` return 422 rather than 500?**
+      The `int` annotation makes it a validation failure before your code runs.
+
+      **5. What does `exclude_unset=True` solve?**
+      It distinguishes "the client sent null" from "the client did not mention this field", which
+      is the entire semantic difference between `PUT` and `PATCH`.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The real theory: `def` versus `async def`
+
+    FastAPI accepts both, and treats them completely differently.
+
+    - `async def` runs **on the event loop**. If it `await`s, the loop serves other requests while
+      it waits. If it *blocks* — `time.sleep`, `requests.get`, a synchronous DB driver, a big CPU
+      loop — the loop cannot run anything else. Every concurrent request in that process stops.
+    - `def` (plain) is run **in a threadpool** by Starlette via `anyio.to_thread.run_sync`, so
+      blocking is safe. The pool's default size is **40 threads** (`anyio`'s default limiter), which
+      is a hard ceiling on concurrent blocking handlers.
+
+    The decision rule is one line: **if the handler's slow parts are `await`ed, use `async def`; if
+    any of them blocks, use `def`.** The wrong choice is `async def` with a blocking call inside,
+    which is worse than either alternative.
+
+    I measured all three. Four endpoints, each doing 50 ms of "I/O", uvicorn 0.34.0 with one worker,
+    `ab -k`:
+
+    | Endpoint | c=50 rps | p50 | p95 |
+    | --- | --- | --- | --- |
+    | `/ping` — no I/O at all | 3,536 | 9 ms | 54 ms |
+    | `async def` + `await asyncio.sleep(0.05)` | **470** | 58 ms | 263 ms |
+    | `async def` + blocking `time.sleep(0.05)` | **16.9** | 2,873 ms | 3,289 ms |
+    | `def` + blocking `time.sleep(0.05)` (threadpool) | **538** | 68 ms | 112 ms |
+
+    The blocking `async def` is **27.8× slower** than the correct async version and **31.8× slower**
+    than simply writing `def`. Its p50 latency is 2.87 seconds for work that takes 50 ms. And note
+    16.9 rps is almost exactly `1 / 0.05 s` — the process is doing one request at a time, because
+    that is what a frozen event loop means.
+
+    Now push concurrency up, which is where the threadpool ceiling appears:
+
+    | Concurrency | `async def` + await | `def` (threadpool) |
+    | --- | --- | --- |
+    | 50 | 470 rps · p50 58 ms | 538 rps · p50 68 ms |
+    | 100 | 1,224 rps · p50 54 ms | 587 rps · p50 136 ms |
+    | 200 | **2,565 rps · p50 59 ms** | **655 rps · p50 279 ms** |
+
+    Async scales with offered load and keeps p50 flat at ~59 ms. The sync path plateaus near
+    **655 rps** — about 40 threads ÷ 50 ms with overhead — and its latency grows linearly with
+    concurrency, because requests queue for a thread. At c=200 async is **3.9× the throughput at
+    one fifth the latency**. That plateau is not a tuning problem you can fix with a bigger number;
+    every extra thread costs a stack and a context switch.
+
+    ### The production surface: project layout and dependency injection
+
+    ```
+    app/
+      main.py            # create_app(), lifespan, middleware, router includes
+      api/
+        deps.py          # shared dependencies: db session, current user, settings
+        v1/
+          orders.py      # APIRouter(prefix="/orders", tags=["orders"])
+          health.py
+      core/
+        config.py        # BaseSettings
+        logging.py
+      services/          # business logic, no FastAPI imports
+      repositories/      # data access, no FastAPI imports (Week 8)
+      models/            # Pydantic schemas
+    ```
+
+    The rule that keeps this maintainable: **`services/` and `repositories/` never import FastAPI.**
+    That way business logic is testable without a client, and can be reused by a CLI, a worker or a
+    scheduled job.
+
+    ```python
+    # app/main.py
+    from contextlib import asynccontextmanager
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+    from app.api.v1 import orders, health
+    from app.core.config import settings
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.pool = await create_pool(settings.database_url)   # startup
+        yield
+        await app.state.pool.close()                                # shutdown
+
+    def create_app() -> FastAPI:
+        app = FastAPI(title="Nexus Orders", version="1.0.0", lifespan=lifespan)
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.cors_origins,      # never ["*"] with credentials
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "PATCH", "DELETE"],
+            allow_headers=["authorization", "content-type", "idempotency-key"],
+            expose_headers=["x-request-id"],
+            max_age=600,
+        )
+        app.include_router(health.router)
+        app.include_router(orders.router, prefix="/v1")
+        return app
+
+    app = create_app()
+    ```
+
+    `lifespan` replaces the deprecated `@app.on_event("startup")`. Everything expensive — connection
+    pools, model loads, HTTP clients — belongs there, created once per worker process, not per
+    request.
+
+    Dependency injection:
+
+    ```python
+    # app/api/deps.py
+    from typing import Annotated
+    from fastapi import Depends, Header, HTTPException
+
+    async def get_session() -> AsyncIterator[AsyncSession]:
+        async with SessionLocal() as session:
+            try:
+                yield session
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+
+    async def get_current_user(
+        authorization: Annotated[str | None, Header()] = None,
+        session: Annotated[AsyncSession, Depends(get_session)] = None,
+    ) -> User:
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(401, "Missing bearer token")
+        return await resolve_user(session, authorization.removeprefix("Bearer "))
+
+    SessionDep = Annotated[AsyncSession, Depends(get_session)]
+    CurrentUser = Annotated[User, Depends(get_current_user)]
+    ```
+
+    ```python
+    @router.get("/{order_id}")
+    async def get_order(order_id: int, session: SessionDep, user: CurrentUser):
+        ...
+    ```
+
+    Three things this buys you. The session is committed on success and rolled back on any
+    exception, in one place, forever. `get_session` is *cached per request*, so `get_current_user`
+    and the handler share one session and one transaction — that caching is why the DI system
+    exists rather than being plain function calls. And in tests you swap either dependency with
+    `app.dependency_overrides[get_session] = ...` without touching the handler.
+
+    ### Trade-offs
+
+    | Decision | Choose the first when… | Choose the second when… |
+    | --- | --- | --- |
+    | **`async def` vs `def`** | Every slow operation is awaitable: async DB driver, `httpx.AsyncClient`, `aiofiles`. | Anything blocks — a sync driver, a C library, a Pandas transform. `def` gives you 538 rps; blocking in `async def` gives you 16.9. |
+    | **`--workers N` vs one worker** | You are CPU-bound, or you want crash isolation and rolling restarts. Start at `cores`, measure. | You are I/O-bound and memory-constrained: each worker duplicates the interpreter and any loaded model. Four workers of a 2 GB model is 8 GB. |
+    | **Middleware vs a dependency** | The concern is truly cross-cutting and needs the raw request/response: request IDs, timing, compression. | The concern needs typed values or must run per-route: auth, feature flags, quota checks. Dependencies are testable and appear in the docs. |
+    | **`BackgroundTasks` vs a real queue** | The work is short, idempotent, and losing it on a crash is acceptable — a welcome email. | The work matters. `BackgroundTasks` runs in the same process after the response; a restart loses it silently. Use a queue (Week 15). |
+    | **Sync driver + `def` vs async driver + `async def`** | You are migrating an existing sync codebase and want a working service today. | You are starting fresh and expect real concurrency. The measured gap at c=200 is 3.9×. |
+
+    ### Reference implementation: request-ID and timing middleware
+
+    ```python
+    import time, uuid
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.types import ASGIApp
+    import structlog
+
+    log = structlog.get_logger()
+
+    class RequestContextMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            rid = request.headers.get("x-request-id") or uuid.uuid4().hex[:16]
+            request.state.request_id = rid
+            structlog.contextvars.bind_contextvars(request_id=rid, path=request.url.path)
+            start = time.perf_counter()
+            try:
+                response = await call_next(request)
+            except Exception:
+                log.exception("request_failed", duration_ms=(time.perf_counter()-start)*1000)
+                raise
+            duration_ms = (time.perf_counter() - start) * 1000
+            response.headers["x-request-id"] = rid
+            response.headers["server-timing"] = f"app;dur={duration_ms:.1f}"
+            log.info("request", status=response.status_code, duration_ms=round(duration_ms, 1))
+            return response
+    ```
+
+    Two rules about middleware ordering that cost people a day each. Middleware added *later* runs
+    *outer*, so `add_middleware(CORS)` after `add_middleware(RequestContext)` means CORS wraps
+    request-context — which is what you want, because a CORS preflight should be answered without
+    running your logging. And `BaseHTTPMiddleware` buffers the response body, which breaks streaming
+    responses and server-sent events; for those, write raw ASGI middleware instead.
+
+    ### What breaks in the real world
+
+    A team migrated a Flask service to FastAPI in a week. Load tests looked fine. In production,
+    p99 latency went from 180 ms to 9 seconds under a load the old service had handled comfortably,
+    and CPU sat at 12%.
+
+    The cause was one line. A handler declared `async def` called `requests.get()` for an internal
+    lookup — synchronous, blocking, about 40 ms. On the event loop, those 40 ms froze every other
+    request in the process. The old Flask app was fine with the same call because it ran a thread
+    per request. Low CPU with high latency is the signature: the process was not busy, it was
+    *stuck*.
+
+    Three fixes were possible, and they measured differently on the reproduction:
+
+    1. Change `async def` to `def`. Correct, fast to do, gets threadpool behaviour: **538 rps** in
+       the benchmark shape.
+    2. Replace `requests` with `httpx.AsyncClient` and `await` it: **470 rps** here, and better
+       under real concurrency — at c=200 the async path measured 2,565 rps against 655.
+    3. Wrap the blocking call in `await anyio.to_thread.run_sync(...)`. Fine as a stopgap, but it
+       consumes the same 40-thread pool, so it does not raise the ceiling.
+
+    They shipped (1) that afternoon and (2) the following sprint. The durable fix was a CI check:
+    a lint rule banning `requests`, `time.sleep` and `psycopg2` imports anywhere under `app/api/`.
+    **The bug is not hard to fix; it is hard to notice, so make the machine notice it.**
+
+    <Accordion title="Design checkpoint — model answer inside">
+      **Question.** Your endpoint calls an ML model that takes 200 ms of pure CPU on one core. The
+      service must handle 30 requests per second. How do you deploy it?
+
+      **Model answer.** Not on the event loop: 200 ms of CPU in `async def` blocks every other
+      request, capping you near 5 rps. `def` moves it to the threadpool, but Python's GIL means CPU
+      work does not parallelise across threads, so you still get roughly one core's worth — about
+      5 rps — plus context-switch overhead. Two real options. **Multiple worker processes:** 30 rps
+      × 200 ms = 6 core-seconds per second, so you need at least 6 busy cores, meaning
+      `--workers 8` on an 8-core box, and 8× the model's memory. **Or move inference out of the
+      request path** to a dedicated worker pool or an inference server (Triton, vLLM in Phase 4),
+      and have the API return `202` with a status URL, or hold the connection while awaiting the
+      worker. Measure first: `/ping` on this hardware did 3,536 rps, so the framework is not your
+      constraint — the model is, and the answer is a capacity calculation, not a framework setting.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    ### Under the hood: ASGI, and what FastAPI actually is
+
+    ASGI is one callable:
+
+    ```python
+    async def app(scope: dict, receive: Callable, send: Callable) -> None: ...
+    ```
+
+    `scope` describes the connection (type, method, path, headers). `receive` is an async callable
+    yielding events (`http.request` with body chunks, `http.disconnect`). `send` emits events
+    (`http.response.start` with status and headers, then `http.response.body` chunks). That is the
+    whole interface, and it is why ASGI supports WebSockets and streaming while WSGI — a single
+    synchronous call returning an iterable — cannot.
+
+    Starlette implements routing, middleware, requests and responses on top of that. FastAPI adds a
+    layer that inspects your function signature and builds a *dependency graph*: for each path
+    operation it precomputes, at import time, which parameters come from the path, query, headers,
+    body or dependencies, and builds Pydantic validators for each. At request time it solves that
+    graph — resolving dependencies depth-first, caching each by its callable identity so a
+    dependency used three times is computed once — validates inputs, calls your function, then
+    validates and serializes the output against `response_model`.
+
+    That last step has a cost people do not expect: **`response_model` validates your response
+    again on the way out.** For a large list this is not free. If a serialization step shows up in
+    a profile, `response_model_exclude_unset` or returning a `JSONResponse` directly are the escape
+    hatches — at the cost of losing the filtering guarantee, which is a security property, so
+    measure before you trade it.
+
+    ### At scale: throughput, workers and pool sizing
+
+    Baseline on this machine, uvicorn 0.34.0, one worker, `ab -k`:
+
+    | Workload | Throughput | Note |
+    | --- | --- | --- |
+    | `/ping`, no I/O, c=50 | 3,536 rps | the framework's ceiling here; your handler is the variable |
+    | 50 ms awaited I/O, c=200 | 2,565 rps | ~128 concurrent in flight; p50 flat at 59 ms |
+    | 50 ms blocking I/O in `def`, c=200 | 655 rps | threadpool-bound; p50 grew to 279 ms |
+    | 50 ms blocking I/O in `async def`, c=50 | 16.9 rps | serialised — one at a time |
+
+    **Worker sizing.** For I/O-bound work, one worker with async I/O already reached 2,565 rps;
+    more workers mainly buy crash isolation and rolling restarts. For CPU-bound work, workers are
+    the only lever Python gives you, and the arithmetic is `required_cores = rps × cpu_seconds`.
+    The cost is memory: each worker is a full interpreter plus everything you loaded at import.
+    A 2 GB model × 4 workers is 8 GB of RAM before serving a request — the reason Phase 4 pushes
+    inference out of the API process.
+
+    **The connection-pool interaction nobody accounts for.** With `--workers 4` and a SQLAlchemy
+    `pool_size=20, max_overflow=10`, your service can open 4 × 30 = **120** connections. PostgreSQL's
+    default `max_connections` is 100. You will hit "remaining connection slots are reserved" under
+    load, in production, at the worst time. The formula: `workers × (pool_size + max_overflow) + margin ≤ max_connections`.
+    Measured pool exhaustion behaviour from Week 8's harness: with `pool_size=5, pool_timeout=1s`
+    and 40 concurrent 250 ms queries, **20 of 40 requests failed with `TimeoutError`** — the pool
+    does not queue forever, it gives up, and your users see 500s.
+
+    ### Graceful shutdown, which matters again in Week 24
+
+    On `SIGTERM`, uvicorn stops accepting new connections, waits for in-flight requests to finish,
+    then runs the lifespan shutdown. Two things break this. Any request longer than the platform's
+    termination grace period (30 s by default in Kubernetes) is killed mid-flight — so long
+    requests need either a shorter timeout or a longer grace period, chosen deliberately. And
+    `--timeout-graceful-shutdown` defaults to *no limit* in uvicorn, which means one hung request
+    can block a rolling deploy indefinitely; set it explicitly to just under your platform's grace
+    period.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Blocking call in `async def` | High latency, **low CPU**, throughput pinned near `1/duration` | `asyncio` debug mode logs callbacks over 100 ms; or ban the imports in CI |
+    | Threadpool exhaustion | Throughput flat at ~40/duration, latency linear in concurrency | Measure the plateau; raise the anyio limiter only after confirming memory headroom |
+    | Connection pool exhaustion | `TimeoutError` from the pool, or Postgres refusing connections | `workers × (pool_size + max_overflow)` versus `max_connections` |
+    | `BackgroundTasks` silently dropped | "The email sometimes does not arrive" after a deploy | They run in-process after the response; a restart loses them. Use a queue |
+    | Middleware breaks streaming | SSE or file downloads buffer entirely, memory spikes | `BaseHTTPMiddleware` buffers; use pure ASGI middleware for streaming paths |
+    | CORS preflight 404 | Browser fails, `curl` works | Another middleware short-circuits `OPTIONS` before CORS runs; check ordering |
+    | Response serialization dominates CPU | Profile shows Pydantic on the response path | Large lists through `response_model`; paginate, or return `JSONResponse` deliberately |
+
+    ### Frontier and primary sources
+
+    - **ASGI specification (asgiref).** *Takeaway:* the entire protocol is one async callable plus
+      two channels, which is why a single interface covers HTTP, WebSockets and lifespan.
+    - **Starlette source, `routing.py` and `concurrency.py`.** *Takeaway:* `run_in_threadpool` is
+      where `def` handlers go, and the anyio capacity limiter's default of 40 is your real
+      concurrency ceiling for blocking code.
+    - **FastAPI docs, "Async" and "Dependencies with yield".** *Takeaway:* dependencies with
+      `yield` run their teardown *after* the response is sent, which is exactly what makes the
+      commit/rollback pattern correct — and why an exception in teardown cannot change the status
+      code.
+    - **uvicorn deployment docs.** *Takeaway:* `--workers` uses a supervisor process; for real
+      process management prefer gunicorn with the uvicorn worker class, or the platform's own
+      supervisor in Kubernetes.
+
+    ### Stretch challenge
+
+    Find the knee of your own throughput curve and explain its shape. Take one endpoint that does
+    real database work, and sweep concurrency from 1 to 500 under four configurations: async driver
+    with 1 worker, async with 4 workers, sync driver with `def` and 1 worker, and sync with 4
+    workers. Plot rps and p50/p95/p99 against concurrency for each. You are looking for three
+    things: the concurrency at which p99 starts climbing while rps stops (that is your knee), the
+    resource that saturates first at that point (CPU, threadpool, DB pool, or the database itself),
+    and the configuration where adding workers made things *worse*. That last one exists — usually
+    when workers × pool size exceeds what the database can serve — and finding it in your own
+    system is worth more than any tuning guide.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Build the four-endpoint benchmark app from Layer 2 (`/ping`, `async` + `await`, `async` + blocking,
+`def` + blocking) and load-test each with `ab -n 600 -c 50 -k`. Then repeat at c=100 and c=200.
+Produce the table and write one paragraph explaining the sync plateau. If your blocking-async
+number is not roughly `1 / delay`, your load generator is the bottleneck, not the server.
+</Card>
+
+## The whiteboard
+
+T1 is the request-path pipeline with the event loop and its three branches. The T2 build-up:
+(1) the pipeline, (2) one async request yielding at `await`, (3) a blocking call freezing the loop,
+(4) the threadpool branch with its 40-thread ceiling.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p1-w06-m2-blank.svg) · [Editable source](/assets/diagrams/p1-w06-m2.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    Deploy the todo API on Fly.io or Render (both free tiers) and put the `/docs` URL in your
+    README. A recruiter can click it and send a request without cloning anything, which is a
+    meaningful advantage. Add the benchmark table to the README — "one blocking call cost 27.8× of
+    throughput, measured" is a sentence that makes an interviewer sit up.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **One:** grep for `async def` handlers that import `requests`, `time.sleep`, `psycopg2` or any
+    sync SDK — each is a frozen event loop. **Two:** compute `workers × (pool_size + max_overflow)`
+    and compare it to your database's `max_connections`; teams are usually over. **Three:** set
+    `--timeout-graceful-shutdown` explicitly to just under your platform's termination grace period,
+    or one hung request will stall a rolling deploy.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| High latency, low CPU | Blocking call inside `async def` | Use `def`, or an async client; 16.9 rps → 470–538 rps |
+| Throughput plateaus around 650 rps | Threadpool ceiling of 40 blocking handlers | Move to async I/O; raising the limiter costs memory and rarely helps |
+| `PATCH` wipes fields | `model_dump()` without `exclude_unset=True` | Add it; that is what makes PATCH different from PUT |
+| Password hash appears in a response | No `response_model`, or the model declares it | Declare a narrow `response_model`; it filters as well as validates |
+| Postgres refuses connections under load | `workers × (pool_size + max_overflow)` exceeds `max_connections` | Size the pool from the formula, with margin for migrations and admin |
+| Background task never ran | `BackgroundTasks` lost on restart | Use a real queue for anything that matters |
+| CORS preflight fails, `curl` works | Middleware ordering — something answers `OPTIONS` before CORS | Add CORS last so it runs outermost |
+| SSE endpoint buffers | `BaseHTTPMiddleware` buffers the body | Use pure ASGI middleware on streaming routes |
+
+## Assessment
+
+**Concept questions**
+
+1. What does ASGI define, and how is it different from WSGI? *(One async callable with receive/send channels; WSGI is one synchronous call returning an iterable, so it cannot do WebSockets or streaming.)*
+2. What happens when a handler declared `async def` calls `time.sleep(0.05)`? *(The event loop is blocked; measured 16.9 rps, p50 2,873 ms.)*
+3. Where do `def` handlers run, and what is the default limit? *(Starlette's threadpool via anyio; 40 threads.)*
+4. Why is `get_session` cached per request? *(So every dependency and the handler share one session and one transaction.)*
+5. What does `response_model` do besides docs? *(Validates and filters the response, preventing undeclared fields from leaking.)*
+6. Compute the maximum connections for `--workers 4`, `pool_size=20`, `max_overflow=10`. *(120 — above PostgreSQL's default `max_connections` of 100.)*
+7. When are `BackgroundTasks` acceptable? *(Short, idempotent work whose loss on restart is tolerable.)*
+8. Why does `BaseHTTPMiddleware` break streaming? *(It buffers the response body before passing it on.)*
+
+**Coding challenge.** Build a service with two endpoints that call a 100 ms external API, one correctly async and one deliberately blocking. Hidden tests: measure both under c=100 and assert the async version achieves at least 5× the throughput; assert the dependency-injected session is rolled back when the handler raises; assert `PATCH` with one field does not modify the others.
+
+**Interview questions**
+
+- *Junior:* "What is the difference between `def` and `async def` in a FastAPI route?"
+- *Mid:* "Latency is 9 seconds and CPU is 12%. What is happening?"
+- *Senior:* "Size the workers, threadpool and database pool for 500 rps at p95 under 200 ms, with a 20 ms query and a 40 ms external call. Show your arithmetic."
+
+**Draw it from memory.** Draw the request path from socket to handler, the single event loop, and the three branches with their measured throughput.
+
+## Sources & further reading
+
+**Primary docs**
+
+- [FastAPI documentation](https://fastapi.tiangolo.com/) — read "Concurrency and async / await" and "Dependencies with yield"; those two pages contain most of what people get wrong.
+- [Starlette documentation](https://www.starlette.io/) — read the middleware and routing pages; FastAPI's behaviour is Starlette's behaviour.
+- [ASGI specification](https://asgi.readthedocs.io/en/latest/specs/main.html) — read it once end to end; it is short, and it makes the framework stack stop being magic.
+- [uvicorn deployment](https://www.uvicorn.org/deployment/) — read the settings table, particularly the graceful-shutdown options.
+
+**Specs and their takeaways**
+
+- **[ASGI 3.0.](https://asgi.readthedocs.io/en/latest/)** *Takeaway:* a single async callable plus two channels covers HTTP, WebSockets and lifespan, which is why the ecosystem converged on it.
+- **[anyio capacity limiter (Starlette's threadpool).](https://anyio.readthedocs.io/en/stable/)** *Takeaway:* the default of 40 is the real ceiling on concurrent blocking handlers, and it is a memory/throughput trade, not a free dial.
+- **[PEP 492 (`async`/`await`).](https://peps.python.org/pep-0492/)** *Takeaway:* coroutines are objects that suspend and resume, which is why "async" gains nothing unless the slow thing actually yields.
+
+**Go deeper**
+
+- [Read Starlette's `concurrency.py` and `routing.py`](https://github.com/encode/starlette/blob/master/starlette/concurrency.py) — under 400 lines together. Seeing `run_in_threadpool` and the `is_async_callable` branch in the source ends every remaining `def` versus `async def` uncertainty permanently.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-06/p1-w06-m2">
+  Attempt the lab first. Seriously.
+</Card>

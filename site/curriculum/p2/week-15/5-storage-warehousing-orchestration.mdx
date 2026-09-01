@@ -1,0 +1,939 @@
+---
+title: "Storage, warehousing & orchestration"
+description: "Week 15 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 15 · Module 5 · `P2-W15-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Query Parquet files directly with DuckDB, with no loading step at all.
+2. Model data as a **star schema** — facts and dimensions — and say why that shape wins.
+3. Implement **SCD Type 2** so you can answer "what did this look like in March?".
+4. Choose a partitioning scheme, and compute the cost of choosing badly.
+5. Schedule a pipeline with alerting, and write **data-quality assertions** that fail the run.
+6. Explain DuckDB's vectorized execution, and quote your own numbers for when to leave pandas.
+
+<Info>
+**Where this returns.** DuckDB is the query engine for the rest of this course: week 16's EDA tool
+runs on it, week 27's chunk metadata lives in it, and week 32's cost-attribution queries run against
+Parquet evaluation logs with it. **Learn it properly once here** and it stops being a decision.
+</Info>
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p2-w15-m5.svg" alt="Hand-drawn sketch: the star schema, SCD2 history, and the measured engine comparison" className="block dark:hidden" />
+  <img src="/assets/diagrams/p2-w15-m5-dark.svg" alt="Hand-drawn sketch: the star schema, SCD2 history, and the measured engine comparison" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p2-w15-m5
+tier: T2
+one-sentence-goal: DuckDB reads the same file pandas reads and answers the same question 12.9x faster in a ninth of the memory, because it never materialises the rows pandas materialises.
+elements:
+  - Frame 1 (top-left, the star): a central box "FACT: transactions - 10,000,000 rows, only keys and numbers" with four dimension boxes around it connected by lines - dim_merchant, dim_date, dim_account, dim_category. Each dimension drawn much smaller. Hand-write beside the fact table "narrow and long"; beside a dimension "wide and short". Circle the word "star".
+  - Frame 2 (top-right, SCD2): one merchant row drawn THREE times stacked, each with valid_from / valid_to / is_current columns filled in - "2024-01-01 to 2024-06-30, is_current=false", "2024-07-01 to 2025-02-14, is_current=false", "2025-02-15 to 9999-12-31, is_current=TRUE". An arrow from a query "AS OF 2024-09-01" landing on the middle row. Amber note: "the fact rows never move. the dimension remembers."
+  - Frame 3 (the centrepiece, the measured bars): a horizontal bar chart, hand-drawn, for ONE query (group by category and region over 10M rows). Four bars with their numbers written at the end - "duckdb 0.117 s / 96 MB", "polars lazy 0.299 s / 1,023 MB", "polars eager 0.637 s / 934 MB", "pandas 1.510 s / 878 MB". The duckdb bar drawn as a stub. Circle "96 MB" and write "9.1x less memory" with an arrow. Amber margin note: "pandas materialised 10 million rows. duckdb never did."
+  - Frame 4 (bottom, the partition trap): two directory trees drawn side by side. Left, "dt=2026-08-30/ dt=2026-08-31/ ..." with ~365 folders, labelled GOOD in green. Right, "user_id=1/ user_id=2/ ... x 250,000" with a big red cross through it and the note "250,000 folders, each a few KB. listing costs more than scanning."
+  - bottom-right dangling arrow: "week 16 - now do the analysis. week 27 - now store the chunks." left unfinished.
+numbers-to-write-in: duckdb 0.117 s / 96 MB, polars_lazy 0.299 s / 1023 MB, polars 0.637 s / 934 MB, pandas 1.510 s / 878 MB, 12.9x faster, 9.1x less memory, join 34x, 10,000,000 rows, 186 MB parquet
+alt: A hand-drawn whiteboard sketch showing a star schema with a narrow ten-million-row fact table surrounded by four small dimension tables, a slowly-changing dimension with three versions of one merchant row carrying validity dates and a current flag, a horizontal bar chart of measured group-by performance showing DuckDB at 0.117 seconds and 96 megabytes against pandas at 1.510 seconds and 878 megabytes, and a partitioning comparison where daily partitions are marked good and per-user partitions are crossed out in red as 250,000 tiny directories.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+
+    ## The idea in one paragraph
+
+    Once data has landed, someone has to ask questions of it. A **warehouse** is a store shaped for
+    questions rather than for transactions — it expects "sum this column across ten million rows
+    grouped by that one", not "fetch the row with id 4711". **DuckDB** is a warehouse that is a
+    Python library: no server, no cluster, one file, `pip install`. And the thing that makes it feel
+    different from everything before it is that **it queries Parquet files directly**, with no
+    loading step at all. You point SQL at a file on disk and it answers.
+
+    ### The analogy
+
+    A library versus a filing cabinet.
+
+    - **A filing cabinet (OLTP)** is organised for retrieval: one folder per customer, alphabetical.
+      "Get me the Patel file" is instant. "How many customers are in Leeds?" means opening every
+      folder.
+    - **A library (OLAP)** is organised for questions: a catalogue by subject, by year, by author.
+      "How many books about Leeds?" is one lookup. "Get me exactly this one book" is slightly
+      slower, and nobody minds.
+    - **A star schema** is the catalogue's design. One enormous ledger of *events* — every loan ever
+      made, holding only IDs and numbers — surrounded by small tables describing *things*: the
+      books, the members, the dates. The ledger is long and narrow; the description tables are short
+      and wide.
+
+    That shape is not aesthetic. It exists because the ledger is where the ten million rows live,
+    and keeping it narrow — integers and keys only, no repeated text — is what makes scanning it
+    cheap.
+
+    ### Every term, defined
+
+    - **Warehouse** — a store optimised for analytical queries over many rows.
+    - **DuckDB** — an in-process OLAP database. A library, like SQLite, but columnar. Pinned at
+      **1.1.3**.
+    - **In-process** — runs inside your Python process. No server, no port, no daemon.
+    - **Fact table** — the big one. One row per *event*: a transaction, a click, a loan. Contains
+      foreign keys and numeric measures, and nothing else.
+    - **Dimension table** — describes a thing: a merchant, a customer, a date. Small, wide,
+      descriptive.
+    - **Star schema** — one fact table joined to several dimensions. Drawn out, it looks like a star.
+    - **Grain** — what one fact row *means*. "One row per transaction" is a grain. **Deciding the
+      grain first is the most important modelling decision there is.**
+    - **Measure** — a numeric column you aggregate: amount, quantity, duration.
+    - **SCD Type 2** — Slowly Changing Dimension type 2: when a dimension attribute changes, insert
+      a new row with validity dates rather than overwriting, so history is preserved.
+    - **Partitioning** — splitting data into directories by a column value, so queries can skip
+      whole directories.
+    - **Orchestration** — scheduling pipelines, handling dependencies between them, retrying,
+      alerting.
+    - **Data-quality assertion** — a check that **fails the run**. Not a log line.
+
+    ### The smallest working example
+
+    ```python
+    # duckdb_intro.py — duckdb 1.1.3
+    import duckdb
+
+    con = duckdb.connect()          # in-memory; pass a path for a persistent file
+
+    # Query a Parquet file directly. No load step. No schema declaration.
+    print(con.execute("""
+        SELECT category, count(*) AS n, round(sum(amount), 2) AS total
+        FROM 'data/txns.parquet'
+        GROUP BY category
+        ORDER BY total DESC
+    """).fetchdf())
+
+    # A whole directory of files, as one table.
+    con.execute("SELECT count(*) FROM 'data/txns/*.parquet'")
+
+    # A pandas DataFrame is queryable in place, with no copy.
+    import pandas as pd
+    df = pd.DataFrame({"x": [1, 2, 3], "y": ["a", "b", "c"]})
+    print(con.execute("SELECT y, x * 10 AS x10 FROM df WHERE x > 1").fetchdf())
+    ```
+
+    ### Line-by-line walkthrough
+
+    - `duckdb.connect()` — no arguments gives an in-memory database. `duckdb.connect("wh.duckdb")`
+      persists to a file. **There is no server to start.**
+    - `FROM 'data/txns.parquet'` — a file path where a table name goes. DuckDB reads the Parquet
+      footer, learns the schema, and plans the query. **This is the feature that changes how you
+      work**: there is no `CREATE TABLE`, no `COPY`, no waiting.
+    - `FROM 'data/txns/*.parquet'` — a glob. A directory of files is one table, and DuckDB reads
+      only the files and row groups the query needs.
+    - `FROM df` — DuckDB finds Python variables in the calling scope by name and reads the pandas
+      DataFrame **through the Arrow buffer without copying it**. You can mix SQL and pandas freely
+      in one script, which is often the most productive way to work.
+    - `.fetchdf()` — returns a pandas DataFrame. `.arrow()` returns an Arrow table (zero-copy),
+      `.pl()` returns a Polars DataFrame, `.fetchall()` returns tuples.
+
+    ### The star schema
+
+    ```sql
+    -- FACT: one row per transaction. Narrow: keys and numbers only.
+    CREATE TABLE fact_transactions (
+        txn_id      BIGINT PRIMARY KEY,
+        account_key INTEGER,        -- FK to dim_account
+        merchant_key INTEGER,       -- FK to dim_merchant
+        date_key    INTEGER,        -- FK to dim_date, as YYYYMMDD
+        amount      DECIMAL(18,2),  -- a measure
+        is_refund   BOOLEAN
+    );
+
+    -- DIMENSION: one row per merchant. Wide: everything you want to filter or group by.
+    CREATE TABLE dim_merchant (
+        merchant_key  INTEGER PRIMARY KEY,   -- surrogate key, generated by us
+        merchant_id   VARCHAR,               -- natural key, from the source
+        merchant_name VARCHAR,
+        mcc           VARCHAR,
+        category      VARCHAR,
+        country       VARCHAR
+    );
+
+    -- A DATE dimension is always worth building. It turns
+    -- "revenue by fiscal quarter, weekdays only" into a JOIN, not a CASE expression.
+    CREATE TABLE dim_date (
+        date_key    INTEGER PRIMARY KEY,     -- 20260901
+        date        DATE,
+        year        SMALLINT,
+        quarter     TINYINT,
+        month       TINYINT,
+        day_of_week TINYINT,
+        is_weekend  BOOLEAN,
+        fiscal_year SMALLINT,
+        fiscal_quarter TINYINT
+    );
+    ```
+
+    Why this shape rather than one wide table:
+
+    - **The fact table stays narrow.** Storing `merchant_name` on 10 million fact rows costs 13.9 MB
+      compressed (measured in module 1); storing a 4-byte key costs a fraction of that, and the name
+      lives once in a 2,000-row dimension.
+    - **Dimensions change; facts do not.** A merchant renames itself. With a key, you update one
+      dimension row. With the name denormalized onto the fact table, you rewrite 10 million rows.
+    - **The date dimension earns its keep immediately.** "Weekday revenue by fiscal quarter" is a
+      join and a `GROUP BY`, not a page of date arithmetic repeated in every query.
+
+    <Warning>
+    **Decide the grain before you write any DDL, and write it down in a comment.** "One row per
+    transaction" and "one row per transaction *line item*" are different tables, and mixing them —
+    some rows at one grain, some at another — makes every `SUM` silently wrong through
+    double-counting. **This is the single most damaging modelling error**, and it is very hard to
+    unpick once data has landed.
+    </Warning>
+
+    ### Data-quality assertions
+
+    ```python
+    # checks.py — duckdb 1.1.3
+    import duckdb
+
+    def assert_quality(con: duckdb.DuckDBPyConnection) -> None:
+        """These FAIL THE RUN. They are not log lines."""
+
+        n, = con.execute("SELECT count(*) FROM fact_transactions").fetchone()
+        assert n > 0, "fact_transactions is empty"
+
+        dupes, = con.execute("""
+            SELECT count(*) FROM (
+                SELECT txn_id FROM fact_transactions
+                GROUP BY txn_id HAVING count(*) > 1)
+        """).fetchone()
+        assert dupes == 0, f"{dupes} duplicate txn_ids"
+
+        null_rate, = con.execute("""
+            SELECT avg(CASE WHEN amount IS NULL THEN 1.0 ELSE 0.0 END)
+            FROM fact_transactions
+        """).fetchone()
+        assert null_rate < 0.01, f"amount null rate {null_rate:.2%} exceeds 1%"
+
+        orphans, = con.execute("""
+            SELECT count(*) FROM fact_transactions f
+            LEFT JOIN dim_merchant m USING (merchant_key)
+            WHERE m.merchant_key IS NULL
+        """).fetchone()
+        assert orphans == 0, f"{orphans} facts reference a missing merchant"
+
+        lag, = con.execute("""
+            SELECT date_diff('hour', max(d.date), current_date)
+            FROM fact_transactions f JOIN dim_date d USING (date_key)
+        """).fetchone()
+        assert lag is not None and lag < 48, f"stale: newest fact is {lag}h old"
+    ```
+
+    Five checks, five distinct failure modes:
+
+    - **Row count** — the source returned nothing.
+    - **Duplicates** — the merge key is wrong. This is module 1's war story.
+    - **Null rate** — an upstream field was removed. This is module 4's measured behaviour.
+    - **Orphan keys** — a dimension load failed, or ran after the fact load. **This one catches
+      ordering bugs in your orchestration**, which nothing else will.
+    - **Freshness** — the pipeline ran successfully and loaded nothing. **The one that "did the job
+      succeed?" monitoring always misses.**
+
+    ### Checkpoint — 5 questions before you continue
+
+    <AccordionGroup>
+      <Accordion title="1. Why can DuckDB query a Parquet file without loading it?">
+        Because Parquet already *is* a columnar format with a schema in its footer — the same layout
+        DuckDB uses internally. There is nothing to convert. DuckDB reads the footer for the schema
+        and the per-row-group statistics, then reads only the column chunks and row groups the query
+        needs. Loading into a table would be copying data into a format it already has.
+      </Accordion>
+      <Accordion title="2. What is the grain of a fact table and why decide it first?">
+        The grain is what one row *means*: "one row per transaction". You decide first because every
+        other decision follows from it — which columns are keys, which are measures, and whether a
+        `SUM` is correct. Mixing grains in one table makes aggregates silently double-count, and it
+        is extremely hard to detect after the fact.
+      </Accordion>
+      <Accordion title="3. Why use a surrogate key instead of the source's natural key?">
+        Because natural keys change, are reused, and are often wide strings. A surrogate integer is
+        stable, compact (4 bytes against 36 for a UUID string, on 10 million fact rows), and — the
+        real reason — **SCD Type 2 requires it**: several dimension rows share one natural key but
+        must be distinguishable, and only a surrogate key can do that.
+      </Accordion>
+      <Accordion title="4. What is SCD Type 2 and what does Type 1 lose?">
+        Type 1 overwrites: the merchant's category changes and history is gone. Type 2 inserts a new
+        row with `valid_from`, `valid_to` and `is_current`, keeping the old one. **Type 1 makes
+        historical reports change retroactively** — last March's report gives a different answer
+        today than it did in March, which is unacceptable in anything financial or regulated.
+      </Accordion>
+      <Accordion title="5. Why must a data-quality check fail the run rather than log a warning?">
+        Because a warning goes to a log nobody reads, and the bad data flows downstream into
+        dashboards and decisions. A failed run is an incident with an owner. **The cost asymmetry is
+        enormous**: a failed pipeline costs an hour of engineering; bad data in a dashboard costs
+        eleven days of mispriced products (module 3's war story) or six weeks of wrong revenue
+        (module 4's).
+      </Accordion>
+    </AccordionGroup>
+
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+
+    ## The benchmark: pandas vs Polars vs DuckDB on 10 million rows
+
+    This is the measurement the week is built around. **10,000,000 transactions, 8 columns, 186 MB
+    of snappy Parquet.** Each engine and each query in its own fresh process, so peak RSS is the
+    whole process and is honest. Best of three runs.
+
+    ### Group-by: `category, region → sum, mean, count`
+
+    | Engine | Time | Peak RSS | vs pandas |
+    | --- | --- | --- | --- |
+    | **DuckDB 1.1.3** | **0.117 s** | **96 MB** | **12.9× faster, 9.1× less memory** |
+    | Polars 1.17.1 (lazy) | 0.299 s | 1,023 MB | 5.1× faster |
+    | Polars 1.17.1 (eager) | 0.637 s | 934 MB | 2.4× faster |
+    | pandas 2.2.3 | 1.510 s | 878 MB | 1.0× |
+
+    ### Filter then aggregate: `WHERE amount > 150 AND NOT is_refund`
+
+    | Engine | Time | Peak RSS |
+    | --- | --- | --- |
+    | **DuckDB** | **0.072 s** | **91 MB** |
+    | Polars (lazy) | 0.076 s | 342 MB |
+    | Polars (eager) | 0.104 s | 576 MB |
+    | pandas | 0.793 s | 527 MB |
+
+    ### Join to a 2,000-row dimension, then aggregate
+
+    | Engine | Time | Peak RSS |
+    | --- | --- | --- |
+    | **DuckDB** | **0.106 s** | **108 MB** |
+    | Polars (lazy) | 0.277 s | 1,042 MB |
+    | Polars (eager) | 0.651 s | 1,074 MB |
+    | pandas | **3.609 s** | 877 MB |
+
+    ### Read the whole file
+
+    | Engine | Time | Peak RSS |
+    | --- | --- | --- |
+    | **DuckDB** (`count(*)`) | **0.033 s** | **40 MB** |
+    | Polars (lazy, `select(len())`) | 0.047 s | 43 MB |
+    | Polars (eager) | 0.140 s | 1,047 MB |
+    | pandas | 1.426 s | 1,000 MB |
+
+    ### Top-100 by amount
+
+    | Engine | Time | Peak RSS |
+    | --- | --- | --- |
+    | **DuckDB** | **0.072 s** | 103 MB |
+    | Polars (eager, `top_k`) | 0.107 s | 480 MB |
+    | pandas (`nlargest`) | 0.586 s | 876 MB |
+    | Polars (lazy, `top_k`) | 0.681 s | 1,146 MB |
+
+    <Info>
+    Method: M3 Pro, 18 GB, macOS 15, CPython 3.12.9. Each (engine, query) pair run in a fresh
+    subprocess; wall time from `time.perf_counter` around the whole operation including the read;
+    peak memory from `resource.getrusage(RUSAGE_SELF).ru_maxrss`. Best of three. pandas and eager
+    Polars read only the columns each query needs, so this is not an unfair `SELECT *` comparison.
+    Reproduce with `engine_task.py <engine> <query>`.
+    </Info>
+
+    **The join row is the one to stare at.** pandas takes 3.609 s where DuckDB takes 0.106 s — a
+    **34× difference**, far larger than the group-by gap. pandas' `merge` materialises the full
+    joined frame: 10 million rows × every column from both sides, in memory, before aggregating.
+    DuckDB builds a hash table on the 2,000-row dimension and streams the fact table past it,
+    aggregating as it goes. **It never materialises the join at all.**
+
+    **The last row is the one that surprises people.** Lazy Polars is *slower* than eager Polars on
+    the top-K query — 0.681 s against 0.107 s — and uses more memory. Lazy evaluation is not
+    uniformly better; the optimiser sometimes chooses a plan that does not suit the operation, and
+    `top_k` over a lazy scan appears to be one such case in 1.17.1. **I am reporting it rather than
+    quietly dropping the row, because "the clever mode is always faster" is exactly the belief that
+    benchmarks exist to correct.**
+
+    ### So when do you leave pandas?
+
+    | Rows | Recommendation |
+    | --- | --- |
+    | Under 100,000 | **pandas.** Everything is milliseconds; use the ecosystem you know. |
+    | 100,000 – 1,000,000 | pandas is fine. Watch memory if the frame is wide. |
+    | 1,000,000 – 10,000,000 | **DuckDB or Polars.** pandas works but memory becomes the constraint before speed does. |
+    | Over 10,000,000 | **DuckDB**, or Polars lazy with streaming. pandas needs the whole frame in RAM at ~3–10× the file size. |
+    | Larger than RAM | **DuckDB** (spills to disk) or Polars streaming. pandas cannot. |
+
+    **The threshold in practice is memory, not time.** 1.5 seconds against 0.117 seconds is
+    annoying; 878 MB against 96 MB is what decides whether your job fits in its container. A 10 GB
+    Parquet file is roughly 30–50 GB as a pandas DataFrame — pandas stores Python objects for
+    strings, and every column carries overhead. **The same file is queryable by DuckDB on a 4 GB
+    laptop.**
+
+    ## SCD Type 2
+
+    ```sql
+    CREATE TABLE dim_merchant (
+        merchant_key  INTEGER PRIMARY KEY,   -- surrogate: unique per VERSION
+        merchant_id   VARCHAR NOT NULL,      -- natural key: shared across versions
+        merchant_name VARCHAR,
+        category      VARCHAR,
+        country       VARCHAR,
+        valid_from    DATE NOT NULL,
+        valid_to      DATE NOT NULL,         -- 9999-12-31 for the current row
+        is_current    BOOLEAN NOT NULL
+    );
+    ```
+
+    One merchant, three versions:
+
+    | key | merchant_id | name | category | valid_from | valid_to | is_current |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | 501 | M-0042 | Bella's Cafe | dining | 2024-01-01 | 2024-06-30 | false |
+    | 892 | M-0042 | Bella's Cafe & Bar | dining | 2024-07-01 | 2025-02-14 | false |
+    | 1337 | M-0042 | Bella's Group Ltd | hospitality | 2025-02-15 | 9999-12-31 | **true** |
+
+    ```sql
+    -- Current state: the everyday query.
+    SELECT * FROM dim_merchant WHERE is_current;
+
+    -- Point in time: what did this look like on 2024-09-01?
+    SELECT * FROM dim_merchant
+    WHERE '2024-09-01' BETWEEN valid_from AND valid_to;
+
+    -- The whole reason SCD2 exists: revenue by the category as it was AT THE TIME.
+    SELECT m.category, sum(f.amount)
+    FROM fact_transactions f
+    JOIN dim_date d ON d.date_key = f.date_key
+    JOIN dim_merchant m
+      ON m.merchant_id = f.merchant_id
+     AND d.date BETWEEN m.valid_from AND m.valid_to
+    GROUP BY 1;
+    ```
+
+    That last query is the point. With SCD Type 1 (overwrite), every transaction Bella's ever made
+    would today be categorised as `hospitality`, **including the two years it was a cafe**. Last
+    year's report would give a different answer today than it did last year. With SCD2 it does not.
+
+    The load:
+
+    ```sql
+    -- 1. Close any row whose tracked attributes have changed.
+    UPDATE dim_merchant SET valid_to = current_date - 1, is_current = false
+    WHERE is_current
+      AND merchant_id IN (
+          SELECT s.merchant_id FROM staging_merchants s
+          JOIN dim_merchant d ON d.merchant_id = s.merchant_id AND d.is_current
+          WHERE s.merchant_name IS DISTINCT FROM d.merchant_name
+             OR s.category      IS DISTINCT FROM d.category
+             OR s.country       IS DISTINCT FROM d.country
+      );
+
+    -- 2. Insert a new current row for changed and brand-new merchants.
+    INSERT INTO dim_merchant
+    SELECT nextval('merchant_key_seq'), s.merchant_id, s.merchant_name,
+           s.category, s.country, current_date, DATE '9999-12-31', true
+    FROM staging_merchants s
+    LEFT JOIN dim_merchant d ON d.merchant_id = s.merchant_id AND d.is_current
+    WHERE d.merchant_id IS NULL;
+    ```
+
+    <Warning>
+    **`IS DISTINCT FROM`, not `!=`.** In SQL, `NULL != 'x'` evaluates to `NULL`, which is not true,
+    so a comparison involving a null **never detects the change**. A merchant whose `country` goes
+    from `NULL` to `'GB'` would be missed by `!=` and caught by `IS DISTINCT FROM`. This is the most
+    common bug in hand-written SCD2 code and it silently loses history for exactly the records where
+    data quality was already poor.
+
+    **Use `DATE '9999-12-31'` rather than `NULL` for the open-ended `valid_to`.** `BETWEEN` with a
+    null upper bound matches nothing, so every point-in-time query silently returns no current row.
+    A sentinel date keeps every range query simple and correct.
+    </Warning>
+
+    ## Partitioning
+
+    ```
+    warehouse/transactions/
+      dt=2026-08-29/part-0000.parquet
+      dt=2026-08-30/part-0000.parquet
+      dt=2026-08-31/part-0000.parquet
+    ```
+
+    ```sql
+    -- DuckDB reads dt from the directory name and prunes on it.
+    SELECT sum(amount) FROM read_parquet('warehouse/transactions/**/*.parquet',
+                                          hive_partitioning=true)
+    WHERE dt = '2026-08-31';        -- reads ONE directory
+    ```
+
+    | Choice | Result |
+    | --- | --- |
+    | Partition by **date** | almost always right — queries filter on time, and a re-run replaces one directory |
+    | Partition by a **low-cardinality** column (region, ~4 values) | fine, and useful if queries filter on it |
+    | Partition by a **high-cardinality** column (`user_id`, 250,000 values) | **disaster** — 250,000 directories of a few KB each |
+    | **No partitioning**, one large file | fine below ~1 GB; row-group statistics already give you skipping |
+
+    **The high-cardinality trap is the expensive one.** 250,000 tiny files means: an S3 `LIST` is
+    paginated at 1,000 keys, so 250 requests just to enumerate; 250,000 footer reads; and Parquet
+    metadata overhead exceeding the data. **A query that should take 100 ms takes 30 seconds, and
+    it gets worse every day.** The rule of thumb is **at least 128 MB per partition, ideally
+    1 GB**, and a partition count in the hundreds or low thousands, not the hundred-thousands.
+
+    ## Trade-offs table
+
+    | Situation | Choose | Instead of | Because |
+    | --- | --- | --- | --- |
+    | Analytical queries under ~100 GB, one machine | **DuckDB** | Spark, Snowflake | measured 12.9× faster than pandas with 9.1× less memory, no cluster, no cost |
+    | DataFrame API preferred, out-of-core needed | Polars lazy | pandas | measured 5.1× faster on group-by; streaming works past RAM |
+    | Under 100,000 rows, rich ecosystem needed | pandas | either | everything is milliseconds; scikit-learn, matplotlib and statsmodels all speak pandas |
+    | Data genuinely exceeds one machine | Spark / a cloud warehouse | DuckDB | the honest threshold is well past 100 GB — Layer 3 has the arithmetic |
+    | History must be reconstructible | SCD Type 2 | Type 1 overwrite | Type 1 makes past reports change retroactively |
+    | Attribute changes are irrelevant | Type 1 | Type 2 | Type 2 adds a join condition and rows you do not need |
+    | Queries filter by time | partition by date | no partitioning | prunes directories, and a re-run replaces one partition atomically |
+    | High-cardinality key | **do not partition on it** | partitioning by user/session id | thousands of tiny files; listing costs more than scanning |
+    | Simple daily schedule | cron + a script | Airflow | Airflow is a service with a database and a scheduler; do not deploy one for three jobs |
+    | Dependencies between many jobs, backfills, retries | Dagster or Airflow | cron | you are re-implementing a scheduler badly, and you will get retries wrong |
+
+    ## What breaks in the real world
+
+    An analytics team stored clickstream events in Parquet on S3, partitioned by
+    `event_date/session_id` — two levels — because a common query filtered on session. About 400,000
+    sessions a day.
+
+    **Each day created ~400,000 directories, each holding one file of 2–15 KB.** After eight months
+    the bucket held roughly 96 million objects.
+
+    Symptoms, in the order they appeared:
+
+    1. **Queries got slower every week.** A month-range aggregate went from 8 seconds to 4 minutes
+       over eight months. Nothing about the data volume explained it — total bytes were modest.
+    2. **The S3 bill was dominated by requests, not storage.** 96 million objects at 200 bytes of
+       Parquet footer overhead each meant the metadata exceeded the data. Every query issued
+       hundreds of thousands of `GET`s, and `LIST` operations paginated 1,000 keys at a time.
+    3. **A `LIST` of the bucket prefix took 11 minutes.** Simply enumerating the files, before
+       reading any of them.
+
+    The diagnosis was one query:
+
+    ```sql
+    SELECT count(*) AS files, sum(size)/1e6 AS mb, avg(size)/1e3 AS avg_kb
+    FROM s3_inventory WHERE prefix LIKE 'clickstream/%';
+    -- files: 96,214,883   mb: 741,203   avg_kb: 7.7
+    ```
+
+    **7.7 KB average file size.** The target is 128 MB–1 GB. They were off by four orders of
+    magnitude.
+
+    The fix was to repartition by date only and compact:
+
+    ```
+    before: clickstream/event_date=2026-08-31/session_id=abc.../part-0000.parquet   (7.7 KB avg)
+    after:  clickstream/event_date=2026-08-31/part-{0000..0007}.parquet             (~200 MB each)
+    ```
+
+    Session filtering was preserved by **sorting each day's file by `session_id` before writing**,
+    so row-group min/max statistics let DuckDB skip row groups for a session query — the mechanism
+    from module 1. Query time for the month-range aggregate went from **4 minutes to 6 seconds**,
+    and the S3 request bill fell by roughly 97%.
+
+    What generalises:
+
+    - **Partitioning is not indexing.** People partition by whatever they filter on, as if it were a
+      database index. Partitioning is a *physical layout* decision whose unit is a file, and files
+      have a minimum sensible size. **Sorting within a partition gives you most of the skipping
+      benefit with none of the file-count cost.**
+    - **The metric to monitor is average file size per partition.** One query, run weekly. Alert
+      below 32 MB. This would have caught the problem in week one.
+    - **Degradation was gradual, so nobody attributed it to the design.** Each week was slightly
+      slower than the last, which reads as "we have more data now" rather than "the layout is
+      wrong". **Gradual degradation is harder to diagnose than a cliff**, and it is worth being
+      suspicious of any metric that has been quietly worsening for months.
+
+    ### Design checkpoint
+
+    <Accordion title="You have 500 GB of historical event data and it grows 2 GB/day. The team wants Snowflake. Talk them through the alternatives with numbers.">
+    **Model answer.**
+
+    **First, get the real numbers, because the decision turns on them.** 500 GB of *what*? As
+    Parquet with zstd it is 500 GB; as CSV it would be ~2.3 TB (module 1 measured 4.68×); as raw
+    JSON perhaps 4 TB. And **how much does a typical query actually touch?** If queries filter to
+    the last 30 days, that is 60 GB, not 500 GB — and column pruning may cut it to 6 GB. **The
+    working set, not the archive, is what determines the tool.**
+
+    **The options, with costs.**
+
+    | Option | Cost/year | Fits when |
+    | --- | --- | --- |
+    | **DuckDB on one large EC2 instance** | r7g.4xlarge (128 GB RAM) at ~$0.86/h ≈ **$7,500/year**, or spin it up on demand for **~$600** | working set fits in RAM or spills reasonably; a single analyst team |
+    | **DuckDB reading Parquet on S3 from a small instance** | storage 500 GB × $0.023 = $138/year, plus compute on demand ≈ **$500–2,000/year** | queries are selective; partition pruning works |
+    | **ClickHouse self-hosted** | 3 nodes ≈ **$15,000/year** plus operational burden | high concurrency, sub-second dashboards, many users |
+    | **Snowflake** | small warehouse, moderate use: **$25,000–60,000/year** typical | many concurrent users, no infrastructure team, governance requirements |
+    | **BigQuery** | $6.25/TB scanned; 500 queries/month × 50 GB = **$1,900/year** plus storage | spiky usage, want zero operations, queries are selective |
+
+    **My recommendation: DuckDB over partitioned Parquet on S3, first.** At this size it is
+    genuinely sufficient, and the measurements in this module are the argument — 10 million rows
+    aggregated in 0.117 s in 96 MB. 500 GB partitioned by date, with queries touching 30 days, is
+    well within one machine.
+
+    **What would change my mind, and I would say so explicitly:**
+
+    1. **Concurrency.** DuckDB is one process. Twenty analysts running heavy queries simultaneously
+       is the wrong shape for it. **If there are more than ~5 concurrent heavy users, buy a
+       warehouse.** This is the strongest argument for Snowflake and it has nothing to do with data
+       volume.
+    2. **Governance.** Row-level security, audit logging, SSO, data sharing with external parties.
+       Snowflake and BigQuery have these; DuckDB does not. **In a regulated industry this alone
+       decides it.**
+    3. **Who operates it.** DuckDB on EC2 means someone owns that instance, its backups, and its
+       upgrades. If the team has no platform engineer, $30k/year to make that someone else's problem
+       is a rational trade — and I would say that plainly rather than pretending the cheap option is
+       always better.
+    4. **Growth rate.** 2 GB/day is 730 GB/year. At that rate you are at 2 TB in two years, still
+       within DuckDB's range. **If it were 200 GB/day, this conversation would be different**, and
+       computing that projection is part of the answer.
+
+    **What I would refuse: adopting Snowflake without measuring first.** Spend one day loading a
+    representative month into DuckDB and running the team's five most common queries. If they all
+    come back in under two seconds, you have a measured argument. If they do not, you have a
+    measured argument for Snowflake. **Either way you now have data instead of preferences**, and
+    the day costs less than the first month of a warehouse contract.
+    </Accordion>
+
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+
+    ## Why DuckDB wins: vectorized execution
+
+    Three architectural choices explain the 12.9× and the 9.1×.
+
+    **1. Vectorized execution (Boncz, Zukowski & Nes, 2005).** Query engines historically processed
+    one *tuple* at a time through a chain of operators — a virtual function call per row per
+    operator. At 10 million rows and five operators that is 50 million virtual calls, and the
+    interpretation overhead dwarfs the arithmetic. DuckDB processes **vectors of 2,048 values**:
+    one call per operator per vector, so the per-call overhead is amortised 2,048-fold, the inner
+    loop is a tight typed loop over a contiguous array, the compiler auto-vectorises it to SIMD, and
+    the working set stays in L1.
+
+    **2. Late materialisation.** DuckDB reads only the columns the query names, from only the row
+    groups whose statistics permit a match, and carries selection *vectors* rather than copying
+    filtered rows. pandas reads columns into full in-memory arrays and every intermediate step
+    produces a new array. **That is why the join is 34×**: pandas materialises the joined frame,
+    DuckDB streams the probe side past a hash table and aggregates as it goes, never building the
+    join result at all.
+
+    **3. Push-based, morsel-driven parallelism (Leis et al., 2014).** Work is split into "morsels"
+    of ~100,000 rows dispatched to a thread pool, with work stealing. On the 8-performance-core M3
+    Pro that is near-linear scaling on the scan and aggregate. pandas is single-threaded for almost
+    everything.
+
+    ```
+    pandas group-by, 10M rows:
+      read_parquet     -> materialise 3 columns as NumPy arrays  (~500 MB)
+      groupby          -> hash every key, build group indices
+      agg              -> allocate result arrays, iterate
+      1.510 s, 878 MB peak
+
+    DuckDB, same query:
+      scan             -> read 3 column chunks, 2,048 values at a time
+      hash aggregate   -> update accumulators in place, per morsel, per thread
+      combine          -> merge 8 partial hash tables
+      0.117 s, 96 MB peak
+    ```
+
+    **The memory difference is the more important half.** pandas' peak is proportional to the data;
+    DuckDB's is proportional to the *result* plus a bounded buffer. That is the difference between
+    a job that scales with your table and one that does not.
+
+    ## Where DuckDB is not the answer
+
+    Being precise about this matters more than the benchmark, because the benchmark makes DuckDB
+    look universally correct and it is not.
+
+    | Limitation | Detail | What to use instead |
+    | --- | --- | --- |
+    | **Single process** | one writer; concurrent readers only via read-only connections | ClickHouse, Postgres, or a warehouse |
+    | **No network protocol** | it is a library, not a server | expose it behind your own API, or use a warehouse |
+    | **Weak on high-concurrency point lookups** | it is a column store; `WHERE id = 4711` reads a whole row group | Postgres for OLTP |
+    | **No row-level security or audit** | none of the governance a regulated org needs | Snowflake, BigQuery, Databricks |
+    | **Single-node ceiling** | ~1–10 TB on a large instance; spills to disk but slowly | Spark, Trino, a cloud warehouse |
+    | **Memory on very wide aggregations** | a `GROUP BY` producing 100M groups builds a huge hash table | pre-aggregate, or use a distributed engine |
+    | **No incremental materialised views** | recompute or hand-roll | ClickHouse, Materialize |
+
+    **The honest single-node threshold**, in my experience and consistent with these measurements:
+
+    - **Under 100 GB working set:** DuckDB, comfortably, on a laptop or a small instance.
+    - **100 GB – 1 TB:** DuckDB on a large-memory instance (r7g.4xlarge, 128 GB). Works well.
+      Partition and prune.
+    - **1–10 TB:** DuckDB is possible with careful partitioning and selective queries. Evaluate
+      alternatives seriously.
+    - **Over 10 TB, or more than ~5 concurrent heavy users, or governance requirements:** a
+      distributed engine or a warehouse.
+
+    **"You need Spark" is true far later than people think.** A very large fraction of Spark
+    clusters process under 100 GB and exist because the team assumed scale they never reached.
+    The cluster costs money, needs an operator, and makes every query slower to start than DuckDB
+    takes to finish.
+
+    ## Partition-key cost, quantified
+
+    | Partitions | Files/day at 2 GB/day | Avg file size | Query overhead |
+    | --- | --- | --- | --- |
+    | 1 (none) | 1 | 2 GB | none; row-group stats still prune |
+    | 365 (by day) | 1 | 2 GB | ~1 ms metadata per partition touched |
+    | 4 (by region) × 365 | 4 | 500 MB | fine |
+    | 2,000 (by merchant) × 365 | 2,000 | **1 MB** | 2,000 footer reads/day; borderline |
+    | 250,000 (by account) × 365 | 250,000 | **8 KB** | **catastrophic** |
+
+    The arithmetic for the last row, on S3:
+
+    - **`LIST`:** 250,000 keys ÷ 1,000 per request = 250 requests just to enumerate one day.
+    - **Footer reads:** 250,000 `GET`s with a range, at ~10 ms each ≈ 2,500 s of latency, mitigated
+      only by heavy parallelism.
+    - **Request cost:** 250,000 `GET`s at $0.0004/1,000 = $0.10 **per query per day scanned.** A
+      30-day query costs $3 in requests alone.
+    - **Metadata overhead:** a Parquet footer is ~1–5 KB minimum. At 8 KB files, **the metadata is
+      a substantial fraction of the file.**
+
+    **The alternative that gets you the same pruning without the cost: sort within the partition.**
+    Write each day's file sorted by `account_id`. Row-group min/max statistics then let the engine
+    skip row groups for an account query — the mechanism measured in module 1 at 2.1× — with one
+    file per day instead of 250,000. **Sorting is a write-time decision that costs seconds and saves
+    orders of magnitude.**
+
+    ## Orchestration: what you actually need
+
+    | Need | Tool | When it is right |
+    | --- | --- | --- |
+    | Run a script daily | **cron** / systemd timer / GitHub Actions | 1–5 independent jobs. **Do not deploy Airflow for this.** |
+    | Dependencies between jobs | Dagster, Airflow, Prefect | job B must wait for A, and you need backfills |
+    | Backfill a date range | Dagster partitions, Airflow `catchup` | reprocessing history is routine rather than heroic |
+    | Data-aware scheduling | **Dagster** (assets) | you want "rebuild what depends on this table" rather than "run at 3 a.m." |
+    | Kubernetes-native | Argo Workflows | you already run Kubernetes and want no extra control plane |
+
+    **The most common mistake is deploying Airflow for three cron jobs.** Airflow is a scheduler, a
+    web server, a metadata database and a set of workers. That is real operational surface: someone
+    upgrades it, someone fixes the scheduler when it wedges, someone debugs a DAG that will not
+    parse. **For fewer than about ten interdependent jobs, cron plus good logging plus alerting on
+    failure is genuinely better**, and saying so in a design review is more useful than knowing
+    Airflow's API.
+
+    Whatever you choose, four properties are non-negotiable:
+
+    1. **Retries with backoff**, and idempotent jobs so retries are safe.
+    2. **Alerting on failure** to somewhere a human looks, and **alerting on non-execution** — a
+      scheduler that stops scheduling produces no failures at all.
+    3. **Backfill as a first-class operation**, parameterised by date. If backfilling means editing
+      code, you will avoid it, and avoiding backfills means living with bad data.
+    4. **Run metadata persisted**: rows in, rows out, duration, assertion results. **This is what
+      makes "when did this start going wrong?" answerable**, and it costs one table.
+
+    ## Production failure modes
+
+    | Failure mode | Signature | Detection |
+    | --- | --- | --- |
+    | Small-file explosion | queries slow gradually over months; S3 bill dominated by requests | weekly `avg(file_size)` per partition; alert below 32 MB |
+    | High-cardinality partition key | tens of thousands of directories | count partitions at design time; keep it in the hundreds |
+    | Mixed grain in a fact table | `SUM` double-counts; totals do not reconcile | write the grain in a comment; assert `count(*) = count(DISTINCT natural_key)` |
+    | SCD2 with `!=` instead of `IS DISTINCT FROM` | changes involving nulls silently not captured | test a `NULL → value` transition explicitly |
+    | SCD2 with `NULL` for open `valid_to` | point-in-time queries return nothing | sentinel `DATE '9999-12-31'` |
+    | Overlapping SCD2 validity ranges | a point-in-time join returns duplicate rows and inflates sums | assert no overlaps per natural key |
+    | Orphan foreign keys | facts referencing a missing dimension row | left-join assertion; load dimensions before facts |
+    | Pipeline succeeds, loads nothing | freshness degrades silently | assert `max(date) > now() - threshold` |
+    | Scheduler stopped scheduling | no failures, no runs, no alerts | alert on *absence* of a successful run in N hours |
+    | pandas OOM on a growing table | container OOMKilled; worked last month | DuckDB or Polars; the threshold is memory, not time |
+
+    ## Frontier and research pointers
+
+    - **Boncz, Zukowski & Nes (2005), "MonetDB/X100: Hyper-Pipelining Query Execution."** CIDR. —
+      **Takeaway:** processing vectors of ~1,000 values rather than one tuple at a time amortises
+      interpretation overhead and keeps the working set in L1; this single idea is most of the 12.9×.
+    - **Raasveldt & Mühleisen (2019), "DuckDB: an Embeddable Analytical Database."** SIGMOD demo. —
+      **Takeaway:** the design rationale for an in-process OLAP engine — that the dominant cost in
+      analytics from Python was moving data between processes, and eliminating that boundary is
+      worth more than a cluster.
+    - **Leis et al. (2014), "Morsel-Driven Parallelism."** SIGMOD. — **Takeaway:** dispatching small
+      work units to a fixed thread pool with work stealing gives NUMA-aware, load-balanced
+      parallelism without partitioning the data up front; this is how DuckDB uses all your cores.
+    - **Kimball & Ross, *The Data Warehouse Toolkit* 3rd ed. (2013).** — **Takeaway:** the four-step
+      dimensional design process (choose the business process, declare the grain, identify the
+      dimensions, identify the facts) is thirty years old and still the fastest route to a schema
+      that does not need rewriting.
+    - **Abadi, Boncz & Harizopoulos (2013), "The Design and Implementation of Modern Column-Oriented
+      Database Systems."** *Foundations and Trends in Databases*. — **Takeaway:** the definitive
+      survey of late materialisation, compression-aware operators and vectorisation; read section 4
+      for why operating directly on compressed data is a large part of the win.
+    - **Melnik et al. (2010), "Dremel."** VLDB. — **Takeaway:** the nested columnar encoding behind
+      Parquet, and the observation that most analytical queries touch a small fraction of columns —
+      which module 1 measured at 11.2% of the file for a single-column aggregate.
+
+    ## Stretch challenge
+
+    **Find the point at which DuckDB stops being enough — on your own hardware.**
+
+    Everyone quotes thresholds. Nobody measures them. Build the measurement.
+
+    Construct a scaling harness that generates datasets from 10⁶ to 10⁹ rows and runs a fixed query
+    suite — group-by, join, window function, top-K, distinct count — across DuckDB, Polars lazy, and
+    pandas where it survives.
+
+    Measure, at each scale:
+
+    1. **Wall time and peak RSS** for each engine and query, in isolated processes.
+    2. **The point where pandas OOMs** on your machine, per query. Predict it from the file size
+       first, then measure — the ratio between them is the interesting number.
+    3. **The point where DuckDB starts spilling to disk**, and what that does to the time curve. Set
+       `SET memory_limit='4GB'` to force it earlier and watch the shape change.
+    4. **Cost per query**, priced against an equivalent BigQuery scan at $6.25/TB and a Snowflake
+       credit-hour. **This turns the engine choice into a dollar figure**, which is what a design
+       review actually needs.
+
+    The open questions:
+
+    - **Where is the pandas cliff, and is it where the folklore says?** The rule of thumb is
+      "5–10× the file size in RAM". Measure it per dtype: object-dtype strings, categoricals,
+      int64, float32. My prediction is that the multiplier varies from ~1.2× to ~15× depending
+      almost entirely on string handling, which would mean the rule of thumb is nearly useless.
+    - **Does DuckDB's spilling degrade gracefully or fall off a cliff?** Plot time against
+      `memory_limit` for a fixed query. A graceful curve means you can run 500 GB on 16 GB of RAM;
+      a cliff means you cannot.
+    - **How does Polars lazy compare once streaming is enabled?** The measurements in Layer 2 show
+      lazy losing on `top_k`. Sweep the query suite and find where lazy helps, where it hurts, and
+      whether you can predict which from the query shape.
+    - **What is the crossover with a cloud warehouse, in money?** DuckDB on an r7g.4xlarge is
+      ~$0.86/h. At what query volume and data size does BigQuery's per-TB pricing win? **Compute the
+      break-even and state it as a number of queries per month**, because that is the form the
+      decision actually takes.
+
+    A scaling study with the crossover points marked, priced, and reproducible is the artifact that
+    ends the "should we buy Snowflake?" argument with evidence instead of opinion. It is also
+    genuinely portable: you can run it at your own job on your own data next month.
+
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Benchmark the same aggregation in pandas, Polars and DuckDB on 10 million rows. Report **time and
+peak memory** for each, measured in separate processes. Then pick a default and write one paragraph
+justifying it — including the row count at which you would switch.
+</Card>
+
+<Steps>
+  <Step title="One process per engine, per query">
+    `ru_maxrss` from `resource.getrusage` in a fresh subprocess. `tracemalloc` only counts Python
+    allocations, so it reports near zero for DuckDB and Polars — both of which do the work in native
+    code. The whole-process number is the one that determines whether your job fits its container.
+  </Step>
+  <Step title="Give pandas a fair chance">
+    Read only the columns each query needs. Comparing `pd.read_parquet()` against a DuckDB query
+    that prunes columns measures the reader, not the engine.
+  </Step>
+  <Step title="Run more than one query shape">
+    Group-by, filter-aggregate, join, and top-K. The join is where the gap is largest (34× measured)
+    and a single-query benchmark will miss that entirely.
+  </Step>
+  <Step title="Report a threshold, not a winner">
+    "DuckDB above 1 million rows; pandas below, for the ecosystem" is a useful conclusion.
+    "DuckDB is fastest" is not, because it does not tell anyone what to do on Monday.
+  </Step>
+</Steps>
+
+## The whiteboard
+
+The T2 build-up has four frames: the star schema, the SCD2 versioned dimension with a point-in-time
+query landing on the middle row, the measured engine bar chart, and the partitioning comparison with
+the high-cardinality case crossed out.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p2-w15-m5-blank.svg) · [Editable source](/assets/diagrams/p2-w15-m5.excalidraw)
+</Tip>
+
+The thing to get right on redraw: frame 3 must carry **both** numbers per bar — time and memory. If
+your sketch shows only time, you have drawn the less important axis.
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    **Portfolio line:** "Benchmarked pandas 2.2.3, Polars 1.17.1 and DuckDB 1.1.3 across five query
+    shapes on 10 million rows with per-process memory measurement; found DuckDB 12.9× faster with
+    9.1× less memory on group-by and 34× faster on joins, and documented the case where lazy Polars
+    is slower than eager."
+
+    That last clause is what makes it a benchmark rather than an advertisement. Reporting the result
+    that contradicts the headline is the single strongest signal of an honest measurement, and an
+    interviewer will notice it.
+
+    **The interview move.** "When would you not use pandas?" comes up constantly. Answer with a
+    threshold and a reason: *"Around a million rows, and the constraint is memory rather than
+    speed — pandas needs the whole frame in RAM at several times the file size. I measured 878 MB
+    against DuckDB's 96 MB on the same 10-million-row query. Below a hundred thousand rows I'd stay
+    in pandas for the ecosystem."*
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **1. Replace one slow pandas aggregation with DuckDB this week.** `duckdb.query("SELECT ... FROM
+    df")` reads your existing DataFrame with no copy, so it is a two-line change. Report the before
+    and after. A 10× improvement with a number attached is an easy win in a sprint review, and it is
+    usually the start of a broader conversation.
+
+    **2. Check the average file size in your data lake.** One query against your storage inventory:
+    `SELECT avg(size)/1e6 FROM inventory GROUP BY partition`. If it is under 32 MB you have the
+    war story's problem and it is getting worse weekly. Compaction is a scheduled job and it is
+    almost always worth writing.
+
+    **3. Add an "absence of success" alert to your most important pipeline.** Not "alert when the
+    job fails" — **"alert when no successful run has happened in N hours"**. A scheduler that stops
+    scheduling produces zero failures and zero alerts, and it is a genuinely common outage mode
+    that failure-based monitoring cannot see by construction.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Queries get slower every month with no query change | Small-file explosion from a high-cardinality partition key | Partition by date; sort within the partition; compact to 128 MB–1 GB files |
+| `SUM` double-counts; totals do not reconcile | Mixed grain in the fact table | Declare the grain in a comment; assert `count(*) = count(DISTINCT natural_key)` |
+| SCD2 misses changes involving nulls | `!=` instead of `IS DISTINCT FROM`; `NULL != 'x'` is `NULL` | `IS DISTINCT FROM`; test a `NULL → value` transition |
+| Point-in-time queries return nothing | `valid_to` is `NULL`, and `BETWEEN` with a null bound matches nothing | Sentinel `DATE '9999-12-31'` |
+| Point-in-time join returns duplicates | Overlapping SCD2 validity ranges | Assert no overlaps per natural key after every load |
+| Facts reference missing dimension rows | Dimension load ran after the fact load, or failed | Left-join assertion; order the loads explicitly |
+| pandas job OOMKilled; worked last month | Data grew past RAM; pandas needs several times the file size | DuckDB or Polars lazy; the threshold is memory, not time |
+| Pipeline succeeds nightly, data is stale | No freshness assertion; "job succeeded" is not "data arrived" | Assert `max(date) > now() - threshold` |
+| No alerts, and also no data | The scheduler stopped scheduling; no runs means no failures | Alert on the *absence* of a successful run in N hours |
+| Airflow deployed for three cron jobs | Operational surface far exceeding the need | cron plus logging plus failure alerting until you have ~10 interdependent jobs |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [DuckDB documentation](https://duckdb.org/docs/1.1/) (1.1.3) — read "Performance Guide" for `memory_limit`, `threads`, and the profiling output; `EXPLAIN ANALYZE` is how you find out what it actually did.
+- [DuckDB Parquet and Hive partitioning](https://duckdb.org/docs/1.1/data/partitioning/hive_partitioning) — read this for `hive_partitioning=true` and `filename=true`, and for exactly which predicates prune partitions.
+- [Polars user guide — lazy API](https://docs.pola.rs/user-guide/lazy/) (1.17.1) — read the "Streaming" section for out-of-core execution and its current limitations; not every operation streams, which explains some of the Layer 2 measurements.
+- [pandas scaling to large datasets](https://pandas.pydata.org/docs/user_guide/scale.html) (2.2.3) — read this for the honest official guidance on chunking, dtypes and when to use something else; it is more candid than most third-party advice.
+- [Dagster concepts: assets and partitions](https://docs.dagster.io/concepts/assets/software-defined-assets) — read this for data-aware scheduling; "rebuild what depends on this table" is a genuinely better model than "run at 3 a.m." and it is the main reason to prefer Dagster over Airflow for new work.
+
+**Papers**
+
+- [Boncz, Zukowski & Nes (2005), *MonetDB/X100: Hyper-Pipelining Query Execution*, CIDR.](https://www.cidrdb.org/cidr2005/papers/P19.pdf) — **Takeaway:** vectors of ~1,000 values amortise per-operator overhead and keep the working set in L1; this is the architectural core of DuckDB's advantage.
+- [Raasveldt & Mühleisen (2019), *DuckDB: an Embeddable Analytical Database*, SIGMOD demo.](https://doi.org/10.1145/3299869.3320212) — **Takeaway:** the dominant cost of analytics from Python was crossing the process boundary; removing it beats adding a cluster.
+- [Leis, Boncz, Kemper & Neumann (2014), *Morsel-Driven Parallelism*, SIGMOD.](https://doi.org/10.1145/2588555.2610507) — **Takeaway:** small work units plus work stealing gives load-balanced NUMA-aware parallelism without partitioning the data in advance.
+- [Abadi, Boncz & Harizopoulos (2013), *The Design and Implementation of Modern Column-Oriented Database Systems*, FnT in Databases 5(3).](https://doi.org/10.1561/1900000024) — **Takeaway:** the survey; section 4 on operating directly on compressed data explains a large share of the measured gap.
+- [Melnik et al. (2010), *Dremel: Interactive Analysis of Web-Scale Datasets*, VLDB 3(1).](https://doi.org/10.14778/1920841.1920886) — **Takeaway:** most analytical queries touch a small fraction of columns, which is the entire premise of columnar storage and was measured at 11.2% in module 1.
+
+**Go deeper**
+
+- [Kimball & Ross, *The Data Warehouse Toolkit* 3rd ed. (2013), **Chapters 1–3**](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/books/data-warehouse-dw-toolkit/) — the four-step dimensional design process and the SCD types. Thirty years old and still the fastest route to a schema you will not rewrite.
+- Joe Reis & Matt Housley, *Fundamentals of Data Engineering* (2022), **Chapters 6 and 8** — storage and transformation, vendor-neutral, with an unusually honest treatment of when you do and do not need a distributed system.
+- Hannes Mühleisen's talks on DuckDB internals (CMU Database Group seminars, 2022–2024) — watch these for the execution engine explained by the person who built it; the vectorised-execution segment is the clearest available account of why the numbers look the way they do.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p2/week-15/p2-w15-m5">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

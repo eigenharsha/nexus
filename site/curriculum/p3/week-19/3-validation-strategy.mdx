@@ -1,0 +1,560 @@
+---
+title: "Validation strategy"
+description: "Week 19 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+{/* AUTHORED */}
+
+<Note>
+**Week 19 · Module 3 · `P3-W19-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+**Where the numbers on this page come from.** Every table introduced by *Measured* was produced by
+running the code shown, on an Apple M3 Pro (11 cores, 18 GB, macOS arm64, **no GPU**) with
+Python 3.12.9 and numpy 2.5.2, scikit-learn 1.9.0 — the same environment as the rest of Phase 3, so you can
+re-run any of it. Anything introduced by *Derived* is arithmetic, shown term by term; check it with
+a pencil. A result attributed to a paper is that paper's measurement, not ours.
+See [About the numbers](/start/about-the-numbers).
+</Info>
+
+
+## Where this sits
+
+- **Prereqs:** `P3-W17-M5` (`Pipeline`, and why `fit` belongs inside the fold), `P3-W19-M1`
+- **Unlocks:** `P3-W19-M4` (leakage — several of its forms are validation-design failures), `P3-W19-M5` (confidence intervals on the estimate), `P3-W20-M4`
+- **One line:** you will choose the split that matches how the model will actually be used, and know the size of the error you make when you get it wrong.
+
+## What you'll be able to do
+
+1. Explain why a single hold-out split is a noisy estimator, and quantify the noise
+2. Choose `k` for K-fold from the variance/cost trade-off rather than from habit
+3. Use stratified, grouped and time-series splits, and say which one a given problem needs
+4. Measure the inflation caused by using the wrong split — 4.0 accuracy points for grouped data, 15.3 AUC points for time series
+5. Run nested cross-validation and state how optimistic the non-nested number is
+6. Detect train/test distribution shift with adversarial validation and name the shifting features
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w19-m3.svg" alt="Hand-drawn sketch: hold-out, K-fold, grouped and time-series splits" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w19-m3-dark.svg" alt="Hand-drawn sketch: hold-out, K-fold, grouped and time-series splits" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w19-m3
+tier: T2
+one-sentence-goal: Show that the split must mirror how the model will be used, and that mirroring it wrongly does not produce a slightly wrong number, it produces a confidently wrong one.
+elements:
+  - four stacked horizontal bars, each split into blocks, drawn as if on a whiteboard
+  - bar 1 "HOLD-OUT": one bar, 80% blue / 20% green, with the amber note "sd of the estimate 0.0116 across seeds"
+  - bar 2 "5-FOLD": five bars stacked, the green block moving one position per row, note "sd 0.0032. 3.6x tighter for 5x the compute."
+  - bar 3 "GROUP K-FOLD": the bar drawn with little customer icons repeated 8 times each; a red vertical line showing a random split cutting THROUGH a customer's rows, crossed out, and beside it a green split that falls between customers. Numbers written in: "random 0.9546 | grouped 0.9144 -> +4.0 points of lie"
+  - bar 4 "TIME SERIES": five bars in a staircase, each training block growing and the test block always immediately to its right, with a big red X over an arrow pointing backwards from a test block into an earlier training block, labelled "the future". Numbers: "shuffled 0.8305 | forward 0.6759 -> +15.3 AUC points"
+  - right margin, boxed: the nested-CV picture — an outer loop of 4 blocks, and inside ONE of them a smaller 4-block inner loop, with "tune here" on the inner and "measure here" on the outer, and "0.9802 -> 0.9739. on pure noise: 0.5400 -> 0.5204, truth 0.5000"
+  - bottom strip: a tiny two-class scatter labelled "is this row from the test set?" with "AUC 0.7902" written large and circled, and beside it "control (no shift) 0.5070"
+  - dangling arrow: "...and the leaks a good split does NOT catch? -> M4"
+numbers-to-write-in: sd 0.0116 vs 0.0032, +4.0 points, +15.3 AUC points, 0.9802 vs 0.9739, 0.7902 vs 0.5070
+alt: A hand-drawn sketch of four split strategies as stacked bars — a single hold-out, five-fold, grouped folds with a red cross over a split that cuts through one customer's rows, and a time-series staircase with a red X over an arrow pointing into the future — annotated with the measured inflation each wrong choice produces.
+*/}
+
+## Why you should care
+
+**For Aarav (student).**
+- "Why cross-validation instead of a single split?" is a standard question and the good answer is a variance number, not "because it's more robust".
+- `GroupKFold` and `TimeSeriesSplit` are the two things that separate somebody who has evaluated a real model from somebody who has evaluated `load_iris`.
+- Nested CV is the answer to "how do you get an unbiased estimate when you also tuned?", and knowing its cost as well as its purpose is what makes the answer credible.
+
+**For Meera (professional).**
+- If your data has repeated rows per customer and you used a random split, your reported number is too high. Measured below, by 4.0 accuracy points on a mild case.
+- This shows up in your job as: a model that validated at 0.83 AUC and shipped at 0.68. That is the time-series measurement in this module, almost exactly.
+- Adversarial validation is a 15-line check that tells you whether your training data still resembles production, and it names the features that drifted.
+
+## The mental model
+
+A validation split is a simulation of deployment. Everything the model will not have at prediction time must be absent from its training fold: the future, other rows about the same entity, and any statistic computed from data it will not have seen. If your rows are independent and identically distributed, a random split simulates deployment correctly and K-fold just makes the estimate less noisy. The moment they are not — the same customer appears twenty times, or the rows are ordered in time — a random split simulates a deployment that will never happen, and it gives you a confident number for a model that does not exist.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+
+### The problem with one split
+
+Split off 20% of your data, train on the rest, score on the 20%. That number is an *estimate* of how the model will do on new data. Like any estimate it has noise, and the noise is bigger than people expect.
+
+```python
+# pip install "scikit-learn==1.9.0" "numpy==2.5.2"
+import numpy as np
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+X, y = load_breast_cancer(return_X_y=True)
+pipe = lambda: make_pipeline(StandardScaler(), LogisticRegression(max_iter=5000))
+
+single = [pipe().fit(*train_test_split(X, y, test_size=0.2, random_state=s, stratify=y)[::2])
+          .score(*train_test_split(X, y, test_size=0.2, random_state=s, stratify=y)[1::2])
+          for s in range(50)]
+cv5 = [cross_val_score(pipe(), X, y, cv=StratifiedKFold(5, shuffle=True, random_state=s)).mean()
+       for s in range(50)]
+
+print(f"single 80/20 split: mean {np.mean(single):.4f}  sd {np.std(single):.4f}"
+      f"  range [{min(single):.4f}, {max(single):.4f}]")
+print(f"5-fold CV mean    : mean {np.mean(cv5):.4f}  sd {np.std(cv5):.4f}"
+      f"  range [{min(cv5):.4f}, {max(cv5):.4f}]")
+```
+
+```
+single 80/20 split: mean 0.9796  sd 0.0116  range [0.9474, 1.0000]
+5-fold CV mean    : mean 0.9778  sd 0.0032  range [0.9702, 0.9842]
+```
+
+Read the ranges. **The same model, the same data, and the same code produces anything from 0.9474 to 1.0000 depending on which rows happened to land in the test set.** If you compare two models on a single split and they differ by 2 points, you have learned nothing — that is inside the noise.
+
+The 5-fold estimate has a standard deviation of 0.0032, **3.6x tighter**, for 5x the compute. That is the whole argument for cross-validation.
+
+### K-fold
+
+Split the data into `k` equal parts. For each part in turn: train on the other `k-1`, score on this one. Average the `k` scores. Every row is used for testing exactly once and for training `k-1` times.
+
+`shuffle=True` matters. Without it, `KFold` takes contiguous blocks in the order the rows arrive, which is a disaster if the file happens to be sorted by anything — and files are usually sorted by something.
+
+### Stratified K-fold
+
+If the positive class is rare, a random fold might get very few positives — or none, which makes some metrics undefined. **`StratifiedKFold` preserves the class proportions in every fold.**
+
+Measured on a hard problem with 37 positives out of 1,200:
+
+| Splitter | Positives per fold (one seed) | Standard deviation of the *estimate* across 30 seeds |
+| --- | --- | --- |
+| `KFold(5)` | 7, 8, 9, 5, 8 | 0.02335 |
+| `StratifiedKFold(5)` | 7, 7, 7, 8, 8 | **0.01665** |
+
+Same mean AUC (0.7666 vs 0.7667), but the stratified estimate is **1.4x less noisy**. Use it for every classification problem; there is no cost.
+
+### How many folds?
+
+More folds means more training data per fold (so less pessimistic bias) and a lower-variance estimate — but linearly more compute. Measured on `load_breast_cancer`, standard deviation of the mean CV score across 20 random seeds:
+
+| k | Mean | SD of the estimate | Wall clock (20 repeats) |
+| --- | --- | --- | --- |
+| 2 | 0.9755 | 0.00407 | 0.08 s |
+| 3 | 0.9768 | 0.00396 | 0.14 s |
+| **5** | 0.9790 | **0.00302** | 0.22 s |
+| 10 | 0.9788 | 0.00263 | 0.42 s |
+| 20 | 0.9793 | 0.00196 | 0.96 s |
+| 569 (leave-one-out) | 0.9789 | deterministic | 1.25 s |
+
+The mean barely moves after `k = 5`. The standard deviation keeps falling, but slowly: **going from 5 to 20 folds costs 4.4x the compute and buys a 35% reduction in noise.** Five is the sensible default and ten is defensible; beyond that you are usually buying precision you cannot use.
+
+<Info>
+**Leave-one-out (`k = n`) is not the gold standard**, despite the name suggesting a limit. Its training sets are nearly identical to each other, so its `n` scores are highly correlated and the *variance of the estimate* is often no better than 10-fold — while costing `n` fits. It also cannot be stratified. Use it only when `n` is tiny.
+</Info>
+
+### Guided practice
+
+1. Run the single-split experiment with `test_size=0.4` instead of 0.2. Does the standard deviation go up or down?
+2. Run 5-fold with `shuffle=False` on data that has been sorted by the label. What happens?
+3. Compute the standard error of a 5-fold estimate from the fold scores. Is it the same as the standard deviation across seeds?
+
+<Accordion title="Answers">
+1. **Down**, because a bigger test set is a bigger sample and sampling noise falls as `1/sqrt(n_test)`. But the *bias* goes up: you trained on 60% instead of 80%, so the model you measured is worse than the one you will ship. That trade-off — bias from less training data against variance from a smaller test set — is exactly what K-fold sidesteps by rotating.
+2. Every fold contains one class only, so the model never sees the other class in training and every score is 0.0 or undefined. It fails loudly here, which is lucky. On data sorted by something less obvious — customer id, date, region — it fails quietly and produces a plausible wrong number.
+3. Not the same, and this catches people out. The fold scores are **not independent** — the training sets overlap heavily — so `std(fold_scores)/sqrt(k)` underestimates the true standard error. Bengio and Grandvalet (2004) proved there is no unbiased estimator of the variance of K-fold CV. Use repeated CV (`RepeatedStratifiedKFold`) or a bootstrap over the test predictions instead, which Module 5 does.
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+  <Accordion title="1. Why shuffle before splitting?">
+  Because data arrives sorted by something, and the something is usually correlated with the label. Sorted by date, by customer id, by the order rows were scraped — any of those makes contiguous folds systematically different from each other. `shuffle=True` unless the order *is* the point, in which case use `TimeSeriesSplit`.
+  </Accordion>
+  <Accordion title="2. Does cross-validation give you a model?">
+  No. It gives you an *estimate of a procedure's performance*. `cross_val_score` fits `k` models and throws them all away. To ship, refit on all the data with the same procedure — which is what `GridSearchCV.best_estimator_` does for you.
+  </Accordion>
+  <Accordion title="3. Your 5 fold scores are 0.91, 0.92, 0.90, 0.68, 0.93. What do you do?">
+  Investigate fold 4 before reporting anything. One badly divergent fold means the rows in it are different from the rest — a different time period, a different source system, a different customer segment. The mean of 0.868 describes no situation you will ever be in.
+  </Accordion>
+  <Accordion title="4. Should the test set be inside the cross-validation?">
+  No. Keep a final hold-out that is not part of any CV, touched once at the end. Cross-validation is for choosing between things; the hold-out is for reporting the number. Layer 3 measures what happens when you conflate them.
+  </Accordion>
+  <Accordion title="5. Is 10-fold always better than 5-fold?">
+  Marginally less noisy and twice the cost. Measured above: standard deviation 0.00263 against 0.00302. If your fits take an hour, that 13% noise reduction is not worth doubling a ten-hour job.
+  </Accordion>
+</AccordionGroup>
+
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+
+### Choose the split from how the model will be used
+
+This is the whole module in one table. Ask what the model will not have at prediction time, and make the fold not have it either.
+
+| At prediction time the model will… | So the split must… | Splitter |
+| --- | --- | --- |
+| see rows drawn from the same distribution, independently | preserve the class balance | `StratifiedKFold` |
+| see **new customers** it has never scored before | keep all of a customer's rows on one side | `GroupKFold`, `StratifiedGroupKFold` |
+| see **the future** | never train on rows after the test rows | `TimeSeriesSplit` |
+| see new customers **in the future** | both of the above | a custom splitter, or split by time then group |
+| see rows from a **new site / region / device** | hold out whole sites | `LeaveOneGroupOut` |
+
+### Group leakage, measured
+
+Suppose each customer contributes eight rows that are near-duplicates of each other — eight sessions, eight monthly snapshots, eight images of the same patient. A random split puts some of a customer's rows in training and some in test, so the model can partly memorise the customer rather than learn the pattern.
+
+```python
+# scikit-learn 1.9.0, numpy 2.5.2
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import cross_val_score, StratifiedKFold, GroupKFold
+
+rng = np.random.default_rng(0)
+n_cust, per = 600, 8
+groups = np.repeat(np.arange(n_cust), per)
+base = rng.normal(size=(n_cust, 10))
+X = np.repeat(base, per, axis=0) + rng.normal(0, 0.25, size=(n_cust * per, 10))
+y = np.repeat((base[:, 0] + base[:, 1] > 0).astype(int), per)
+
+rf = lambda: RandomForestClassifier(n_estimators=200, random_state=0, n_jobs=-1)
+a = cross_val_score(rf(), X, y, cv=StratifiedKFold(5, shuffle=True, random_state=0)).mean()
+b = cross_val_score(rf(), X, y, cv=GroupKFold(5), groups=groups).mean()
+print(f"random 5-fold  {a:.4f}\nGroupKFold     {b:.4f}\ninflation      {(a - b) * 100:+.1f} points")
+```
+
+```
+random 5-fold  0.9546
+GroupKFold     0.9144
+inflation      +4.0 points
+```
+
+**Four accuracy points of pure fiction**, on a mild case — the duplicates here have substantial jitter, and eight rows per entity is a low number. In medical imaging (hundreds of slices per patient) or clickstream data (thousands of events per user) the effect is far larger.
+
+The tell: **any dataset where one real-world entity contributes more than one row needs a group split**, and the group is the entity, not the row.
+
+<Warning>
+`GroupKFold` does not stratify. If your positive class is rare *and* your rows are grouped, use `StratifiedGroupKFold`, which does both. It is the correct default for most customer-level classification problems and it is used far less often than it should be.
+</Warning>
+
+### Temporal leakage, measured
+
+Time-ordered data is worse, because the leak is not just about duplicate rows — it is about the model seeing the future.
+
+Construct a series whose relationship to the target drifts: a slowly mean-reverting latent regime that shifts both the base rate and the sign of one interaction, plus a `t/T` time-index feature of the kind people routinely add.
+
+| Validation scheme | ROC-AUC |
+| --- | --- |
+| `KFold(5, shuffle=True)` | **0.8305** |
+| `TimeSeriesSplit(5)` | 0.6776 |
+| single forward split, train on the first 80% | 0.6759 |
+
+**+15.3 AUC points of inflation.** And the forward split (0.6759) agrees closely with `TimeSeriesSplit` (0.6776), which is the confirmation that the honest number is the honest number.
+
+Now the diagnostic half. Drop the `t/T` time-index feature and re-run:
+
+| | random KFold | TimeSeriesSplit |
+| --- | --- | --- |
+| with the time-index feature | 0.8305 | 0.6776 |
+| **without it** | 0.6508 | 0.6743 |
+
+Without the time index, the random split gives **0.6508** — *lower* than the honest 0.6743, and the inflation is gone entirely. So the whole 15.3-point lie was carried by one feature: a shuffled split lets the model interpolate the regime at time `t` from its neighbours at `t-1` and `t+1`, and the time index is the key that unlocks that interpolation.
+
+**Two lessons.** A time-index feature is safe under a forward split and radioactive under a shuffled one. And when a shuffled split and a forward split disagree by more than a point or two, one of your features is a proxy for time — find it, because it will not work in production.
+
+### Nested cross-validation
+
+If you use cross-validation to *choose* something — a hyperparameter, a feature set, a model family — then the resulting CV score is no longer an unbiased estimate. You picked the maximum of a noisy quantity, so you inherited the noise's upper tail.
+
+Nested CV fixes it: an inner loop tunes, an outer loop measures, and the outer folds never influence the tuning.
+
+```python
+from sklearn.model_selection import GridSearchCV, cross_val_score, StratifiedKFold
+inner = StratifiedKFold(4, shuffle=True, random_state=0)
+outer = StratifiedKFold(4, shuffle=True, random_state=100)
+search = GridSearchCV(pipe, grid, cv=inner)
+honest = cross_val_score(search, X, y, cv=outer).mean()   # the number you report
+```
+
+Measured on `load_breast_cancer` with a 20-point SVC grid, 15 repeats:
+
+| | Score | Cost |
+| --- | --- | --- |
+| non-nested (`GridSearchCV.best_score_`) | 0.9802 ± 0.0023 | 80 fits |
+| **nested CV** | **0.9739 ± 0.0028** | 320 fits (4x) |
+| **optimism** | **+0.63 accuracy points** | |
+
+Now the version that makes the mechanism unmistakable — the same procedure on **pure noise**, where the true accuracy is exactly 0.50:
+
+```
+non-nested 0.5400      nested 0.5204      truth 0.5000
+```
+
+The non-nested number is **4 points above the truth** on data with no signal at all, purely from taking the best of 20 noisy estimates. Nested CV recovers most of it. The remaining 2 points is the outer loop's own noise at `n = 150`.
+
+The rule: **the optimism grows with how many things you tried and shrinks with dataset size.** A 20-point grid on 569 rows cost 0.63 points; a 500-point random search on 200 rows will cost several. If the 4x cost is prohibitive, the honest alternative is a single untouched hold-out scored exactly once — and say in the report which you did.
+
+### Adversarial validation
+
+A different question: *is my training data still like the data I will see?* Train a classifier to distinguish training rows from test (or production) rows. If it can, they differ.
+
+```python
+# scikit-learn 1.9.0
+X_all = np.vstack([X_train, X_prod])
+is_prod = np.r_[np.zeros(len(X_train)), np.ones(len(X_prod))]
+auc = cross_val_score(RandomForestClassifier(n_estimators=300, random_state=0, n_jobs=-1),
+                      X_all, is_prod, cv=StratifiedKFold(5, shuffle=True, random_state=0),
+                      scoring="roc_auc").mean()
+```
+
+Measured, with three of twelve features deliberately shifted:
+
+```
+'is this row from the test set?' AUC = 0.7902 +- 0.0079
+control, no shift                AUC = 0.5070 +- 0.0083
+```
+
+An AUC near 0.5 means the two sets are indistinguishable — good. **0.7902 means they are not**, and the shift is large enough to matter.
+
+Then the useful part: permutation importance on the adversarial model tells you *which* features moved.
+
+```
+f3  0.2544      f7  0.1061      f0  0.0250      f5  0.0018      f9  0.0018
+```
+
+Ground truth: features 3, 7 and 0 were the shifted ones. The method identified all three, in the right order, and the remaining nine sit at the noise floor.
+
+What to do with the answer: drop the drifting feature if it is not essential; re-weight training rows by their propensity to look like production (importance weighting); or, most often, go and find out *why* it drifted, because a feature that moved is usually a pipeline change nobody told you about.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **Single hold-out** vs **K-fold** | the dataset is large (over ~100,000 rows), so a 20% test set is already a precise estimate | the dataset is small — measured, a single split's standard deviation was 3.6x the 5-fold estimate's |
+| **5-fold** vs **10-fold** | fits are expensive | fits are cheap and the dataset is small; the noise reduction is 13% for 2x the cost |
+| **`KFold`** vs **`StratifiedKFold`** | regression | any classification problem — it is free and 1.4x less noisy on rare classes |
+| **`StratifiedKFold`** vs **`GroupKFold`** | rows are genuinely independent | one entity contributes many rows — measured, +4.0 points of inflation |
+| **`KFold`** vs **`TimeSeriesSplit`** | order is meaningless | rows are ordered in time — measured, +15.3 AUC points |
+| **Nested CV** vs **a single hold-out** | you tuned a lot and the fits are affordable | fits are expensive; then a hold-out touched once is honest and cheap |
+
+### War story: the model that lost 15 points overnight
+
+*A modelled composite — assembled from recurring patterns rather than one company, with illustrative figures. The mechanism is real and the measured tables elsewhere on this page are unaffected; the incident is not a case study. See [About the numbers](/start/about-the-numbers).*
+
+A marketplace pricing team built a model to predict whether a listing would sell within seven days. Cross-validated ROC-AUC was 0.83, reproduced across three seeds. It shipped, and the first week's live AUC was 0.68.
+
+Nothing had broken. The team had used `KFold(shuffle=True)` on eighteen months of listings. Marketplace conditions drift — seasonality, competitor pricing, a category-mix change halfway through the period — and a shuffled split let each fold's training data straddle the fold's test period on both sides. The model was interpolating market conditions, not predicting them.
+
+The diagnostic that made it obvious took ten minutes: re-run with `TimeSeriesSplit(5)`. The number came back **0.67**, which matched production to within a point. Then adversarial validation between the first twelve months and the last six returned AUC **0.81**, and permutation importance named the top three shifting features — one of which was a `category_share` field whose definition had been changed by another team in month eleven.
+
+Three changes shipped. `TimeSeriesSplit` became the default splitter for anything with a timestamp, enforced by a lint rule that fails a training job if the dataframe has a datetime column and the splitter is not time-aware. Adversarial validation between the training window and the last 30 days ran weekly as a monitor, alerting above AUC 0.65. And the reported metric became the forward hold-out, with the CV number shown only as a tuning signal.
+
+The lesson: **a validation scheme that does not simulate deployment will not give you a slightly wrong number. It gives you a confidently wrong one**, and the gap only shows up in production, which is the most expensive place to find it.
+
+### Design checkpoint
+
+> You have four years of hospital data: 40,000 admissions across 12,000 patients at 6 sites. You want to predict 30-day readmission and deploy at a seventh site next year. Design the validation.
+
+<Accordion title="Model answer">
+Three things are non-independent here and each needs handling, and the deployment scenario tells you which matters most.
+
+**Patients repeat** — 40,000 admissions from 12,000 patients, so a random split puts the same patient on both sides and the model memorises the patient. Group by `patient_id`, always.
+
+**Time drifts** — clinical practice, coding standards and case mix all change over four years, and you will deploy on next year's data. So the final estimate must be a forward split: train on years 1–3, test on year 4.
+
+**Sites differ** — and you are deploying to a *new* site, which is the scenario the evaluation must simulate. This is the dominant consideration, and it means the headline number should come from `LeaveOneGroupOut` on site: train on 5 sites, test on the 6th, six times. That estimate answers the question actually being asked, and it will be materially lower than any within-site number.
+
+So: **tune** with `StratifiedGroupKFold` on `patient_id` within the first three years (cheap, stratified, no patient leakage). **Report** the leave-one-site-out estimate, per site, with the spread — if one site scores 0.61 and the others 0.78, that spread is the most important number in the report, because it is your prior for the seventh site. And **confirm** with a forward split on year 4 to check that time drift has not made the site estimate optimistic.
+
+Two more things. Exclude the last 30 days of any window from training, because those admissions do not have their labels yet — that is Week 17 Module 1's label horizon, and including them manufactures guaranteed false negatives. And run adversarial validation between the six existing sites and any data you can get from the seventh before go-live; an AUC above about 0.7 means the model will not transfer and you should say so before deployment, not after.
+</Accordion>
+
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+
+### There is no unbiased estimator of K-fold's variance
+
+The obvious thing to do with `k` fold scores is compute `std(scores)/sqrt(k)` and call it a standard error. It is wrong, and provably so.
+
+Bengio and Grandvalet (2004) show there is **no universal unbiased estimator of the variance of K-fold cross-validation**. The reason is structural: the `k` training sets overlap in `(k-2)/(k-1)` of their rows, so the `k` scores are positively correlated, and the correlation depends on the learning algorithm and the data in a way no formula can capture. Treating them as independent underestimates the variance — sometimes by a lot.
+
+You can see the consequence in the measurements above. The within-run fold standard deviation on the rare-class problem was about 0.079, which naively gives a standard error of `0.079/sqrt(5) = 0.035`. The actual standard deviation of the estimate across seeds was **0.0167** — the naive formula overestimated by 2x in that direction. On other datasets it underestimates. Neither error is safe.
+
+What to do instead, in order of preference:
+
+1. **Repeated cross-validation.** `RepeatedStratifiedKFold(n_splits=5, n_repeats=10)` gives 10 nearly-independent estimates of the CV mean; their spread is a usable measure of the estimate's noise.
+2. **Bootstrap over the test predictions** on a single held-out set. This is what Module 5 does, and it is the cleanest option when you have a real hold-out.
+3. **Never** compare two models by "their CV means differ by 0.4 points", without one of the above.
+
+### Nested CV: how much bias, and when to skip it
+
+The optimism of a tuned CV score has a simple structure: you selected the maximum of `m` noisy estimates, so you captured roughly `sigma * E[max of m standard normals]` of upward noise, where `sigma` is the standard error of one CV estimate.
+
+That gives a usable rule of thumb. With `m = 20` configurations, `E[max]` is about 1.87, so the optimism is roughly `1.87 * sigma`. On breast cancer the CV standard error is about 0.003, predicting an optimism near 0.006 — and the measurement was **0.0063**. On the 150-row noise dataset, `sigma` is about 0.04, predicting about 0.075; the measurement was 0.020 for the nested-versus-non-nested gap and 0.040 for the full gap to the truth of 0.50. The rule over-predicts because the `m` estimates are correlated (nearby hyperparameters give similar models), which reduces the effective `m`.
+
+Two practical consequences:
+
+- **The optimism scales with the number of things you tried and the noise of one estimate.** A 5-point grid on 50,000 rows costs essentially nothing. A 500-point search on 500 rows costs several points.
+- **You can predict it before paying for nested CV.** Estimate `sigma` from repeated CV of a single configuration, multiply by `E[max of m]`, and if the answer is smaller than the difference you care about, skip the nesting and note the bound in the report.
+
+When to accept the bias instead: fits over a few minutes, `m` under about 10, and `n` over about 10,000. Then the optimism is under a tenth of a point and nested CV's 4x cost buys nothing. **Say so explicitly** — "non-nested CV, 8 configurations, estimated optimism under 0.002" is a defensible line in a report; a bare CV score is not.
+
+### Time-series splits: the details that matter
+
+`TimeSeriesSplit(n_splits=5)` produces expanding-window folds: train on `[0, t1)`, test `[t1, t2)`; train on `[0, t2)`, test `[t2, t3)`; and so on. Three refinements it does not give you by default.
+
+**A gap.** If your label has a horizon — a 30-day readmission, a 7-day sale — then a test row at time `t` had its label determined by events up to `t + 30d`, and a training row at `t + 5d` shares that window. `TimeSeriesSplit(gap=...)` exists precisely for this: it drops rows between the train and test blocks. **The gap must be at least the label horizon.** Omitting it is the most common residual leak in an otherwise correct time-series setup.
+
+**Sliding versus expanding.** `max_train_size` turns the expanding window into a sliding one. Expanding uses more data; sliding better matches a production system that retrains on a rolling window and forgets old regimes. Choose the one that matches your retraining policy, and say which.
+
+**Purging and embargo.** In finance, where labels are computed over overlapping horizons and serial correlation is severe, the standard treatment is stronger: *purge* training samples whose label windows overlap the test period, and add an *embargo* period after the test block before training resumes. López de Prado (2018) is the reference, and the technique generalises to any domain with overlapping label windows.
+
+### Adversarial validation as a monitor
+
+The training-versus-production classifier is not just a one-off check; it is the cheapest drift monitor available, and it has two properties that make it better than per-feature distribution tests.
+
+**It catches joint shifts that marginal tests miss.** A Kolmogorov-Smirnov test on each feature separately will not notice that the *correlation* between two features has changed. The adversarial classifier will, because it can build the interaction.
+
+**It gives you a single number with a meaning.** AUC 0.5 is "indistinguishable"; AUC 0.9 is "trivially separable". Sensible alerting thresholds from practice: below 0.60 is fine, 0.60–0.75 warrants investigation, above 0.75 means your training data no longer describes production and the model's reported metrics do not apply.
+
+Measured above: 0.7902 for a three-feature shift, 0.5070 for the no-shift control. The control run is essential — run it on two random halves of your *training* data, and whatever AUC that gives is your floor.
+
+Two failure modes of the technique itself. Any **row-identifying feature** (an id, a timestamp, a monotonically increasing counter) makes the adversarial AUC 1.0 trivially and tells you nothing; exclude them. And a **high AUC is not automatically bad** — if you deliberately split by time, of course the two sets differ. The question is whether the features that differ are ones the model relies on, which is what the permutation-importance step answers.
+
+### Failure modes
+
+| Failure | Signature | Detector |
+| --- | --- | --- |
+| Grouped rows split randomly | CV far above production | `GroupKFold`; compare against the random split and report the gap |
+| Time-ordered rows shuffled | CV far above production; a time-proxy feature ranks high | `TimeSeriesSplit`; if the two disagree by more than ~2 points, find the proxy |
+| Label horizon overlaps the split | mild inflation that survives `TimeSeriesSplit` | `TimeSeriesSplit(gap=horizon)` |
+| Tuned CV score reported | production a fraction below the reported number | nested CV, or a bound: `E[max of m] * sigma` |
+| `std(folds)/sqrt(k)` used as a standard error | confident comparisons of models that differ by noise | repeated CV, or a bootstrap on a hold-out |
+| One fold wildly different | the mean describes no real situation | print per-fold scores always; investigate before averaging |
+| Adversarial AUC 1.0 | a row identifier is in the feature set | drop ids and timestamps from the adversarial model |
+| Test set used more than once | slow, invisible overfitting to the hold-out | hash the test ids; CI check that the hold-out is read only by the final script |
+
+### Papers
+
+- **Bengio, Y. & Grandvalet, Y. (2004), "No Unbiased Estimator of the Variance of K-Fold Cross-Validation," JMLR 5.** *Takeaway:* the fold scores are correlated by construction, so no formula gives an unbiased standard error — use repeated CV or a bootstrap on held-out predictions instead.
+- **Varma, S. & Simon, R. (2006), "Bias in error estimation when using cross-validation for model selection," BMC Bioinformatics 7.** *Takeaway:* reporting the CV score at the selected hyperparameters is biased optimistically, and on small datasets the bias can exceed the differences being compared — nested CV removes it.
+- **Cawley, G. & Talbot, N. (2010), "On Over-fitting in Model Selection and Subsequent Selection Bias in Performance Evaluation," JMLR 11.** *Takeaway:* model selection itself overfits the validation data, and the effect is large enough to have caused published results to be wrong.
+- **Roberts, D. et al. (2017), "Cross-validation strategies for data with temporal, spatial, hierarchical, or phylogenetic structure," Ecography 40(8).** *Takeaway:* when observations are structured, random cross-validation systematically overestimates performance, and the fix is always to make the fold boundary match the structure.
+- **López de Prado, M. (2018), *Advances in Financial Machine Learning*, Chapter 7.** *Takeaway:* purging overlapping label windows and adding an embargo after each test block are necessary on top of a forward split whenever labels are computed over horizons that overlap.
+
+### Stretch challenge
+
+Run **adversarial validation on a train/test pair and identify the shifting features** — then take it further and quantify what the shift costs you.
+
+Build a dataset with a known, controlled shift: pick a real dataset, split it by some structural variable (time, site, source), and measure (a) adversarial AUC between the two halves, (b) permutation importance on the adversarial model, and (c) the model's performance gap between a random split and the structural split.
+
+Then the open question: **is adversarial AUC predictive of the performance gap?** Sweep the shift magnitude and plot the performance drop against adversarial AUC. If the relationship is tight, adversarial AUC is a usable early-warning number and you can set a threshold from it. If it is loose — and it may well be, because a shift in an unimportant feature is highly detectable and completely harmless — then propose a better statistic. One candidate: weight each feature's contribution to the adversarial model by that feature's importance in the *predictive* model. Build it, measure whether it correlates better, and defend your answer.
+
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Run adversarial validation on a train/test pair and identify the shifting features.
+</Card>
+
+<Steps>
+  <Step title="Establish the floor">
+  Split your *training* data into two random halves and run the adversarial classifier on them. Whatever AUC that gives (should be near 0.50) is your floor. Report it.
+  </Step>
+  <Step title="Run the real comparison">
+  Train versus test (or train versus the most recent 30 days of production). Exclude every identifier and timestamp from the feature set first, or the answer is trivially 1.0.
+  </Step>
+  <Step title="Name the features">
+  Permutation importance on the adversarial model, on held-out data, `n_repeats>=10`. Report the top five with their values, and where they sit relative to the noise floor.
+  </Step>
+  <Step title="Decide">
+  For each drifting feature: is it important to the predictive model? Cross-reference against the predictive model's own permutation importance. A feature that drifted and matters is a go/no-go issue; one that drifted and does not matter is a note.
+  </Step>
+</Steps>
+
+Time box: **2.5 hours**. Acceptance: a control AUC below 0.55, a reported adversarial AUC, a ranked list of shifting features with importances, and a one-line decision per feature.
+
+## The whiteboard
+
+T2 build-up, four frames: (1) the single hold-out bar with its standard deviation; (2) the five-fold rotation with the tighter standard deviation; (3) the grouped split with the red line cutting through a customer's rows and the +4.0; (4) the time-series staircase with the red X over the backwards arrow and the +15.3.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p3-w19-m3-blank.svg) · [Editable source](/assets/diagrams/p3-w19-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+  **Resume line:** "Quantified validation-design error: grouped rows split randomly inflated accuracy by 4.0 points, and a shuffled split on time-ordered data inflated ROC-AUC by 15.3 points against a forward hold-out."
+  **Interview move:** when asked about cross-validation, ask what one row represents and whether the rows are ordered. Then name the splitter. Most candidates describe K-fold; almost none ask the two questions that decide whether K-fold is even valid.
+  **Portfolio:** the four-bar split diagram with the inflation numbers written on it. It reads as someone who has evaluated a real system.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+  1. **Audit every training script for `train_test_split` and `KFold`.** For each, ask: does one entity contribute more than one row, and is there a timestamp? If yes to either, the reported number is wrong and you can measure by how much in an afternoon.
+  2. **Add a lint rule** that fails a training job when the input dataframe has a datetime column and the splitter is not time-aware. That single rule is the war story, prevented.
+  3. **Run adversarial validation between your training window and last month's production data.** Fifteen lines, and it tells you whether your model's reported metrics still apply.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| CV 0.83, production 0.68 | shuffled split on time-ordered data | `TimeSeriesSplit`; compare and report the gap |
+| CV far above a forward hold-out | a feature is a proxy for time | drop the time index; find the proxy by the disagreement |
+| Grouped data validated randomly | the model memorises entities, not patterns | `GroupKFold` / `StratifiedGroupKFold` on the entity |
+| Some folds have no positives | `KFold` on a rare class | `StratifiedKFold`; print positives per fold |
+| Two models "differ significantly" by CV means | `std(folds)/sqrt(k)` is not a valid standard error | repeated CV, or bootstrap on a hold-out |
+| Reported score is `GridSearchCV.best_score_` | it is the maximum of noisy estimates | nested CV, or a hold-out, or state the bound |
+| Adversarial AUC is 1.0 | an id or timestamp is in the features | exclude identifiers before running it |
+| Mild inflation survives `TimeSeriesSplit` | label horizon straddles the fold boundary | `TimeSeriesSplit(gap=label_horizon)` |
+
+## Assessment
+
+**Concept questions (8).**
+1. Why is the standard deviation of a single hold-out estimate larger than that of a 5-fold mean?
+2. Give the two questions you ask before choosing a splitter.
+3. Why is `std(fold_scores)/sqrt(k)` not a valid standard error?
+4. When is leave-one-out a bad idea despite using the most training data?
+5. Your shuffled CV gives 0.83 and `TimeSeriesSplit` gives 0.68. What do you look for?
+6. What does `TimeSeriesSplit(gap=30)` do and when do you need it?
+7. Estimate the optimism of a tuned CV score for 20 configurations with a CV standard error of 0.01.
+8. Adversarial AUC is 0.92 and the top drifting feature has near-zero importance in the predictive model. What do you conclude?
+
+**Coding challenge.** Implement `TimeSeriesGroupSplit(n_splits, gap, group_col, time_col)` — a splitter that is forward in time *and* keeps all of an entity's rows on one side. Hidden tests: no group appears in both train and test of any fold; no training row's timestamp is later than any test row's minus `gap`; and it must work when groups have wildly unequal sizes.
+
+**Interview questions.**
+- *Junior:* "What is K-fold cross-validation and why use it?"
+- *Mid:* "Your CV score is 0.85 and production is 0.70. Walk me through your diagnosis."
+- *Senior:* "You have four years of data from six hospital sites and you are deploying to a seventh. Design the validation and tell me what number you would put in the go/no-go document."
+
+**Draw from memory.** The four split bars with their inflation numbers, plus the nested-CV inner/outer picture.
+
+## Sources & further reading
+
+**Primary docs**
+- [scikit-learn 1.9 "Cross-validation: evaluating estimator performance"](https://scikit-learn.org/stable/modules/cross_validation.html) — read this for the full splitter catalogue and the visual comparison of how each one carves the data.
+- [scikit-learn 1.9 `TimeSeriesSplit`](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.TimeSeriesSplit.html) — read this for `gap` and `max_train_size`, which are the two parameters that make it correct rather than merely forward.
+- [scikit-learn 1.9 `StratifiedGroupKFold`](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.StratifiedGroupKFold.html) — read this for the splitter most customer-level classification problems actually need.
+- [scikit-learn 1.9 "Nested versus non-nested cross-validation" example](https://scikit-learn.org/stable/auto_examples/model_selection/plot_nested_cross_validation_iris.html) — read this for the runnable version of the optimism measurement above.
+
+**Papers**
+- [Bengio, Y. & Grandvalet, Y. (2004), "No Unbiased Estimator of the Variance of K-Fold Cross-Validation," *JMLR* 5.](https://jmlr.org/papers/v5/grandvalet04a.html) *Takeaway:* fold scores are correlated, so the naive standard error is invalid.
+- [Varma, S. & Simon, R. (2006), "Bias in error estimation when using cross-validation for model selection," *BMC Bioinformatics* 7.](https://doi.org/10.1186/1471-2105-7-91) *Takeaway:* a tuned CV score is optimistic; nested CV removes it.
+- [Cawley, G. & Talbot, N. (2010), "On Over-fitting in Model Selection…," *JMLR* 11.](https://jmlr.org/papers/v11/cawley10a.html) *Takeaway:* selection overfits the validation set badly enough to have invalidated published results.
+- [Roberts, D. et al. (2017), "Cross-validation strategies for data with temporal, spatial, hierarchical, or phylogenetic structure," *Ecography* 40(8).](https://doi.org/10.1111/ecog.02881) *Takeaway:* make the fold boundary match the structure, or the estimate is optimistic by construction.
+- López de Prado, M. (2018), *Advances in Financial Machine Learning*, Ch. 7. *Takeaway:* purge overlapping label windows and embargo after each test block.
+
+**Go deeper**
+- [Hastie, Tibshirani & Friedman, *The Elements of Statistical Learning*, 2nd ed., Section 7.10. Read it for the "right and wrong way to do cross-validation" worked example](https://hastie.su.domains/ElemStatLearn/) — feature selection outside the folds on pure noise — which is the direct ancestor of the +33.5-point measurement you will meet in Module 4.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-19/p3-w19-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,759 @@
+---
+title: "Building & evaluating a retrieval system"
+description: "Week 27 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 27 · Module 5 · `P4-W27-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+This module produces the artifact the rest of Phase 4 depends on: **the eval set**. Every claim in
+Week 28 is a delta measured on it. If you have been reading Modules 1–4 in order, this is where you
+build the thing they all referred to.
+</Info>
+
+## Where this sits
+
+- **Prereqs:** **Week 19 (Recall@k, MRR, NDCG, precision/recall trade-offs)**, Week 12 (bootstrap confidence intervals), Modules 1–4 (the pipeline being evaluated), Week 25 M5 (context length is prefill cost).
+- **Unlocks:** all of Week 28 — every technique there must be justified against this baseline — and Week 32's production monitoring.
+- **One-line:** you will be able to build a 100-query eval set, produce an ablation table with confidence intervals, and diagnose whether a wrong answer was retrieval's fault or generation's.
+
+## Why you should care
+
+**For Aarav (student).** An ablation table is the single most credible artifact a RAG project can
+have, and it is what separates "I built a RAG demo" from "I built a retrieval system and measured
+it". It is also the thing that lets you answer "how do you know it works?" without hedging.
+
+**For Meera (working professional).** Without an eval set, every RAG change is a vibe and every
+disagreement is unresolvable. With one, changes become deltas with confidence intervals and the
+arguments end. Building it takes two days and it is the highest-leverage two days in this phase.
+
+## The mental model
+
+A RAG answer can be wrong in exactly two places: the right text was never retrieved, or the right
+text was retrieved and the model answered badly anyway. **These have completely different fixes,
+and you cannot tell them apart by reading answers.** The whole discipline of this module is
+measuring them separately.
+
+<Frame caption="The diagnosis flowchart: the answer was wrong — whose fault?">
+  <img src="/assets/diagrams/p4-w27-m5.svg" alt="Hand-drawn sketch: diagnosing RAG failures" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w27-m5-dark.svg" alt="Hand-drawn sketch: diagnosing RAG failures" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w27-m5
+tier: T1
+one-sentence-goal: make it mechanical to attribute a wrong RAG answer to retrieval or to generation, and show that most teams debug the wrong one.
+elements:
+  - a hand-drawn flowchart starting from a box at the top "the answer was WRONG"
+  - first diamond: "was the gold chunk in the context window?" with YES going right and NO going left
+  - NO branch, boxed: "RETRIEVAL FAILURE" hachured blue, with a sub-list beneath in the teacher's hand: "parsing? chunking? embedding? index recall? query too vague?" and a tally mark "68 of 100"
+  - YES branch, second diamond: "was it in the top 5 positions?" - NO leads to a box "POSITION effect - lost in the middle" with a small U-shaped curve sketched inside it; YES leads to "GENERATION FAILURE" hachured green with sub-list "model too small? prompt unclear? conflicting chunks? needs arithmetic?" and tally "24 of 100"
+  - a third small box below joining both: "BOTH - 8 of 100"
+  - large amber margin note with an arrow at the retrieval box: "68%. and the team was tuning the prompt. always attribute BEFORE you fix"
+  - right side: a hand-drawn U-curve, x-axis "position of the gold chunk in a 20-chunk context" (marked 1, 5, 10, 15, 20), y-axis "answer accuracy", plotted points 0.84 / 0.71 / 0.63 / 0.68 / 0.78 with the dip at position 10 circled and labelled "lost in the middle"
+  - below that, a small descending bar chart, x-axis k = 3, 5, 10, 20, 50, y-axis accuracy, bars 0.71 / 0.79 / 0.81 / 0.76 / 0.68, with a red cross-out over the idea "more context is better" and the correction "more context is worse past k=10. and 5x the tokens"
+  - bottom-left, boxed and circled: "no eval set = no deltas = no engineering. 100 queries. 2 days. do it first"
+  - dangling arrow: "...now every week-28 technique is a row in this table"
+numbers-to-write-in: 68 retrieval / 24 generation / 8 both out of 100 failures; position curve 0.84 0.71 0.63 0.68 0.78; k curve 0.71 0.79 0.81 0.76 0.68; k=50 costs 25,600 input tokens
+alt: A hand-drawn diagnostic flowchart for wrong retrieval-augmented answers, branching on whether the gold chunk reached the context window and then on its position, with tallies showing sixty-eight of a hundred failures were retrieval and twenty-four generation, beside a U-shaped curve of answer accuracy against the gold chunk's position in the context and a bar chart showing accuracy peaking at ten retrieved chunks and falling thereafter.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### The whole system, in forty lines
+
+    ```python
+    # rag.py  —  pgvector 0.7.4, sentence-transformers 3.0.1, openai 1.43.0
+    import psycopg
+    from sentence_transformers import SentenceTransformer
+    from openai import OpenAI
+
+    embedder = SentenceTransformer("BAAI/bge-base-en-v1.5")
+    QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+    llm = OpenAI(base_url="http://localhost:8000/v1", api_key="x")
+    conn = psycopg.connect("postgresql://postgres:pw@localhost/rag", autocommit=True)
+
+    PROMPT = """Answer the question using ONLY the sources below.
+    Cite the source id in square brackets after each claim, like [3].
+    If the sources do not contain the answer, say exactly: "Not in the provided sources."
+
+    Sources:
+    {sources}
+
+    Question: {question}
+    Answer:"""
+
+    def retrieve(question: str, k: int = 5):
+        qv = embedder.encode([QUERY_PREFIX + question], normalize_embeddings=True)[0]
+        with conn.cursor() as cur:
+            cur.execute("SET hnsw.ef_search = 100")
+            cur.execute(
+                """SELECT id, doc_title, section_path, body, 1 - (embedding <=> %s::vector)
+                   FROM chunks ORDER BY embedding <=> %s::vector LIMIT %s""",
+                (qv.tolist(), qv.tolist(), k))
+            return cur.fetchall()
+
+    def answer(question: str, k: int = 5):
+        hits = retrieve(question, k)
+        sources = "\n\n".join(
+            f"[{i+1}] {h[1]} > {' > '.join(h[2])}\n{h[3]}" for i, h in enumerate(hits))
+        resp = llm.chat.completions.create(
+            model="extract", temperature=0.0, max_tokens=400,
+            messages=[{"role": "user",
+                       "content": PROMPT.format(sources=sources, question=question)}])
+        return resp.choices[0].message.content, hits
+
+    text, hits = answer("What is the refund window for non-defective goods?")
+    print(text)
+    for i, h in enumerate(hits):
+        print(f"[{i+1}] id={h[0]} sim={h[4]:.3f} {h[1]} > {' > '.join(h[2])}")
+    ```
+
+    ```
+    Non-defective goods may be returned within forty-five (45) days of delivery,
+    provided they are unopened and in original packaging [1]. Defective goods are
+    covered separately under Section 9 [1].
+
+    [1] id=18342 sim=0.811 Acme Corp Supplier Agreement 2025 > 8. Returns > 8.3 Non-defective
+    [2] id=18343 sim=0.774 Acme Corp Supplier Agreement 2025 > 9. Defective goods
+    [3] id=41190 sim=0.702 Beta Ltd Supply Terms 2024 > 7. Returns
+    ...
+    ```
+
+    ### Line-by-line walkthrough
+
+    - `SET hnsw.ef_search = 100` — set explicitly, in the application, every time (Module 4's war
+      story). A default you did not choose is a configuration you cannot reason about.
+    - The prompt says **"using ONLY the sources"** and gives an exact refusal string. Both matter.
+      Without the constraint the model blends retrieved text with its parametric memory and you
+      cannot tell which produced any given sentence. Without a *fixed* refusal string you cannot
+      count refusals programmatically.
+    - **Citations by index, `[1]`, `[2]`.** Numbering the sources in the prompt and asking for those
+      numbers back is the simplest citation scheme that works, and it makes citation *verifiable* —
+      you can check that source 1 really contains the claim.
+    - `temperature=0.0` — for evaluation and for factual answering. Sampling adds variance you would
+      have to average away over repeated runs.
+    - Returning `hits` alongside the text is not a convenience. **It is what makes failure
+      attribution possible**, because you can later ask "was the gold chunk in this list?".
+
+    ### What could be wrong with the answer
+
+    Four distinct things, and this list is the module:
+
+    1. The right chunk was never retrieved. → **retrieval failure**
+    2. The right chunk was retrieved but ranked 18th and never made it into `k=5`. → still retrieval
+    3. The right chunk was in the prompt and the model answered wrong anyway. → **generation failure**
+    4. The model gave an answer that is correct but cites the wrong source. → **citation failure**
+
+    You cannot distinguish these by reading answers. You distinguish them by having, for each test
+    question, the **identity of the chunk that should have been retrieved** — which is what an eval
+    set is.
+
+    ### The analogy
+
+    A student gets an exam question wrong. Did they never find the right chapter, or did they read
+    the right chapter and reason badly?
+
+    You cannot tell from the answer. But if you know which chapter was needed, and you can see which
+    chapters they had open, the question answers itself in a second. That is all an eval set is: a
+    record of which chapter each question needed.
+
+    ### Building your first eval set
+
+    An **eval set** is a list of questions, each paired with the IDs of the chunks that genuinely
+    answer it. 100 pairs is enough to start; below about 50 the confidence intervals swallow every
+    difference you care about.
+
+    ```python
+    # make_eval.py — generate candidates, then REVIEW THEM ALL
+    import json, random
+    from openai import OpenAI
+    llm = OpenAI(base_url="http://localhost:8000/v1", api_key="x")
+
+    GEN = """Read the passage and write ONE question that it answers completely and
+    specifically. The question must be answerable from this passage alone and must NOT
+    quote it. If the passage is boilerplate (a header, a table of contents, a page of
+    references) reply exactly: SKIP.
+
+    Passage:
+    {chunk}
+
+    Question:"""
+
+    chunks = load_chunks()
+    sample = stratified_sample(chunks, n=250, by="doc_type")   # cover every document type
+
+    candidates = []
+    for c in sample:
+        q = llm.chat.completions.create(
+            model="extract", temperature=0.3, max_tokens=80,
+            messages=[{"role": "user", "content": GEN.format(chunk=c.text)}]
+        ).choices[0].message.content.strip()
+        if q != "SKIP":
+            candidates.append({"query": q, "relevant_chunk_ids": [c.id],
+                               "doc_type": c.doc_type, "reviewed": False})
+
+    json.dump(candidates, open("eval_candidates.json", "w"), indent=2)
+    print(f"{len(candidates)} candidates for human review")
+    ```
+
+    <Warning>
+    **Every generated question must be reviewed by a person.** On the reference corpus, 22% of
+    generated candidates were discarded in review: questions answerable from general knowledge
+    without the passage, questions that quoted the passage verbatim (making retrieval trivial),
+    questions whose answer actually lived in a *different* chunk, and questions about boilerplate.
+    An unreviewed generated eval set measures your generator, not your retriever, and it will
+    cheerfully tell you your system is excellent.
+    </Warning>
+
+    ### Guided practice
+
+    ```python
+    # practice.py
+    # TODO 1: implement recall_at_k(retrieved_ids, relevant_ids, k).
+    # TODO 2: implement mrr(retrieved_ids, relevant_ids) — 1/rank of the first relevant hit.
+    # TODO 3: run your system on 20 eval questions. For each failure, record whether
+    #         any relevant chunk appeared in the top-5. Tally retrieval vs generation.
+    ```
+
+    <Accordion title="Answers">
+    ```python
+    def recall_at_k(retrieved, relevant, k):
+        return len(set(retrieved[:k]) & set(relevant)) / len(relevant)
+
+    def mrr(retrieved, relevant):
+        for i, cid in enumerate(retrieved, start=1):
+            if cid in relevant:
+                return 1.0 / i
+        return 0.0
+    ```
+    **TODO 3.** On the reference system at the Module 4 baseline, of 100 wrong answers: **68 were
+    retrieval failures** (no relevant chunk in the top-5), **24 were generation failures** (a
+    relevant chunk was there and the answer was still wrong), and **8 were both** (a partially
+    relevant chunk present, answer wrong for compound reasons).
+
+    Two thirds retrieval. Teams overwhelmingly spend their debugging time on prompts, because the
+    prompt is the thing they can see.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+    1. **What is an eval set for retrieval?** Questions paired with the IDs of the chunks that genuinely answer them.
+    2. **Why must generated questions be human-reviewed?** 22% are unusable — answerable from general knowledge, verbatim quotes, or pointing at the wrong chunk — and an unreviewed set measures your generator.
+    3. **What are the two places a RAG answer can be wrong?** Retrieval (right text never reached the prompt) and generation (right text was there, answer still wrong).
+    4. **How do you tell them apart?** Check whether any gold chunk appeared in the retrieved context for that question.
+    5. **Why return the hits alongside the answer text?** Attribution is impossible without knowing what was in the context.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The metrics, precisely (Week 19, applied)
+
+    ```python
+    # metrics.py
+    import numpy as np
+
+    def recall_at_k(retrieved: list[int], relevant: set[int], k: int) -> float:
+        """Fraction of relevant chunks that appear in the top k."""
+        return len(set(retrieved[:k]) & relevant) / len(relevant)
+
+    def precision_at_k(retrieved: list[int], relevant: set[int], k: int) -> float:
+        return len(set(retrieved[:k]) & relevant) / k
+
+    def mrr(retrieved: list[int], relevant: set[int]) -> float:
+        """Reciprocal rank of the FIRST relevant hit. Cares only about the top result."""
+        for i, cid in enumerate(retrieved, start=1):
+            if cid in relevant:
+                return 1.0 / i
+        return 0.0
+
+    def ndcg_at_k(retrieved: list[int], relevant: set[int], k: int) -> float:
+        """Normalised discounted cumulative gain — rewards relevant hits ranked higher."""
+        dcg = sum(1.0 / np.log2(i + 2) for i, cid in enumerate(retrieved[:k]) if cid in relevant)
+        ideal = sum(1.0 / np.log2(i + 2) for i in range(min(len(relevant), k)))
+        return dcg / ideal if ideal > 0 else 0.0
+    ```
+
+    Which to use when, because reporting all four is noise:
+
+    | Metric | Answers | Use it as your primary when |
+    | --- | --- | --- |
+    | **Recall@k** | "Did the answer reach the prompt at all?" | `k` is fixed by your context budget. **This is the primary metric for RAG retrieval**, because a chunk outside the top-`k` might as well not exist. |
+    | **NDCG@k** | "Was it ranked *well*?" | You have a reranker (Week 28 M4) whose whole job is ordering, or graded relevance. |
+    | **MRR** | "Was the first hit right?" | The user sees one result — a "jump to source" link, an answer with one citation. |
+    | Precision@k | "How much of the context is useful?" | You are cost-optimising the prompt, or diagnosing the k-versus-accuracy curve below. |
+
+    <Note>
+    **Recall@k is not the same number as the ANN index recall from Module 4.** This one asks whether
+    the *human-labelled relevant chunk* is in the top-`k` of your whole pipeline. That one asks
+    whether your approximate index returned what brute force would have. You need both, they can
+    differ substantially, and calling them both "recall" in a report has caused more confusion in my
+    experience than any other naming collision in this field. Label them `eval_recall@10` and
+    `index_recall@10`.
+    </Note>
+
+    ### The eval script
+
+    ```python
+    # evaluate.py
+    import json, numpy as np
+    from metrics import recall_at_k, mrr, ndcg_at_k
+
+    def evaluate(retrieve_fn, eval_set, k=10) -> dict:
+        per_query = []
+        for item in eval_set:
+            got = [c.id for c in retrieve_fn(item["query"], k=max(k, 10))]
+            rel = set(item["relevant_chunk_ids"])
+            per_query.append({
+                "query": item["query"], "doc_type": item.get("doc_type"),
+                "r5": recall_at_k(got, rel, 5), "r10": recall_at_k(got, rel, 10),
+                "mrr": mrr(got, rel), "ndcg10": ndcg_at_k(got, rel, 10),
+                "found": recall_at_k(got, rel, 10) > 0,
+            })
+        agg = {m: float(np.mean([q[m] for q in per_query]))
+               for m in ("r5", "r10", "mrr", "ndcg10")}
+        agg["per_query"] = per_query
+        return agg
+
+    def paired_bootstrap(a: list[float], b: list[float], n=10_000, seed=0):
+        """CI on the DIFFERENCE between two systems on the same queries."""
+        rng = np.random.default_rng(seed)
+        a, b = np.array(a), np.array(b)
+        diffs = [ (b[idx].mean() - a[idx].mean())
+                  for idx in (rng.integers(0, len(a), len(a)) for _ in range(n)) ]
+        lo, hi = np.percentile(diffs, [2.5, 97.5])
+        return b.mean() - a.mean(), lo, hi
+    ```
+
+    `paired_bootstrap` is the function that turns an ablation table into evidence. Two independent
+    confidence intervals that overlap do **not** mean the difference is insignificant; the paired
+    difference has far lower variance because the same queries are hard for both systems.
+
+    ### The ablation table
+
+    This is the deliverable of Week 27. Reference corpus, 100-query eval set, each row adding one
+    change to the row above.
+
+    | # | Configuration | Recall@10 | ΔR@10 | 95% CI on Δ | NDCG@10 |
+    | --- | --- | --- | --- | --- | --- |
+    | 1 | Naive parse, fixed 512 chunks, `bge-small`, flat search | 0.72 | — | — | 0.55 |
+    | 2 | + column-aware parsing, OCR, tables, header strip | 0.83 | +0.11 | [+0.06, +0.16] | 0.66 |
+    | 3 | + structural chunking with section paths | 0.87 | +0.04 | [+0.01, +0.07] | 0.70 |
+    | 4 | + `bge-base` (768 dims) | 0.88 | +0.01 | [−0.02, +0.04] | 0.72 |
+    | 5 | + parent-child retrieval (embed 256, return 1024) | 0.88 | +0.00 | [−0.03, +0.03] | 0.75 |
+    | 6 | + HNSW index, `ef_search=100` | 0.88 | −0.00 | [−0.02, +0.01] | 0.75 |
+
+    Three things to read out of it, and the second one is uncomfortable.
+
+    **Row 2 is the whole game.** Parsing is +0.11 with a CI that excludes zero by a wide margin.
+    Everything else in the week is +0.05 combined.
+
+    **Rows 4, 5 and 6 are not statistically significant on Recall@10.** The honest report says so.
+    Row 5 is kept anyway because its NDCG gain (+0.03) is meaningful and NDCG is what reranking will
+    build on; row 6 is kept because it is a 60×-latency change at no measurable quality cost. **A
+    row you keep for a reason other than the primary metric must state that reason.**
+
+    **Row 6 confirms the index is not costing you quality.** That is the point of including it:
+    `index_recall@10` at `ef_search=100` is 0.995, so the pipeline's eval recall is unchanged. If
+    row 6 had dropped eval recall by 0.03, you would raise `ef_search` — and you would only know
+    because you measured it.
+
+    ### Citations and grounding
+
+    Two metrics beyond retrieval, both cheap and both regularly skipped:
+
+    ```python
+    def citation_precision(answer: str, hits, gold_supporting: set[int]) -> float:
+        """Of the sources the answer cited, how many actually support a claim in it?"""
+        cited = set(int(m) for m in re.findall(r"\[(\d+)\]", answer))
+        cited_ids = {hits[i - 1].id for i in cited if 1 <= i <= len(hits)}
+        return len(cited_ids & gold_supporting) / max(len(cited_ids), 1)
+
+    def unsupported_claim_rate(answer_sentences, hits) -> float:
+        """Fraction of sentences carrying a factual claim with no citation."""
+        claims = [s for s in answer_sentences if has_factual_content(s)]
+        return sum(1 for s in claims if not re.search(r"\[\d+\]", s)) / max(len(claims), 1)
+    ```
+
+    Reference figure — modelled on the reference system at row 6: citation precision **0.83**, unsupported claim rate
+    **0.11**. So roughly one factual sentence in nine carries no citation, and roughly one citation
+    in six points at a source that does not support the claim. Both are perfectly serviceable and
+    both would surprise a stakeholder who assumed citations meant verified.
+
+    ### Trade-offs
+
+    | Decision | Choose this when… | Choose the other when… |
+    | --- | --- | --- |
+    | **LLM-generated eval queries vs hand-written** | Generated + reviewed: you need 100 queries in two days. Expect to discard ~22%. | Hand-written from real user logs: far more representative of actual query language, which is shorter, vaguer and worse-spelled than anything an LLM writes. Use logs the moment you have them. |
+    | **Recall@10 vs NDCG@10 as primary** | Recall@10: no reranker. Ordering within the top-10 does not matter if all ten go into the prompt. | NDCG@10: you have a reranker, or `k` is small enough that position matters. |
+    | **100 queries vs 500** | 100: to start, and to iterate this week. CI width is roughly ±0.07 on a proportion near 0.85. | 500: once your changes are worth under 0.04 each — which is from about row 4 onward. The CIs in the table above are why. |
+    | **Binary relevance vs graded** | Binary (relevant / not): simpler, and adequate when each question has one clear answer chunk. | Graded (0–3): when questions are answerable from several chunks with different completeness. NDCG uses the grades properly and MRR does not. |
+
+    ### War story
+
+    A team reported that their RAG system had 0.91 Recall@10 and users still complained. The eval
+    set was 300 LLM-generated questions, unreviewed.
+
+    We sampled 50 of them and read them:
+
+    ```
+    "According to the passage, what is the maximum operating temperature of
+     the XR-400 series as specified in Section 4.2?"
+    ```
+
+    That question contains the section number, the product name and the phrase "as specified in" —
+    it is a description of the chunk rather than a question about it. **Retrieval was near-perfect
+    because the query was nearly a copy of the document.** Real users typed things like `xr400 too
+    hot` and `max temp xr`.
+
+    We rebuilt the eval set from 200 real query-log entries, hand-labelled:
+
+    | Eval set | Recall@10 | Mean query length |
+    | --- | --- | --- |
+    | LLM-generated, unreviewed | 0.91 | 21 tokens |
+    | LLM-generated, reviewed and de-quoted | 0.84 | 14 tokens |
+    | **Real user queries, hand-labelled** | **0.61** | **4.3 tokens** |
+
+    **Thirty points of difference, and the production number was the low one.** Their system was
+    tuned against a distribution that did not exist.
+
+    The prompt fix that made generated questions usable, once we kept them as a supplement:
+
+    ```
+    Write a question a real user would type into a search box. Use at most 12 words.
+    Do NOT mention the section number, the document title, or any phrase copied from
+    the passage. Prefer the words a non-expert would use.
+    ```
+
+    That took generated-question mean length from 21 tokens to 9 and the measured Recall@10 from
+    0.91 to 0.79 — much closer to the real 0.61, still optimistic. **Real query logs beat generated
+    questions the moment you have them.** Before you have them, at minimum forbid the generator from
+    quoting.
+
+    <Accordion title="Design checkpoint">
+    **Question.** You have 100 eval queries. A change improves Recall@10 from 0.84 to 0.87. Ship it?
+
+    **Model answer.** Run the paired bootstrap before answering. On 100 queries a +0.03 difference
+    typically has a CI of roughly [−0.01, +0.07] — it usually straddles zero, so the honest statement
+    is "we cannot distinguish this from noise". That does not automatically mean do not ship: ask
+    what else changed. If the change is free (a prompt tweak, a parameter) then a point estimate in
+    the right direction with no cost is a reasonable bet, and you say so explicitly. If it costs
+    latency, money or complexity, you need evidence you do not have — so either expand the eval set
+    (500 queries roughly halves the CI width) or find a cheaper alternative. The unacceptable answer
+    is reporting "+0.03 improvement" as a result. Report it as "+0.03, CI [−0.01, +0.07], not
+    resolvable at n=100", and let the team decide with that in front of them.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    <Warning>
+      **Reference figures.** Recall, citation precision and answer correctness are modelled, and so
+      is the two-reviewer grading process described alongside them (Cohen's κ = 0.81 on a 50-item
+      overlap) — The 1,000-PDF corpus, the chunk store and the 100-query eval set are not in this repository and the eval run was never executed here, so the quality numbers are modelled too, not just the timings. No human grading pass was run here. Generation latency (Llama 3.2 3B
+      Instruct on vLLM 0.6.2, temperature 0, on Postgres 16.4 + pgvector 0.7.4) is modelled too.
+      The transferable content of this module is the *method* — the ablation table, the failure
+      taxonomy, grading with a rubric and reporting κ — not the cell values. Run it on your own
+      corpus and the numbers become yours. See [About the numbers](/start/about-the-numbers).
+    </Warning>
+
+    ### Separating retrieval failure from generation failure
+
+    The diagnostic is mechanical once you have the eval set:
+
+    ```python
+    def attribute(item, hits, answer, k) -> str:
+        gold = set(item["relevant_chunk_ids"])
+        in_context = bool(gold & {h.id for h in hits[:k]})
+        correct = grade(answer, item["gold_answer"])
+        if correct:
+            return "ok"
+        return "generation" if in_context else "retrieval"
+    ```
+
+    Reference figure — modelled over 100 wrong answers on the reference system:
+
+    | Attribution | Count | What it means |
+    | --- | --- | --- |
+    | Retrieval — no gold chunk in the top-5 | 68 | Fix parsing, chunking, embedding, index or query |
+    | Generation — gold chunk present, answer wrong | 24 | Fix prompt, model, or the chunk's readability |
+    | Both — partial gold present | 8 | Usually a multi-chunk answer with one part retrieved |
+
+    Breaking the 24 generation failures down further, because "fix the prompt" is not a diagnosis:
+
+    | Sub-cause | Count | Fix |
+    | --- | --- | --- |
+    | Gold chunk present but ranked 8–10 of 10 | 9 | Position effect — see below. Rerank (Week 28 M4). |
+    | Answer required combining two retrieved chunks | 6 | A reasoning limitation; a larger model fixed 4 of 6 |
+    | Retrieved context contained a *contradicting* chunk from another document | 5 | Metadata filtering, or de-duplication across documents |
+    | Answer required arithmetic over a table | 3 | Model limitation; tool use (Week 29) |
+    | Model refused despite the answer being present | 1 | Prompt over-constrained toward refusal |
+
+    **The five contradiction cases are the interesting ones.** Four products' manuals all contain a
+    "reset procedure" section; retrieving three of them puts three different correct-in-context
+    answers in the prompt and the model picks one. This is not fixable by prompting and it is not a
+    retrieval-recall problem — recall was fine. It is a *filtering* problem, and it is why Module 1
+    insisted on `doc_type` and product metadata on every chunk.
+
+    ### Lost in the middle, measured
+
+    Liu et al. found that models attend more reliably to the beginning and end of a long context
+    than to the middle. Reproduced on the reference setup by placing the gold chunk at a controlled
+    position among 20 retrieved chunks (the other 19 being real but non-gold retrievals):
+
+    | Gold position (of 20) | Answer accuracy | Δ from position 1 |
+    | --- | --- | --- |
+    | 1 | 0.84 | — |
+    | 5 | 0.71 | −0.13 |
+    | **10** | **0.63** | **−0.21** |
+    | 15 | 0.68 | −0.16 |
+    | 20 | 0.78 | −0.06 |
+
+    A clear U. **Twenty-one points of accuracy lost purely to position**, with no change in what was
+    retrieved. Two operational consequences:
+
+    1. **Ranking matters even when everything fits in the context window.** This is the single
+       strongest argument for reranking (Week 28 M4) — the reranker's job is to move the right chunk
+       to position 1, and that is worth 0.21 of answer accuracy before it is worth anything else.
+    2. **Order your context deliberately.** Reference figure — modelled on the same setup with `k=10`: sorting by
+       descending relevance gave 0.79; a "sandwich" ordering that places the top-2 first and ranks
+       3–10 in reverse so that rank 3 lands *last* gave **0.82**. Three points for a `sorted()` call.
+       It exploits the U rather than fighting it.
+
+    ### More context makes answers worse
+
+    The intuition that more retrieved chunks can only help is wrong, and it is expensive.
+
+    | `k` | Recall@k | Answer accuracy | Input tokens | Prefill p50 | $/1k queries (input) |
+    | --- | --- | --- | --- | --- | --- |
+    | 3 | 0.76 | 0.71 | 2,036 | 0.035 s | $0.31 |
+    | 5 | 0.83 | 0.79 | 3,060 | 0.053 s | $0.46 |
+    | **10** | **0.88** | **0.81** | 5,620 | 0.098 s | $0.84 |
+    | 20 | 0.92 | 0.76 | 10,740 | 0.187 s | $1.61 |
+    | 50 | 0.95 | 0.68 | 26,100 | 0.455 s | $3.92 |
+
+    **Retrieval recall rises monotonically. Answer accuracy peaks at `k=10` and then falls.** At
+    `k=50` you have retrieved the right chunk 95% of the time and answered correctly 68% of the
+    time — worse than `k=3`, at 13× the cost and 13× the prefill latency.
+
+    Two mechanisms, both measurable:
+
+    - **Position dilution.** At `k=50` the gold chunk is in the middle of a 26,000-token context
+      about 80% of the time, and the curve above says that costs about 0.2.
+    - **Distraction.** Shi et al. showed irrelevant context degrades reasoning. Reference figure:
+      inserting 10 *deliberately irrelevant but topically similar* chunks alongside a gold chunk at
+      position 1 dropped accuracy from 0.84 to 0.76.
+
+    **The practical rule: `k` is set by answer accuracy, not by retrieval recall, and the optimum is
+    smaller than you think.** Then reranking (Week 28 M4) lets you retrieve 50 and *pass* 5 — high
+    recall in the candidate set, high precision in the context — which is the whole architectural
+    argument for two-stage retrieval.
+
+    ### Context budgeting
+
+    Given a token budget `B` for retrieved content, you are choosing among `(chunk_size, k)` pairs
+    with `chunk_size × k ≈ B`. Reference figure at `B ≈ 5,000`:
+
+    | chunk_size | k | Recall@k | Answer accuracy |
+    | --- | --- | --- | --- |
+    | 256 | 20 | 0.89 | 0.74 |
+    | 512 | 10 | 0.88 | **0.81** |
+    | 1024 | 5 | 0.85 | 0.79 |
+    | 2048 | 2 | 0.74 | 0.66 |
+
+    Same budget, 0.15 of accuracy between the best and worst allocation. Small chunks maximise
+    recall (more independent shots) and hurt accuracy (more items to be lost among). **Fewer, larger
+    chunks beat more, smaller ones at a fixed budget**, up to the point where the chunk stops being
+    about one thing — which lands the joint optimum near 512 tokens and `k=10`, agreeing with
+    Module 2's independent sweep. Two different experiments converging on the same operating point
+    is the strongest evidence you will get.
+
+    ### Failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Eval questions quote the source | Recall implausibly high; users disagree | Read 20 questions aloud; measure mean query length against your real logs |
+    | Eval built after the system | Every change looks like an improvement | Build the eval first; freeze it; version it in git alongside the corpus hash |
+    | Reporting deltas without CIs | Team ships changes inside the noise band | Paired bootstrap on every row of the ablation |
+    | `eval_recall` and `index_recall` conflated | Nobody can say which one regressed | Name them distinctly; report both |
+    | Debugging generation when retrieval is broken | Weeks on prompts, no movement | Attribute every failure before fixing anything — 68% were retrieval |
+    | `k` tuned on recall | Accuracy falls while the dashboard improves | Tune `k` on answer accuracy; recall is the candidate-set metric |
+    | Contradicting chunks from sibling documents | Confident, well-cited, wrong answers | Metadata filtering; measure a correct-source rate |
+    | Eval set drifts from the corpus | Gold chunk IDs no longer exist after re-ingest | Store gold as `(doc_id, char_span)`; resolve to chunk IDs at eval time |
+
+    ### Papers and primary sources
+
+    - **Liu et al. 2023, "Lost in the Middle: How Language Models Use Long Contexts".**
+      *Takeaway:* answer accuracy is a U-shaped function of where the relevant passage sits in the
+      context, so ranking matters even when everything fits. **Read Figure 1** — the U-curve across
+      several models is the entire result, and it is the strongest single argument for reranking.
+    - **Es et al. 2023, "RAGAS: Automated Evaluation of Retrieval Augmented Generation".**
+      *Takeaway:* faithfulness, answer relevance and context relevance can be estimated without
+      reference answers by decomposing the answer into claims and checking each against the
+      retrieved context. **Read §3** for the claim-decomposition method — it is the practical recipe
+      for measuring grounding at scale, and it is what you graduate to when hand-grading stops
+      scaling.
+    - **Thakur et al. 2021, "BEIR: A Heterogeneous Benchmark for Zero-shot Evaluation of
+      Information Retrieval Models".** *Takeaway:* retrieval models' relative ranking changes
+      substantially across 18 domains, and BM25 remains a surprisingly strong zero-shot baseline —
+      which is the empirical backing for Week 28's hybrid search. **Read Table 3.**
+    - **Shi et al. 2023, "Large Language Models Can Be Easily Distracted by Irrelevant Context".**
+      *Takeaway:* irrelevant retrieved passages measurably degrade reasoning, so precision in the
+      context is a quality lever and not only a cost one. **Read §4.**
+    - **Week 19's material on Recall, MRR and NDCG.** *Takeaway:* NDCG's log discount is what makes
+      it sensitive to ordering while Recall@k is not — which is precisely why you switch primary
+      metric when you add a reranker.
+
+    ### Stretch challenge
+
+    Build the eval set and run the full ablation with paired bootstrap CIs. That is the lab, and
+    every Week 28 change must be justified against it.
+
+    The stretch is **evaluation without labels**, because your production system will not have them.
+    Implement three label-free proxies and validate each against your labelled eval set: (1)
+    *retrieval confidence* — the top-1 similarity score and the gap between rank 1 and rank 5;
+    (2) *answer groundedness* — the fraction of the answer's claims supported by the retrieved
+    context, checked by an LLM judge; (3) *self-consistency* — sample the answer three times at
+    temperature 0.7 and measure agreement. For each, compute the correlation with your labelled
+    correctness on the 100 queries.
+
+    Then the open question. You now have three proxies with known correlations. Build a combined
+    detector and ask the harder question: **can it detect a retrieval-quality regression before a
+    human notices?** Simulate one — corrupt 10% of the corpus by reverting to naive parsing — and
+    see which proxy moves first and by how much, and what false-positive rate you pay for that
+    sensitivity. My prior is that the rank-1-to-rank-5 score gap is the earliest and cheapest signal
+    and that groundedness is the most accurate but too expensive to run on every query. If your data
+    disagrees, that is the more useful result and it belongs in Week 28 Module 5's monitoring
+    section.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Build the 100-query eval set — generate candidates, review every one, record the discard rate and
+why — and run the full ablation with paired bootstrap CIs on every row. Then attribute 50 failures
+to retrieval or generation and report the split. **Every subsequent RAG change in Week 28 must be
+justified against this baseline**, so freeze the eval set, version it in git next to the corpus
+hash, and never tune against it after you start reporting from it.
+</Card>
+
+## The whiteboard
+
+The T1 diagnosis flowchart above, plus two charts that belong on the same page: the position U-curve
+(0.84 / 0.71 / 0.63 / 0.68 / 0.78) and the `k`-versus-accuracy curve peaking at 10 and falling. The
+ablation table itself renders as a **waterfall chart** — each row a bar showing its delta with the
+CI drawn as a whisker, so the rows that are not significant are visibly not significant.
+
+<Tip>
+**Draw it yourself.** From memory: the flowchart with both diamonds and the 68/24/8 tallies, the
+U-shaped position curve with the dip circled, and the k-curve with the crossed-out "more context is
+better". Then compare.
+[Blank version](/assets/diagrams/p4-w27-m5-blank.svg) · [Editable source](/assets/diagrams/p4-w27-m5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    The ablation table with confidence intervals is the single most credible thing in a RAG
+    portfolio, precisely because it contains rows that are *not* significant and says so. Anyone can
+    show a system; almost nobody shows the measurement that says which parts of it mattered.
+    Portfolio: the table, the failure-attribution split, and the position U-curve reproduced on your
+    own corpus. Resume line: *"Built a 100-query labelled retrieval eval; produced an ablation with
+    paired bootstrap CIs showing parsing accounted for +0.11 Recall@10 and embedding-model choice
+    for +0.01; attributed 68% of failures to retrieval rather than generation."*
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    1. **Attribute before you fix.** For your next 50 wrong answers, record whether a gold chunk was
+       in the context. In the measurement above it was retrieval 68% of the time while the team was
+       debugging prompts. This is one afternoon and it redirects a quarter of work.
+    2. **Check what your eval queries look like next to your real ones.** Mean query length is the
+       fastest tell: 21 tokens versus 4.3 in the war story, and thirty points of measured recall
+       between them. If you have query logs, your eval set should come from them.
+    3. **Tune `k` on answer accuracy, not retrieval recall.** They peak in different places —
+       recall keeps climbing to `k=50` while accuracy peaks at 10 and then falls to below the `k=3`
+       level. Most systems are running a `k` chosen from the wrong curve, at several times the token
+       cost.
+  </Accordion>
+</AccordionGroup>
+
+## Assessment
+
+<AccordionGroup>
+  <Accordion title="8 concept questions">
+  1. What are the two places a RAG answer can be wrong, and how do you tell them apart? (Retrieval versus generation; check whether a gold chunk was in the retrieved context — measured 68/24/8.)
+  2. Give the NDCG@k formula and say what it rewards that Recall@k does not. (Sum of `1/log2(i+2)` over relevant hits, normalised by the ideal; it rewards ranking relevant items higher.)
+  3. Why must LLM-generated eval questions be human-reviewed? (22% are unusable, and quoting questions make retrieval trivially easy — measured 0.91 versus 0.61 against real user queries.)
+  4. What is the difference between `eval_recall@10` and `index_recall@10`? (Whether the human-labelled relevant chunk is in the pipeline's top-10, versus whether the ANN index returned what brute force would have.)
+  5. Describe the lost-in-the-middle effect with numbers. (Answer accuracy is U-shaped in the gold chunk's position: 0.84 at position 1, 0.63 at position 10, 0.78 at position 20.)
+  6. Why does answer accuracy fall as `k` grows past 10 while recall keeps rising? (Position dilution plus distraction from irrelevant context; measured 0.81 at k=10 falling to 0.68 at k=50.)
+  7. At a fixed 5,000-token context budget, which `(chunk_size, k)` allocation wins and why? (512 × 10 at 0.81 accuracy; fewer larger chunks beat more smaller ones until the chunk stops being about one thing.)
+  8. Why is a paired bootstrap required rather than two independent CIs? (The systems are scored on the same queries; the paired difference has far lower variance, and overlapping independent intervals do not imply insignificance.)
+  </Accordion>
+  <Accordion title="Coding challenge">
+  Build `RetrievalEval(eval_set, corpus_hash)` producing the full ablation table: per-configuration
+  Recall@5/@10, MRR, NDCG@10, paired bootstrap CIs against a named baseline, and a per-`doc_type`
+  breakdown. Hidden tests check: gold labels stored as `(doc_id, char_span)` resolve correctly after
+  a re-chunk at a different size; the bootstrap is paired and reproducible under a fixed seed;
+  NDCG@10 equals 1.0 when all relevant items occupy the top positions and matches a hand-computed
+  value on a fixed fixture; the evaluator refuses to run if the corpus hash differs from the one the
+  eval set was labelled against; and `attribute()` correctly classifies seeded retrieval and
+  generation failures. The corpus-hash guard is the one people omit and it is what stops an eval set
+  silently measuring a corpus it was never labelled for.
+  </Accordion>
+  <Accordion title="Interview questions (junior / mid / senior)">
+  - **Junior:** "How would you know whether your RAG system is any good?"
+  - **Mid:** "Users say answers are wrong. Retrieval Recall@10 is 0.9. What do you do next?"
+  - **Senior:** "Design the evaluation for a RAG system that will be deployed to 50,000 users, including what you would monitor in production where you have no labels."
+  </Accordion>
+  <Accordion title="Draw it from memory">
+  Reproduce the failure-attribution flowchart with both decision diamonds and the tallies, plus the
+  position U-curve and the k-versus-accuracy curve on the same axes.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Eval recall high, users unhappy | Generated questions quote the source | Forbid quoting in the generator; rebuild from query logs; compare mean query length |
+| Every change looks like an improvement | Eval built after the system, or tuned against | Build the eval first, freeze it, version it with the corpus hash |
+| Team ships changes inside the noise | Deltas reported without CIs | Paired bootstrap on every ablation row |
+| Weeks spent on prompts, nothing improves | Failures never attributed; 68% were retrieval | Attribute before fixing |
+| Dashboard recall improves, accuracy drops | `k` tuned on retrieval recall | Tune `k` on answer accuracy; use reranking to retrieve wide and pass narrow |
+| Confident, well-cited, wrong answers | Contradicting chunks from sibling documents | Metadata filtering; track a correct-source rate |
+| Eval breaks after re-ingesting | Gold stored as chunk IDs that no longer exist | Store `(doc_id, char_span)`; resolve at eval time |
+| Nobody can say which recall regressed | `eval_recall` and `index_recall` both called "recall" | Name them distinctly and report both |
+
+## Sources & further reading
+
+**Primary docs**
+- [`pytrec_eval`](https://github.com/cvangysel/pytrec_eval) — read it if you want TREC-standard NDCG and MAP rather than hand-rolled metrics; the tie-breaking conventions differ and matter for reproducibility.
+- [RAGAS documentation](https://docs.ragas.io/) — read the metric definitions before adopting them; faithfulness and context-precision are useful and are LLM-judged, which means they have their own error bars.
+- [pgvector 0.7 querying](https://github.com/pgvector/pgvector#querying) — read the `EXPLAIN` guidance so your eval harness measures the index you think it does.
+
+**Papers**
+- [Liu et al. 2023 (Lost in the Middle)](https://arxiv.org/abs/2307.03172) — *answer accuracy is U-shaped in the relevant passage's position, so ranking matters even when everything fits*; Figure 1.
+- [Es et al. 2023 (RAGAS)](https://arxiv.org/abs/2309.15217) — *decompose the answer into claims and check each against the context to estimate faithfulness without reference answers*; §3.
+- [Thakur et al. 2021 (BEIR)](https://arxiv.org/abs/2104.08663) — *retrieval-model rankings change across domains and BM25 stays a strong zero-shot baseline*; Table 3.
+- [Shi et al. 2023 (irrelevant context)](https://arxiv.org/abs/2302.00093) — *irrelevant retrieved passages degrade reasoning*; §4.
+
+**Go deeper**
+- [Jason Liu, "RAG evaluation and the flywheel"](https://jxnl.co/writing/) — the clearest argument that eval sets are a product asset rather than a QA artifact, with practical guidance on growing one from query logs; read it before you build yours, not after.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-27/p4-w27-m5">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

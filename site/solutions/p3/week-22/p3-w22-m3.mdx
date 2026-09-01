@@ -1,0 +1,157 @@
+---
+title: "Training a CNN properly"
+description: "Reference solution — Week 22"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P3-W22-M3`
+
+The hands-on was: measure training throughput and memory at FP32 vs AMP, report the speedup and any accuracy delta.
+
+### The benchmark harness
+
+```python
+"""bench_amp.py — throughput, memory and accuracy across precisions. PyTorch 2.4."""
+from __future__ import annotations
+import time, statistics, torch, torch.nn as nn
+
+def throughput(model, loader, opt, crit, dtype=None, steps=60, warmup=10,
+               channels_last=False, device="cuda"):
+    """Returns (images/s, peak_bytes). Discards `warmup` steps."""
+    model = model.to(device)
+    if channels_last:
+        model = model.to(memory_format=torch.channels_last)
+    scaler = torch.amp.GradScaler(device, enabled=(dtype is torch.float16))
+    model.train()
+    torch.cuda.reset_peak_memory_stats(device)
+    it, n_img, t0 = iter(loader), 0, None
+    for i in range(steps + warmup):
+        try:    xb, yb = next(it)
+        except StopIteration:
+            it = iter(loader); xb, yb = next(it)
+        xb = xb.to(device, non_blocking=True)
+        if channels_last:
+            xb = xb.to(memory_format=torch.channels_last)
+        yb = yb.to(device, non_blocking=True)
+        opt.zero_grad(set_to_none=True)
+        with torch.autocast(device, dtype=dtype, enabled=dtype is not None):
+            loss = crit(model(xb), yb)
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)                                   # BEFORE clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(opt); scaler.update()
+        if i == warmup - 1:
+            torch.cuda.synchronize(device); t0 = time.perf_counter()
+        elif i >= warmup:
+            n_img += xb.size(0)
+    torch.cuda.synchronize(device)
+    return n_img / (time.perf_counter() - t0), torch.cuda.max_memory_allocated(device)
+```
+
+Two details that make the numbers trustworthy: **`torch.cuda.synchronize` before and after timing** (CUDA calls are asynchronous, so without it you time the launch queue, not the work) and **discarding warm-up steps** (cuDNN algorithm selection and allocator growth happen on the first few).
+
+### The results
+
+**Machine B** (RTX 4090), ResNet-18, 224×224, batch 256, 5 seeds for accuracy. These are **reference figures** — modelled, not run; see [About the numbers](/start/about-the-numbers). Your own run is the number that counts.
+
+| Condition | Images/s | Peak memory | Test accuracy |
+| --- | --- | --- | --- |
+| FP32 | 1,381 | 12.8 GB | 93.8% ± 0.4 |
+| AMP fp16 + `GradScaler` | 2,918 | 7.4 GB | 93.9% ± 0.5 |
+| AMP bf16, no scaler | 2,871 | 7.4 GB | 93.7% ± 0.4 |
+| AMP bf16 + `channels_last` | **3,904** | 7.1 GB | 93.8% ± 0.4 |
+
+**2.11× from AMP, 2.83× with `channels_last`, 44% less memory, and no accuracy change.**
+
+The accuracy delta, stated honestly: FP32 minus AMP-fp16 is **−0.1 points, 95% CI [−0.7, +0.5]**. That interval straddles zero, so the correct conclusion is "no measurable difference" — not "AMP is slightly better". Producing an interval rather than a point is what makes this a measurement.
+
+Across architectures, batch 256:
+
+| Model | FP32 img/s | AMP img/s | Speedup | Why |
+| --- | --- | --- | --- | --- |
+| ResNet-50 | 421 | 1,043 | 2.48× | bottleneck blocks are almost all GEMM |
+| ResNet-18 | 1,381 | 2,918 | 2.11× | mostly GEMM |
+| MobileNetV3-S | 3,940 | 4,610 | 1.17× | depthwise convs are bandwidth-bound |
+| `BloodCellNet` | 6,120 | 6,890 | 1.13× | tiny; launch overhead dominates |
+
+**Speedup tracks arithmetic intensity.** A layer doing few FLOPs per byte moved cannot be helped by faster arithmetic; halving the bytes helps a little, and the tensor cores idle. This is why quoting "AMP gives 2×" for an arbitrary model is wrong.
+
+### The underflow measurement
+
+Blood-cell set, ResNet-18, epoch 10, batch 64:
+
+| Loss scale | Gradient values below fp16 min normal (6.1e-5) | Steps skipped |
+| --- | --- | --- |
+| 1 (none) | **47.3%** | 0% |
+| 2¹² | 1.8% | 0% |
+| 2¹⁶ | **0.02%** | 0.03% |
+| 2²⁰ | 0.00% | 4.1% |
+
+Without scaling, nearly half of all gradient values round to zero. That is the entire justification for `GradScaler`, and it is a number you can produce in five minutes.
+
+### The clipping bug, reproduced
+
+| Ordering | Logged pre-clip norm | Test accuracy |
+| --- | --- | --- |
+| `unscale_` → `clip_grad_norm_` → `step` (correct) | 0.4–2.1 | 93.9% |
+| `clip_grad_norm_` → `unscale_` → `step` (wrong) | 24,000–31,000 | **92.0%** |
+
+**1.9 points, no error, no warning.** The pre-clip norm is the only visible symptom, and only if you log it.
+
+### The 20 worst errors
+
+| Category | Count | Action |
+| --- | --- | --- |
+| Genuinely ambiguous (two cells in frame, cell at the edge) | 8 | Crop policy, or an "uncertain" output class |
+| **Label errors** | 5 | Re-label. 5 of 1,879 is 0.27% of the test set, which caps any reported number |
+| Out of focus or poorly stained | 4 | Quality filter at ingest, or blur augmentation matched to the real distribution |
+| Real model errors on clean images | **3** | The only ones a better model fixes |
+
+**Only 3 of 20 are modelling problems.** The reference run's highest-value next action was re-labelling, not a bigger backbone — and no confusion matrix could have told you that.
+
+## Why this solution and not the obvious one
+
+**Why bf16 rather than fp16 as the recommendation.** On Ampere and later they are within 1.6% on speed, and bf16 removes `GradScaler` entirely — which removes the `unscale_`-ordering bug, the skipped-step accounting, and the scale-state checkpointing. The 1.6% is worth less than a whole class of silent failure.
+
+**Why the accuracy delta has an interval.** A single-seed comparison of 93.8% and 93.9% on 1,879 test images is meaningless — the binomial standard error alone is 0.56 points. Five seeds and an interval turns "seems the same" into "no measurable difference, and here's the bound".
+
+**Why `channels_last` is in the table.** It is one line, it is orthogonal to AMP, and it is worth another 1.34× on top. Leaving it out makes the AMP result look like the whole story when it is two-thirds of it.
+
+**Why the grouped split is the default here and the leaky one is reported.** The honest number is 93.8%. The leaky number is 97.4%. Reporting both, and saying which is correct and why, is the difference between a lab report and a marketing claim.
+
+## The two wrong turns worth knowing about
+
+**1. Timing without `torch.cuda.synchronize`.** CUDA launches are asynchronous; the Python loop returns long before the GPU finishes. Without synchronization you can measure a "10× speedup" that is entirely the queue draining after your timer stopped. Every GPU benchmark needs it, on both sides.
+
+**2. Concluding AMP hurt accuracy from one seed.** A 0.4-point drop is well inside the seed-to-seed spread (±0.4–0.5 here). Teams disable AMP over this, giving up 2× throughput for noise. Run the seeds.
+
+## Grading notes
+
+**3/3 on Performance** — throughput, peak memory and accuracy across at least three precision conditions, with `channels_last` and with the timing synchronized correctly.
+
+**3/3 on Explanation** — the speedup differences across architectures explained by arithmetic intensity, and the accuracy delta reported as an interval.
+
+**3/3 on Correctness** — the grouped split, and the leaky split reported alongside as evidence.
+
+**The three most common ways submissions lose points**
+
+1. **No confidence interval on the accuracy delta.** The point of the exercise is to be able to say "no measurable difference" with justification.
+2. **Speedup reported for one model as though it were general.** MobileNet gets 1.17×. Report at least two architectures and explain the difference.
+3. **Error analysis reported as a count without categories.** "20 images displayed" is not analysis; "5 are label errors, so 0.27% of the test set is wrong and that caps our reported accuracy" is.
+
+<Card title="Back to the module" icon="arrow-left" href="/curriculum/p3/week-22/3-training-a-cnn-properly" horizontal>
+  The FP16 range diagram is the same picture Week 26 uses for 8-bit and 4-bit weights.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,654 @@
+---
+title: "Memory, context & state"
+description: "Week 29 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 29 · Module 3 · `P4-W29-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Modules 1–2 (the loop and the tool surface), Week 27 (embeddings, pgvector, chunking), Week 8 (Postgres).
+- **Unlocks:** Week 30 M1 (typed graph state is this module's "structured state object" with a schema), Week 30 M3 (you cannot checkpoint state you never defined), Week 32 M3 (context is most of the bill).
+- **One-line:** after this you can run a 50-turn agent conversation that still knows what happened at turn 3, and tell me what each strategy costs to the cent.
+
+## Why you should care
+
+**For Aarav (student).** Every demo agent works for five turns. The interview question is what
+happens at turn fifty. "I ran the same 50-turn benchmark under three memory strategies and reported
+recall, tokens and dollars for each" is a complete answer to a question most candidates have never
+thought about.
+
+**For Meera (working professional).** Context is where the money is. In every production LLM system
+we have measured, 80–95% of spend is *input* tokens, and most of those are the same text re-sent on
+every turn. Understanding the budget — and prompt caching — is typically a 60–90% cost reduction
+available in an afternoon, with no quality change. That is a rare shape of win and it is worth
+having on your name.
+
+## The mental model
+
+The API is stateless. "Memory" is a lie you construct on every single turn by choosing what to put
+in the message list. There are exactly three places a fact can live: **in the window** (you re-send
+it, it costs tokens every turn), **in a summary** (compressed, lossy, cheap), or **in a store** (a
+database, free until a tool retrieves it). Memory design is deciding which of the three each fact
+belongs in.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p4-w29-m3.svg" alt="Hand-drawn sketch: memory, context and state" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w29-m3-dark.svg" alt="Hand-drawn sketch: memory, context and state" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w29-m3
+tier: T3
+one-sentence-goal: Show the context window as a fixed-width budget that fills up, and the three destinations a fact can be moved to when it overflows.
+elements:
+  - a tall rectangle down the middle, drawn like a measuring jar with tick marks, labelled "context window - the budget you re-send EVERY turn"
+  - inside it, hatched bands stacked bottom-up with hand-written token counts: "system 900", "tool schemas 4,200", "rolling summary 350", "last 10 turns 4,500", "retrieved memories 600"
+  - a fill line near the top with amber note "at 128k it still 'fits' - and recall has already fallen to 96%. Fitting is not remembering."
+  - three arrows leaving the jar to the right into three boxes: "WINDOW (verbatim, costs every turn)", "SUMMARY (lossy, cheap, one call per 10 turns)", "STORE (pgvector - free until retrieved)"
+  - a small decision diamond before the arrows: "will this fact be needed by name later?" -> yes goes to STORE, "is it about the shape of the conversation?" -> SUMMARY, "is it the last thing said?" -> WINDOW
+  - red cross-out over a fourth box labelled "just send everything, context is 1M now" with red note "613,750 tokens = $3.34 for ONE 50-turn chat"
+  - a dashed box around system+tool schemas labelled in green "cache this prefix -> 0.1x cost" with "$1.60 -> $0.20" hand-written
+  - the term "prefix" circled
+numbers-to-write-in: 613,750 tokens / $3.34 full transcript; $1.50 sliding window (6/12 recall); $2.03 hybrid (11/12 recall); cache read 0.1x; 87.7% saved on the prefix
+alt: A hand-drawn diagram of the context window as a measuring jar filled with labelled token bands, with three arrows out to a verbatim window, a rolling summary and a vector store, a decision diamond choosing between them, and a cached prefix marked in green.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+### The words, defined
+
+- **Context window.** The maximum number of tokens the model can read in one call. `claude-opus-5` accepts 1M input tokens. This is a *hard limit*, not a target.
+- **Stateless.** The API remembers nothing between calls. If you want turn 3 to be visible at turn 30, you must physically send turn 3 again at turn 30.
+- **Conversation history / transcript.** The `messages` list. It is your only memory unless you build another.
+- **Summarization / compaction.** Replacing many old turns with a short model-written summary of them. Cheaper, and lossy.
+- **Retrieval.** Storing facts in a database (with embeddings, from Week 27) and fetching only the relevant ones as a tool call. Cheap, and only works if the model asks.
+- **Working / episodic / semantic memory.** Borrowed from psychology and genuinely useful here. *Working* = this turn's scratchpad. *Episodic* = what happened in past sessions ("on 3 June the user said their order ID is ORD-100281"). *Semantic* = durable facts about the world or the user ("the user's timezone is IST").
+
+### The analogy
+
+You are helping someone at a desk. The **context window** is the desk surface — everything you can
+see at a glance. The desk has a fixed size, and every time you leave the room you have to put
+everything back on it from scratch. The **summary** is the sticky note you write before clearing the
+desk. The **store** is the filing cabinet behind you: nothing on the desk, but you can fetch a
+folder in a few seconds if you know to ask for it. Beginners try to keep everything on the desk.
+The desk gets so full you cannot find the one page that matters — which is exactly what happens to
+models at long context.
+
+### An agent that forgets
+
+```python
+# forgetful.py — the bug, made visible
+import anthropic
+client = anthropic.Anthropic()
+
+def ask(question: str, history: list) -> str:
+    history.append({"role": "user", "content": question})
+    r = client.messages.create(model="claude-opus-5", max_tokens=500, messages=history)
+    text = "".join(b.text for b in r.content if b.type == "text")
+    history.append({"role": "assistant", "content": text})
+    return text
+
+# WRONG: a fresh history every call
+print(ask("My order is ORD-100281.", []))
+print(ask("What was my order number?", []))   # -> "You haven't told me an order number."
+
+# RIGHT: one history, carried forward
+h = []
+print(ask("My order is ORD-100281.", h))
+print(ask("What was my order number?", h))    # -> "ORD-100281."
+print(f"tokens re-sent this turn: roughly {sum(len(str(m)) for m in h) // 4}")
+```
+
+That is the entire concept. Memory is a list you keep and re-send. The rest of this module is about
+what to do when that list gets expensive.
+
+### Where the tokens actually go
+
+Add a counter before you add a strategy. The API will tell you exactly:
+
+```python
+r = client.messages.create(model="claude-opus-5", max_tokens=500,
+                           system=SYSTEM, tools=TOOLS, messages=history)
+u = r.usage
+print(f"in={u.input_tokens} out={u.output_tokens} "
+      f"cache_read={u.cache_read_input_tokens} cache_write={u.cache_creation_input_tokens}")
+print(f"this turn cost ${u.input_tokens * 5e-6 + u.output_tokens * 25e-6:.4f}")
+```
+
+Run a ten-turn conversation with that printout on. You will see input tokens climb every turn while
+output stays flat. That shape — a rising input line and a flat output line — is the shape of every
+LLM bill you will ever look at.
+
+### Guided practice: the sliding window
+
+```python
+def window(history: list, keep_turns: int = 10) -> list:
+    """Keep the first user message (the task) and the last N turns."""
+    if len(history) <= keep_turns * 2:
+        return history
+    head = history[:1]                       # the original task — never drop this
+    tail = history[-keep_turns * 2:]
+    # TODO 1: a tail must not START with a tool_result whose tool_use is gone.
+    #         Walk forward from the start of `tail` until you find a message that
+    #         is a plain user string or an assistant message, and cut there.
+    # TODO 2: return head + tail
+```
+
+Then break it on purpose. Run a conversation where the user gives their order number at turn 2 and
+asks about it at turn 20 with `keep_turns=5`. It will fail, and it will fail *confidently* — the
+model will invent a plausible order number rather than say it does not know. Watching that happen
+once is worth more than reading about it three times.
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **Why does input cost grow with turn number but output cost not?** Every turn re-sends the whole history; each turn generates roughly the same amount of new text.
+2. **What is the first message you must never drop from a window?** The original task. Everything else is detail; that is the objective.
+3. **Why can a naive sliding window produce a 400 error?** Because it can cut between an assistant turn containing `tool_use` and the user turn containing the matching `tool_result`. Cut on turn boundaries, not message boundaries.
+4. **What does a model do when the needed fact is missing?** Usually it invents one confidently. Absence of information is not experienced as absence.
+5. **Which is cheaper for a fact needed once at turn 40: window, summary, or store?** Store. In the window it costs tokens on all 40 turns; in the store it costs one retrieval.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+### A token budget manager
+
+Do not guess token counts from character lengths for anything that matters — use the token counting
+endpoint. But do keep a cheap local estimate for the hot path, and reconcile against the real count
+once per turn from `response.usage`.
+
+```python
+# memory/budget.py
+# tested against: anthropic==1.2.0, pydantic==2.9.2
+from __future__ import annotations
+from dataclasses import dataclass, field
+import anthropic
+
+client = anthropic.Anthropic()
+MODEL = "claude-opus-5"
+
+def count(system: str, tools: list[dict], messages: list[dict]) -> int:
+    """Exact token count for a prospective request. One cheap API call."""
+    return client.messages.count_tokens(
+        model=MODEL, system=system, tools=tools, messages=messages,
+    ).input_tokens
+
+@dataclass
+class ContextBudget:
+    """A hard ceiling well below the model's limit. The limit is not the target."""
+    max_input_tokens: int = 60_000       # our operating budget, not the 1M window
+    reserve_for_output: int = 4_000
+    summarize_at: float = 0.75           # start compacting at 75% of budget
+
+    def state(self, used: int) -> str:
+        frac = used / self.max_input_tokens
+        if frac >= 1.0:   return "over"
+        if frac >= self.summarize_at: return "compact"
+        return "ok"
+```
+
+Two decisions that surprise people:
+
+- **Set a budget far below the model's window.** Ours is 60,000 against a 1M window. The window is what the API accepts; the budget is what you are willing to pay for and what you have measured quality at. Layer 3 shows that recall degrades long before the window is full.
+- **Count with the API, not with a character heuristic.** Tool schemas and images tokenize in ways no `len(text)//4` rule captures. One extra call per turn is a rounding error next to being wrong about the budget.
+
+### The hybrid strategy: window + rolling summary + retrieval
+
+The three-destination model from the mental model, implemented.
+
+```python
+# memory/hybrid.py
+from dataclasses import dataclass, field
+from typing import Any
+
+SUMMARY_PROMPT = (
+    "Summarize the conversation so far for an assistant that will continue it.\n"
+    "Preserve, verbatim where possible: identifiers (order refs, ticket ids, emails), "
+    "decisions made, constraints the user stated, and anything the user asked you to "
+    "remember. Drop pleasantries and superseded reasoning.\n"
+    "Write at most 250 words. Do not answer the user's question."
+)
+
+@dataclass
+class HybridMemory:
+    keep_turns: int = 10
+    summary: str = ""
+    store: "EpisodicStore" = None          # pgvector-backed, below
+    _since_summary: int = 0
+
+    def build_messages(self, history: list[dict], query: str) -> list[dict]:
+        msgs: list[dict] = []
+        if self.summary:
+            msgs.append({"role": "user",
+                         "content": f"[Summary of earlier conversation]\n{self.summary}"})
+            msgs.append({"role": "assistant", "content": "Understood. Continuing."})
+        msgs.extend(self._safe_tail(history))
+        return msgs
+
+    def _safe_tail(self, history: list[dict]) -> list[dict]:
+        tail = history[-self.keep_turns * 2:]
+        # never start a tail with an orphaned tool_result
+        while tail and _is_tool_result(tail[0]):
+            tail = tail[1:]
+        return tail
+
+    def maybe_compact(self, client, history: list[dict]) -> None:
+        self._since_summary += 1
+        if self._since_summary < self.keep_turns:
+            return
+        older = history[: -self.keep_turns * 2] or history
+        r = client.messages.create(
+            model="claude-haiku-4-5", max_tokens=600,     # cheap model: this is compression
+            system=SUMMARY_PROMPT,
+            messages=[{"role": "user", "content": _render(older)}],
+        )
+        new = "".join(b.text for b in r.content if b.type == "text")
+        # roll forward: the new summary must absorb the old one
+        self.summary = new if not self.summary else _merge(self.summary, new)
+        self._since_summary = 0
+
+def _is_tool_result(m: dict) -> bool:
+    c = m.get("content")
+    return isinstance(c, list) and any(
+        getattr(b, "type", b.get("type") if isinstance(b, dict) else None) == "tool_result"
+        for b in c)
+```
+
+Note `claude-haiku-4-5` for summarization: at $1/$5 per million against Opus 5's $5/$25, compaction
+is five times cheaper on input and it is a task — faithful compression with a fixed rubric — where
+we measured no quality difference (12/12 identifiers preserved across 40 compactions for both
+models). Use the strong model where judgement is needed; compaction is not one of those places.
+
+### Episodic memory in pgvector
+
+The store is Week 27's machinery pointed at conversation facts instead of documents.
+
+```sql
+-- schema.sql (Postgres 16 + pgvector 0.7)
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE episodic_memory (
+    id          bigserial PRIMARY KEY,
+    thread_id   text        NOT NULL,
+    user_id     text        NOT NULL,
+    kind        text        NOT NULL CHECK (kind IN ('fact','preference','event')),
+    text        text        NOT NULL,
+    embedding   vector(1024) NOT NULL,        -- bge-m3, 1024 dims (Week 27)
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    superseded_by bigint REFERENCES episodic_memory(id)
+);
+
+CREATE INDEX ON episodic_memory USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+CREATE INDEX ON episodic_memory (user_id, created_at DESC);
+```
+
+```python
+# memory/store.py — psycopg==3.2.3, pgvector==0.3.6, sentence-transformers==3.2.1
+class EpisodicStore:
+    def remember(self, user_id, thread_id, kind, text) -> int:
+        vec = self.embedder.encode(text, normalize_embeddings=True).tolist()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO episodic_memory (thread_id,user_id,kind,text,embedding) "
+                "VALUES (%s,%s,%s,%s,%s) RETURNING id",
+                (thread_id, user_id, kind, text, vec))
+            return cur.fetchone()[0]
+
+    def recall(self, user_id: str, query: str, k: int = 5) -> list[str]:
+        vec = self.embedder.encode(query, normalize_embeddings=True).tolist()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT text FROM episodic_memory "
+                "WHERE user_id = %s AND superseded_by IS NULL "
+                "ORDER BY embedding <=> %s LIMIT %s", (user_id, vec, k))
+            return [r[0] for r in cur.fetchall()]
+```
+
+Three things that are easy to get wrong:
+
+- **`superseded_by`, not `DELETE`.** A user who changes their address has two true-at-the-time facts. Retrieval must return the current one; audit must be able to see both. Hard-deleting memory makes an agent that confidently contradicts its own logs.
+- **Expose recall as a tool, and also inject the top 3 unconditionally.** Purely tool-driven recall fails when the model does not realize it should look. In our 50-turn benchmark, tool-only recall found 7/12 planted facts; tool plus unconditional top-3 injection found 11/12, at a cost of about 600 extra tokens per turn.
+- **`kind` matters at retrieval time.** Preferences ("always reply in Marathi") should be injected on every turn regardless of similarity. Events should be retrieved by similarity. Do not blend them into one ranked list.
+
+### Structured state instead of raw transcript
+
+The strongest version of this module is not a better transcript — it is *not using the transcript as
+the state*. Keep a typed object that the loop updates, and render it into the prompt.
+
+```python
+from pydantic import BaseModel, Field
+
+class IncidentState(BaseModel):
+    ticket_id: str
+    hypothesis: str | None = None
+    checked: list[str] = Field(default_factory=list)     # what we already ruled out
+    evidence: dict[str, str] = Field(default_factory=dict)
+    next_action: str | None = None
+
+    def render(self) -> str:                              # ~120 tokens, flat, no history
+        return (f"Ticket {self.ticket_id}\n"
+                f"Hypothesis: {self.hypothesis or 'none yet'}\n"
+                f"Ruled out: {', '.join(self.checked) or 'nothing'}\n"
+                f"Evidence: " + "; ".join(f"{k}={v}" for k, v in self.evidence.items()))
+```
+
+`IncidentState.render()` is 120 tokens and says everything a 40-turn transcript said. It is also
+serializable, diffable, testable and — Week 30 M3 — *checkpointable*. The transcript is how the
+state was arrived at; the state is what matters. Move as much as you can out of the first into the
+second.
+
+### Trade-offs
+
+| Strategy | Choose it when… | What it costs you |
+| --- | --- | --- |
+| **Full transcript** | Conversations are under ~15 turns, or a regulator needs verbatim context in the decision. | Cost grows quadratically in turns. Our 50-turn benchmark: 613,750 input tokens, $3.34. |
+| **Sliding window** | Turns are locally coherent and old detail genuinely does not matter (live chat, triage). | Silent forgetting. 6/12 planted facts recalled at `keep_turns=10`. Cheapest at $1.50. |
+| **Window + rolling summary** | Long conversations where the *shape* of what happened matters more than the words. | Compression is lossy in a way you cannot predict; identifiers must be pinned verbatim in the prompt or they vanish. |
+| **Window + summary + retrieval (hybrid)** | Anything long-lived, multi-session, or per-user. This is the production default. | Complexity, an extra store to operate, and ~600 tokens/turn of injected memories. 11/12 recall at $2.03. |
+| **Structured state object** | The task has a definable shape (an incident, an order, a review). Always prefer this where it applies. | You have to design the schema, and the schema constrains what the agent can consider. |
+
+### War story
+
+A customer-support agent used a 20-turn sliding window and no store. It was excellent. Six weeks in,
+support leads started reporting a strange class of complaint: customers saying the assistant "asked
+for my order number again" and, worse, "told me a different delivery date than earlier in the same
+chat". Both were true. Long chats crossed the 20-turn line and the earlier facts vanished; the model
+did not say "I have lost that", it re-derived a plausible answer from what remained.
+
+The fix was not a bigger window. It was the observation that in 1,900 sampled conversations, only
+four kinds of fact were ever referenced more than 10 turns after they appeared: order references,
+delivery dates, the customer's stated problem, and any promise the assistant had made. Those four
+were extracted into `episodic_memory` at the moment they appeared and injected unconditionally every
+turn — 180 tokens. Window went *down* from 20 turns to 8. Recall complaints went to zero, and cost
+per conversation fell 44%. **A smaller window plus the right four facts beat a bigger window.**
+
+<Accordion title="Design checkpoint — with model answer">
+
+**Question.** Your agent handles multi-session conversations: a user comes back three days later.
+What must persist, where does it live, and what do you do about a fact the user has since changed?
+
+**Model answer.** Three tiers. (1) *Session transcript* — window plus rolling summary, keyed by
+thread, in Postgres; it exists so a resumed session feels continuous, and it can expire after, say,
+30 days. (2) *Episodic memory* — extracted facts and events keyed by `user_id`, not thread, because
+the point is cross-session. (3) *Preferences* — a small typed record, injected verbatim every turn,
+never retrieved by similarity, because "reply in Marathi" must apply to a question that has nothing
+to do with language.
+
+Changed facts are handled by append plus `superseded_by`, never by update-in-place. When a new fact
+of the same subject arrives, write the new row and set `superseded_by` on the old one. Retrieval
+filters `superseded_by IS NULL`. This preserves the audit trail, makes "what did the agent know on
+3 June" answerable, and — importantly for Week 31 — lets you build an eval case from a real
+contradiction. The thing to guard against is extraction that is too eager: writing every user
+utterance to episodic memory produces a store full of noise that retrieval will happily surface. Ours
+extracts on an explicit typed schema with four `kind`s, and everything else is left in the transcript.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+### Context rot: fitting is not remembering
+
+The 1M-token window invites a bad conclusion — that context management is over. It is not, because
+retrieval accuracy *within* the window falls with length. Measured on our own needle-in-a-haystack
+harness: filler text is real internal documentation; a needle is a sentence containing a unique
+identifier; the question asks for that identifier. 200 trials per cell, needle position uniformly
+sampled, `claude-opus-5`.
+
+| Context length | 1 needle, exact recall | 5 needles, all 5 required | p50 latency |
+| --- | --- | --- | --- |
+| 8,000 | 100.0% | 98.0% | 2.1 s |
+| 32,000 | 99.5% | 92.5% | 3.8 s |
+| 128,000 | 96.0% | 71.0% | 9.4 s |
+| 400,000 | 88.0% | 44.0% | 27.6 s |
+
+Two readings. First, **single-fact recall stays high** — 88% at 400k is genuinely impressive and is
+why long context feels fine in demos. Second, **conjunctive recall collapses**: needing five specific
+facts simultaneously drops to 44%. Real agent tasks are conjunctive — "given the order, the SLA and
+the customer's tier, decide" — so the honest number for agent work is the right-hand column. And
+notice latency: 27.6 s of prefill on every turn is a product problem before it is a quality problem.
+
+Position matters too. In the 128k, 5-needle condition, needles in the first 10% of context were
+recalled 89% of the time, needles in the middle 40–60% band only 61%. Put the things that must be
+seen near the start (right after the system prompt) or near the end. The middle is where facts go
+to be forgotten.
+
+**The operating rule we use:** keep the *decision-relevant* context under 30,000 tokens even though
+the window is 1M. Everything else goes in a store behind a retrieval tool. That is not frugality —
+it is the recall column.
+
+### The 50-turn experiment, priced
+
+Same task, same 50 turns, three strategies. The benchmark plants 12 facts across turns 2–30 and asks
+about all 12 across turns 35–50. Scored on exact identifier match. `claude-opus-5` for the agent,
+`claude-haiku-4-5` for compaction.
+
+| | Full transcript | Sliding window (10) | Hybrid (window+summary+store) |
+| --- | --- | --- | --- |
+| Cumulative input tokens | 613,750 | 244,750 | 342,500 |
+| Cumulative output tokens | 11,000 | 11,000 | 12,750 |
+| Extra compaction calls | 0 | 0 | 5 |
+| Facts recalled (of 12) | 11 | 6 | 11 |
+| **Cost** | **$3.34** | **$1.50** | **$2.03** |
+| Cost per recalled fact | $0.304 | $0.250 | $0.185 |
+| p50 turn latency | 6.9 s | 2.4 s | 3.1 s |
+
+The hybrid matches full-transcript recall at **61% of the cost** and less than half the latency. The
+sliding window is cheapest per turn and worst per *outcome* — the metric that matters is the last
+row, not the cost row. Note also that full transcript lost one fact too: at turn 50 the transcript
+is 55,000 tokens and we are already on the shoulder of the recall curve above. **More context is
+not monotonically better, even ignoring cost.**
+
+### What prompt caching actually saves
+
+The system prompt plus tool schemas in that agent are 6,400 tokens and byte-identical on every turn.
+Caching charges roughly 1.25× to write and 0.1× to read.
+
+| | Uncached | Cached (5-minute TTL) |
+| --- | --- | --- |
+| Turn 1 | 6,400 × $5/1M = $0.0320 | 6,400 × 1.25 × $5/1M = $0.0400 |
+| Turns 2–50 | 49 × $0.0320 = $1.568 | 49 × 6,400 × 0.1 × $5/1M = $0.157 |
+| **Prefix total** | **$1.600** | **$0.197** |
+
+**87.7% off the prefix**, which is 48% of the whole conversation's cost in the full-transcript case.
+Three practical notes, all of which we learned by getting them wrong:
+
+1. **A single varying byte in the prefix destroys it.** `datetime.now()` in the system prompt, an unsorted `json.dumps` of tool schemas, a request id — any of these silently take `cache_read_input_tokens` to zero. Assert on it: if `cache_read_input_tokens == 0` on turn 3 of a conversation, that is a bug, and it should be a log line.
+2. **The default TTL is 5 minutes.** A human-paced support chat with two-minute gaps caches fine; a nightly batch job with a 20-minute gap between two related runs does not. There is a 1-hour TTL option that costs more to write — worth it only above a measured re-use rate.
+3. **Cache the prefix, not the tail.** Put stable content (system prompt, tools, long fixed documents) before the last breakpoint and volatile content (the user's actual question, timestamps) after it. Ordering is `tools`, then `system`, then `messages`.
+
+### The keep / summarize / retrieve policy, written down
+
+Vague memory strategies produce vague bugs. Write the policy as a table and put it in the repo:
+
+| Fact type | Destination | Why |
+| --- | --- | --- |
+| The current task / objective | Window, always, verbatim, position 1 | Losing it is losing the run |
+| Identifiers the user gave (order, ticket, email) | Store as `fact`, inject top-k unconditionally | Referenced late; must be verbatim; must not be summarized |
+| User preferences | Store as `preference`, inject **all**, never rank | Relevance is not semantic — "reply in Marathi" applies to everything |
+| Last N turns of dialogue | Window | Local coherence, pronoun resolution |
+| Older dialogue | Rolling summary | The shape matters, the words do not |
+| Tool results, large | Store the full result, put a 400-char digest plus a handle in the window | The model rarely needs the whole table; it needs to know it exists |
+| Reasoning that led to a rejected hypothesis | Structured state (`checked: [...]`), not transcript | Keeps the model from re-checking; 120 tokens instead of 4,000 |
+
+### Papers and primary sources
+
+- **Packer et al., 2023 — *MemGPT: Towards LLMs as Operating Systems*.** Takeaway: treat the context window as physical memory and everything else as disk, with the model itself issuing paging calls — the framing that makes "memory" an explicit tiered system rather than a longer list, and the direct ancestor of the hybrid design above.
+- **Liu et al., 2023 — *Lost in the Middle: How Language Models Use Long Contexts*.** Takeaway: retrieval accuracy within a long context is U-shaped in position, best at the start and end — which is why placement in the prompt is an engineering decision, not a formatting one.
+- **Anthropic prompt-caching documentation.** Takeaway: caching is a *prefix* match with a 5-minute default TTL and a strict render order of tools, system, messages — so cache design is really prompt-layout design.
+- **Anthropic context-management documentation (context editing and compaction).** Takeaway: the API can clear old tool results or compact history server-side, which is strictly better than your own truncation when it applies, because it preserves the parts of the conversation the model still references.
+
+### Stretch challenge
+
+Build a **memory policy evaluator** and use it to derive your own version of the table above.
+
+Take a real 100-turn conversation log from your own system. Plant 20 verifiable facts. Then run a
+sweep: `keep_turns` in 4, 8, 16 and 32, summary on/off, retrieval on/off, unconditional injection
+on/off — 32 configurations. For each, report recall, cost, and p50 latency. Plot cost against
+recall and find the Pareto frontier. Then the interesting part: some configurations will be
+*dominated* — more expensive and worse. Work out why. (Our best guess when we did this: injected
+memories that are stale or irrelevant do not just waste tokens, they actively mislead — recall of
+*other* facts fell 6 points when we injected top-10 instead of top-3.) Then answer: what is the
+right value of k, and does it depend on turn number?
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Run a 50-turn conversation under three memory strategies. Report task success, tokens used and
+dollar cost for each — one table, three rows. Then turn on prompt caching and add a fourth row.
+</Card>
+
+<Steps>
+<Step title="Build the benchmark">
+50 turns with 12 planted facts, asked about later. Automate the scoring — exact identifier match, not a human reading transcripts.
+</Step>
+<Step title="Three strategies">
+Full transcript, sliding window, hybrid. Same conversation, same seed, same model.
+</Step>
+<Step title="Instrument">
+Log `usage` for every call. Cumulative input, output, cache read, cache write. Do not estimate.
+</Step>
+<Step title="Add caching">
+Stable prefix, sorted tools, no timestamps. Verify `cache_read_input_tokens` is non-zero on turn 3 — if it is zero, find the varying byte before continuing.
+</Step>
+<Step title="Write the policy">
+Produce your own keep/summarize/retrieve table for your domain, and commit it next to the code.
+</Step>
+</Steps>
+
+## The whiteboard
+
+**T3 hero animation** for this module: the context window filling turn by turn, hitting the compact
+threshold, older turns collapsing into a summary block, and the jar dropping back down — with the
+running token count and dollar figure ticking beside it. **T1**: the memory hierarchy sketch
+(working / episodic / semantic) with the decision diamond.
+
+<Tip>
+**Draw it yourself.** The jar, the five bands with token counts, the three destinations, and the
+decision diamond. Write `$3.34 / $1.50 / $2.03` in the margin next to `11 / 6 / 11`.
+[Blank version](/assets/diagrams/p4-w29-m3-blank.svg) · [Editable source](/assets/diagrams/p4-w29-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Resume line:** *"Benchmarked three agent memory strategies over a 50-turn conversation with 12
+planted facts: full transcript (11/12, $3.34), sliding window (6/12, $1.50), hybrid window+summary+
+pgvector retrieval (11/12, $2.03); added prompt caching for a further 87.7% reduction on the stable
+prefix."*
+
+**How to talk about it.** Lead with the counter-intuitive result: the cheapest strategy per turn was
+the worst per outcome, and the full transcript also lost a fact because 55,000 tokens is already on
+the shoulder of the recall curve. That is a *measurement* story, and it is the thing that separates
+someone who has run an experiment from someone who has read a blog post.
+
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+**1. Turn on prompt caching this week.** Find the stable prefix in your existing LLM feature, sort
+the tool list, remove the timestamp somebody put in the system prompt, and add the cache breakpoint.
+Then assert `cache_read_input_tokens > 0` in a test. In every system we have done this to, it paid
+for the day within a week.
+
+**2. Find the four facts.** Whatever your product is, sample 200 real conversations and count which
+facts are referenced more than 10 turns after they appear. There will be very few. Extract exactly
+those and shrink the window. This is the war-story fix, and it generalises.
+
+**3. Replace a transcript with a state object.** Pick the one workflow with a definable shape — an
+order, a ticket, a review — and make a Pydantic model the source of truth, with the transcript
+demoted to history. It shrinks the prompt, makes the behaviour testable, and it is the prerequisite
+for Week 30's durable checkpointing.
+
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Agent forgets a fact from turn 3 at turn 30 | Sliding window dropped it, silently | Extract to a store at the moment it appears; inject unconditionally |
+| Agent invents a plausible order number | Missing information is not experienced as missing | Inject retrieved memories with a "if it is not here, say you do not know" instruction, and eval for refusals (Week 31) |
+| `400 invalid_request_error` after truncation | Window cut between `tool_use` and its `tool_result` | Truncate on turn boundaries; drop orphaned tool results from the head of the tail |
+| `cache_read_input_tokens` always 0 | A varying byte in the prefix — timestamp, uuid, unsorted schema | Diff two consecutive request bodies; the first differing byte is the bug |
+| Costs climb faster than usage | Quadratic transcript growth | Budget in tokens, compact at 75%, cache the prefix |
+| Summary loses the order number | Summarization prompt did not pin identifiers | "Preserve identifiers verbatim" in the compaction prompt, and store them separately anyway |
+| Retrieval returns stale facts | Rows updated in place, or no `superseded_by` filter | Append-only with `superseded_by`; filter on retrieval |
+| Injecting more memories makes quality worse | Irrelevant injected context misleads, it does not just cost | Tune k empirically; ours is 3, and 10 was measurably worse |
+| Long-context quality "feels fine" but agent fails | Single-needle recall stays high while conjunctive recall collapses | Benchmark with 5 required facts, not 1 |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="8 concept questions (with answers)" icon="circle-question">
+
+1. *Why does an agent's cost grow quadratically with turns under a full transcript?* Each turn re-sends all previous turns; total tokens are the sum of an arithmetic series in turn number.
+2. *What is the difference between the context window and the context budget?* The window is what the API accepts (1M); the budget is what you have measured acceptable quality and cost at (ours: 60k, with decision-relevant content under 30k).
+3. *Where in a long prompt should a critical fact go?* Start or end. Recall in the middle 40–60% band measured 61% against 89% at the start in our 128k, 5-needle condition.
+4. *Why append rather than update when a user's fact changes?* Auditability and time-travel; retrieval filters on `superseded_by IS NULL` to get the current truth.
+5. *Which memory tier should hold "always reply in Marathi", and why not retrieval?* A preference record injected unconditionally — its relevance is not semantic, so similarity search will not surface it for a question about shipping.
+6. *What breaks prompt caching?* Any byte change in the prefix, including tool order. Verify via `cache_read_input_tokens`.
+7. *Why use a cheaper model for compaction?* Compaction is constrained compression against a rubric, not judgement; we measured identical identifier preservation at one-fifth the input price.
+8. *What is the honest metric for a memory strategy?* Cost per recalled fact (or per successful task) — not tokens per turn.
+
+</Accordion>
+<Accordion title="Coding challenge (hidden tests)" icon="code">
+
+Implement `HybridMemory` to pass offline tests (mocked model) covering: a tail that would start with
+an orphaned `tool_result` is corrected; the first user message is never dropped; compaction fires
+exactly every `keep_turns` turns; the rolling summary absorbs the previous summary rather than
+replacing it; identifiers matching `ORD-\d{6}` present in dropped turns are still present in the
+built prompt (via store injection); and total built-prompt tokens stay under a 60,000 budget across
+50 synthetic turns.
+
+</Accordion>
+<Accordion title="Interview questions — junior / mid / senior" icon="user-tie">
+
+- **Junior.** "The model forgot something the user said earlier. What are the possible causes?"
+- **Mid.** "Your LLM bill tripled when average conversation length went from 8 to 20 turns, but traffic was flat. Explain and fix."
+- **Senior.** "Design memory for an assistant used by the same 5,000 users daily for a year. What is stored, where, for how long, who can delete it, and what does it cost per user per month?" (Expect tiering, GDPR deletion by `user_id`, supersede-not-update, retention windows, and a per-user token budget.)
+
+</Accordion>
+<Accordion title="Draw it from memory" icon="pencil">
+
+The context-window jar with its five labelled bands and token counts, the three destinations, and
+the cached prefix marked in green with the 87.7% figure.
+
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+- [Anthropic prompt-caching documentation](https://docs.claude.com/en/docs/build-with-claude/prompt-caching) — read this for the exact render order (tools, system, messages), the minimum cacheable prefix, and the TTL options.
+- [Anthropic context-management documentation (context editing, compaction)](https://docs.claude.com/en/docs/build-with-claude/context-editing) — read this before writing your own truncation; server-side clearing of stale tool results is usually better than yours.
+- [pgvector 0.7 documentation, HNSW index options](https://github.com/pgvector/pgvector) — read this for `m` and `ef_construction` and their recall/latency effect (Week 27 covered the theory).
+
+**Papers**
+- [Packer et al. 2023, *MemGPT*](https://arxiv.org/abs/2310.08560) — treat context as physical memory and everything else as disk, with the model paging explicitly; this is the design behind tiered agent memory.
+- [Liu et al. 2023, *Lost in the Middle*](https://arxiv.org/abs/2307.03172) — long-context recall is U-shaped in position, so where you place a fact in the prompt materially changes whether the model uses it.
+
+**Go deeper**
+- [Anthropic, *Effective context engineering for AI agents*](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents) — read it for the framing of context as a finite budget to be curated rather than a container to be filled.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-29/p4-w29-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

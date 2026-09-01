@@ -1,0 +1,136 @@
+---
+title: "Testing, docs & deployment"
+description: "Reference solution — Week 6"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W06-M5`
+
+The exercise is the load-test report. Here is what a 3/3 report contains, using real numbers.
+
+### The sweep
+
+```bash
+for c in 10 25 50 100 200; do
+  ab -n $((c*20)) -c $c -k -q http://127.0.0.1:8111/async-await \
+    | egrep "Requests per second|  50%|  95%|  99%"
+done
+```
+
+| Concurrency | rps | p50 | p95 | p99 |
+| --- | --- | --- | --- | --- |
+| 50 (`async def` + await) | 470 | 58 ms | 263 ms | 308 ms |
+| 100 | 1,224 | 54 ms | 212 ms | 217 ms |
+| 200 | 2,565 | 59 ms | 72 ms | 76 ms |
+| 50 (`def`, threadpool) | 538 | 68 ms | 112 ms | 124 ms |
+| 100 | 587 | 136 ms | 160 ms | 183 ms |
+| 200 | 655 | 279 ms | 302 ms | 309 ms |
+
+### Reading it
+
+The sync curve has a textbook knee between c=50 and c=100: **throughput rose 9% (538 → 587) while
+p50 doubled (68 → 136 ms)**. Past it, latency is linear in concurrency and throughput is pinned.
+
+Little's Law names the constraint without a profiler. At c=200 sync: `L = λW = 655 × 0.279 = 183`
+requests resident. The threadpool holds 40, so **143 are queued**. That single calculation is the
+whole diagnosis, and it takes ten seconds.
+
+The async curve has not bent at c=200 — p50 is 54–59 ms across a 4× range — so its knee is higher
+and the exercise is to find it.
+
+### The one fix, and the re-measure
+
+The fix was changing the handler from `def` to `async def` with an awaitable client. At c=200:
+**655 → 2,565 rps, p50 279 → 59 ms.** A 3.9× throughput gain at one fifth the latency, from one
+keyword and one library swap.
+
+### The pool-exhaustion measurement
+
+40 concurrent 250 ms queries, SQLAlchemy 2.0.36:
+
+| Pool config | Result |
+| --- | --- |
+| `pool_size=2, max_overflow=0, pool_timeout=1s` | **8 of 40 succeeded**; 32 `TimeoutError` |
+| `pool_size=5, max_overflow=0, pool_timeout=1s` | **20 of 40 succeeded**; 20 `TimeoutError` |
+| `pool_size=5, max_overflow=10, pool_timeout=2s` | 40/40 in 1,150 ms |
+| `pool_size=20, max_overflow=10, pool_timeout=2s` | 40/40 in 700 ms |
+
+The pool does not queue forever — it gives up. Half the requests became 500s while the database sat
+idle, which is why this failure is so often misdiagnosed as an application bug.
+
+### The test suite shape
+
+```
+5 endpoint tests via TestClient  -> 0.25 s     (measured)
+```
+
+with `dependency_overrides` for the fake database and a `with TestClient(app)` context manager so
+lifespan runs.
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: reporting the peak instead of the knee.** 655 rps is the sync path's peak and it is
+achieved at p50 279 ms. Quoting it as capacity means promising a number your users experience as
+"the app is slow". Capacity is the knee: about 538 rps at p50 68 ms.
+
+**Wrong turn 2: using the mean.** The mean latency at c=100 sync is not far off c=50's, and the
+knee is invisible in it. Percentiles are not optional — the knee is a *shape* change that only
+p95/p99 shows.
+
+**Wrong turn 3: adding workers before identifying the constraint.** If the bottleneck is the
+database or the connection pool, more workers open more connections to something already saturated
+and throughput *falls*. Little's Law first, then instrument the suspected resource, then change one
+thing.
+
+**Wrong turn 4: measuring your own load generator.** My first attempt used a Python `httpx` async
+client and reported 29.6 rps for an endpoint that `ab` measured at 470. The check that catches it:
+the blocking endpoint must measure near `1 / delay` (16.9 against a theoretical 20). If it does not,
+the client saturated first.
+
+**Wrong turn 5: closed-model load generation.** `ab` and most VU-based tools stop issuing requests
+while stalled, so the worst latencies are never sampled — Gil Tene's coordinated omission. For the
+final report, use `k6`'s constant-arrival-rate executor, which keeps offering load regardless of
+whether the system is keeping up, and expect the p99 to get worse. That is not a regression; it is
+the truth arriving.
+
+## Measured numbers this solution produces
+
+| Claim | Number |
+| --- | --- |
+| Endpoint tests are cheap | 5 tests, 0.25 s, no server, no database |
+| Sync knee | between c=50 and c=100: +9% throughput, +100% p50 |
+| Threadpool ceiling | ~655 rps ≈ 40 threads / 50 ms |
+| Little's Law at c=200 sync | 183 resident, 40 executing, 143 queued |
+| Fix impact | 655 → 2,565 rps; p50 279 → 59 ms (3.9× / 4.7×) |
+| Pool exhaustion | `pool_size=5, timeout=1s`: 20 of 40 requests failed |
+| Max connections risk | 4 workers × (20 + 10) = 120 vs default `max_connections` 100 |
+
+## Grading notes
+
+**A 3/3 on performance**: five concurrency levels, percentiles not means, the knee identified, the
+saturated resource named *with evidence* (Little's Law arithmetic or pool instrumentation), one fix,
+and a re-measure.
+
+**A 3/3 on correctness**: tests pass in randomised order, leave no data behind, finish in under 30
+seconds, and include the cross-tenant 404 check from `P1-W06-M4`.
+
+**A 3/3 on explanation**: distinguishes liveness from readiness and says what breaks if they are
+conflated; and names one thing the report could not determine with the instrumentation available.
+
+**The four most common ways submissions lose points**
+
+1. One concurrency level, so there is no curve and no knee.
+2. Mean latency instead of percentiles.
+3. "We added workers and it got faster" with no identification of what was saturated — sometimes true, always unexplained.
+4. A liveness probe that queries the database. It passes every test and takes the whole fleet down during the first database blip.

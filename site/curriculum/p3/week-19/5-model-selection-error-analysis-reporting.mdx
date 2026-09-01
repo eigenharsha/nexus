@@ -1,0 +1,598 @@
+---
+title: "Model selection, error analysis & reporting"
+description: "Week 19 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+{/* AUTHORED */}
+
+<Note>
+**Week 19 · Module 5 · `P3-W19-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+**Where the numbers on this page come from.** Every table introduced by *Measured* was produced by
+running the code shown, on an Apple M3 Pro (11 cores, 18 GB, macOS arm64, **no GPU**) with
+Python 3.12.9 and numpy 2.5.2, scikit-learn 1.9.0 — the same environment as the rest of Phase 3, so you can
+re-run any of it. Anything introduced by *Derived* is arithmetic, shown term by term; check it with
+a pencil. A result attributed to a paper is that paper's measurement, not ours.
+See [About the numbers](/start/about-the-numbers).
+</Info>
+
+
+## Where this sits
+
+- **Prereqs:** `P3-W19-M1` (metrics), `P3-W19-M3` (honest estimates), `P3-W19-M4` (leakage), Week 12 (the bootstrap)
+- **Unlocks:** `P3-W20` (everything you build there gets reported this way), `P3-W24` (shadow deployment), **`P3-W31` (LLM evals are this module with fuzzier labels)**
+- **One line:** you will produce a report that says what the model does, where it fails, how sure you are, and whether to ship it — and be able to defend every number in it.
+
+## What you'll be able to do
+
+1. Beat the three baselines that matter before claiming anything
+2. Compare two models with a paired bootstrap and report a confidence interval, not a point
+3. Find the slice where a good model is bad, and weight slices by what the business cares about
+4. Write a model card that a reviewer, a regulator and your successor can all use
+5. Explain the offline/online gap and name the three mechanisms that cause it
+6. Make a ship / no-ship recommendation with the uncertainty stated
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w19-m5.svg" alt="Hand-drawn sketch: baselines, slices and the bootstrap interval" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w19-m5-dark.svg" alt="Hand-drawn sketch: baselines, slices and the bootstrap interval" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w19-m5
+tier: T2
+one-sentence-goal: Show that a single headline number hides both the slice where the model fails and the uncertainty in the comparison, and that weighting by what the business values changes the headline.
+elements:
+  - top-left: a ladder of five rungs drawn as a hand-drawn staircase, labelled bottom to top "majority 0.5035 | random 0.4997 | one feature 0.8014 | logistic regression 0.8917 | the model 0.8991", with an amber note beside the third rung "if you cannot beat THIS, stop"
+  - centre: a single large bar labelled "OVERALL 0.8991" drawn confidently, then split by a jagged crack into two unequal bars — a wide one "self-serve 0.9548" and a narrow one "enterprise 0.5842" drawn in red
+  - beneath the two bars, two boxes drawn to scale by REVENUE not by row count, so the enterprise box is nearly a third as wide as the self-serve one, labelled "85% of rows, 70% of revenue" and "15% of rows, 30% of revenue"
+  - big amber margin note pointing at the enterprise bar: "the model is a coin flip on a third of the revenue. the headline never said so."
+  - hand-written under the bars: "revenue-weighted 0.8457. the headline overstates by 5.3 points."
+  - right side: a number line with two dots and whiskers — "all rows +0.0426 [+0.0397, +0.0457]" drawn well clear of a vertical zero line, and "enterprise +0.0331 [+0.0150, +0.0519]" drawn much wider but still clear of zero, with the zero line drawn heavy and labelled "no difference"
+  - bottom strip: three small boxes labelled "OFFLINE 0.98" -> "SHADOW ?" -> "ONLINE ?", the last two empty with a dangling "...and then?" arrow, and a red note "the gap is a measurement, not a surprise"
+numbers-to-write-in: 0.5035 / 0.8014 / 0.8917 / 0.8991, 0.9548 vs 0.5842, 70.4% vs 29.6%, 0.8457, +0.0426 [+0.0397,+0.0457], +0.0331 [+0.0150,+0.0519]
+alt: A hand-drawn sketch with a staircase of baseline scores, a confident overall accuracy bar cracked into a strong self-serve slice and a weak enterprise slice drawn proportional to revenue rather than row count, and a number line showing two bootstrap confidence intervals for a model comparison, both clear of zero but of very different widths.
+*/}
+
+## Why you should care
+
+**For Aarav (student).**
+- Every project you present will be judged on whether you knew what your number meant. "0.89, against a one-feature baseline of 0.80, with a bootstrap interval" is a different sentence from "0.89".
+- Slice analysis is the fastest way to find something interesting to say about a model, which is what interviewers are actually listening for.
+- A model card is a concrete artifact you can put in a repository, and almost no student projects have one.
+
+**For Meera (professional).**
+- The ship/no-ship conversation is the one where technical work becomes a decision, and the person who brings the slice table and the interval usually wins it.
+- This shows up in your job as: two models 0.4 points apart and a week spent arguing about which is better, when a paired bootstrap would have settled it in ten minutes.
+- The revenue-weighted metric in Layer 2 is the single most persuasive thing you can put in front of a commercial stakeholder.
+
+## The mental model
+
+A headline metric is an average, and averages hide two things: **where** the model fails and **how sure** you are. Slicing recovers the first — the model that is excellent overall can be a coin flip on the segment that pays. A bootstrap recovers the second — a difference of half a point between two models is often indistinguishable from noise, and the interval tells you before you spend a sprint on it. A report that shows only a headline is not a report; it is a claim. What ships is a claim, an interval, a slice table, and a stated decision.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+
+### The three baselines you must beat
+
+Before any model claims anything, three numbers go in the table with it. All three take under a minute to compute.
+
+**1. The majority class.** Predict the most common label for everything.
+**2. Random.** Predict labels drawn from the training distribution. This is the floor for AUC.
+**3. The best single feature.** Threshold on one column. This is the one that hurts.
+
+Measured on a 21,000-row test set:
+
+| Model | Accuracy | ROC-AUC |
+| --- | --- | --- |
+| majority class | 0.5035 | 0.5000 |
+| stratified random | 0.4997 | 0.4996 |
+| **single feature `x0`** | **0.8014** | **0.8804** |
+| logistic regression | 0.8917 | 0.9327 |
+| gradient boosting | **0.8991** | **0.9754** |
+
+Read the third row. **One feature and a threshold gets 0.8014 accuracy.** The gradient-boosted model gets 0.8991. So the entire modelling effort — feature engineering, hyperparameter tuning, a boosted ensemble — bought **9.8 accuracy points over a single `if` statement**.
+
+That is a real gain and worth having. But it is a very different sentence from "our model is 90% accurate", and if you had not computed the third baseline you would have said the second sentence.
+
+<Warning>
+The single-feature baseline is the one people skip, and it is the one that most often embarrasses a project. It takes two lines: for each column, threshold at every value and keep the best score. If your model does not clearly beat it, you have not learned anything the business could not have got from a rule.
+</Warning>
+
+### Slices: where a good model is bad
+
+The overall number above is 0.8991. Now split the test set by customer segment:
+
+| Slice | Accuracy | ROC-AUC | Rows | Share of revenue |
+| --- | --- | --- | --- | --- |
+| **overall** | **0.8991** | 0.9754 | 21,000 | 100% |
+| self-serve | 0.9548 | 0.9931 | 17,845 (85.0%) | 70.4% |
+| **enterprise** | **0.5842** | **0.6215** | 3,155 (15.0%) | **29.6%** |
+
+**The model is a coin flip on enterprise customers.** ROC-AUC 0.6215 is barely above chance, and that slice is 15% of the rows and **29.6% of the revenue**.
+
+Nothing in the headline said so. The self-serve slice is 85% of the rows, so it dominates the average, and it is the easy one.
+
+### Weighting by what matters
+
+Accuracy weights every row equally. The business does not. Weight each row by its revenue instead:
+
+```
+unweighted accuracy       0.8991
+revenue-weighted accuracy 0.8457
+```
+
+**The headline overstates performance on the money by 5.3 points.** That single comparison is usually the most persuasive line in a report to a commercial stakeholder, and it is four lines of code:
+
+```python
+import numpy as np
+w = revenue / revenue.sum()
+print("unweighted      :", (preds == y_true).mean())
+print("revenue-weighted:", np.sum(w * (preds == y_true)))
+```
+
+Pick the weight from the decision: revenue, cost, patient-days, transaction value. Whatever the model's mistakes are denominated in.
+
+### How sure are you? The bootstrap
+
+Two models score 0.9754 and 0.9327 AUC. Is the first genuinely better, or did it get a friendlier test set?
+
+The **bootstrap** answers this by simulating other test sets you might have drawn. Resample the test rows *with replacement*, recompute both scores on the resample, take the difference, and repeat a few thousand times. The spread of those differences is your uncertainty.
+
+Crucially it is **paired**: both models are scored on the *same* resample each time, so the shared difficulty of those particular rows cancels out.
+
+```python
+# pip install "numpy==2.5.2" "scikit-learn==1.9.0"
+import numpy as np
+from sklearn.metrics import roc_auc_score
+
+rng = np.random.default_rng(0)
+diffs = []
+for _ in range(4000):
+    i = rng.integers(0, len(y_test), len(y_test))     # SAME indices for both models
+    if y_test[i].sum() in (0, len(i)):
+        continue
+    diffs.append(roc_auc_score(y_test[i], p_a[i]) - roc_auc_score(y_test[i], p_b[i]))
+d = np.array(diffs)
+print(f"difference {d.mean():+.4f}  95% CI [{np.percentile(d, 2.5):+.4f}, {np.percentile(d, 97.5):+.4f}]")
+```
+
+```
+all rows          A 0.9754   B 0.9327   difference +0.0426   95% CI [+0.0397, +0.0457]
+enterprise slice  A 0.6215   B 0.5886   difference +0.0331   95% CI [+0.0150, +0.0519]
+```
+
+Both intervals exclude zero, so both differences are real. But look at the **widths**: ±0.003 on 21,000 rows, ±0.018 on 3,155. **The same size of difference is decisive on the full test set and marginal on the slice**, purely because the slice is smaller. That is the whole reason to report an interval rather than a number.
+
+### Guided practice
+
+1. Compute the majority-class and single-feature baselines for a dataset you already have.
+2. Bootstrap your model's AUC (not a difference) and report the 95% interval.
+3. Slice your test set by any categorical column and find the worst slice with at least 100 rows.
+
+<Accordion title="Answers">
+1. `DummyClassifier(strategy="most_frequent")` and, for the single feature, loop over columns computing `roc_auc_score(y, X[:, j])` and `roc_auc_score(y, -X[:, j])` — you must try both signs, and forgetting the second is a common way to under-report this baseline.
+2. Resample rows, recompute, take the 2.5th and 97.5th percentiles. Note this interval covers *sampling* noise in the test set only — it does not cover the noise from having trained on one particular training set, which is larger and needs repeated retraining to measure.
+3. Sort slices by score ascending and filter to those with enough rows for the estimate to mean anything. With fewer than about 100 rows and a moderate base rate, the interval is wide enough that "worst slice" is mostly noise — report the interval next to it so nobody over-reads a small slice.
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+  <Accordion title="1. Why must the bootstrap be paired?">
+  Because both models face the same rows. An unpaired comparison adds the variance of "which rows were drawn" twice, when it actually cancels. Pairing typically halves the interval width, and it is free.
+  </Accordion>
+  <Accordion title="2. Your model beats the majority baseline by 40 points. Good?">
+  Unknown. The majority baseline is trivial to beat on a balanced problem. The single-feature baseline is the one that tells you whether the model earned its complexity — measured above, it was already at 0.8014.
+  </Accordion>
+  <Accordion title="3. What does a bootstrap interval NOT include?">
+  Training-set variability, model-selection noise, and distribution shift. It answers "if I had drawn a different test set from the same distribution", nothing more. Layer 3 covers what to do about the rest.
+  </Accordion>
+  <Accordion title="4. A slice of 40 rows scores 0.42. Is that a finding?">
+  Not on its own. Bootstrap that slice; with 40 rows the interval will be very wide. Report the interval, and if it comfortably includes the overall score then the slice is not distinguishable from the rest.
+  </Accordion>
+  <Accordion title="5. Which slices should you check?">
+  At minimum: every categorical feature the business names; the deciles of your top numeric feature; time period; and any attribute you are accountable for (region, age band, protected characteristics). Check them all automatically — it is a `groupby` — and read the ones that are large or valuable.
+  </Accordion>
+</AccordionGroup>
+
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+
+### The slice report, generated
+
+Slice analysis should be a function, not an afternoon. The design decision that matters: report **size, metric and interval per slice**, sorted by the metric ascending, so the worst slice is the first thing you see.
+
+```python
+# pip install "numpy==2.5.2" "pandas==3.0.5" "scikit-learn==1.9.0"
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+from sklearn.metrics import roc_auc_score
+
+
+def bootstrap_ci(y, p, metric=roc_auc_score, n_boot: int = 2000,
+                 alpha: float = 0.05, rng=None) -> tuple[float, float, float]:
+    """Percentile bootstrap interval for one metric on one set of predictions."""
+    rng = rng or np.random.default_rng(0)
+    y, p = np.asarray(y), np.asarray(p)
+    point = float(metric(y, p))
+    vals = []
+    for _ in range(n_boot):
+        i = rng.integers(0, len(y), len(y))
+        if len(np.unique(y[i])) < 2:                  # degenerate resample
+            continue
+        vals.append(metric(y[i], p[i]))
+    if not vals:
+        return point, float("nan"), float("nan")
+    return point, float(np.percentile(vals, 100 * alpha / 2)), float(np.percentile(vals, 100 * (1 - alpha / 2)))
+
+
+def slice_report(y, p, slices: dict[str, np.ndarray], weight=None,
+                 metric=roc_auc_score, min_rows: int = 50, n_boot: int = 2000) -> pd.DataFrame:
+    """One row per slice value, sorted worst-first.
+
+    slices : name -> array of slice labels, one per test row
+    weight : optional per-row weight (revenue, cost, exposure)
+    """
+    rows = []
+    overall, lo, hi = bootstrap_ci(y, p, metric, n_boot)
+    rows.append({"slice": "OVERALL", "value": "-", "n": len(y),
+                 "share_rows": 1.0,
+                 "share_weight": 1.0 if weight is not None else np.nan,
+                 "metric": overall, "lo": lo, "hi": hi})
+    for name, labels in slices.items():
+        for v in pd.unique(labels):
+            m = labels == v
+            if m.sum() < min_rows:
+                continue
+            pt, l, h = bootstrap_ci(y[m], p[m], metric, n_boot)
+            rows.append({"slice": name, "value": v, "n": int(m.sum()),
+                         "share_rows": float(m.mean()),
+                         "share_weight": float(weight[m].sum() / weight.sum())
+                                         if weight is not None else np.nan,
+                         "metric": pt, "lo": l, "hi": h})
+    df = pd.DataFrame(rows)
+    head, tail = df.iloc[:1], df.iloc[1:].sort_values("metric")
+    return pd.concat([head, tail], ignore_index=True)
+
+
+def paired_bootstrap(y, p_a, p_b, metric=roc_auc_score, n_boot: int = 4000,
+                     rng=None) -> dict:
+    """Paired percentile bootstrap of metric(A) - metric(B). Same resample for both."""
+    rng = rng or np.random.default_rng(0)
+    y, p_a, p_b = np.asarray(y), np.asarray(p_a), np.asarray(p_b)
+    d = []
+    for _ in range(n_boot):
+        i = rng.integers(0, len(y), len(y))
+        if len(np.unique(y[i])) < 2:
+            continue
+        d.append(metric(y[i], p_a[i]) - metric(y[i], p_b[i]))
+    d = np.asarray(d)
+    return {"a": float(metric(y, p_a)), "b": float(metric(y, p_b)),
+            "diff": float(d.mean()),
+            "lo": float(np.percentile(d, 2.5)), "hi": float(np.percentile(d, 97.5)),
+            "p_a_better": float((d > 0).mean())}
+```
+
+Two design choices worth defending. `min_rows` exists because a slice of 12 rows produces an interval so wide it is not worth printing — and printing it invites somebody to act on it. And the overall row is pinned to the top rather than sorted, so a reader always has the comparison in view.
+
+### The report that gets read
+
+Six sections. This ordering is deliberate: the decision is first because that is what the reader wants, and the caveats are last because that is what they will otherwise skip.
+
+1. **The recommendation**, in one sentence, with the condition attached. "Ship to the self-serve segment only; do not route enterprise accounts through this model."
+2. **The headline metric with its interval**, against the baseline ladder.
+3. **The slice table**, worst-first, with sizes and business weights.
+4. **The comparison** against the incumbent, as a paired bootstrap interval.
+5. **The operating point**: the threshold, how it was chosen, and the confusion matrix there.
+6. **What would change the recommendation.** Which assumption, if wrong, flips the decision.
+
+Section 6 is the one that turns a report into a document somebody can act on. "This assumes the enterprise segment stays at 30% of revenue; above 40% the revenue-weighted number falls below the incumbent and we should not ship."
+
+### Model cards
+
+A **model card** (Mitchell et al., 2019) is a short structured document that travels with the model. It answers the questions a reviewer, a regulator and your replacement all need, and it is the artifact most likely to still be useful in two years.
+
+```markdown
+# Model card: churn-scorer v1.4
+
+## Intended use
+Rank active subscribers by 30-day churn risk, scored 00:05 UTC on the 1st.
+Consumed by: retention team's weekly call list, capacity 300.
+
+## Out of scope
+Individual pricing. Credit decisions. Anything where a false positive is
+consequential to the customer without human review.
+
+## Training data
+events.subscriptions, 2023-01-01 to 2025-06-30. 412,338 rows, 26.5% positive.
+Known issues: 11 rows with tenure=0 have TotalCharges set to 0, not imputed.
+Excluded: accounts closed for fraud (different process).
+
+## Metrics
+Held-out test set, 2025-07-01 to 2025-09-30, touched once.
+ROC-AUC 0.849 [0.841, 0.857]; PR-AUC 0.656; Brier 0.134; precision@300 0.687.
+Baselines: majority 0.735 accuracy; existing rules precision@300 0.603.
+
+## Slices                     <- the section reviewers actually read
+| slice          | n     | share of revenue | AUC   | 95% CI          |
+| self-serve     | 17845 | 70.4%            | 0.993 | [0.992, 0.994]  |
+| enterprise     |  3155 | 29.6%            | 0.622 | [0.601, 0.642]  |
+WORST SLICE: enterprise. The model is near chance on 29.6% of revenue.
+
+## Ethical considerations
+`region` and `plan_tier` correlate with income. Not used directly; both are
+recoverable from the retained features. Slice metrics by region reported above.
+Harm from a false positive: an unnecessary discount offer. Low.
+
+## Caveats and recommendations
+save_rate is unmeasured; the business case assumes 0.20 and breaks even at 0.156.
+Do not use for enterprise accounts. Re-evaluate quarterly or on any upstream
+schema change.
+
+## Version
+sklearn 1.9.0, xgboost 2.1.4, python 3.12.9. git 4f2a9c1. Owner: @retention-ml.
+```
+
+The section that changes behaviour is **Slices**, because it is where a model card stops being paperwork. A card without a worst-slice line is a brochure.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **Bootstrap on a hold-out** vs **repeated CV** | you have a real hold-out and want the test-set sampling interval | you want to include training-set variability, which the bootstrap on a fixed model cannot see |
+| **Paired** vs **unpaired bootstrap** | always, when comparing two models on the same test set | never — unpaired throws away the pairing and roughly doubles the interval |
+| **Unweighted** vs **business-weighted metric** | rows genuinely are equally important | they are not — measured, revenue weighting moved the headline 5.3 points |
+| **Ship on the overall metric** vs **ship per slice** | performance is uniform across slices you care about | it is not — then ship to the slices where it works and say so |
+| **A single number** vs **an interval** | never | always, and especially on slices, where the interval is 6x wider |
+
+### Error analysis: the loop
+
+Slicing tells you *where*. Error analysis tells you *why*, and it is manual work that nothing automates.
+
+1. **Sample 50 errors from the worst slice.** Not the worst 50 — a random 50, or you will only see the confident mistakes.
+2. **Read them.** Yes, actually read the rows. Put them in a spreadsheet next to the prediction and the label.
+3. **Tag each with a cause.** Ambiguous label, missing feature, distribution shift, genuinely hard, label error.
+4. **Count the tags.** The distribution tells you what to fix. If 40% are label errors, no modelling will help and the next project is a labelling project.
+5. **Re-check after the fix** on the same 50 rows.
+
+The single most common finding from this loop, in practice, is that a substantial fraction of "errors" are label errors — which means your metric has a ceiling below 1.0 that nobody has computed.
+
+### War story: the 92% that shipped and was switched off
+
+*A modelled composite — assembled from recurring patterns rather than one company, with illustrative figures. The mechanism is real and the measured tables elsewhere on this page are unaffected; the incident is not a case study. See [About the numbers](/start/about-the-numbers).*
+
+A B2B SaaS company built a model to predict which trial accounts would convert, so sales could prioritise outreach. Test accuracy 0.92, comfortably above the 0.70 anyone expected. It shipped to the sales team's queue.
+
+Six weeks later the enterprise reps had stopped using it. The self-serve reps loved it.
+
+The slice table nobody had built:
+
+| Slice | Accuracy | AUC | Rows | Revenue |
+| --- | --- | --- | --- | --- |
+| overall | 0.8991 | 0.9754 | 21,000 | 100% |
+| self-serve | 0.9548 | 0.9931 | 85.0% | 70.4% |
+| enterprise | **0.5842** | **0.6215** | 15.0% | **29.6%** |
+
+Self-serve conversion is nearly deterministic — a few product-usage signals predict it almost perfectly, which is why the overall number looked so good. Enterprise conversion depends on procurement cycles, champion turnover and competitive bake-offs, none of which were in the feature set. The model was a coin flip on the accounts worth the most money, and the 85%-of-rows self-serve segment had carried the average.
+
+The revenue-weighted accuracy was **0.8457** — 5.3 points below the headline — and even that understated it, because it still averaged the good slice with the bad one.
+
+Three changes. The model was scoped to self-serve only, in the model card's *Intended use* section, and the enterprise queue went back to the reps' own judgement. A separate enterprise project started with an explicit data-collection phase, because the honest finding was that the necessary features did not exist. And slice reporting by segment and by revenue decile became mandatory in the review template, generated automatically.
+
+The lesson: **the headline metric is an average over a population, and the population is almost never the thing you care about.** A model that is 90% accurate overall and 58% accurate on a third of the revenue is two models, and only one of them should ship.
+
+### Design checkpoint
+
+> Two models. A scores 0.8412 AUC, B scores 0.8389. B is already in production; A takes 4x the compute. What do you recommend?
+
+<Accordion title="Model answer">
+Run the paired bootstrap first — everything else depends on it. A difference of 0.0023 on a typical hold-out will almost certainly have an interval spanning zero, in which case the recommendation is **keep B**, and the reason is not "the difference is small" but "the difference is not established". Say it that way; it is more defensible and it stops the argument.
+
+If the interval does exclude zero, the recommendation is still probably keep B, and now for cost reasons: quantify the 4x compute in currency per month and set it against 0.0023 AUC converted into the business metric at the actual operating point. Very often 0.002 AUC is worth nothing at a fixed capacity — check by computing precision@k for both, which is the number the operator experiences and which may show no difference at all.
+
+Then two things that could change the answer, both worth checking before closing it out. Slice the comparison: if A is uniformly a touch better it is uninteresting, but if A is much better on one valuable slice and slightly worse elsewhere, the right answer might be to route that slice to A. And check calibration if anything downstream multiplies the probability by money — a model with the same AUC and better Brier is genuinely better for that consumer, and AUC will never show it.
+
+Finally, whatever you recommend, write down what would change it. "If the enterprise slice grows past 40% of revenue, re-run this comparison" is the sentence that stops the question being reopened from scratch in six months.
+</Accordion>
+
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+
+### What the bootstrap interval does not cover
+
+A percentile bootstrap over test rows answers exactly one question: *if I had drawn a different test set of the same size from the same distribution, how much would this number move?* Three other sources of variance are usually larger and it sees none of them.
+
+**Training-set variability.** Refit the same procedure on a different training sample and you get a different model. On small datasets this dominates: Week 19 Module 3 measured a single-split estimate at standard deviation 0.0116 against a 5-fold mean's 0.0032, and most of that gap is training variability, not test variability. To measure it you must retrain — repeated CV, or a bootstrap over the *training* set with refitting, which costs `n_boot` fits.
+
+**Model-selection noise.** If you chose this model from twenty candidates by comparing them on the same test set, the winner's score is the maximum of twenty noisy estimates. Module 3 measured that optimism at +0.63 accuracy points on a real dataset and **+1.96 points on pure noise**. The bootstrap on the winner cannot see it.
+
+**Distribution shift.** The bootstrap assumes the test rows are exchangeable with production rows. If they are not — and Module 3's adversarial validation exists to tell you — the interval is a precise statement about the wrong population.
+
+So the honest hierarchy: report the bootstrap interval, and state that it covers test sampling only. If the decision is expensive, spend the compute to measure training variability too. And never report an interval so narrow that it implies more certainty than the model-selection process warrants.
+
+### Correcting for multiple comparisons, and when not to
+
+If you slice by ten features with five values each, you have computed fifty intervals, and about two or three will exclude zero by chance alone at the 95% level. Reporting the worst slice without acknowledging that is a form of the same selection bias as tuning on the test set.
+
+Three options, in increasing order of conservatism:
+
+- **Report all slices, sorted, with intervals.** Let the reader see that you looked at fifty. This is usually enough and it is what the `slice_report` function above does by construction.
+- **Bonferroni**: multiply each p-value by the number of comparisons, or equivalently widen each interval to `1 - alpha/m`. Simple, very conservative, and fine when `m` is small.
+- **Benjamini-Hochberg** false discovery rate control when `m` is large. Controls the expected proportion of false findings rather than the probability of any, which is the right trade for exploratory slicing.
+
+The counter-argument, which is often correct in practice: if a slice is *pre-specified* because the business named it — enterprise customers, a regulated region, a protected group — it is not a multiple comparison at all. It is one hypothesis you were always going to test. **Pre-specify the slices that matter in the model card before you look**, and treat everything else as exploratory.
+
+### The offline/online gap
+
+The most consistent finding in applied ML is that the online number is worse than the offline one. Three mechanisms, and they need different fixes.
+
+**1. Training/serving skew.** The feature computed in the training pipeline differs from the feature computed in the serving pipeline — a different default for nulls, a different time window, a different join. This is the largest and most common cause, and Week 20 Module 5 is entirely about preventing it. **Detection:** log the serving feature vector, replay it against the training pipeline for the same entity and timestamp, and diff. Any non-zero diff rate is the finding.
+
+**2. Distribution shift between the training window and now.** Measurable *before* deployment with adversarial validation (Module 3), which returned AUC 0.7902 on a three-feature shift against a 0.5070 no-shift control.
+
+**3. The feedback loop.** The model changes the world it predicts. A churn model that triggers retention offers reduces churn among the people it flags, so its own future training data shows those people not churning, and the model learns they were never at risk. **Detection:** you cannot, from observational data. You need a holdout — a small randomised fraction of flagged customers who deliberately receive no intervention. That holdout is expensive, unpopular, and the only way to keep measuring the model's real effect after it starts working.
+
+The practical protocol: **shadow deploy first.** Run the model on live traffic, log its predictions, take no action, and compare against the offline number on the same rows after the labels mature. The gap you measure there is real and free. Then A/B test the *decision*, not the model — because what you care about is whether acting on the score changes the outcome, which no offline metric can tell you.
+
+### Statistical comparison beyond the bootstrap
+
+For classifiers evaluated on the same test set there is a classical alternative worth knowing. **McNemar's test** works on the 2x2 table of disagreements: `b` = rows A got right and B got wrong, `c` = the reverse. Under the null the statistic `(|b - c| - 1)^2 / (b + c)` is chi-squared with one degree of freedom. It uses only the disagreements, which is exactly the pairing insight, and Dietterich (1998) recommends it as the test with acceptable Type I error for comparing two classifiers on a single test set.
+
+Its limitations are why the bootstrap is usually the better default: it applies to hard predictions only, so it says nothing about AUC or calibration; and it tests a hypothesis rather than producing an interval, which is less useful for a decision. **Report an interval; use McNemar's when a reviewer wants a p-value.**
+
+Across multiple datasets — comparing model *families* rather than two fitted models — the right procedure is the Friedman test with a Nemenyi post-hoc, as laid out by Demšar (2006). That is the procedure benchmark papers should use and mostly do not.
+
+### Regression testing for models
+
+A model is code, and code gets regression tests. Three that are cheap and catch real failures:
+
+- **Golden predictions.** Freeze 1,000 rows and their predictions. Assert the refit model's predictions on them are within a tolerance. This catches library upgrades, preprocessing changes and silent schema drift. Set the tolerance from measured run-to-run noise, not from a guess.
+- **Slice floors.** Assert every pre-specified slice's metric is above a threshold. A refit that improves overall while destroying a slice is a common and otherwise invisible regression.
+- **Invariance and directional tests.** Assert that a prediction does not change when an irrelevant field changes, and that it moves in the expected direction when a monotone driver increases. Ribeiro et al.'s CheckList (2020) formalised this for NLP; the idea generalises to tabular models and it is the direct ancestor of the LLM eval suites you will build in Week 31.
+
+**This is where Phase 3 hands off to Phase 4.** An LLM eval suite is exactly this module: baselines, slices, intervals, and a frozen set of cases with expected behaviour. The labels are fuzzier and the metric is a judge model, but the discipline is identical, and teams that skip it there are making the same mistake as teams that report a single accuracy number here.
+
+### Failure modes
+
+| Failure | Signature | Detector |
+| --- | --- | --- |
+| No single-feature baseline | a complex model whose gain over a rule was never measured | loop over columns, threshold each, keep the best; report it |
+| Headline hides a bad slice | stakeholders in one segment stop using the model | automatic slice report, sorted worst-first, with business weights |
+| Difference of 0.002 shipped as an improvement | a sprint spent on a change inside the noise | paired bootstrap; if the interval crosses zero, say "not established" |
+| Worst slice is noise | a tiny slice reported as a finding | `min_rows`; report the interval next to the slice metric |
+| Fifty slices, three "significant" | multiple comparisons | pre-specify slices; Benjamini-Hochberg for the exploratory rest |
+| Offline 0.98, online 0.71 | training/serving skew | replay serving feature vectors through the training pipeline and diff |
+| Model works, then stops working | feedback loop — the model changed its own training data | a permanent randomised holdout, sized before launch |
+| A refit quietly broke one segment | overall metric flat, slice metric collapsed | slice floors as assertions in CI |
+
+### Papers
+
+- **Mitchell, M. et al. (2019), "Model Cards for Model Reporting," FAccT.** *Takeaway:* a short structured document with an explicit disaggregated-performance section makes the "works overall, fails for a subgroup" failure visible by default rather than by luck.
+- **Dietterich, T. (1998), "Approximate Statistical Tests for Comparing Supervised Classification Learning Algorithms," Neural Computation 10(7).** *Takeaway:* most common comparison procedures have badly inflated Type I error; McNemar's test and 5x2-fold CV are the two with acceptable behaviour.
+- **Demšar, J. (2006), "Statistical Comparisons of Classifiers over Multiple Data Sets," JMLR 7.** *Takeaway:* for comparing algorithms across datasets, use the Friedman test with a Nemenyi post-hoc rather than averaging scores or running pairwise t-tests.
+- **Ribeiro, M. T. et al. (2020), "Beyond Accuracy: Behavioral Testing of NLP Models with CheckList," ACL.** *Takeaway:* a held-out accuracy number hides systematic behavioural failures that targeted invariance and directional tests expose — the design pattern behind every serious eval suite, including Week 31's.
+- **Sculley, D. et al. (2015), "Hidden Technical Debt in Machine Learning Systems," NeurIPS 28.** *Takeaway:* feedback loops and undeclared consumers make a deployed model's measured performance a moving target, so the monitoring plan is part of the model, not an afterthought.
+- **Barocas, S., Hardt, M., Narayanan, A. (2023), *Fairness and Machine Learning*, Chapter 3.** *Takeaway:* the common group-fairness criteria are mutually incompatible except in degenerate cases, so slice reporting must be accompanied by an explicit statement of which criterion you chose and why.
+
+### Stretch challenge
+
+Produce a **slice report showing a model that is 92% overall but 61% on a segment that is 30% of revenue**, then take it to the decision. Build or find such a dataset — the construction in this module uses a segment where the signal is genuinely weaker, which is the realistic mechanism, not a labelling artifact.
+
+Then go further than the report. Compute the **decision-loss** version: apply the model's ranking at a fixed capacity, apply the observed outcomes, and report expected value overall and per slice. Then answer the open question: **is it better to ship one model to everyone, ship to the good slice only, or train a separate model for the weak slice?** Quantify all three, including the cost of maintaining two models, and state what the weak-slice model would need to score to be worth building.
+
+There is no single right answer — the interesting part is that "ship to the good slice only" is frequently correct and is almost never the option that gets proposed, because it feels like an admission of failure rather than what it is, which is scoping.
+
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Produce a slice report showing a model that is strong overall and weak on a high-value segment, then write the ship/no-ship recommendation.
+</Card>
+
+<Steps>
+  <Step title="Build the baseline ladder">
+  Majority, random, best single feature, incumbent (if any), your model. One table. The single-feature row is mandatory.
+  </Step>
+  <Step title="Generate the slice report">
+  Every categorical feature plus deciles of your top numeric feature. Sorted worst-first, with `n`, share of rows, share of business weight, metric and 95% bootstrap interval. Enforce `min_rows`.
+  </Step>
+  <Step title="Compare with a paired bootstrap">
+  Against the incumbent, overall and on the worst slice. Report both intervals and note how much wider the slice one is.
+  </Step>
+  <Step title="Write the recommendation">
+  One sentence with the scope condition, then the number that supports it, then the one assumption that would flip it.
+  </Step>
+</Steps>
+
+Time box: **3 hours**. Acceptance: a slice table with intervals, a paired bootstrap interval against the incumbent, and a recommendation containing a scope condition and a named assumption.
+
+## The whiteboard
+
+T2 build-up, four frames: (1) the baseline staircase with the single-feature rung highlighted; (2) the overall bar cracking into two slices; (3) the same two slices redrawn to scale by revenue; (4) the two bootstrap intervals on a number line with zero marked.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p3-w19-m5-blank.svg) · [Editable source](/assets/diagrams/p3-w19-m5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+  **Resume line:** "Built an automated slice report with bootstrap confidence intervals; identified a segment holding 29.6% of revenue where the model performed at 0.62 AUC against a 0.98 headline, and scoped the deployment accordingly."
+  **Interview move:** when presenting a result, lead with the baseline ladder and the worst slice rather than the headline. "0.90 overall, against 0.80 from a single feature, and 0.58 on the segment that is a third of revenue." That is a much more interesting first sentence than a metric.
+  **Portfolio:** a model card in the repository. Almost no student projects have one, and it takes an hour.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+  1. **Add the single-feature baseline** to your team's evaluation template. It is two lines and it occasionally ends a project, which is a good outcome delivered early.
+  2. **Automate the slice report** for your main model and put it in the weekly review. Sorted worst-first, weighted by revenue. Expect the first run to find something.
+  3. **Replace point comparisons with paired bootstrap intervals** in any model-vs-model discussion. It converts "I think A is better" into "the difference is +0.004 with an interval crossing zero", which ends the argument in the right way.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| "90% accurate" with no context | no baseline ladder | majority, random, and best single feature in the same table |
+| Model abandoned by one team | a slice where it fails, never reported | automatic slice report weighted by business value |
+| A sprint spent on a 0.002 gain | no interval on the comparison | paired bootstrap; if it crosses zero, "not established" |
+| A tiny slice reported as a finding | no minimum size, no interval | `min_rows`; always print the interval |
+| Several "significant" slices out of fifty | multiple comparisons | pre-specify the slices that matter; FDR-control the rest |
+| Offline 0.98, online 0.71 | training/serving skew | replay serving features through the training pipeline and diff |
+| Model's measured effect fades | feedback loop | a permanent randomised holdout, sized before launch |
+| Refit broke one segment silently | no per-slice regression test | slice floors as CI assertions |
+
+## Assessment
+
+**Concept questions (8).**
+1. Name the three baselines and say which one most often embarrasses a project.
+2. Why must a model comparison bootstrap be paired?
+3. Overall accuracy is 0.8991 and revenue-weighted is 0.8457. What does the gap mean?
+4. Your worst slice has 40 rows and scores 0.42. What do you report?
+5. What three sources of variance does a test-set bootstrap not cover?
+6. When is slicing not a multiple-comparisons problem?
+7. Name the three mechanisms behind the offline/online gap and the detection for each.
+8. Why can a feedback loop only be measured with a randomised holdout?
+
+**Coding challenge.** Implement `slice_report(y, p, slices, weight, metric, min_rows, n_boot)` returning a DataFrame sorted worst-first with `n`, row share, weight share, metric and a 95% interval, plus `paired_bootstrap(y, p_a, p_b, metric)`. Hidden tests: on synthetic data with a known 15-point slice gap, the report must place the weak slice first and its interval must exclude the overall value; and the paired interval must be at least 30% narrower than an unpaired one on the same data.
+
+**Interview questions.**
+- *Junior:* "Your model is 95% accurate. What else do I need to know?"
+- *Mid:* "Two models differ by 0.003 AUC. How do you decide?"
+- *Senior:* "A model performs well overall and badly on your most valuable customer segment. Walk me through the decision and what you would put in front of the exec."
+
+**Draw from memory.** The baseline staircase, the cracked overall bar with both slices drawn to revenue scale, and the two intervals against a zero line.
+
+## Sources & further reading
+
+**Primary docs**
+- [scikit-learn 1.9 `DummyClassifier` / `DummyRegressor`](https://scikit-learn.org/stable/modules/model_evaluation.html#dummy-estimators) — read this for the baseline strategies and which metric each is optimal under.
+- [scikit-learn 1.9 "Model evaluation" — multi-metric and per-slice scoring](https://scikit-learn.org/stable/modules/model_evaluation.html) — read this for `cross_validate` with multiple scorers, which is the cheapest way to get a slice table out of cross-validation.
+- [scipy 1.18 `scipy.stats.bootstrap`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.stats.bootstrap.html) — read this for BCa intervals, which are better than the percentile method when the statistic is skewed.
+
+**Papers**
+- [Mitchell, M. et al. (2019), "Model Cards for Model Reporting," *FAccT*.](https://doi.org/10.1145/3287560.3287596) *Takeaway:* disaggregated performance as a required section makes subgroup failures visible by default.
+- [Dietterich, T. (1998), "Approximate Statistical Tests for Comparing Supervised Classification Learning Algorithms," *Neural Computation* 10(7).](https://doi.org/10.1162/089976698300017197) *Takeaway:* most common comparison tests have inflated Type I error; McNemar's is one of the two that do not.
+- [Demšar, J. (2006), "Statistical Comparisons of Classifiers over Multiple Data Sets," *JMLR* 7.](https://jmlr.org/papers/v7/demsar06a.html) *Takeaway:* Friedman plus Nemenyi is the correct procedure across datasets.
+- [Ribeiro, M. T. et al. (2020), "Beyond Accuracy: Behavioral Testing of NLP Models with CheckList," *ACL*.](https://doi.org/10.18653/v1/2020.acl-main.442) *Takeaway:* targeted invariance and directional tests expose failures a held-out metric cannot see.
+- [Sculley, D. et al. (2015), "Hidden Technical Debt in Machine Learning Systems," *NeurIPS 28*.](https://papers.nips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html) *Takeaway:* feedback loops make measured performance a moving target; monitoring is part of the model.
+- [Barocas, Hardt & Narayanan (2023), *Fairness and Machine Learning*, Ch. 3.](https://fairmlbook.org/) *Takeaway:* group-fairness criteria are mutually incompatible, so state which one you chose.
+
+**Go deeper**
+- Efron, B. & Tibshirani, R., *An Introduction to the Bootstrap* (1993), Chapters 12–14. Read it for percentile versus BCa intervals and the conditions under which each is trustworthy — about 30 pages, and it is the difference between using the bootstrap and understanding it.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-19/p3-w19-m5">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

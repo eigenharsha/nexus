@@ -1,0 +1,168 @@
+---
+title: "SQL II: analytical SQL"
+description: "Reference solution — Week 7"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W07-M4`
+
+The exercise: a monthly cohort-retention matrix in one query, plus the invariant test.
+
+### The query
+
+```sql
+WITH first_order AS (
+  SELECT customer_id, date_trunc('month', min(placed_at)) AS cohort
+  FROM   orders
+  WHERE  status <> 'cancelled'                 -- SAME filter as the activity CTE below
+  GROUP  BY 1),
+act AS (
+  SELECT f.cohort, o.customer_id,
+         (extract(year  FROM age(date_trunc('month', o.placed_at), f.cohort)) * 12
+        + extract(month FROM age(date_trunc('month', o.placed_at), f.cohort)))::int AS m
+  FROM   orders o
+  JOIN   first_order f USING (customer_id)
+  WHERE  o.status <> 'cancelled')              -- SAME filter. This is the whole bug class.
+SELECT cohort::date AS cohort,
+       count(DISTINCT customer_id) FILTER (WHERE m = 0) AS cohort_size,
+       round(100.0 * count(DISTINCT customer_id) FILTER (WHERE m = 1)
+                   / count(DISTINCT customer_id) FILTER (WHERE m = 0), 1) AS m1_pct,
+       round(100.0 * count(DISTINCT customer_id) FILTER (WHERE m = 2)
+                   / count(DISTINCT customer_id) FILTER (WHERE m = 0), 1) AS m2_pct,
+       round(100.0 * count(DISTINCT customer_id) FILTER (WHERE m = 3)
+                   / count(DISTINCT customer_id) FILTER (WHERE m = 0), 1) AS m3_pct,
+       round(100.0 * count(DISTINCT customer_id) FILTER (WHERE m = 6)
+                   / count(DISTINCT customer_id) FILTER (WHERE m = 0), 1) AS m6_pct
+FROM   act
+GROUP  BY 1
+ORDER  BY 1;
+```
+
+Real output on 749,741 orders from 150,000 customers, **2,328 ms**:
+
+```
+   cohort   | cohort_size | m1_pct | m2_pct | m3_pct | m6_pct
+------------+-------------+--------+--------+--------+--------
+ 2024-01-01 |       15063 |   63.1 |   50.2 |   38.3 |   17.2
+ 2024-02-01 |       14439 |   66.7 |   47.2 |   38.6 |   17.7
+ 2024-03-01 |       15590 |   65.2 |   49.2 |   38.7 |   17.6
+ 2024-04-01 |       14901 |   67.0 |   47.6 |   39.0 |   18.0
+ 2024-05-01 |       15486 |   65.2 |   49.6 |   39.1 |   17.4
+```
+
+### The invariant test — the actual deliverable
+
+```sql
+-- Retention is monotonically non-increasing by construction.
+-- If this returns any rows, the query is wrong.
+WITH matrix AS ( /* the query above */ )
+SELECT cohort, m1_pct, m2_pct, m3_pct, m6_pct
+FROM   matrix
+WHERE  m1_pct > 100
+   OR  m2_pct > m1_pct
+   OR  m3_pct > m2_pct
+   OR  m6_pct > m3_pct;
+```
+
+Run it in CI against a fixed fixture. It is four lines and it catches the entire class of cohort
+bugs — including the 112% retention in the module's war story, which came from defining the cohort
+over non-cancelled orders and the activity over all orders.
+
+### The other four patterns, verified
+
+```sql
+-- ROWS vs RANGE, on (1,1,2,3,3,4) with a 1-preceding frame
+ x | rows_frame | range_frame
+---+------------+-------------
+ 1 |          1 |           2
+ 1 |          2 |           2
+ 2 |          3 |           4
+ 3 |          5 |           8
+ 3 |          6 |           8
+ 4 |          7 |          10
+```
+
+```sql
+-- Dedup: 9,997 rows -> 1,999 in 3.8 ms
+SELECT count(*) AS total, count(*) FILTER (WHERE rn = 1) AS kept FROM (
+  SELECT id, row_number() OVER (PARTITION BY customer_id ORDER BY placed_at DESC, id DESC) rn
+  FROM orders WHERE customer_id < 2000) t;
+--  total | kept
+--   9997 | 1999
+```
+
+```sql
+-- Running total + 3-month moving average: 85.7 ms
+SELECT month, revenue,
+       sum(revenue) OVER (ORDER BY month ROWS UNBOUNDED PRECEDING) AS running_total,
+       round(avg(revenue) OVER (ORDER BY month ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)) AS ma3
+FROM (SELECT date_trunc('month', placed_at)::date AS month, sum(total_cents) AS revenue
+      FROM orders WHERE status = 'paid' GROUP BY 1) m ORDER BY month;
+```
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: different filters for cohort and activity.** This is the 112% bug. If the cohort is
+defined over non-cancelled orders and activity over all orders, a customer whose first order was
+cancelled lands in a later cohort than their first activity month — and appears in month 1 of a
+cohort that never counted them in month 0. Roughly 12% of customers were in that state in the real
+incident. **One filtered set, used for both.**
+
+**Wrong turn 2: omitting the frame on a running total.** With `ORDER BY month` and no frame clause,
+the default is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`. `RANGE` groups tied values, so
+if two rows share a month the running total jumps by both at once. Verified on
+`(1,1,2,3,3,4)`: `ROWS` gives 1,2,3,5,6,7 and `RANGE` gives 2,2,4,8,8,10 — **every value differs.**
+Write `ROWS UNBOUNDED PRECEDING` explicitly.
+
+**Wrong turn 3: deduplicating without a tiebreaker.** `ORDER BY placed_at DESC` alone means two rows
+with the same timestamp are ordered arbitrarily, so the query returns a different row on different
+runs. Add `, id DESC`. This bug reproduces intermittently, which makes it expensive.
+
+**Wrong turn 4: exporting to Pandas.** Measured on 3,000,000 order items producing 20,000 groups:
+SQL 127 ms, pure Python 1,220 ms, Pandas 1,826 ms, `COPY` plus `read_csv` 2,357 ms. SQL is
+**14.4× faster than Pandas** and moves 20,000 rows over the wire instead of 3,000,000. The honest
+caveat, which a 3/3 answer includes: this ratio depends on the aggregation reducing rows heavily,
+and Arrow-native transfer narrows the pull cost considerably.
+
+**Wrong turn 5: `WHERE rn <= 3` in the same query level.** Window functions are evaluated after
+`WHERE`. Compute the rank in a CTE and filter outside it.
+
+## Measured numbers this solution produces
+
+| Claim | Number |
+| --- | --- |
+| Cohort matrix, 749,741 orders / 150,000 customers | 2,328 ms |
+| Retention shape produced | m1 63–67%, m2 47–50%, m3 38–39%, m6 17–18% |
+| Top-3-per-category: window vs correlated subquery | 330 ms vs cancelled at 5 min 07 s |
+| Running total + 3-month MA | 85.7 ms |
+| Dedup with `ROW_NUMBER` | 9,997 → 1,999 in 3.8 ms |
+| Aggregate in SQL vs Pandas (3M rows → 20k groups) | 127 ms vs 1,826 ms (14.4×) |
+| Aggregate in SQL vs pure Python | 127 ms vs 1,220 ms (9.6×) |
+
+## Grading notes
+
+**A 3/3 on correctness**: cohort and activity from one filtered set; the invariant test present and
+running; explicit `ROWS` frames on every running aggregate; a deterministic tiebreaker in every
+deduplication window.
+
+**A 3/3 on explanation**: shows the `ROWS`/`RANGE` difference with worked values rather than
+describing it, and states the crossover rule for SQL versus Pandas as selectivity rather than row
+count.
+
+**The four most common ways submissions lose points**
+
+1. No invariant test. The matrix looks plausible and is unverified.
+2. Default `RANGE` frame on a running total over a column with ties.
+3. Non-deterministic deduplication — passes today, different results next week.
+4. A correlated subquery for top-N. It is correct and it does not finish.

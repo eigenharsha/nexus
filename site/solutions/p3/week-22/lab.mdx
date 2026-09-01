@@ -1,0 +1,180 @@
+---
+title: "Lab — Blood-cell image classifier (≥90% test accuracy)"
+description: "Reference solution — Week 22"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `LAB-P3-W22`
+
+Full source is in `labs/p3/week-22/solution/`. This page is the reasoning and the numbers.
+
+## The dataset audit, which decides everything after it
+
+```python
+"""audit.py — run this BEFORE you train anything."""
+from __future__ import annotations
+import re, collections
+from pathlib import Path
+import imagehash
+from PIL import Image
+
+root = Path("data/blood_cells")
+files = sorted(root.rglob("*.jpeg"))
+print("files:", len(files))                                   # 12,444
+
+# 1. class balance
+counts = collections.Counter(p.parent.name for p in files)
+print(counts)
+# {'NEUTROPHIL': 3123, 'EOSINOPHIL': 3120, 'MONOCYTE': 3098, 'LYMPHOCYTE': 3103}
+
+# 2. corrupt files
+bad = []
+for p in files:
+    try:
+        Image.open(p).verify()
+    except Exception as e:
+        bad.append((p, repr(e)))
+print("corrupt:", len(bad))                                   # 3
+
+# 3. near-duplicates via perceptual hash
+buckets = collections.defaultdict(list)
+for p in files:
+    buckets[str(imagehash.phash(Image.open(p)))].append(p)
+dupe_groups = [v for v in buckets.values() if len(v) > 1]
+print("exact-phash groups:", len(dupe_groups),
+      "images involved:", sum(len(g) for g in dupe_groups))
+# exact-phash groups: 1,847  images involved: 5,209
+
+# 4. augmentation source groups from the filename
+def source_id(p: Path) -> str:
+    m = re.search(r"BloodImage_(\d+)", p.name)
+    return m.group(1) if m else p.stem
+groups = collections.Counter(source_id(p) for p in files)
+print("distinct sources:", len(groups),
+      "median images per source:", sorted(groups.values())[len(groups)//2])
+# distinct sources: 364  median images per source: 34
+```
+
+**364 source images became 12,444 files.** A per-file random split scatters ~34 augmented copies of each source across train, validation and test. That is the finding, and it changes the split.
+
+Reference figure — cost of getting it wrong:
+
+| Split | Test accuracy reported |
+| --- | --- |
+| Per-file random | **97.4%** |
+| Grouped by source image | **93.8%** |
+
+**3.6 points of accuracy that does not exist.** The higher number is the wrong one, and it is the one a submission that skipped the audit will report.
+
+## The result table
+
+**Machine B** (RTX 4090) for training, **Machine C** (`c7i.xlarge`, 4 vCPU) for latency — both **reference figures**, modelled rather than run; see [About the numbers](/start/about-the-numbers). Grouped split throughout, 3 seeds. Grade yourself on your own measurements, not on matching these.
+
+| Model | Test acc | CPU p50 | CPU p95 | ONNX size |
+| --- | --- | --- | --- | --- |
+| `BloodCellNet` from scratch | 84.2% | 9 ms | 13 ms | 1.6 MB |
+| MobileNetV3-Small, fine-tuned | 91.2% | **12 ms** | 17 ms | **9.8 MB** |
+| ResNet-18, fine-tuned | 93.8% | 41 ms | 58 ms | 44.7 MB |
+| ResNet-18, staged + discriminative LRs | **94.4%** | 41 ms | 58 ms | 44.7 MB |
+| EfficientNet-B0, fine-tuned | **94.9%** | 63 ms | 91 ms | 20.5 MB |
+| ResNet-50, fine-tuned | 94.6% | 108 ms | 147 ms | 97.8 MB |
+| ViT-B/16, fine-tuned | 92.4% | 312 ms | 401 ms | 330.3 MB |
+| **ResNet-18 staged, ONNX int8** | **94.2%** | **14 ms** | **19 ms** | **11.3 MB** |
+
+**The recommendation is the last row, and it is not the most accurate model.** ResNet-18 with the staged recipe, exported to ONNX and dynamically quantized: 94.2% accuracy at 14 ms p50 and 19 ms p95, in an 11.3 MB file. EfficientNet-B0 is 0.7 points better and 4.5× slower on the target hardware.
+
+That is the deliverable the ticket asked for. A submission that reports EfficientNet-B0 at 94.9% and stops has answered a question the customer did not ask.
+
+<Warning>
+**ViT-B/16 has the best ImageNet top-1 in this table (81.1%) and the worst blood-cell accuracy
+(92.4%), at 22× the latency of the recommended model.** Transformers are data-hungry: at 8,742
+training images the convolutional inductive bias is worth more than the Transformer's
+flexibility. Module 4 Layer 3 has the full data-efficiency curve. Choosing a backbone by
+ImageNet leaderboard position is how you get this row.
+</Warning>
+
+## Per-class metrics and the confusion matrix
+
+ResNet-18 staged, 1,879 test images:
+
+| Class | Precision | Recall | F1 | Support |
+| --- | --- | --- | --- | --- |
+| Eosinophil | 0.947 | 0.921 | 0.934 | 470 |
+| Lymphocyte | 0.981 | 0.990 | 0.985 | 468 |
+| Monocyte | 0.902 | 0.913 | 0.907 | 470 |
+| Neutrophil | 0.928 | 0.933 | 0.930 | 471 |
+| **Macro** | **0.940** | **0.939** | **0.939** | 1,879 |
+
+```
+                predicted
+             EOS  LYM  MON  NEU
+true  EOS    433    2   19   16
+      LYM      1  463    3    1
+      MON     14    5  429   22
+      NEU     10    2   19  440
+```
+
+**Monocyte ↔ neutrophil (41 errors) and eosinophil ↔ monocyte (33) are 63% of all errors.** Lymphocytes are essentially solved (F1 0.985) because they are morphologically distinct — small, dense nucleus, almost no cytoplasm. The three granulocyte-adjacent classes are the hard ones, which is also true for human technicians.
+
+95% Wilson interval on 93.8% with n=1,879: **[92.6%, 94.8%]**. Quote it. A competing model at 94.4% is not distinguishable from this one on this test set, and saying so is more useful than pretending otherwise.
+
+## The 20 worst errors
+
+| Category | Count | What it means |
+| --- | --- | --- |
+| Genuinely ambiguous — two cells in frame, or a cell cut by the border | 8 | The model is not wrong so much as the question is. An "uncertain" output or a crop policy addresses it |
+| **Label errors** | 5 | 5 of 1,879 is 0.27% of the test set. **The true ceiling on any reported accuracy here is about 99.7%**, and our 94% is 5.7 points below a bound nobody usually computes |
+| Out of focus or under-stained | 4 | A quality gate at ingest is cheaper than modelling around it |
+| Real errors on clean, unambiguous images | **3** | The only three a better model would fix |
+
+**Only 3 of the 20 worst errors are modelling problems.** The reference project's highest-value next action was re-labelling and a quality gate, not a bigger backbone. This is the section that most distinguishes a strong submission, and it takes forty minutes.
+
+## Why this solution and not the obvious one
+
+**Why the grouped split, even though it reports a worse number.** Because the customer will deploy on new slides, not on rotations of slides the model has seen. 97.4% is a measurement of memorization. Reporting the honest number *and* the leaky one, with an explanation, is strictly better than reporting either alone.
+
+**Why staged fine-tuning rather than a single-LR fine-tune.** 94.4% vs 93.8%, and — the stronger reason — it retains 55.1% of the backbone's ImageNet linear-probe accuracy against 41.3% for the single-LR version. If the lab ever wants a second model (say, red-cell morphology) on the same backbone, that difference matters.
+
+**Why ONNX int8 rather than the fp32 PyTorch model.** 2.9× faster on the target hardware, 4× smaller, 0.2 accuracy points. The ticket's second constraint was CPU-only hardware; ignoring it while optimizing accuracy is answering the wrong question.
+
+**Why the model card includes "what would make this unsafe".** A pre-screen that silently degrades when the lab changes stain supplier is worse than no pre-screen, because the humans have stopped double-checking. Naming the failure mode you cannot currently detect is part of shipping a medical-adjacent model, and Week 24 Module 5 builds the monitor for it.
+
+## The two wrong turns worth knowing about
+
+**1. Training first, auditing later.** The audit takes an hour and changes the split, which changes every number afterwards. Submissions that train first invariably report a leaky number and then have to redo the entire results table.
+
+**2. Optimizing for the accuracy bar and ignoring the latency constraint.** The ticket has two hard constraints. EfficientNet-B0 satisfies one of them. On a 4 vCPU box serving a slide with 200 cells on it, 63 ms per cell is 12.6 seconds per slide versus 2.8 seconds for the recommended model — and that is the number the lab experiences.
+
+A third, common on the `hard` track: **Grad-CAM only on correct predictions.** The misclassified ones are where the information is. In the reference run, the Grad-CAM for one confident error highlighted a staining artifact at the image border rather than the cell — which is a data-collection finding, not a modelling one, and is invisible in any aggregate metric.
+
+## Grading notes
+
+**What a 3/3 looks like on each row**
+
+- **Correctness 3** — grouped split with the leaky comparison reported; ≥93% held while meeting the stated CPU p95 budget; ONNX parity verified at two batch sizes.
+- **Code quality 3** — one shared preprocessing module imported by both the training script and the benchmark; config-driven training; a test asserting that both preprocessing paths produce identical tensors.
+- **Performance 3** — the four-row export table with p50 and p95 on the target hardware, the quantization accuracy delta, and the backbone comparison on accuracy *and* latency.
+- **Explanation 3** — a model card someone can act on, the 20-error categorization, and a deployment recommendation that is explicitly not the highest-accuracy model, with the reason.
+
+**The three most common ways submissions lose points**
+
+1. **No dataset audit**, so the reported accuracy is 3.6 points of leakage. This caps Correctness at 1 regardless of everything else, because the headline number is wrong.
+2. **Latency measured on the training GPU.** The customer has a CPU box. A p50 measured on a 4090 is not a measurement of anything they will experience.
+3. **Error analysis that lists the 20 images without categorizing them.** The categories are the finding. Without them there is no reason to prefer re-labelling over a bigger model, and the submission's recommendation section is guesswork.
+
+<Card title="Back to the lab" icon="arrow-left" href="/curriculum/p3/week-22/lab" horizontal>
+  Next week this model goes behind an API and into a container. Keep the ONNX artifact.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

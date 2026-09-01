@@ -1,0 +1,136 @@
+---
+title: "Lab — Evaluation harness"
+description: "Reference solution — Week 19"
+hidden: true
+icon: "lock"
+---
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+<Info>
+**Provenance.** The reference figures below were produced by running the code on an Apple M3 Pro (11 cores, 18 GB, macOS arm64, no GPU), Python 3.12.9, with the versions pinned in the week index. Arithmetic shown term by term is *derived* and holds anywhere; results attributed to a paper are that paper's. See [About the numbers](/start/about-the-numbers).
+</Info>
+
+
+## Reference solution — `LAB-P3-W19`
+
+## The design decision that determines whether this gets reused
+
+**Make the interval the default return type.** Every metric function returns `(point, lo, hi)`, never a bare float. A harness that makes it easy to print a naked number will be used to print naked numbers, and eighteen months later somebody will put one on a slide.
+
+The second decision, from the ticket: **`select_cv` refuses rather than guesses.**
+
+```python
+def select_cv(df, target, group_col=None, time_col=None, n_splits=5, allow_random=False):
+    if time_col is not None and not allow_random:
+        return TimeSeriesSplit(n_splits=n_splits, gap=infer_gap(df, target))
+    if time_col is not None:
+        raise ValueError(
+            f"'{time_col}' looks like a timestamp. A random split on time-ordered data "
+            f"inflated ROC-AUC by 15.3 points in the Module 3 measurement. "
+            f"Pass allow_random=True if you are certain.")
+    if group_col is not None:
+        return StratifiedGroupKFold(n_splits) if _is_classification(df[target]) else GroupKFold(n_splits)
+    return StratifiedKFold(n_splits, shuffle=True, random_state=0)
+```
+
+Silently doing the reasonable thing is what a *convenience* library does. The ticket asked for a harness that fails loudly, and the error message carries the measurement that justifies the refusal.
+
+## H2 is the hard criterion, and here is why
+
+Five-of-five detection is straightforward: make every threshold aggressive and everything gets flagged. **Zero false positives on twenty clean datasets is the constraint that makes the harness survivable.** A detector that fires on a quarter of clean runs is switched off within a month, and then you have spent the effort and gained a false sense of coverage.
+
+Each check needs its threshold calibrated against a null distribution, not guessed:
+
+**Shuffled-label test.** Chance is not always 0.5 — for accuracy it is the majority-class rate. Run `n_repeats` shuffles, and compare the mean against chance using the *observed* spread across those repeats rather than a fixed tolerance:
+
+```python
+z = (mean_shuffled - chance) / (sd_shuffled / np.sqrt(n_repeats) + 1e-12)
+flagged = z > 3.0        # calibrate the 3.0 on your clean datasets, do not assume it
+```
+
+**Near-duplicate detection.** "Distance below 0.01" is meaningless without the data's scale. Compute the nearest-neighbour distance distribution *within* the training split, and flag cross-split pairs falling below its 1st percentile. This is scale-free and it is the only version that works across datasets.
+
+**Single-feature dominance.** Some datasets genuinely have one dominant feature — that is not a leak, it is a fortunate dataset. Flag on the **ratio** of the top feature's held-out permutation importance to the sum of the rest, with the threshold calibrated on your clean set, and emit it as a **warning** rather than an error. This is the one check that cannot be made precise, and pretending otherwise is what produces false positives.
+
+**Report the false-positive rate per check, not for the suite.** One noisy check at 20% is what gets the whole harness disabled, and the aggregate number hides which one it was.
+
+## The trap that costs three of the five detections
+
+```python
+# WRONG — passes, and the leak is untouched
+X_sel = SelectKBest(f_classif, k=20).fit_transform(X, y)
+audit.shuffled_label_test(model, X_sel, y, cv)
+```
+
+By the time the test shuffles the labels, selection has already used the real ones, so the selected features are uncorrelated with the shuffled target and the model correctly scores chance. **The test passes on a leaked dataset.**
+
+The API must therefore accept an **unfitted estimator and raw `X`** — never a pre-transformed matrix — and the docstring must say so, because this is the mistake every user of the library will make once.
+
+```python
+def shuffled_label_test(estimator, X, y, cv, ...):
+    """Run the WHOLE pipeline on permuted labels.
+
+    `estimator` MUST be unfitted and MUST contain every fitted step, including
+    selection, encoding and resampling. Passing a pre-transformed X silently
+    defeats the test.
+    """
+```
+
+## H5: making it finish in 180 seconds
+
+The naive implementation does 2,000 resamples across 30 slices — 60,000 metric evaluations, each sorting the scores to compute AUC. It will not finish.
+
+Three changes, in order of payoff:
+
+1. **Draw all resample indices at once.** `rng.integers(0, n, size=(n_boot, n))` in one call rather than `n_boot` calls.
+2. **Compute AUC from ranks.** `roc_auc_score` sorts every time. Rank the scores **once**, then each resample's AUC is a sum over the pre-computed ranks — the Mann-Whitney form. This is the single biggest win and it turns an `O(n log n)` per resample into `O(n)`.
+3. **Subsample large slices.** A slice of 100,000 rows does not need all of them for a stable interval; cap at 20,000 and note the cap in the report.
+
+Report the breakdown of where the time went. "Under budget" is a 2; "under budget, and here is the profile showing bootstrap resampling fell from 140 s to 11 s after switching to rank-based AUC" is a 3.
+
+## What goes in the example report
+
+The checked-in HTML file is the artifact the ticket actually wanted. In order:
+
+1. The recommendation, one sentence, with its scope condition.
+2. The baseline ladder — including the best single feature.
+3. The headline metric with its interval.
+4. The slice table, worst-first, with `n`, row share, weight share and intervals.
+5. The leakage audit result, per check, with pass/fail and the value against the threshold.
+6. The reliability curve and the calibration summary.
+7. The threshold table with realised costs at the default, the F1 maximiser, the closed form and the empirical argmin.
+8. The assumption that would flip the recommendation.
+
+Someone should be able to open that file and decide, without reading any code.
+
+## Why this solution and not the obvious one
+
+**The obvious solution is a module of metric functions with a `compute_all()` that returns a dict.** It is a metrics library, and the ticket did not ask for one — those exist. The ticket asked for something that *fails loudly when the number is not trustworthy*, which means the refusing splitter, the leakage audit with a calibrated false-positive rate, and intervals by default. A harness that will happily compute a beautiful bare number for a leaked model has not addressed the complaint.
+
+Two more wrong turns:
+
+1. **Building it as a notebook.** It is imported by the Midterm, by Week 20's fraud lab and by Week 31. A notebook cannot be imported, cannot be tested and cannot be versioned meaningfully.
+2. **Skipping the twenty clean datasets.** Without them there is no false-positive rate, and without a false-positive rate the leakage audit is a set of thresholds somebody guessed.
+
+## Grading notes
+
+**3/3 on each rubric row:**
+
+- **Correctness (3):** 5/5 detection **and** zero false positives across twenty clean datasets, with the rate reported per check; the shuffled-label test takes unfitted estimators; `select_cv` raises on a datetime column.
+- **Code quality (3):** `mypy --strict` clean; importable and pip-installable; intervals are the default return type; a new metric can be added without touching the report module.
+- **Performance (3):** under 180 s with a profile showing what was vectorised and by how much.
+- **Explanation (3):** the checked-in HTML report leads with a recommendation and names the assumption that would flip it — not a wall of metrics.
+
+**The three most common ways submissions lose points:**
+
+1. **The shuffled-label test applied to pre-transformed data.** Three of the five leaks go undetected and the submission reports 2/5 with no idea why.
+2. **Guessed thresholds.** Passes H1, fails H2, and the write-up has no false-positive rate in it.
+3. **A metrics library rather than a harness.** Technically complete, and it does not solve the problem in the ticket.

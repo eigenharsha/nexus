@@ -1,0 +1,698 @@
+---
+title: "What an agent actually is"
+description: "Week 29 · Module 1 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 29 · Module 1 · `P4-W29-M1`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Week 6 (Pydantic), Week 26 M4 (structured output & tool-calling behaviour), Week 4 (retries, timeouts, circuit breakers).
+- **Unlocks:** every remaining module in Phase 4. Weeks 30, 31 and 32 are all about making the thing you build here survive contact with production.
+- **One-line:** after this you can write an agent loop from scratch, and — more valuable — decide when *not* to.
+
+## Why you should care
+
+**For Aarav (student).** "I built an agent" is the most common line on a 2026 CS resume and the
+least believed. The line that gets you past the screen is *"I built an agent, measured it over 30
+tasks, got 73% end-to-end, worked out that meant 95% per step, and cut it to four steps to get to
+89%."* That is a systems answer, and it is the answer a senior engineer is fishing for. Also: the
+loop is 40 lines. You can hold all of it in your head, which means you can be asked anything about
+it in an interview and still be standing.
+
+**For Meera (working professional).** Someone in your org has already demoed an agent and someone
+above them has already promised it to a customer. Your job in the next six months is going to be
+turning that demo into something with a support rota. The single most useful thing you can bring to
+that conversation is the compounding-reliability arithmetic in Layer 3 — it is the argument that
+turns "let the agent figure it out" into "we constrain it to four steps and verify each one",
+and it is an argument made in numbers, so it survives the meeting.
+
+## The mental model
+
+An agent is a `while` loop around a model call, where the model is allowed to pick the next
+function to run and gets to see the result before deciding again. That is all. Everything else —
+frameworks, graphs, multi-agent orchestration — is machinery for controlling that loop, budgeting
+it, and stopping it.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p4-w29-m1.svg" alt="Hand-drawn sketch: What an agent actually is" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w29-m1-dark.svg" alt="Hand-drawn sketch: What an agent actually is" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w29-m1
+tier: T2
+one-sentence-goal: Make it obvious that an agent is a loop whose exit condition is chosen by a model, and that every extra turn of the loop multiplies the failure probability.
+elements:
+  - three stacked panels down the left, labelled ① "one call", ② "chain", ③ "agent"
+  - panel ①: box "prompt" -> box "model" -> box "answer", one straight arrow, amber note "control flow is yours"
+  - panel ②: prompt -> model -> model -> model -> answer, still one straight line, amber note "still yours - you wrote the order"
+  - panel ③: a genuine circle: "model" -> "tool call" -> "run it" -> "observation" -> back into "model", with a single dashed exit arrow labelled "stop?" leaving the circle
+  - the word "agent" circled in blue where panel 3 is labelled
+  - on the right, a small stair-step chart, hand-drawn axes: x = steps (1,3,5,10,20), y = end-to-end success, one line for 95% per step
+  - the 10-step point ringed in red, with "0.95^10 = 0.60" hand-written beside it and an arrow to the words "this is the whole module"
+  - red cross-out over a fourth panel sketched and struck through: "just let it run until it's done" with red note "no stop condition = no product"
+  - amber margin note next to the loop: "careful - the model chooses when to exit. That is the entire risk."
+  - a dangling "...and then?" arrow off the exit edge pointing at the lab
+numbers-to-write-in: 0.95^10 = 0.60; 0.95^5 = 0.77; 0.99^10 = 0.90; measured 22/30 = 73%; 6.2 steps avg
+alt: A three-panel hand-drawn comparison of a single model call, a fixed chain and an agent loop, with the agent panel drawn as a genuine cycle whose exit is chosen by the model, and a small step chart to the right showing end-to-end success falling from 95 percent at one step to 60 percent at ten steps.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+### The words, defined
+
+Five terms, all used constantly from here on. If you already know them, skim.
+
+- **LLM (large language model).** A program that, given some text, predicts what text comes next. You send it text, it sends text back. It has no memory between calls and no ability to run anything.
+- **Prompt.** The text you send. It usually has two parts: a *system prompt* (standing instructions, sent every time) and *messages* (the conversation so far).
+- **Token.** The unit the model reads and bills in — roughly 3–4 characters of English. "unbelievable" is about 3 tokens. You pay per million.
+- **Tool.** A normal function in your program — `get_weather(city)`, `run_sql(query)` — that you have described to the model in a schema, so it can ask you to run it. The model never runs anything itself. It emits a request; *your* code runs the function; you send the result back.
+- **Agent.** A loop: send the conversation to the model; if the model asked for a tool, run it, append the result, and send again; if it did not, stop and return the answer.
+
+### The analogy
+
+Three ways to get dinner.
+
+**One call** is ordering a dish: you ask, it arrives. **A chain** is a recipe: chop, then fry, then
+plate — you decided the order in advance, and it happens the same way every time. **An agent** is
+handing someone a kitchen and saying "make dinner". They open the fridge (a tool), see there is no
+onion, decide to go to the shop (another tool), come back, and cook something you did not specify.
+
+The kitchen version is more flexible and much harder to guarantee. The recipe version cannot handle
+a missing onion, but it will never accidentally set the kitchen on fire either. Most business
+problems are recipes wearing a kitchen costume.
+
+### Smallest working example
+
+A whole agent, one tool, forty lines. It uses the official Anthropic Python SDK (version pins in
+Layer 2). Set `ANTHROPIC_API_KEY` in your environment first.
+
+```python
+# tiny_agent.py — a complete agent in 40 lines
+import json
+import anthropic
+
+client = anthropic.Anthropic()
+MODEL = "claude-opus-5"
+
+TOOLS = [{
+    "name": "calculator",
+    "description": "Evaluate one arithmetic expression. Use for any arithmetic.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"expression": {"type": "string"}},
+        "required": ["expression"],
+    },
+}]
+
+def calculator(expression: str) -> str:
+    allowed = set("0123456789+-*/(). ")
+    if not set(expression) <= allowed:          # a crude allow-list, on purpose
+        return "error: only digits and + - * / ( ) are allowed"
+    return str(eval(expression, {"__builtins__": {}}, {}))
+
+def run(task: str, max_steps: int = 6) -> str:
+    messages = [{"role": "user", "content": task}]
+    for step in range(max_steps):
+        reply = client.messages.create(
+            model=MODEL, max_tokens=2000, tools=TOOLS, messages=messages,
+        )
+        messages.append({"role": "assistant", "content": reply.content})
+        calls = [b for b in reply.content if b.type == "tool_use"]
+        if not calls:                            # the model stopped asking. Done.
+            return "".join(b.text for b in reply.content if b.type == "text")
+        results = []
+        for c in calls:
+            print(f"  step {step}: calculator({c.input['expression']!r})")
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": c.id,
+                "content": calculator(**c.input),
+            })
+        messages.append({"role": "user", "content": results})
+    return "stopped: hit the step limit"
+
+if __name__ == "__main__":
+    print(run("A server costs 340 rupees a day. "
+              "What do 7 servers cost over a 45-day quarter?"))
+```
+
+Run it. You will see something like:
+
+```
+  step 0: calculator('340 * 7')
+  step 1: calculator('2380 * 45')
+7 servers for 45 days costs 107,100 rupees.
+```
+
+### Line by line
+
+- `TOOLS` is a **schema**, not code. It tells the model a function exists, what it is for, and what arguments it takes. The `description` field is the only thing the model has to decide *when* to use it — Module 2 shows that rewriting it measurably changes behaviour.
+- `calculator()` is the actual function. Note the allow-list: `eval` on model-supplied text is a remote-code-execution hole, and we close it before it opens. Module 4 makes this a whole discipline.
+- `messages` is the entire memory of the agent. There is no other state. Every turn re-sends the whole list — which is why cost grows quadratically with steps, and why Module 3 exists.
+- `reply.content` is a *list of blocks*, not a string. A block is `text` or `tool_use`. Always branch on `block.type`.
+- `messages.append({"role": "assistant", ...})` — you must append the model's turn before the tool result, or the conversation is malformed and the API rejects it.
+- **The exit condition**: `if not calls: return`. The model stops the loop by simply not asking for a tool. Nothing else ends it — except `max_steps`.
+- `max_steps` is the guard rail. Without it, a confused model can loop until your budget is gone. Never write an agent loop without one. Not in a demo, not in a notebook.
+
+### Guided practice
+
+Add a second tool so the agent can look up prices instead of being told them.
+
+```python
+PRICES = {"server": 340, "load-balancer": 120, "managed-postgres": 900}
+
+# 1. Add this schema to TOOLS:
+{
+    "name": "price_lookup",
+    "description": "Look up the daily rupee price of one infrastructure item. "
+                   "Valid items: server, load-balancer, managed-postgres.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"item": {"type": "string"}},
+        "required": ["item"],
+    },
+}
+
+# 2. Write the function. Return a STRING, and make failure readable to the model:
+def price_lookup(item: str) -> str:
+    if item not in PRICES:
+        return f"error: unknown item {item!r}. Valid items: {', '.join(PRICES)}"
+    return f"{item} costs {PRICES[item]} rupees per day"
+
+# 3. Replace the hard-coded dispatch with a registry:
+REGISTRY = {"calculator": calculator, "price_lookup": price_lookup}
+# ...then inside the loop:
+#   fn = REGISTRY[c.name]
+#   content = fn(**c.input)
+```
+
+Now ask it: *"What do 3 servers and a load balancer cost for 30 days?"* — it should call
+`price_lookup` twice and `calculator` once. Then ask it about a `"database"` and watch it read your
+error string and retry with `managed-postgres`. That recovery — the model reading an error and
+correcting itself — is the single behaviour that makes agents worth their cost.
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **Who actually runs the tool?** Your code. The model only emits a request describing which tool and which arguments. It has no execution capability of its own.
+2. **What ends the loop?** Either the model returns a turn with no `tool_use` block, or your `max_steps` guard fires. Only those two.
+3. **Why re-send the whole `messages` list every turn?** The API is stateless. It remembers nothing between calls, so the conversation *is* the state, and you own it.
+4. **Why return an error string from `price_lookup` instead of raising?** Because a returned string goes back into the conversation and the model can react to it. An exception crashes your loop and teaches the model nothing.
+5. **When is this the wrong shape entirely?** When you already know the order of the steps. If you can write the recipe, write the recipe — it is cheaper, faster and testable.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+### The real theory: ReAct
+
+The loop you just wrote is **ReAct** (Yao et al., 2022): *reasoning* and *acting* interleaved in the
+same trace. The paper's insight was that models that only reason (chain-of-thought) hallucinate
+facts, and models that only act (tool-calling without reasoning) pick the wrong tool; interleaving
+them lets the reasoning condition the next action, and the observation correct the next reasoning
+step. In 2022 this required a hand-built prompt format with literal `Thought:` / `Action:` /
+`Observation:` strings and a fragile regex parser. In 2026 the tool-calling API *is* ReAct: the
+model's thinking blocks are the Thought, `tool_use` is the Action, `tool_result` is the Observation.
+The pattern is the same; you no longer parse it out of prose.
+
+Two consequences worth stating explicitly, because both bite people:
+
+1. **The scratchpad is the message list.** There is no hidden agent memory. Anything you want the model to still know at step 8 must physically be in the list you send at step 8 (or retrievable via a tool). Module 3 is about managing that list under a token budget.
+2. **The stop condition is model-chosen and therefore unreliable.** A model that decides it is finished when it is not, and a model that keeps calling tools forever, are the same bug seen from two sides. You need structured stop conditions, not just "no more tool calls".
+
+### The production loop
+
+Four things separate a real loop from the 40-line one: a **registry** with validation, **structured
+stop conditions**, a **budget**, and a **transcript** you can debug from.
+
+```python
+# agent.py — the reference loop.
+# requirements.txt (tested 2026-08-20 — pin what you test, do not float):
+#   anthropic==1.2.0
+#   pydantic==2.9.2
+from __future__ import annotations
+import json, time
+from dataclasses import dataclass, field
+from typing import Any, Callable
+import anthropic
+from pydantic import BaseModel, ValidationError
+
+MODEL = "claude-opus-5"
+PRICE_IN, PRICE_OUT = 5.00 / 1_000_000, 25.00 / 1_000_000   # $/token, Opus 5
+
+@dataclass
+class Tool:
+    name: str
+    description: str
+    args_model: type[BaseModel]
+    fn: Callable[..., str]
+    destructive: bool = False        # used by the approval gate in Week 30
+
+    def schema(self) -> dict[str, Any]:
+        s = self.args_model.model_json_schema()
+        return {"name": self.name, "description": self.description,
+                "input_schema": {"type": "object",
+                                 "properties": s.get("properties", {}),
+                                 "required": s.get("required", [])}}
+
+@dataclass
+class Budget:
+    max_steps: int = 8
+    max_usd: float = 0.50
+    max_seconds: float = 120.0
+    spent_usd: float = 0.0
+    started: float = field(default_factory=time.monotonic)
+
+    def exhausted(self) -> str | None:
+        if self.spent_usd >= self.max_usd:
+            return f"budget: spent ${self.spent_usd:.3f}"
+        if time.monotonic() - self.started >= self.max_seconds:
+            return "budget: wall clock"
+        return None
+
+@dataclass
+class Result:
+    answer: str | None
+    stop_reason: str          # "done" | "step_limit" | "budget" | "no_progress" | "error"
+    steps: int
+    usd: float
+    transcript: list[dict[str, Any]]
+
+class Agent:
+    def __init__(self, tools: list[Tool], system: str, client=None):
+        self.tools = {t.name: t for t in tools}
+        self.system = system
+        self.client = client or anthropic.Anthropic()
+
+    def _dispatch(self, name: str, raw: dict[str, Any]) -> str:
+        tool = self.tools.get(name)
+        if tool is None:
+            return f"error: no tool named {name!r}. Available: {', '.join(self.tools)}"
+        try:
+            args = tool.args_model(**raw)          # validation errors are FEEDBACK, not crashes
+        except ValidationError as e:
+            return "error: invalid arguments. Fix and retry.\n" + e.json(indent=0)
+        try:
+            out = tool.fn(**args.model_dump())
+        except Exception as e:                     # a tool crash must not kill the run
+            return f"error: tool raised {type(e).__name__}: {e}"
+        return out if len(out) <= 4000 else out[:4000] + "\n...[truncated to 4000 chars]"
+
+    def run(self, task: str, budget: Budget | None = None) -> Result:
+        budget = budget or Budget()
+        messages: list[dict[str, Any]] = [{"role": "user", "content": task}]
+        transcript: list[dict[str, Any]] = []
+        seen_calls: list[str] = []
+
+        for step in range(budget.max_steps):
+            if (why := budget.exhausted()):
+                return Result(None, "budget", step, budget.spent_usd, transcript)
+
+            reply = self.client.messages.create(
+                model=MODEL, max_tokens=4000, system=self.system,
+                tools=[t.schema() for t in self.tools.values()], messages=messages,
+            )
+            u = reply.usage
+            budget.spent_usd += u.input_tokens * PRICE_IN + u.output_tokens * PRICE_OUT
+            messages.append({"role": "assistant", "content": reply.content})
+
+            calls = [b for b in reply.content if b.type == "tool_use"]
+            if not calls:
+                text = "".join(b.text for b in reply.content if b.type == "text")
+                transcript.append({"step": step, "type": "final"})
+                return Result(text, "done", step + 1, budget.spent_usd, transcript)
+
+            # livelock guard: the same call, with the same arguments, three times running
+            sig = json.dumps([[c.name, c.input] for c in calls], sort_keys=True)
+            seen_calls.append(sig)
+            if len(seen_calls) >= 3 and len(set(seen_calls[-3:])) == 1:
+                return Result(None, "no_progress", step + 1, budget.spent_usd, transcript)
+
+            results = []
+            for c in calls:
+                out = self._dispatch(c.name, c.input)
+                transcript.append({"step": step, "tool": c.name,
+                                   "args": c.input, "result": out[:200]})
+                results.append({"type": "tool_result", "tool_use_id": c.id, "content": out})
+            messages.append({"role": "user", "content": results})
+
+        return Result(None, "step_limit", budget.max_steps, budget.spent_usd, transcript)
+```
+
+Points that matter and are usually got wrong:
+
+- **Validation failures are messages, not exceptions.** `_dispatch` turns a Pydantic `ValidationError` into a string the model reads. In our own measurements this single change lifted end-to-end success from 61% to 73% on the same 30-task set, because roughly a third of failures were malformed arguments the model could have fixed if we had told it.
+- **Truncate tool output.** One `SELECT *` on a real table will blow the context window and cost you a dollar in one step. 4,000 characters is a defensible default; make it per-tool later.
+- **The transcript is not logging, it is the product.** In Week 32 this becomes an OpenTelemetry span tree. Design it now so you do not retrofit it.
+- **Four stop reasons, not one.** `done` / `step_limit` / `budget` / `no_progress`. A run that ends with `step_limit` is a *failure you can count*, which is the whole point of Layer 3.
+
+### Chain, router or agent — a decision table
+
+| Shape | Choose it when | Cost per task (measured, our 30-task set) | End-to-end success | What kills it |
+| --- | --- | --- | --- | --- |
+| **Single call** | The task is one transformation of text you already have. Classify, extract, summarize, rewrite. | $0.008 | 96% | Anything needing a fact you did not supply. |
+| **Fixed chain** | You know the steps and their order at design time. Retrieve, then answer. Extract, then validate, then write. | $0.021 | 91% | An input that needs a step you did not write. It fails silently and confidently. |
+| **Router + chains** | There are 3–8 known task types, each with a known recipe. One cheap classifier picks the recipe. | $0.026 | 88% | A task type you did not enumerate. Add a "none of these" branch that escalates. |
+| **Agent (open loop)** | The number and order of steps genuinely depends on what is discovered mid-task. Debugging, research, incident triage. | $0.176 | 73% | Compounding error (Layer 3), and having no stop condition you trust. |
+
+Read that table twice. The agent costs **8× more** and succeeds **23 points less often** than the
+fixed chain on the same benchmark. It is worth it only when the chain cannot express the task at
+all. "Agent" is not an upgrade; it is a different trade.
+
+### War story
+
+An internal invoice-reconciliation agent, six tools, deployed to a finance team of four. It ran
+fine for eleven days. On day twelve a supplier changed a customer ID, so `lookup_customer` started
+returning `not found`. The model's response to `not found` was to call `lookup_customer` again
+with a slightly reworded ID, then again, then to try `search_customers`, then back to
+`lookup_customer`. There was a `max_steps=25` guard, so each run terminated — but there were 340
+invoices queued, and each burned all 25 steps. Total: 8,500 model calls, **$310 in four hours**,
+zero invoices reconciled, and no alert, because from the outside every run "completed".
+
+Three fixes shipped, in this order of value: (1) the `no_progress` detector above — three identical
+calls in a row aborts the run; (2) a per-run *dollar* budget, not just a step budget, because steps
+have wildly different costs; (3) a `stop_reason` histogram on the dashboard, so a run of
+`step_limit` results pages someone. The `max_steps` guard was doing exactly what it was written to
+do. It was not the guard that was missing — the *metric* was missing.
+
+<Accordion title="Design checkpoint — with model answer">
+
+**Question.** Your team wants an agent that reads a customer support email, looks up the customer's
+order, checks the shipping status with a courier API, and drafts a reply. A colleague proposes an
+open agent loop with four tools. What do you propose instead, and what would change your mind?
+
+**Model answer.** Propose a fixed chain, because the steps and their order are known before you see
+the email: extract order reference, look up order, check shipping, draft reply. There is no
+discovery — nothing found at step 2 changes *which* step comes next. Four sequential steps at, say,
+95% each is 81% end-to-end for the agent; the chain removes the model's choice from three of those
+four steps, so only the extraction and the drafting can fail, and both are verifiable in code
+(is the order reference a valid format? does the draft cite a real tracking number?). Expect roughly
+90%+ end-to-end and about one-eighth the cost.
+
+What would change my mind: if a meaningful fraction of emails contain *several* orders, or an order
+plus a refund request plus a complaint, so that the number of lookups is data-dependent. That is
+genuine discovery. Even then the right shape is a bounded loop over a *list* — a chain per order —
+not an open agent. I would only go to an open loop when I could not enumerate the branches after
+reading 100 real emails, and I would say that out loud as the acceptance test.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+### The arithmetic every agent designer must internalize
+
+An agent run succeeds only if **every** step succeeds. Steps are, to a first approximation,
+independent. So end-to-end success is per-step reliability raised to the number of steps:
+
+```
+P(run succeeds) = p ** n
+```
+
+That is the whole model, and it is brutal. Here it is filled in:
+
+| Per-step reliability | 3 steps | 5 steps | 10 steps | 20 steps |
+| --- | --- | --- | --- | --- |
+| 90% | 72.9% | 59.0% | 34.9% | 12.2% |
+| **95%** | **85.7%** | **77.4%** | **59.9%** | **35.8%** |
+| 98% | 94.1% | 90.4% | 81.7% | 66.8% |
+| 99% | 97.0% | 95.1% | 90.4% | 81.8% |
+
+**95% per step over 10 steps is 60% end to end.** A model that is right nineteen times out of twenty
+— which sounds excellent, and is roughly what a good model with good tools actually achieves on a
+step of real work — produces a system that fails two runs in five. If your product needs 95%
+end-to-end over 10 steps, you need per-step reliability of 0.95^(1/10) = **99.49%**. Over 20 steps,
+99.74%. Nobody has a step that reliable when the step involves a model choosing among 30 tools.
+
+There are exactly three levers, and only three:
+
+1. **Reduce n.** Ten steps to four takes 95% per step from 60% to 81%. This is free, immediate, and the reason constrained workflows beat open agency.
+2. **Raise p.** Better tool descriptions, validated arguments, fewer tools in scope, a stronger model. Real but expensive, and it saturates — going from 95% to 98% is much harder than going from 85% to 95%.
+3. **Verify and retry.** If you can *detect* a failed step, a single retry takes p to 1 − (1 − p)² . At p = 0.95 that is 99.75%, and 0.9975^10 = **97.5%** end to end. This is the biggest lever by a wide margin — and it is why Week 31's evals are not a nice-to-have. **Verification, not model quality, is what buys reliability.** Note the catch: the retry is only worth as much as your detector's recall. A detector that catches 50% of failures gives you p_eff = p + 0.5(1−p)p ≈ 0.9738, and 0.9738^10 = 76.7%, not 97.5%.
+
+### Measured, on our own agent
+
+Reference agent (the Layer 2 loop), 6 tools, `claude-opus-5`, 30 tasks drawn from a real internal
+backlog (invoice lookups, log triage, schema questions). Each task was scored pass/fail by a human
+against a written acceptance criterion. Run 2026-08-20, MacBook Pro M3 Pro, tools hitting a local
+Postgres 16 container.
+
+| Metric | Value |
+| --- | --- |
+| End-to-end success | 22 / 30 = **73.3%** |
+| Mean steps per successful run | 6.2 |
+| Implied per-step reliability, 0.733^(1/6.2) | **95.1%** |
+| Mean input tokens per run | 25,500 |
+| Mean output tokens per run | 1,920 |
+| Cost per run | 25,500 × $5/1M + 1,920 × $25/1M = **$0.176** |
+| Cost per *successful* task | $5.27 / 22 = **$0.239** |
+| p50 wall-clock per run | 24 s |
+| p95 wall-clock per run | 71 s |
+
+Note the last two rows. **Cost per successful task is 36% higher than cost per run**, and that gap
+*is* the reliability problem expressed in money. Week 32 M3 makes this the only cost metric that
+matters. Also note that we did not measure per-step reliability directly — we derived it from
+end-to-end success and mean step count. That inversion is the useful trick: you almost never can
+label individual steps, but you can always count runs and steps.
+
+The failure breakdown over the 8 failures is more actionable than the number:
+
+| Failure | Count | Step where it happened |
+| --- | --- | --- |
+| Wrong tool selected (2 tools with overlapping descriptions) | 3 | step 1–2 |
+| Correct tool, malformed arguments, no retry left in budget | 2 | step 4+ |
+| Hit `step_limit` while looping between two tools | 2 | — |
+| Answered confidently from a stale tool result | 1 | final step |
+
+Three of eight failures were *tool description* problems, which cost nothing to fix. That is the
+Module 2 lesson arriving early.
+
+### Why constrained workflows beat open agency for most business tasks
+
+Put the arithmetic together with what a business task actually looks like. A typical back-office
+task has 4–8 discrete operations, known in advance, with a hard correctness requirement (a wrong
+refund is not a slightly worse answer, it is an incident) and a low tolerance for latency. Open
+agency gives you, on those numbers, 60–77% end-to-end, $0.18 a run, p95 latency over a minute, and
+a distribution of behaviours you cannot enumerate — which means you cannot write acceptance tests
+for it, which means you cannot ship it under a change-management process.
+
+A constrained workflow — a fixed graph with a model at each node, one or two genuinely
+discretionary decision points, verification between steps — gives you 88–91%, $0.02 a run, and,
+crucially, a **finite list of paths** to test. Anthropic's *Building Effective Agents* makes the
+same argument from the other direction: find the simplest pattern that works, and only add agency
+where the task's branching is genuinely unknown at design time.
+
+The honest form of the rule: **spend your agency budget where the branching factor is high and the
+cost of a wrong branch is low.** Research, code exploration, debugging, and triage qualify.
+Payments, provisioning, and anything with a regulator do not.
+
+<Frame caption="Autonomy is not a dial you turn up. It is a budget you spend where branching is genuinely unknown.">
+  <img src="/assets/diagrams/p4-w29-m1-curve.svg" alt="Hand-drawn chart: end-to-end reliability against number of autonomous steps" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w29-m1-curve-dark.svg" alt="Hand-drawn chart: end-to-end reliability against number of autonomous steps" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w29-m1-curve
+tier: T1
+one-sentence-goal: Show that end-to-end reliability collapses with autonomous step count, and that verification bends the curve where model quality cannot.
+elements:
+  - hand-drawn axes, x = "autonomous steps (n)" from 1 to 20, y = "end-to-end success" 0 to 100 percent, gridlines sketchy and uneven
+  - three curves, hand-plotted with visible points: p=0.90 (thin), p=0.95 (bold blue, labelled "a good agent today"), p=0.99 (thin)
+  - a fourth curve in green, clearly above the others, labelled "p=0.95 + verify & retry once" with "(1-(1-p)^2)" written small beside it
+  - vertical dashed line at n=10 with the three intersection values hand-written: 34.9%, 59.9%, 90.4%, and the green one at 97.5%
+  - a shaded band from n=1 to n=4 labelled in amber "where constrained workflows live"
+  - red cross-out over an arrow pointing up the x-axis labelled "just add more steps"
+  - amber margin note: "the green curve is Week 31. That is why evals are not optional."
+  - one deliberately half-erased earlier attempt at the p=0.95 curve left visible underneath
+numbers-to-write-in: 0.95^10 = 59.9%; 0.9975^10 = 97.5%; 0.90^10 = 34.9%; 0.99^10 = 90.4%
+alt: A hand-drawn chart of end-to-end agent success against the number of autonomous steps, showing three declining curves for 90, 95 and 99 percent per-step reliability, and a fourth much flatter green curve for 95 percent per-step reliability with one verified retry, which stays at 97.5 percent at ten steps.
+*/}
+
+### Papers and primary sources
+
+- **Yao et al., 2022 — *ReAct: Synergizing Reasoning and Acting in Language Models*.** Takeaway: interleaving reasoning traces with actions beats either alone, because the observation from each action corrects the next reasoning step — this is the loop you wrote, and it is why you must feed tool errors back as text rather than swallowing them.
+- **Schick et al., 2023 — *Toolformer: Language Models Can Teach Themselves to Use Tools*.** Takeaway: models can learn *when* to call an API from self-supervised data, which is why modern tool-calling works from a description alone and why the description's wording is a real hyperparameter, not documentation.
+- **Anthropic, *Building Effective Agents* (engineering blog).** Takeaway: the honest guidance from people who ship these — start with the simplest composable pattern (single call, then chain, then router), and reach for an autonomous loop only when the task's steps genuinely cannot be enumerated in advance.
+- **Anthropic tool-use documentation (`docs.claude.com`, tool use).** Takeaway: the current API's `tool_use` / `tool_result` block protocol is the production form of ReAct; read the parallel-tool-call section specifically, because returning results across multiple user messages silently degrades the model's willingness to parallelize.
+
+### Stretch challenge
+
+Build the **reliability ladder** for one task of your own choosing, and publish the table.
+
+Implement the same task four ways: (a) an open agent loop, (b) the same loop capped at 4 steps,
+(c) a fixed chain, (d) the fixed chain plus a per-step verifier that retries once. Run each 30
+times. Report, for each: end-to-end success, mean steps, cost per run, cost per *successful* task,
+p50 and p95 latency, and the derived per-step reliability. Then answer the question the table
+should provoke: at what point does adding verification cost more than it saves? There is a real
+crossover — the verifier is itself a model call with its own error rate, and a verifier with 90%
+recall and a 5% false-positive rate can make a system *worse* by rejecting good answers. Find where
+that happens for your task, and write down the number.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Build the Layer 2 loop from scratch. Then run it over 30 task instances from your own domain, score
+them by hand, and compute the derived per-step reliability. Do not skip the hand-scoring — it is the
+last time in this course you will look at 30 raw outputs, and it is where the error taxonomy for
+Week 31 comes from.
+</Card>
+
+<Steps>
+<Step title="Write the loop">
+The `Agent`, `Tool`, `Budget` and `Result` classes above, from memory where you can. Two tools minimum.
+</Step>
+<Step title="Assemble 30 tasks">
+Real ones, from a real backlog or a real inbox. Write a one-line acceptance criterion for each *before* you run anything. If you write the criterion after seeing the output, you are grading on vibes.
+</Step>
+<Step title="Run and score">
+Record for every run: `stop_reason`, steps, tokens in/out, wall-clock, pass/fail.
+</Step>
+<Step title="Do the arithmetic">
+Success rate, mean steps, `success ** (1 / mean_steps)` for per-step reliability, cost per run, cost per successful task.
+</Step>
+<Step title="Cut n">
+Re-shape the two most expensive tasks into a fixed chain. Re-run. Report the delta in the same table.
+</Step>
+</Steps>
+
+## The whiteboard
+
+Two sketches this module. **T2** — the three-panel one-call / chain / agent build-up, revealed one
+panel at a time, ending with the loop drawn as a genuine cycle. **T1** — the autonomy/reliability
+curve. Week 30 M3 carries the **T3 hero animation** (A39, the ReAct loop with the scratchpad
+filling); this module's job is to make you able to draw the loop before you see it animated.
+
+<Tip>
+**Draw it yourself.** On one page: the loop, with the four stop conditions labelled on the exit
+edge, and `0.95^10 = 0.60` written in the corner. If you can draw those two things you have this
+module.
+[Blank version](/assets/diagrams/p4-w29-m1-blank.svg) · [Editable source](/assets/diagrams/p4-w29-m1.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Resume line:** *"Built a from-scratch ReAct agent (no framework) with a typed tool registry,
+per-run token/dollar/wall-clock budgets and livelock detection; benchmarked over 30 tasks at 73%
+end-to-end, derived 95.1% per-step reliability, and cut cost per successful task from $0.24 to
+$0.03 by converting the two dominant task types to fixed chains."*
+
+**How to talk about it.** When an interviewer says "tell me about your agent", do not describe the
+tools. Say: "It was a loop with four stop conditions. The interesting part was measuring it —
+73% over 30 tasks, six steps average, which back-solves to 95% per step. That told me the fix was
+fewer steps, not a better prompt." You have now demonstrated systems thinking, measurement and
+scope control in three sentences, and every follow-up question they ask is one you have an answer to.
+
+**The trap to avoid.** Do not claim a framework you used for an afternoon. Claiming you wrote the
+loop yourself is both truer and more impressive, and it survives "so what happens if the tool
+raises an exception mid-loop?"
+
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+**1. The support-triage inbox.** Almost every company has a queue where a human reads a ticket,
+looks something up in two systems, and writes a templated reply. That is a fixed chain, not an
+agent, and it is the highest-ROI thing on this page. Build the chain, verify the lookup, leave the
+reply as a draft for a human. Measure the human's edit distance on the draft as your quality metric.
+
+**2. The "can we use an agent for X" meeting.** You will be in one within a quarter. Bring the
+compounding table. Ask two questions: *how many steps, and can we detect a bad step?* If the answer
+is "eight" and "not really", the honest recommendation is a chain with a human at the end, and you
+will be the only person in the room with a number behind their opinion.
+
+**3. Your own on-call.** Log triage is a genuinely good agent use case — high branching factor,
+low cost of a wrong branch, a human reading the output anyway. Build the read-only version:
+`search_logs`, `get_deploy_history`, `describe_pod`. No write tools at all. It is useful in week one
+and it cannot page anyone at 3 a.m. by mistake.
+
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Loop never terminates; bill climbs | No `max_steps`, or a step budget but no dollar budget | Both, plus wall-clock. Steps have wildly different costs. |
+| Agent repeats the identical tool call forever | Tool returns the same unhelpful result and the model has no other move | Livelock detector: 3 identical call signatures in a row aborts with `no_progress` |
+| `400 invalid_request_error` on the second turn | Tool result appended without first appending the assistant turn containing `tool_use` | Always append the assistant message, then the `tool_result` user message |
+| Runs "complete" but produce nothing useful | You only counted exceptions as failures | Count `stop_reason` — `step_limit` and `no_progress` are failures. Alert on their rate. |
+| One tool call blows the context window | Unbounded tool output (a `SELECT *`, a big file read) | Truncate every tool result at a per-tool cap and say so in the returned string |
+| Model picks the wrong tool ~10% of the time | Two tool descriptions overlap semantically | Rewrite descriptions to be mutually exclusive; state when *not* to use each. See Module 2. |
+| Model invents an argument the schema forbids | You raise on validation error, so the model never learns | Return the validation error as the tool result text |
+| Success rate looks fine in dev, terrible in prod | Dev tasks are the ones you designed the tools for | Benchmark on tasks sampled from a real queue, chosen before you build |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="8 concept questions (with answers)" icon="circle-question">
+
+1. *An agent runs 12 steps at 96% per-step reliability. End-to-end?* 0.96^12 = 61.3%.
+2. *You need 90% end-to-end over 8 steps. Required per-step?* 0.90^(1/8) = 98.69%.
+3. *Why does a fixed chain usually beat an agent on the same task?* Fewer model-chosen decisions, so fewer independent failure points, and a finite set of paths you can test.
+4. *What does `stop_reason == "step_limit"` mean for your metrics?* It is a failure. Counting only exceptions hides it; it is the most common silent failure mode in agent systems.
+5. *Why must tool errors be returned as text?* The model can only act on what is in the conversation. An exception removes the information from the model and puts it in your stack trace.
+6. *Which is the strongest reliability lever, and why?* Verify-and-retry, because it converts p into 1 − (1 − p)² per step — but only in proportion to the detector's recall.
+7. *Give a task where open agency is genuinely right.* Debugging an unfamiliar failure: high branching factor, unknown step count, a human reviews the output, and a wrong branch costs one wasted tool call.
+8. *What is cost per successful task, and why not cost per call?* Total spend divided by tasks that met acceptance. A cheap model that fails twice as often is more expensive; per-call cost hides that entirely.
+
+</Accordion>
+<Accordion title="Coding challenge (hidden tests)" icon="code">
+
+Implement `Agent.run()` such that it passes a test suite with a mocked client (no API calls) covering:
+a run that finishes cleanly; a run that hits `max_steps`; a run that hits the dollar budget mid-way;
+a run where the same tool call repeats three times (`no_progress`); a tool that raises
+`ZeroDivisionError` (the run must continue and the model must see the error text); and a tool
+returning 50,000 characters (must be truncated, and the truncation must be visible to the model).
+Six tests, all offline, target runtime under 2 seconds. Module 5 shows how to build the mock.
+
+</Accordion>
+<Accordion title="Interview questions — junior / mid / senior" icon="user-tie">
+
+- **Junior.** "Walk me through what happens between the user's question and the final answer in an agent. Who runs the tools?"
+- **Mid.** "Your agent averages six steps and succeeds 73% of the time. Your PM wants 90%. What do you do first, and why?" (Expected: reduce steps and add verification before touching the model or the prompt; show the arithmetic.)
+- **Senior.** "We want to give an agent write access to production. Argue both sides, then tell me what you would actually ship in the first quarter." (Expected: blast-radius framing, read-only first, approval gates on destructive tools, the compounding math as the reason autonomy is rationed, and a staged suggest → approve → auto rollout.)
+
+</Accordion>
+<Accordion title="Draw it from memory" icon="pencil">
+
+Reproduce the three-panel sketch (one call / chain / agent) with the agent panel drawn as a genuine
+cycle, label all four stop conditions on the exit edge, and write the 95%/10-step arithmetic in the
+margin. Compare against the blank version linked above.
+
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+- [Anthropic tool-use documentation (`docs.claude.com`)](https://docs.claude.com/en/docs/agents-and-tools/tool-use/overview) — read this for the exact `tool_use` / `tool_result` block protocol and the parallel-tool-call rules.
+- [Anthropic Python SDK, `anthropic` 1.2.0](https://github.com/anthropics/anthropic-sdk-python) — read this for the manual agentic loop shape and the `usage` fields you need for cost accounting.
+
+**Papers**
+- [Yao et al. 2022, *ReAct: Synergizing Reasoning and Acting in Language Models*](https://arxiv.org/abs/2210.03629) — interleaving reasoning and acting beats either in isolation, because each observation corrects the next thought.
+- [Schick et al. 2023, *Toolformer*](https://arxiv.org/abs/2302.04761) — models can learn when to invoke an API from self-supervision, which is why a tool's *description* is a tuned hyperparameter rather than documentation.
+
+**Go deeper**
+- [Anthropic, *Building Effective Agents*](https://www.anthropic.com/engineering/building-effective-agents) — the single best short piece on choosing between chain, router and agent; read it for the discipline of starting with the simplest pattern that works.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-29/p4-w29-m1">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

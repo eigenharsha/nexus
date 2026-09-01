@@ -1,0 +1,92 @@
+---
+title: "Temporal, text & interaction features"
+description: "Reference solution — Week 20"
+hidden: true
+icon: "lock"
+---
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+<Info>
+**Provenance.** The reference figures below were produced by running the code on an Apple M3 Pro (11 cores, 18 GB, macOS arm64, no GPU), Python 3.12.9, with the versions pinned in the week index. Arithmetic shown term by term is *derived* and holds anywhere; results attributed to a paper are that paper's. See [About the numbers](/start/about-the-numbers).
+</Info>
+
+
+## Reference solution — `P3-W20-M2`
+
+The task: build a feature with a subtle point-in-time bug, detect it via a backtest, then fix it.
+
+## Four numbers, not two
+
+The submission that scores a 2 measures the leaky CV and the correct CV. The one that scores a 3 measures what production actually gets.
+
+| What was measured | AUC |
+| --- | --- |
+| random-split CV, leaky feature | **0.8421** ← the number that shipped |
+| random-split CV, correct feature | 0.8526 |
+| forward backtest, leaky feature on both sides | 0.8196 |
+| **production reality: trained on leaky, served with correct** | **0.8076** |
+| **honest model: trained on correct, served with correct** | **0.8303** |
+
+Two costs, and naming both is the deliverable.
+
+**The broken promise: 0.8421 reported, 0.8076 delivered — a 3.5-point gap.** This is the part everybody expects.
+
+**The real loss: 0.8303 was available and 0.8076 was delivered — 2.3 points thrown away.** The model was *trained* to rely on a feature whose serving-time behaviour is different, so it allocated capacity to something that is not there at inference. **The leak did not merely inflate the report; it produced a worse model.** That second cost is what most write-ups miss and it is why "the number was wrong" understates the problem.
+
+## The bug and the fix
+
+```python
+# WRONG -- one value per customer, computed over their entire history
+df["cust_mean_all"] = df.groupby("cust")["amt"].transform("mean")
+
+# RIGHT -- as of each row, excluding the row itself
+df["cust_mean_prior"] = df.groupby("cust")["amt"].transform(
+    lambda s: s.shift(1).expanding().mean())
+```
+
+In SQL, the same thing, and this is the version that ships:
+
+```sql
+AVG(amount) OVER (
+  PARTITION BY customer_id
+  ORDER BY ts
+  ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+) AS cust_mean_prior
+```
+
+`1 PRECEDING` rather than `CURRENT ROW` is the entire correctness argument, and it is one token. Unit-test it with an event at exactly the decision timestamp — a `<=` where a `<` belongs is the most common residual bug in an otherwise correct implementation, and it is invisible in aggregate metrics.
+
+## The detector
+
+Two levels, and you should build both.
+
+**The backtest.** Compare shuffled-split cross-validation against a forward hold-out. Here the gap was 2.2 points; Week 19 Module 3 measured 15.3 on a time-index feature. **The size tells you how bad; the existence tells you to look.** It is cheap and it belongs in every time-ordered project.
+
+**The serving replay**, which is stronger and is what you should automate. Take historical `(entity, timestamp)` pairs, recompute every feature through the **serving** code path, and diff against what the training pipeline produced. Any non-zero mismatch rate is the finding. The backtest cannot catch skew, because it computes both sides with the training code; the replay can, because it runs the code that will actually be in the request path.
+
+## Why this solution and not the obvious one
+
+**The obvious solution measures the leaky and correct CV scores, sees 0.8421 against 0.8526, and concludes the leaky feature is worse and therefore not a problem.** That is backwards. The leaky feature scored *lower* on CV here because the correct expanding-mean feature is genuinely more informative — the leak's damage shows up in the *serving* row, not in the CV comparison. Any analysis that does not simulate serving with the correct feature misses it entirely.
+
+Two more wrong turns:
+
+1. **Fixing it by deleting the feature.** The legitimate signal — this customer's prior spending — is real and valuable. Re-window rather than delete: same source, a window that ends at the prediction timestamp. Deleting costs you the 0.8303.
+2. **Forgetting to sort before `groupby().shift()`.** `shift(1)` respects row order, so on an unsorted frame the "previous" row is whatever happened to be above it. This produces a feature that is neither the leaky one nor the correct one, and it will look plausible.
+
+## Grading notes
+
+**3/3 looks like:** all four numbers measured; both costs named separately — the broken promise and the real performance lost; the SQL window written with `1 PRECEDING` and a boundary-condition test; a stated shuffled-versus-forward gap; and a serving-replay design even if not implemented.
+
+**The three most common ways submissions lose points:**
+
+1. **Only the two CV numbers**, so the production reality is never simulated and the real cost is invisible.
+2. **Deleting the feature instead of re-windowing.** Correct but wasteful, and a reviewer will ask.
+3. **No boundary test.** `<=` versus `<` is one character and it is the residual bug in most otherwise-correct point-in-time joins.

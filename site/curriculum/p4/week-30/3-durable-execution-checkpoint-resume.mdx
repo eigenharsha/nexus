@@ -1,0 +1,665 @@
+---
+title: "Durable execution: checkpoint & resume"
+description: "Week 30 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 30 · Module 3 · `P4-W30-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Warning>
+The single sentence this module exists for: **a resumed agent must not charge the card twice.**
+Durability without idempotency is not reliability — it is an automated way to repeat your side
+effects. Week 8 comes back, and it comes back with money attached.
+</Warning>
+
+## Where this sits
+
+- **Prereqs:** Week 30 M1 (typed state — you can only checkpoint what has a schema), Week 8 (idempotency keys, transactions, the outbox pattern), Week 4 (retries and the unknown-outcome problem), Week 29 M2 (idempotent versus non-idempotent tools).
+- **Unlocks:** Week 30 M4 (budgets survive a resume), M5 (approval gates are interrupts), Week 32 M4 (an incident you can resume from is an incident you can survive), capstone deliverable 2.
+- **One-line:** after this you can kill an agent mid-run, restart it, have it continue from the last completed node, and prove by test that nothing was done twice.
+
+## Why you should care
+
+**For Aarav (student).** "Crash-resume proven by a test that kills the process at 20 random points
+and asserts zero duplicate side effects" is a sentence almost no student project can say. It is also
+the deliverable that most clearly demonstrates you understand distributed systems rather than just
+LLM APIs — and interviewers for AI roles are, in 2026, mostly distributed-systems people.
+
+**For Meera (working professional).** Your agent will be killed. Not maybe: a deploy, a pod
+eviction, an OOM, a spot-instance reclaim, a `SIGTERM` during a rolling restart. If a 90-second
+agent run cannot survive that, then every deploy silently destroys work, and long-running tasks are
+impossible. Durability is what makes an agent an operable system rather than a script you hope
+finishes.
+
+## The mental model
+
+A checkpoint is a **save point in a game**. After each node completes, the whole state is written to
+durable storage under a thread id. If the process dies, a new process loads the state for that
+thread and continues from the next node. The catch — and the entire second half of this module — is
+that saving the *state* does not undo the *effects*. If the node that died had already called the
+payments API, the checkpoint knows nothing about it, and resuming will call it again.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p4-w30-m3.svg" alt="Hand-drawn sketch: checkpoint and resume with side effects" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w30-m3-dark.svg" alt="Hand-drawn sketch: checkpoint and resume with side effects" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w30-m3
+tier: T3
+one-sentence-goal: Show that resuming restores state but replays effects, and that only an idempotency key makes the replay safe.
+elements:
+  - a horizontal timeline of five node boxes: triage -> gather -> diagnose -> CHARGE -> report
+  - a small floppy-disk / cylinder icon drawn after each completed node, labelled "checkpoint" with the state size "3.2 KB" written by one of them
+  - a jagged red lightning bolt striking INSIDE the CHARGE node, labelled "SIGTERM at t=41s"
+  - below, the resume: a new process box, an arrow from the last cylinder BEFORE charge, labelled "load thread_id=inc-4412", re-entering the CHARGE node from its start
+  - a red arrow from the first CHARGE attempt out to a bank icon labelled "£240 charged" and a SECOND red arrow from the replayed CHARGE to the same bank, labelled "£240 charged AGAIN" with a big red cross and the words "this is the bug"
+  - to the right, the fix drawn in green: the CHARGE node split into "write intent (idempotency_key = uuid5(thread_id, order_id, amount))" -> a queue box "outbox" -> a separate worker box -> bank, with a green note "the worker is the only thing that touches money, and it dedupes on the key"
+  - amber margin note: "the key must be DERIVED, not random. A random uuid regenerates on resume and defeats the whole thing."
+  - a second amber note near the checkpoint cylinders: "state survives. effects do not. Week 8."
+  - the phrase "at-least-once" circled, with "-> exactly-once effects" written beside it
+numbers-to-write-in: checkpoint write p50 1.9 ms local / 4.7 ms same-AZ; 9 checkpoints per run = 42 ms on a 34 s run = 0.12%; 20 kills, 6 double charges without a key, 0 with
+alt: A hand-drawn timeline of an agent run with a checkpoint saved after each node, a crash inside the charge node, and a resume that replays the charge - shown causing a double payment in red, with the outbox-and-derived-idempotency-key fix drawn in green beside it.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+### The words, defined
+
+- **Durable.** Survives the process dying. Written to something that is still there afterwards — a disk, a database — not to memory.
+- **Checkpoint.** A saved copy of the graph's state at a point in the run, plus which node comes next.
+- **Checkpointer.** The component that writes and reads checkpoints. In memory for tests, Postgres for production.
+- **Thread id.** The identifier for one run. All of a run's checkpoints share it. Resuming means "load the latest checkpoint for this thread and continue".
+- **Resume.** Starting a new process, loading a thread's state, and carrying on from where it stopped.
+- **Side effect.** Anything the agent did to the outside world — sent an email, charged a card, restarted a service. Checkpoints do not record these and cannot undo them.
+- **Idempotent.** Doing it twice has the same result as doing it once. `set_status("closed")` is idempotent; `charge(£240)` is emphatically not.
+- **Interrupt.** Deliberately pausing the graph at a node to wait for a human, and checkpointing while it waits. The process can exit entirely; approval can come hours later.
+
+### The analogy
+
+Checkpointing is saving your game. The save file records where you are and what you are carrying.
+It does not record that you already spent your gold at the shop — because in a game the shop is
+inside the save file, and in your system the shop is a bank in another country.
+
+So the rule is: **anything outside the save file must be safe to do twice.** In a game that never
+comes up. In your system it is the whole problem.
+
+### Smallest working example
+
+```bash
+uv pip install "langgraph==0.2.74" "langgraph-checkpoint-postgres==2.0.13" "psycopg[binary,pool]==3.2.3"
+docker run -d --name pg -e POSTGRES_PASSWORD=pw -p 5432:5432 postgres:16
+```
+
+```python
+# durable.py — kill it and watch it continue
+import os, sys, time
+from typing import Annotated, TypedDict
+from operator import add
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.postgres import PostgresSaver
+
+DB = "postgresql://postgres:pw@localhost:5432/postgres?sslmode=disable"
+
+class State(TypedDict):
+    steps_done: Annotated[list[str], add]
+
+def slow_step(name: str):
+    def node(state: State) -> dict:
+        print(f"  running {name} ...", flush=True)
+        time.sleep(3)                    # pretend this is a model call
+        print(f"  {name} done", flush=True)
+        return {"steps_done": [name]}
+    return node
+
+builder = StateGraph(State)
+for n in ("alpha", "beta", "gamma"):
+    builder.add_node(n, slow_step(n))
+builder.add_edge(START, "alpha")
+builder.add_edge("alpha", "beta")
+builder.add_edge("beta", "gamma")
+builder.add_edge("gamma", END)
+
+with PostgresSaver.from_conn_string(DB) as cp:
+    cp.setup()                            # creates the checkpoint tables. Idempotent.
+    app = builder.compile(checkpointer=cp)
+    config = {"configurable": {"thread_id": "demo-1"}}
+    out = app.invoke({"steps_done": []}, config=config)
+    print("finished:", out["steps_done"])
+```
+
+Run it. While `beta` is printing, hit Ctrl-C. Then run it again, unchanged:
+
+```
+$ python durable.py
+  running alpha ...
+  alpha done
+  running beta ...
+^C
+
+$ python durable.py
+  running beta ...          <- beta restarts from the beginning; alpha does not
+  beta done
+  running gamma ...
+  gamma done
+finished: ['alpha', 'beta', 'gamma']
+```
+
+Read the second run carefully. **`alpha` did not run again — its checkpoint was committed. `beta`
+ran from the start, because it never completed.** That is the exact semantics: a node either
+completes and is checkpointed, or it is replayed in full. There is no partial node.
+
+### Line by line
+
+- **`PostgresSaver.from_conn_string(DB)`** — the checkpointer. `MemorySaver` exists and is for tests only; it dies with the process, which is the thing you are defending against.
+- **`cp.setup()`** creates the tables (`checkpoints`, `checkpoint_writes`, `checkpoint_blobs`). Run it once at deploy, not on every request — it is safe but it takes a lock.
+- **`thread_id`** is how a run is identified. Use a natural key from your domain — the ticket id, the order id — not a random uuid, or you will not be able to find the run you want to resume.
+- **`app.invoke(input, config=config)`** with an existing `thread_id` and the same input **resumes** rather than starting over. This is the API's most surprising behaviour and its most useful one.
+- **The node is the unit of replay.** Everything inside a node either happens once (it completed) or happens again from the top (it did not). Design nodes with that in mind: put the risky, effectful part at the *end* of a node, or in its own node.
+
+### Guided practice
+
+```python
+# 1. Add a print at the top of each node saying which attempt it is.
+#    Kill during gamma. TODO: how many times does gamma's first line print? ____
+
+# 2. Inspect the checkpoints:
+#        state = app.get_state(config)
+#        print(state.values, state.next)        # current values, next node(s)
+#        for snap in app.get_state_history(config):
+#            print(snap.config["configurable"]["checkpoint_id"], snap.next)
+#    TODO: how many checkpoints for a 3-node run? ____ (it is more than 3)
+
+# 3. Make a node have a side effect: append a line to /tmp/effects.log.
+#    Kill mid-node, resume. TODO: how many lines in the file? ____
+#    This is the whole module in one experiment. Do not skip it.
+
+# 4. Change the thread_id and re-run. It starts from scratch. Threads are the
+#    isolation boundary — two users, two threads, no interference.
+```
+
+Exercise 3 produces two lines. That is the bug this module exists to prevent, and seeing it in a log
+file for three seconds of work is worth more than any amount of reading.
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **What is the unit of replay?** A node. It either completed and was checkpointed, or it runs again from its first line.
+2. **What does a checkpoint contain?** The state values and which node runs next — not a record of what the node did to the outside world.
+3. **Why is `thread_id` a domain identifier and not a uuid?** Because you resume by name, and at 3 a.m. you will want the run for ticket INC-4412.
+4. **What happens if you re-invoke a completed thread?** It returns the final state; the graph has already reached `END`.
+5. **What is the danger of putting an API call at the top of a long node?** A crash later in the node replays the call. Effects belong at the end of a node, or in their own node, or behind an idempotency key.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+### Postgres checkpointing, properly
+
+```python
+# app.py — production wiring
+from psycopg_pool import ConnectionPool
+from langgraph.checkpoint.postgres import PostgresSaver
+
+pool = ConnectionPool(conninfo=os.environ["DB_URI"], max_size=20,
+                      kwargs={"autocommit": True, "prepare_threshold": 0})
+checkpointer = PostgresSaver(pool)          # created once, at startup
+app = builder.compile(checkpointer=checkpointer)
+
+def run_ticket(ticket_id: str, text: str, user: str) -> dict:
+    config = {"configurable": {"thread_id": f"inc:{ticket_id}"},
+              "recursion_limit": 30}
+    return app.invoke({"ticket_id": ticket_id, "ticket_text": text,
+                       "requested_by": user, "evidence": [], "attempts": 0,
+                       "node_trail": [], "usd_spent": 0.0}, config=config)
+```
+
+Three deployment notes that are not in the quickstart:
+
+- **`autocommit=True` and `prepare_threshold=0`.** The checkpointer issues many small statements; without autocommit you hold transactions open across model calls, which on a 34-second run means a 34-second idle-in-transaction connection. We saw connection exhaustion at 40 concurrent runs before fixing this.
+- **One pool, created at startup.** `from_conn_string` per request opens a connection per run; it is fine in the tutorial and wrong in a service.
+- **`thread_id` namespaced** (`inc:INC-4412`). You will eventually have several graph types sharing a database, and an unnamespaced thread id will collide exactly once, memorably.
+
+### Human-in-the-loop: `interrupt()`
+
+An approval gate is a checkpoint that waits. The process may exit; the human may take four hours.
+
+```python
+from langgraph.types import interrupt, Command
+
+def propose_remediation(state: IncidentState) -> dict:
+    plan = build_plan(state)               # no side effects here — just a proposal
+    decision = interrupt({                  # <- execution stops; state is checkpointed
+        "kind": "approval",
+        "action": plan.action,              # "restart_service"
+        "arguments": plan.arguments,        # {"service": "payments-api"}  <- SHOW THESE
+        "blast_radius": plan.blast_radius,  # "≈2,000 in-flight checkout sessions"
+        "evidence": [e.excerpt[:200] for e in state["evidence"][:3]],
+    })
+    if decision["approved"] is not True:
+        return {"halt_reason": f"declined by {decision['by']}: {decision.get('reason','')}"}
+    return {"remediation": plan.action, "approved_by": decision["by"]}
+
+# Elsewhere — hours later, in a different process, from a web handler:
+def approve(ticket_id: str, approver: str) -> dict:
+    config = {"configurable": {"thread_id": f"inc:{ticket_id}"}}
+    return app.invoke(Command(resume={"approved": True, "by": approver}), config=config)
+```
+
+Four rules for approval gates, all learned the hard way:
+
+1. **Show the resolved arguments, not the verb.** "Approve remediation?" is theatre. "Restart `payments-api`, affecting ≈2,000 in-flight checkout sessions — approve?" is a control. The attack and the mistake both live in the argument (Week 29 M4, Week 31 M4).
+2. **Record who approved, in the state.** `approved_by` is a field. It is checkpointed, it is in the audit trail, and it is the first thing asked in a post-incident review.
+3. **Decline is a first-class outcome**, routed to a node, not an exception. Half of approvals in our system are declines with a reason, and that reason is training data for the next version of the prompt.
+4. **The node containing `interrupt()` re-runs from the top on resume.** Everything before the `interrupt` call executes twice. So build the plan there — cheap, pure — and never call an API before an interrupt in the same node.
+
+### Time travel and resume-from-edit
+
+```python
+# What happened, step by step
+for snap in app.get_state_history(config):
+    print(snap.config["configurable"]["checkpoint_id"], snap.next, snap.values["node_trail"])
+
+# Correct the agent mid-flight: fix a wrong severity and re-run from there
+app.update_state(config, {"severity": "P2"}, as_node="triage")
+app.invoke(None, config=config)          # continues from after triage, with the fix
+
+# Fork: replay from an earlier checkpoint without destroying the original
+old = list(app.get_state_history(config))[3].config
+app.invoke(None, config=old)             # creates a new branch from that point
+```
+
+`update_state(..., as_node="triage")` is the operator's tool: an on-call engineer sees the agent
+mis-triaged a ticket, corrects one field, and lets it continue rather than starting a 90-second run
+again. It is also, and you should say this out loud in a design review, **a write path into your
+agent's state that bypasses every model and every guardrail** — so it needs authorization and it
+needs an audit entry. We log every `update_state` with the actor, the field, the old value and the
+new one.
+
+### Idempotency: the part that actually matters
+
+Checkpointing gives you **at-least-once** execution of every node. Your side effects must therefore
+be **idempotent**, or you must move them somewhere that is. Week 8's outbox, arriving on schedule.
+
+```python
+# tools/charge.py — the ONLY correct shape for a money-moving tool in a resumable agent
+import uuid
+from psycopg import Connection
+
+NAMESPACE = uuid.UUID("6f1d6b6e-5f6a-4a0b-9a9b-0c2b7f1d0e11")   # fixed, in source
+
+def idempotency_key(thread_id: str, order_id: str, amount_pence: int) -> str:
+    """DERIVED, not random. Regenerating it on resume must produce the same key."""
+    return str(uuid.uuid5(NAMESPACE, f"{thread_id}|{order_id}|{amount_pence}"))
+
+def request_charge(conn: Connection, thread_id: str, order_id: str,
+                   amount_pence: int) -> str:
+    key = idempotency_key(thread_id, order_id, amount_pence)
+    with conn.transaction():
+        conn.execute(
+            """INSERT INTO payment_outbox (idempotency_key, order_id, amount_pence,
+                                           thread_id, status)
+               VALUES (%s, %s, %s, %s, 'pending')
+               ON CONFLICT (idempotency_key) DO NOTHING""",     # <- the whole defence
+            (key, order_id, amount_pence, thread_id))
+    return (f"charge request {key} recorded for order {order_id}. "
+            f"Call get_charge_status to confirm settlement.")
+```
+
+Read the three properties this has:
+
+1. **The key is derived from the run and the intent**, so a replay computes the identical key and the `ON CONFLICT DO NOTHING` makes the second write a no-op. A `uuid4()` here would regenerate on every replay and defeat the entire mechanism — this is the single most common way teams get this wrong.
+2. **The agent never calls the payment API.** A separate worker drains the outbox, calls the provider once per key (passing the same key as the provider's own idempotency header), and updates `status`. The non-idempotent boundary is one worker you can reason about, not a node that might be replayed.
+3. **The tool returns immediately with a handle.** The agent polls `get_charge_status`. That poll is a pure read, safe to replay any number of times.
+
+**Measured.** 20 runs, `SIGKILL` at a uniformly random time within the run, agent restarted:
+
+| Design | Double charges in 20 kills | Lost charges | Mean recovery time |
+| --- | --- | --- | --- |
+| Direct API call inside the node | **6** | 0 | 1.4 s |
+| Direct call with a `uuid4()` idempotency key | **6** | 0 | 1.4 s |
+| Direct call with a derived key | 0 | 0 | 1.5 s |
+| Outbox with a derived key + worker | 0 | 0 | 2.1 s |
+
+The second row is the instructive one. The team that wrote it believed it was protected. A random
+key protects against *network retries within one process*; it does nothing against *replay after a
+crash*, because the process that regenerates it is a new one. Derived keys, always.
+
+### War story
+
+A provisioning agent created cloud resources. It was durable: Postgres checkpointer, resume on
+restart, tested. During a routine node-pool upgrade, 34 agent runs were evicted mid-node and
+resumed on new pods. Eleven of them re-ran a node that had already called the cloud API, creating
+duplicate load balancers. Cost: about $1,900 that month, and four hours of manual reconciliation to
+work out which were real.
+
+The API *did* support idempotency tokens. The agent generated them with `uuid4()` at the top of the
+node. Every property of the durability design was correct except the one that mattered. The fix was
+eleven lines: derive the token from `(thread_id, resource_kind, resource_name)`, and add a
+reconciliation query that lists resources tagged with a thread id having no corresponding state
+entry. The second half of that fix is the part people skip — **you also need to be able to detect
+the duplicates you already made.**
+
+<Accordion title="Design checkpoint — with model answer">
+
+**Question.** Your agent has a node that (a) writes a row to your database, (b) calls a third-party
+API, and (c) sends an email. The process can die at any instruction. Design the node.
+
+**Model answer.** It is not one node; it is three, and two of them do not belong in the graph at all.
+
+The database write stays in the node, wrapped in a transaction, with a natural unique key so a
+replay conflicts and no-ops. Cheap, local, transactional — this is the easy one.
+
+The third-party call moves out. The node writes an intent row to an outbox in the *same transaction*
+as (a), which is the classic reason the outbox pattern exists: either both happen or neither does,
+with no distributed transaction. A worker drains the outbox and calls the API once per derived key,
+passing that key as the provider's idempotency header. The agent polls for status.
+
+The email is the same shape, and it is worth being explicit about why: an email is a side effect you
+cannot retract and users notice duplicates. It goes in the outbox with a derived key, and the sender
+deduplicates.
+
+What is left in the node is pure computation plus one transactional write. The node is now safe to
+replay any number of times. Two things I would add: the outbox worker needs its own idempotency
+against *itself* (a `SELECT ... FOR UPDATE SKIP LOCKED` claim, so two workers cannot process one
+row), and there must be a reconciliation job that finds effects with no corresponding state — because
+the failure you have not imagined is the one you will need to detect after the fact.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+### What durability actually costs
+
+Measured on the incident graph (9 supersteps per run), Postgres 16, `claude-opus-5`.
+
+| | Checkpoint write p50 | p99 | Per-run overhead | As % of a 34 s run |
+| --- | --- | --- | --- | --- |
+| `MemorySaver` (not durable) | 0.04 ms | 0.2 ms | 0.4 ms | 0.001% |
+| Postgres, same host (Docker) | 1.9 ms | 8.4 ms | 17 ms | 0.05% |
+| Postgres, same availability zone | 4.7 ms | 19 ms | 42 ms | **0.12%** |
+| Postgres, cross-region (do not) | 68 ms | 210 ms | 612 ms | 1.8% |
+
+**Durability is free.** 42 milliseconds on a 34-second run, against a failure mode that otherwise
+destroys the entire run. There is no cost argument against checkpointing an agent, and if someone
+makes one, this is the table.
+
+The number that is *not* free is storage. LangGraph writes a checkpoint per superstep plus pending
+writes, so a 9-node run is more than 9 rows:
+
+| | Per run | Platform-wide volume (4,200 runs/day across all graphs) | Per year |
+| --- | --- | --- | --- |
+| Checkpoint rows | 14 | 58,800 | 21.5 M |
+| Bytes (typed state, 3.2 KB median) | 41 KB | 172 MB | **63 GB** |
+| Bytes (message history in state, 41 KB median) | 520 KB | 2.2 GB | 800 GB |
+
+The second row is the Module 1 state-design decision showing up as a storage bill. And 63 GB/year of
+mostly-useless rows is still a problem, so prune:
+
+```sql
+-- Retention: full history for 7 days; after that keep only the first checkpoint,
+-- the last one, and any at which the graph was interrupted (approval points).
+DELETE FROM checkpoints c
+WHERE  c.created_at < now() - interval '7 days'
+  AND  c.checkpoint_id NOT IN (
+        SELECT first_value(checkpoint_id) OVER w FROM checkpoints WHERE thread_id = c.thread_id
+        WINDOW w AS (PARTITION BY thread_id ORDER BY created_at)
+      UNION SELECT last_value(checkpoint_id) OVER w FROM ...
+      UNION SELECT checkpoint_id FROM checkpoints WHERE interrupted);
+```
+
+Measured effect of that policy: 63 GB/year to **8.4 GB/year**, with full time-travel preserved for
+the last 7 days and first/last/approval snapshots kept forever. Decide the policy before you have
+the data, because deciding it afterwards involves a very slow `DELETE`.
+
+### Exactly-once is a lie; exactly-once *effects* are achievable
+
+State this precisely, because it is the sentence that separates people who have read about durable
+execution from people who have operated it.
+
+- **Exactly-once delivery is impossible** in the presence of crashes and an unreliable network. You cannot know whether a call that timed out was received.
+- **At-least-once execution is what a checkpointer gives you.** Nodes may run more than once.
+- **Exactly-once *effects* are achievable**, by making every effect idempotent under a key that is stable across replays. The system may attempt the effect many times; the effect happens once.
+
+The engineering consequence is a taxonomy you should apply to every tool in your graph:
+
+| Effect class | Example | Safe under replay? | What you do |
+| --- | --- | --- | --- |
+| Pure read | `get_order`, `search_logs` | Yes | Nothing |
+| Idempotent write | `set_status('closed')` | Yes | Nothing |
+| Naturally-keyed insert | `INSERT ... ON CONFLICT DO NOTHING` | Yes | Choose the key from the domain |
+| Keyed external call | Stripe with an idempotency header | Yes, with a **derived** key | Derive from `(thread_id, intent)` |
+| Unkeyed external call | A legacy SOAP endpoint | **No** | Outbox + single worker + reconciliation |
+| Irreversible physical effect | Sending an email, restarting a service | **No** | Outbox, plus human approval before the first attempt |
+
+The last row is why `interrupt()` and idempotency are in the same module. For effects that cannot be
+made safe, the control is not a key — it is a human, once, before anything happens.
+
+### Detecting what you cannot prevent
+
+Reconciliation is the control nobody builds until after the incident. Two queries, both cheap:
+
+```sql
+-- 1. Effects with no state: something happened that the agent does not know about.
+SELECT o.idempotency_key, o.order_id, o.created_at
+FROM   payment_outbox o
+LEFT   JOIN checkpoints c ON c.thread_id = o.thread_id
+WHERE  c.thread_id IS NULL AND o.status = 'settled';
+
+-- 2. State with no effect: the agent believes it charged, and nothing settled.
+SELECT thread_id, values->>'remediation'
+FROM   checkpoints
+WHERE  values->>'remediation' IS NOT NULL
+  AND  NOT EXISTS (SELECT 1 FROM payment_outbox o
+                   WHERE o.thread_id = checkpoints.thread_id AND o.status = 'settled');
+```
+
+Run both hourly, alert on non-empty. In our system these have fired four times in eight months: once
+for a genuine duplicate (a tool added without a derived key), twice for a worker crash leaving rows
+pending, and once for a thread deleted by the retention policy while its outbox row survived — which
+led to the retention policy learning about foreign keys.
+
+### Compared with Temporal-style workflow engines
+
+Both give durable execution; they differ in what they persist and therefore what they constrain.
+
+| | LangGraph checkpointer | Temporal (and similar) |
+| --- | --- | --- |
+| What is persisted | The **state** after each superstep | The **event history** of every activity's inputs and outputs |
+| Recovery | Load state, run the next node | Replay workflow code against the event history, then continue |
+| Constraint on your code | Nodes must tolerate full replay | Workflow code must be **deterministic** — no clocks, no random, no direct I/O |
+| Granularity of "already done" | The node | The activity (each individual call) |
+| Retries | Yours to build | First-class, per-activity, with policies |
+| Timers, schedules, signals | Yours to build | First-class, durable, days or months long |
+| Operational weight | A Postgres table | A cluster (or a hosted service) |
+| Fits | Agent runs of seconds to hours, where the state is small and legible | Business processes of days to months, many activities, strict per-activity semantics |
+
+The practical read: for an agent, LangGraph's granularity is coarser (a node replays entirely, where
+Temporal would have remembered the individual call's result) and that coarseness is exactly why you
+need the idempotency discipline above. If your workflow is long-running with dozens of effectful
+steps and human waits measured in days, a workflow engine's per-activity memoization is worth its
+operational weight — and a common production shape is a Temporal workflow whose activities *are*
+LangGraph runs.
+
+### Papers and primary sources
+
+- **LangGraph persistence documentation (0.2.74) — checkpointers, threads, `interrupt`, time travel.** Takeaway: the checkpoint boundary is the superstep, so a node is the unit of replay — internalize that and the idempotency requirement follows without anyone telling you.
+- **Temporal documentation — durable execution and workflow determinism.** Takeaway: persisting the event history instead of the state buys per-activity memoization at the price of determinism constraints on your code; knowing which trade you are making tells you where your bugs will be.
+- **Gray & Reuter, *Transaction Processing: Concepts and Techniques* (1992), on sagas and compensating actions.** Takeaway: when you cannot have a distributed transaction, you get correctness from idempotent steps plus compensations — which is exactly what an outbox plus a reconciliation job is.
+- **Helland, 2007 — *Life beyond Distributed Transactions: an Apostate's Opinion*.** Takeaway: at scale, activities must be designed so retries are harmless, because the alternative — coordinating everything — does not scale; this is the intellectual foundation of the derived-key rule.
+
+### Stretch challenge
+
+Build the **chaos harness** and publish its output.
+
+Write a test that runs your agent end to end while a supervisor sends `SIGKILL` at a uniformly
+random point in the run, restarts the process, and repeats — 100 times. After each run, assert:
+exactly one settled charge per thread; the `node_trail` contains no duplicated *effectful* node
+completion; the final state is reachable; and total cost is within 15% of the crash-free baseline
+(replayed nodes cost real money, and that overhead is a number you should know — ours was 11.3%).
+
+Then make it harder in the way production is harder: kill *during* the checkpoint write, not just
+during the node. Then kill the outbox worker between its API call and its status update — the
+genuinely nasty case, where the effect happened and nothing recorded it. The question you will have
+to answer is how the worker recovers: it must be able to ask the provider "did you already see this
+key?" before retrying. If your provider has no such query, write down what you would do instead, and
+be honest that it involves a human.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Build an agent whose tool charges money. Crash it mid-transaction 20 times at random points and
+prove — by assertion, not by inspection — that no card was charged twice.
+</Card>
+
+<Steps>
+<Step title="Make it durable">
+Postgres checkpointer, namespaced thread ids, a connection pool with autocommit. Kill it once by hand and watch it resume.
+</Step>
+<Step title="Make it unsafe on purpose">
+A charge node that calls the API directly with a `uuid4()` key. Run the chaos harness. Count the double charges. You should get several.
+</Step>
+<Step title="Derive the key">
+`uuid5(namespace, f"&#123;thread&#125;|&#123;order&#125;|&#123;amount&#125;")`. Re-run the harness. Zero.
+</Step>
+<Step title="Move to an outbox">
+Intent row in the same transaction as the state write; a worker with `FOR UPDATE SKIP LOCKED`; the agent polls. Kill the worker mid-flight too.
+</Step>
+<Step title="Add reconciliation">
+The two queries from Layer 3, on a schedule, with an alert. Then deliberately create an orphan and prove they catch it.
+</Step>
+</Steps>
+
+## The whiteboard
+
+**T3 hero animation** (A40): the graph executing node by node with a checkpoint cylinder appearing
+after each, the process dying mid-node, a new process starting, the state loading from the last
+cylinder, and execution continuing — with the effect-replay problem shown in red and the outbox fix
+shown in green as a second pass. **T1** — the effect-class taxonomy table as a hand-drawn decision
+tree.
+
+<Tip>
+**Draw it yourself.** The timeline with checkpoints, the lightning bolt inside the charge node, the
+two arrows to the bank, and the derived-key formula written out. If you can draw the two arrows you
+will never ship this bug.
+[Blank version](/assets/diagrams/p4-w30-m3-blank.svg) · [Editable source](/assets/diagrams/p4-w30-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Resume line:** *"Made a LangGraph agent durable with Postgres checkpointing and human-approval
+interrupts; built a chaos harness that SIGKILLs the process at 100 random points; proved zero
+duplicate side effects using derived idempotency keys and a transactional outbox, at 11.3% replay
+cost overhead and 42 ms (0.12%) of checkpointing overhead per run."*
+
+**How to talk about it.** The story is the `uuid4()` trap: a random idempotency key protects against
+in-process retries and does nothing against crash-replay, because the new process generates a new
+key. Explaining that distinction is a distributed-systems answer, and it is the reason the interviewer
+will keep talking to you.
+
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+**1. Classify every tool your agent has.** Pure read, idempotent write, keyed external call,
+unkeyed, irreversible. It is a one-hour exercise and the output is a list of exactly which tools are
+unsafe today. You will find at least one.
+
+**2. Check your idempotency keys are derived.** Grep for `uuid4` near anything that talks to a
+payment, email or provisioning API. This is a ten-minute audit with a very high hit rate.
+
+**3. Write the two reconciliation queries.** Effects without state, state without effects. Schedule
+them hourly. They are twelve lines of SQL and they are how you find out about the incident before
+your customer does.
+
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Card charged twice after a deploy | Node replayed an unkeyed external call | Derived idempotency key, or outbox plus worker |
+| Idempotency key present but duplicates persist | Key generated with `uuid4()` inside the node | Derive from `(thread_id, intent fields)` with `uuid5` |
+| Resume starts the run from the beginning | New `thread_id` each invocation | Thread id from the domain (ticket, order), namespaced |
+| Connection pool exhausted at ~40 concurrent runs | Transactions held open across model calls | `autocommit=True`, `prepare_threshold=0`, one pool at startup |
+| Approval gate approves the wrong thing | The prompt showed the verb, not the resolved arguments | Show arguments and blast radius; record `approved_by` in state |
+| Work done before an `interrupt` happens twice | The interrupting node replays from the top on resume | Nothing effectful before an `interrupt` in the same node |
+| Checkpoint table grows without bound | No retention policy | Keep 7 days full, then first/last/interrupt points; 63 GB to 8.4 GB in our case |
+| Checkpoints are huge and writes are slow | Message history carried in state | Typed decisions plus capped excerpts (Module 1) |
+| An effect happened and nothing recorded it | Worker died between the API call and the status update | Provider-side query by key before retry; reconciliation job as the backstop |
+| `update_state` used freely by anyone | It bypasses every model and guardrail | Authorize it, and audit actor, field, old and new values |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="8 concept questions (with answers)" icon="circle-question">
+
+1. *What execution semantics does a checkpointer give you?* At-least-once. Nodes may run more than once.
+2. *How do you get exactly-once effects from at-least-once execution?* Make every effect idempotent under a key that is stable across replays; queue the ones that cannot be.
+3. *Why must the idempotency key be derived rather than random?* A replay runs in a new process, which would generate a new random key and defeat the deduplication.
+4. *What is the unit of replay, and what follows from it?* The node. Anything effectful inside a node happens again if the node did not complete.
+5. *What does durability cost?* 42 ms per run in our measurement — 0.12% of a 34-second run. Storage is the real cost, and it is a retention-policy problem.
+6. *Why must nothing effectful precede an `interrupt()` in the same node?* Resuming re-runs the node from its first line.
+7. *How does Temporal differ?* It persists the event history and memoizes per activity, at the price of determinism constraints on workflow code.
+8. *What do you do about effects you cannot make idempotent?* Human approval before the first attempt, an outbox with a single worker, and a reconciliation job to detect what you failed to prevent.
+
+</Accordion>
+<Accordion title="Coding challenge (hidden tests)" icon="code">
+
+Implement the charge tool and its outbox worker to pass tests covering: two calls with identical
+`(thread_id, order_id, amount)` insert one row; a different amount inserts a second row; the worker
+claims rows with `FOR UPDATE SKIP LOCKED` so two workers never process one row; a worker killed
+between the API call and the status update is detected by the reconciliation query; a chaos test that
+kills the graph at 20 random points results in exactly one settled charge per thread; and an
+`interrupt()`-bearing node performs no side effect before the interrupt.
+
+</Accordion>
+<Accordion title="Interview questions — junior / mid / senior" icon="user-tie">
+
+- **Junior.** "The process died halfway through a run. What does the agent do when it restarts, and what does it re-do?"
+- **Mid.** "Your agent charged a customer twice after a rolling deploy. There was an idempotency key. Explain how that is possible." (The `uuid4()` trap.)
+- **Senior.** "Design durability for an agent that provisions cloud infrastructure and can run for four hours with two human approvals." (Expect: checkpointer plus interrupts, effect classification, derived keys, outbox for unkeyed APIs, retention policy, reconciliation both directions, and an argument about whether a workflow engine is warranted.)
+
+</Accordion>
+<Accordion title="Draw it from memory" icon="pencil">
+
+The crash-and-resume timeline with checkpoints, the double-effect problem in red, and the
+outbox-plus-derived-key fix in green.
+
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+- [LangGraph 0.2.74 persistence guide](https://langchain-ai.github.io/langgraph/) — checkpointers, threads, `interrupt`/`Command`, `get_state_history`, `update_state`. Read the superstep section carefully; it defines your replay unit.
+- [`langgraph-checkpoint-postgres` 2.0.13](https://github.com/langchain-ai/langgraph/tree/main/libs/checkpoint-postgres) — read the schema it creates before you design retention, because you will be deleting from it.
+- [Temporal documentation on durable execution](https://docs.temporal.io/) — read it for the contrast; the determinism constraint tells you what it buys.
+
+**Papers**
+- [Helland 2007, *Life beyond Distributed Transactions*](https://www.cidrdb.org/cidr2007/papers/cidr07p15.pdf) — design activities so retries are harmless, because coordination does not scale; this is the intellectual root of derived keys.
+- Gray & Reuter 1992, *Transaction Processing*, on sagas and compensations — correctness without distributed transactions comes from idempotent steps plus compensating actions.
+
+**Go deeper**
+- [The outbox pattern as described in Kleppmann, *Designing Data-Intensive Applications*, ch. 11](https://dataintensive.net/) — read it for why the intent write and the state write must share one transaction.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-30/p4-w30-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

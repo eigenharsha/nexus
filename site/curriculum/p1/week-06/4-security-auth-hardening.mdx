@@ -1,0 +1,663 @@
+---
+title: "Security, auth & hardening"
+description: "Week 6 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 6 · Module 4 · `P1-W06-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Distinguish authentication from authorisation and place each in the right layer of a FastAPI app.
+2. Hash passwords with argon2id at a cost you chose from a measurement, not from a default.
+3. Issue, verify, expire and revoke access and refresh tokens — including the revocation part, which most tutorials skip.
+4. Exploit IDOR, mass assignment and a tampered JWT against a deliberately vulnerable API, then close each hole and prove it with a test.
+5. Configure CORS, rate limiting and body-size limits so that the boring attacks stop being interesting.
+
+## Where this sits
+
+| | |
+| --- | --- |
+| **Prereqs** | `P1-W05-M1` (cookies, CORS), `P1-W06-M2` (dependencies), `P1-W06-M3` (models) |
+| **Unlocks** | `P1-W06-M5`, the Week 6 lab, and Week 31 (prompt injection is this module's lesson applied to LLMs) |
+| **One-line** | After this you can ship an API that a competent attacker finds boring. |
+
+## Why you should care
+
+### For Aarav (student)
+
+- Every take-home with a login is silently graded on this. Storing a password with SHA-256 fails the review instantly, and most candidates do it.
+- Being able to say "argon2id at 65 ms per hash, because I measured bcrypt cost 12 at 246 ms and that was too slow for our login rate" is a senior-sounding sentence built from one afternoon's work.
+- The vulnerable-app exercise gives you three real exploits you have personally run, which is the most memorable interview material in Phase 1.
+
+### For Meera (working professional)
+
+- This shows up in your job as: "a customer can see another customer's invoice by changing the ID in the URL." That is IDOR, it is the most common serious API bug in production, and it is a two-line fix that must be applied in fifty places.
+- Password hashing cost is a capacity decision: at 246 ms per bcrypt-12 verify, 20 logins per second consumes 5 CPU cores doing nothing else.
+- Auditors and enterprise customers ask about these controls by name. Being the person who can answer is career-relevant beyond the code.
+
+## The mental model
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p1-w06-m4.svg" alt="Hand-drawn sketch: authentication, authorisation and the object-level check" className="block dark:hidden" />
+  <img src="/assets/diagrams/p1-w06-m4-dark.svg" alt="Hand-drawn sketch: authentication, authorisation and the object-level check" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p1-w06-m4
+tier: T2
+one-sentence-goal: Make it obvious that authentication answers "who are you", route authorisation answers "may your role do this", and only the object-level check answers "may YOU touch THIS row" - and that skipping the third is IDOR.
+elements:
+  - a request arrow entering from the left carrying a token
+  - gate 1 box "authN - who are you?" with a key icon drawn by hand, outputs "user 7"
+  - gate 2 box "authZ (route) - may this role call this endpoint?" outputs "role=customer, scope=orders:read"
+  - gate 3 box "authZ (object) - does row 4102 belong to user 7?" drawn in green with a thick border
+  - a red arrow bypassing gate 3 straight to the database, crossed out, labelled "IDOR: GET /invoices/4102 returns someone else's invoice"
+  - amber margin note beside gate 3: "this is the one everyone forgets - and it is the most common serious API bug"
+  - a small side box "password -> argon2id -> stored hash" with the cost written beside it
+  - circled key term "object-level authorization"
+  - a dangling arrow labelled "...and how do you REVOKE a token you already signed?"
+numbers-to-write-in: argon2id 65.5 ms hash / 51.4 ms verify; bcrypt cost 10 = 79.3 ms, cost 12 = 245.6 ms, cost 14 = 1,237.7 ms; JWT HS256 sign 10.5 us, verify 13.2 us; bcrypt truncates at 72 bytes
+alt: A hand-drawn diagram showing a request passing through three gates - authentication, route authorization and object-level authorization - with a red arrow bypassing the third gate labelled IDOR, and measured password-hashing and token-verification timings written alongside.
+*/}
+
+Three questions, in order, and they are not the same question. **Who are you?** (authentication).
+**May someone like you do this?** (route authorisation). **May *you* touch *this specific row*?**
+(object-level authorisation). Almost every serious API breach in the wild is the third question
+never being asked.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Plain English
+
+    - **Authentication (authN)** — proving who you are. A password, a token, a passkey.
+    - **Authorisation (authZ)** — deciding what you may do once you are known.
+
+    They are separate, and confusing them produces the wrong status code and the wrong fix. `401`
+    means "I do not know who you are"; `403` means "I know, and no".
+
+    **Never store a password.** Store a **hash** — the output of a one-way function. When someone
+    logs in you hash what they typed and compare hashes. If your database leaks, the attacker has
+    hashes, not passwords.
+
+    Not all hashes are suitable. SHA-256 is a *fast* hash, designed to be fast, and a modern GPU
+    computes billions per second — so a leaked SHA-256 password database is cracked in hours. A
+    **password hashing function** is deliberately *slow* and memory-hungry: **argon2id** and
+    **bcrypt** are the two you should use. They also include a **salt** — random bytes stored with
+    the hash — so two users with the same password get different hashes and one cracked password
+    does not reveal the others.
+
+    A **token** is a string the server gives you after login, which you send with each later
+    request so you do not re-send the password. A **JWT** (JSON Web Token) is a token that carries
+    its claims in the token itself, signed so the server can verify it did not change.
+
+    ### The analogy
+
+    A hotel. Showing your passport at reception is authentication, once. The key card you get is a
+    token: it proves you checked in without revealing your identity documents to every door. The
+    card opens *your* room and the gym, not other rooms — that is authorisation. And crucially, the
+    card can be deactivated when you check out. A JWT with no revocation mechanism is a key card
+    that works until its printed expiry date no matter what happens, which is why the expiry needs
+    to be short.
+
+    ### Smallest working example
+
+    ```bash
+    uv pip install "fastapi==0.115.6" "uvicorn[standard]==0.34.0" \
+                   "argon2-cffi==23.1.0" "PyJWT==2.10.1" "python-multipart==0.0.20"
+    ```
+
+    ```python
+    from datetime import datetime, timedelta, timezone
+    from typing import Annotated
+    import jwt
+    from argon2 import PasswordHasher
+    from argon2.exceptions import VerifyMismatchError
+    from fastapi import Depends, FastAPI, HTTPException, status
+    from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+    from pydantic import BaseModel
+
+    SECRET = "change-me-and-load-it-from-the-environment"   # see BaseSettings in M3
+    ALGORITHM = "HS256"
+    ACCESS_TTL = timedelta(minutes=15)
+
+    app = FastAPI()
+    ph = PasswordHasher()                       # argon2id with sane defaults
+    oauth2 = OAuth2PasswordBearer(tokenUrl="token")
+
+    USERS = {"meera": {"id": 1, "password_hash": ph.hash("correct horse battery staple")}}
+
+    class Token(BaseModel):
+        access_token: str
+        token_type: str = "bearer"
+
+    @app.post("/token", response_model=Token)
+    async def login(form: Annotated[OAuth2PasswordRequestForm, Depends()]):
+        user = USERS.get(form.username)
+        if user is None:
+            ph.hash("dummy")                    # same work as a real verify: no user enumeration
+            raise HTTPException(401, "Incorrect username or password")
+        try:
+            ph.verify(user["password_hash"], form.password)
+        except VerifyMismatchError:
+            raise HTTPException(401, "Incorrect username or password")
+        now = datetime.now(timezone.utc)
+        token = jwt.encode(
+            {"sub": str(user["id"]), "iat": now, "exp": now + ACCESS_TTL},
+            SECRET, algorithm=ALGORITHM,
+        )
+        return Token(access_token=token)
+
+    async def current_user_id(token: Annotated[str, Depends(oauth2)]) -> int:
+        try:
+            claims = jwt.decode(token, SECRET, algorithms=[ALGORITHM])
+        except jwt.ExpiredSignatureError:
+            raise HTTPException(401, "Token expired")
+        except jwt.InvalidTokenError:
+            raise HTTPException(401, "Invalid token")
+        return int(claims["sub"])
+
+    @app.get("/me")
+    async def me(user_id: Annotated[int, Depends(current_user_id)]):
+        return {"user_id": user_id}
+    ```
+
+    ```bash
+    TOKEN=$(curl -s -X POST localhost:8000/token \
+      -d "username=meera&password=correct horse battery staple" | jq -r .access_token)
+    curl -s localhost:8000/me -H "Authorization: Bearer $TOKEN"
+    # {"user_id":1}
+    ```
+
+    ### Line by line
+
+    - `PasswordHasher()` — argon2id with the library's defaults. Measured on my machine: **65.5 ms
+      per hash, 51.4 ms per verify**.
+    - `ph.hash(...)` in the "user not found" branch — without it, a missing username returns in
+      microseconds and a real one in 65 ms, so an attacker can enumerate valid usernames with a
+      stopwatch. Doing the same work either way closes that.
+    - One error message for both wrong-user and wrong-password — same reason.
+    - `"sub"` — the subject claim, the user id. `"iat"` issued-at, `"exp"` expiry. PyJWT enforces
+      `exp` automatically; verified, an expired token raises `ExpiredSignatureError`.
+    - `algorithms=[ALGORITHM]` on `decode` — a *list you specify*. Never read the algorithm from
+      the token's own header; that is the classic forgery.
+    - `Depends(oauth2)` — extracts the bearer token and, as a bonus, wires the Authorize button in
+      `/docs`.
+    - 15-minute access tokens — short, because with a plain JWT you cannot revoke early. Layer 2
+      adds refresh tokens so short expiry is not painful.
+
+    ### Guided practice
+
+    Try each of these against your running app and record what happens.
+
+    1. Change one character in the token's payload segment and call `/me`. You should see
+       `Invalid token` — the signature no longer matches.
+    2. Set `ACCESS_TTL = timedelta(seconds=2)`, get a token, wait three seconds, call `/me`.
+       Verified result: `401 Token expired`.
+    3. Call `/me` with no header at all. `401`, from `OAuth2PasswordBearer`.
+    4. Time a login for a valid username and for a nonsense one. They should be within a few
+       milliseconds of each other. If the nonsense one is instant, you removed the dummy hash.
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+      **1. Why is SHA-256 wrong for passwords?**
+      It is designed to be fast, so an attacker with a GPU tries billions of candidates per second.
+      Password hashes must be deliberately slow and memory-hard.
+
+      **2. What is a salt for?**
+      So identical passwords produce different hashes, defeating precomputed rainbow tables and
+      preventing one cracked password from revealing every account that shares it.
+
+      **3. Why does the "user not found" branch still hash something?**
+      To keep response time constant, so an attacker cannot enumerate valid usernames by timing.
+
+      **4. Why must `algorithms` be passed explicitly to `jwt.decode`?**
+      Otherwise the token's own header chooses the verification algorithm, which is attacker-controlled.
+
+      **5. What is the difference between 401 and 403?**
+      401: we do not know who you are — authenticate. 403: we know, and you still may not.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The real theory: hashing cost is a capacity decision
+
+    Password hashing is deliberately slow, so its cost parameter is a trade between attacker effort
+    and your CPU budget. Measured on Apple Silicon, single core, median of ten runs:
+
+    | Algorithm and cost | Hash | Verify |
+    | --- | --- | --- |
+    | argon2id, defaults (t=3, m=64 MiB, p=4) | **65.5 ms** | **51.4 ms** |
+    | bcrypt cost=10 | 79.3 ms | — |
+    | bcrypt cost=12 | 245.6 ms | 261.1 ms |
+    | bcrypt cost=14 | 1,237.7 ms | — |
+
+    Each bcrypt cost increment doubles the work: 79 → 246 → 1,238 ms across costs 10, 12, 14.
+
+    Turn that into capacity. At 20 logins per second with bcrypt-12 at 246 ms, you need
+    `20 × 0.246 = 4.9` CPU cores doing nothing but hashing. With argon2id at 51 ms verify, the same
+    load needs 1.0 core — but argon2id also uses **64 MiB of memory per concurrent hash**, so 20
+    concurrent logins is 1.25 GB of RAM. Both are real constraints, and neither is visible until
+    a login spike.
+
+    Two consequences that follow directly. Login must be **rate limited**, or it is a CPU
+    amplification attack: one attacker at 100 requests per second costs you 25 cores. And password
+    hashing must run in a threadpool (`def` endpoint or `run_in_executor`), never on the event loop
+    — 65 ms of pure CPU on the loop stalls every concurrent request, exactly as measured in
+    `P1-W06-M2`.
+
+    ### The production surface
+
+    **Access plus refresh tokens.** The access token is short-lived (5–15 minutes) and stateless.
+    The refresh token is long-lived (7–30 days), **stored server-side**, and rotates on every use:
+
+    ```python
+    REFRESH_TTL = timedelta(days=14)
+
+    async def issue_pair(user_id: int, session) -> tuple[str, str]:
+        now = datetime.now(timezone.utc)
+        jti = secrets.token_urlsafe(32)
+        access = jwt.encode({"sub": str(user_id), "iat": now, "exp": now + ACCESS_TTL,
+                             "scope": "orders:read orders:write"}, SECRET, algorithm="HS256")
+        refresh_raw = secrets.token_urlsafe(48)
+        await session.execute(insert(RefreshToken).values(
+            id=jti, user_id=user_id,
+            token_hash=hashlib.sha256(refresh_raw.encode()).hexdigest(),   # hash it at rest
+            expires_at=now + REFRESH_TTL, revoked_at=None,
+        ))
+        return access, f"{jti}.{refresh_raw}"
+
+    async def rotate(refresh: str, session) -> tuple[str, str]:
+        jti, raw = refresh.split(".", 1)
+        row = await session.get(RefreshToken, jti)
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        if row is None or not hmac.compare_digest(row.token_hash, digest):
+            raise HTTPException(401, "Invalid refresh token")
+        if row.revoked_at is not None:
+            # replay of an already-rotated token: assume theft, kill the whole family
+            await revoke_all_for_user(session, row.user_id)
+            raise HTTPException(401, "Refresh token reuse detected")
+        if row.expires_at < datetime.now(timezone.utc):
+            raise HTTPException(401, "Refresh token expired")
+        row.revoked_at = datetime.now(timezone.utc)
+        return await issue_pair(row.user_id, session)
+    ```
+
+    The reuse-detection branch is the part worth stealing. A refresh token is single-use; if an
+    old one is presented again, either the client has a bug or someone stole it. Revoking the whole
+    family costs a legitimate user one re-login and costs an attacker everything. Note the refresh
+    token is **hashed at rest** — a database leak should not hand out live sessions — and compared
+    with `hmac.compare_digest`.
+
+    **Scopes and roles as dependencies:**
+
+    ```python
+    def require_scope(*needed: str):
+        async def dep(claims: Annotated[dict, Depends(decode_token)]) -> dict:
+            granted = set(claims.get("scope", "").split())
+            if not set(needed) <= granted:
+                raise HTTPException(403, f"Requires scope: {' '.join(needed)}")
+            return claims
+        return dep
+
+    @router.post("/orders", dependencies=[Depends(require_scope("orders:write"))])
+    async def create_order(...): ...
+    ```
+
+    This is route-level authorisation — question two of three. Question three still has to happen
+    inside the handler, and that is the next section.
+
+    ### Trade-offs
+
+    | Decision | Choose the first when… | Choose the second when… |
+    | --- | --- | --- |
+    | **argon2id vs bcrypt** | New systems. Memory-hardness raises the cost of GPU and ASIC attacks; measured 51.4 ms verify against bcrypt-12's 261.1 ms. | You have an existing bcrypt corpus, or memory is tight — 64 MiB per concurrent hash is real. Rehash on next successful login to migrate. |
+    | **Stateless JWT vs server-side session** | Multiple services must verify without calling an auth service; you accept that revocation is delayed by the token's TTL. | You need instant revocation, per-session visibility ("log out everywhere"), or you must store more state than fits comfortably in a token. |
+    | **Cookie vs `Authorization` header** | The client is a browser you control: `HttpOnly` means XSS cannot read the token. Then you need CSRF protection. | The client is mobile, a CLI, or a third party; or you are cross-origin and cookies fight you. |
+    | **Short access TTL vs long** | Security matters more than a refresh round trip — 5–15 minutes is the normal answer. | The client cannot refresh (an offline device); then use a server-side session so you retain revocation. |
+    | **Rate limit by IP vs by account** | Anonymous endpoints: signup, password reset, login attempts against unknown users. | Authenticated endpoints — IP limits punish everyone behind one NAT and let a distributed attacker through. Do both. |
+
+    ### Reference implementation: the object-level check
+
+    This is the most important code in the module.
+
+    ```python
+    # WRONG — this is IDOR. The user is authenticated, the route is authorised,
+    # and any user can read any invoice by changing the number in the URL.
+    @router.get("/invoices/{invoice_id}")
+    async def get_invoice(invoice_id: int, session: SessionDep, user: CurrentUser):
+        return await session.get(Invoice, invoice_id)
+
+    # RIGHT — ownership is part of the query, not a check after it
+    @router.get("/invoices/{invoice_id}", response_model=InvoiceOut)
+    async def get_invoice(invoice_id: int, session: SessionDep, user: CurrentUser):
+        invoice = (await session.execute(
+            select(Invoice).where(Invoice.id == invoice_id, Invoice.user_id == user.id)
+        )).scalar_one_or_none()
+        if invoice is None:
+            raise HTTPException(404, "Invoice not found")     # 404, not 403
+        return invoice
+    ```
+
+    Three deliberate decisions. Ownership is **in the `WHERE` clause**, so there is no window
+    between fetching and checking and no way to forget the check while keeping the fetch. The
+    response is **404, not 403**, because 403 confirms the invoice exists — that is an enumeration
+    oracle telling an attacker exactly which IDs are real. And the `response_model` is a narrow
+    output model, so even if the query is later widened, internal fields do not leak.
+
+    Two structural defences that scale better than remembering: use non-sequential public
+    identifiers (UUIDv7 or a prefixed random id) so guessing is impractical, and put the tenant or
+    owner filter in a repository layer or a SQLAlchemy `with_loader_criteria` so a developer cannot
+    write an unfiltered query by accident. You build that repository in `P1-W08-M5`.
+
+    ### What breaks in the real world
+
+    A B2B analytics product added a "share report" feature. The endpoint was
+    `GET /api/reports/{report_id}`, authenticated, and returned the report if the caller had the
+    `reports:read` scope. Every customer had that scope. Report IDs were sequential integers.
+
+    A customer's engineer noticed her report was id 4102, tried 4101 out of curiosity, and received
+    another company's revenue data. She reported it responsibly. The audit found that **every report
+    ever created was readable by every authenticated user** — roughly 240,000 documents across 900
+    tenants — and that the bug had shipped 14 months earlier.
+
+    The immediate fix was one `WHERE` clause. The systemic fixes were the interesting part:
+    ownership moved into a repository layer that every query goes through, so an unfiltered query
+    is not expressible; a test was added that iterates every route with a path parameter and asserts
+    a second tenant gets 404; sequential integer IDs were replaced with UUIDv7 in the public API;
+    and an alert now fires when one account reads more than 50 distinct report IDs in an hour, which
+    would have caught active exploitation.
+
+    The lesson is not "remember to check ownership". People forget; that is a given. The lesson is
+    **make the unsafe version hard to write**, and add a test that scales with your route count
+    rather than with your discipline.
+
+    <Accordion title="Design checkpoint — model answer inside">
+      **Question.** A user clicks "log out everywhere" after her laptop is stolen. Your access
+      tokens are stateless JWTs with a 15-minute TTL. What actually happens, and what should?
+
+      **Model answer.** Honestly: her refresh tokens are revoked immediately, and her *access*
+      tokens keep working for up to 15 more minutes, because a stateless JWT cannot be recalled —
+      the whole point is that verification needs no lookup. Say that out loud rather than pretending
+      otherwise. Three ways to close the window, in increasing cost. **One:** shorten the access
+      TTL to 5 minutes, so the exposure is bounded and cheap. **Two:** keep a `token_version`
+      integer on the user row, put it in the token as a claim, and compare on each request —
+      "log out everywhere" increments it and every existing token becomes invalid instantly. This
+      costs one cached lookup per request, and it is what most production systems do. **Three:** a
+      full denylist of revoked `jti` values in Redis with a TTL equal to the token's remaining life
+      — precise, but now every request depends on Redis being up, so you have traded availability
+      for revocation latency. Pick two and say which you picked and why; the wrong answer is
+      claiming the JWT was revoked when it was not.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    ### JWT footguns, and what modern libraries already fixed
+
+    The two classic JWT attacks are `alg: none` (strip the signature, set the header algorithm to
+    `none`) and **key confusion** (take an RS256 public key, which is public, and use it as the
+    HMAC secret for an HS256 token — if the server verifies with "the key" without pinning the
+    algorithm, the forgery validates).
+
+    I tried both against PyJWT 2.10.1. Verified results:
+
+    ```
+    forged alg:none token, algorithms=["HS256"]        -> InvalidAlgorithmError
+    forged alg:none token, algorithms=["none"]         -> InvalidKeyError: when alg = "none", key must be None
+    forged alg:none token, algorithms=["HS256","none"] -> InvalidKeyError
+    HS256 token signed with an RSA public key          -> InvalidKeyError at ENCODE time:
+        "The specified key is an asymmetric key or x509 certificate and should not be used as an HMAC secret."
+    ```
+
+    So a current library blocks both by construction. That is worth knowing precisely, because the
+    internet is full of 2015 advice that treats these as live threats in every stack. They are live
+    threats in *old* libraries and in hand-rolled verification, and the general principle survives:
+    **the verifier, not the token, chooses the algorithm.**
+
+    The footgun that is still wide open is this one:
+
+    ```
+    jwt.decode(forged_token, options={"verify_signature": False})
+      -> {'sub': '42', 'role': 'admin'}
+    ```
+
+    Verified: a completely forged token yields attacker-chosen claims. This appears in real
+    codebases as "we just wanted to read the user id for logging", and then someone reuses that
+    helper in an authorisation path. Grep for `verify_signature` in every codebase you inherit.
+
+    Two more that no library can fix for you. **JWTs cannot be revoked** — covered above; the
+    mitigation is short TTLs plus a version claim. And **`exp` is checked against the verifier's
+    clock**: a server 90 seconds fast rejects freshly issued tokens. PyJWT's `leeway` parameter
+    exists for this, and a few seconds of leeway is correct; a few minutes hides a real clock
+    problem you should fix with NTP.
+
+    ### Timing attacks, measured honestly
+
+    The standard advice is to compare secrets with `hmac.compare_digest` because `==` short-circuits
+    on the first differing byte and leaks position through timing. I measured 32-character hex
+    strings on this machine, 400,000 iterations each:
+
+    | Comparison | Time |
+    | --- | --- |
+    | `==`, strings differ at the **last** character | 26 ns |
+    | `==`, strings differ at the **first** character | 24 ns |
+    | `hmac.compare_digest`, differ at last | 58 ns |
+    | `hmac.compare_digest`, differ at first | 89 ns |
+
+    The honest reading: **no measurable leak from `==` at this size locally** — 24 versus 26 ns is
+    inside the noise, because CPython compares lengths first and short strings are compared in
+    word-sized chunks, not character by character. Timing attacks on string comparison are real
+    (Nate Lawson's remote timing work established that microsecond differences are recoverable over
+    a network with enough samples), but you should not claim to have demonstrated one when you have
+    not.
+
+    The engineering conclusion is unchanged, and now it is honest: `compare_digest` costs about
+    30–60 ns extra per comparison — utterly irrelevant next to a 51 ms password verify — and
+    guarantees constant time by construction rather than by an accident of CPython's optimiser that
+    could change in the next release. Use it for every secret comparison: tokens, API keys, HMAC
+    signatures, refresh tokens.
+
+    ### bcrypt's 72-byte truncation
+
+    Verified on bcrypt 4.2.1:
+
+    ```python
+    >>> h = bcrypt.hashpw(b"A" * 72, bcrypt.gensalt(4))
+    >>> bcrypt.checkpw(b"A" * 72 + b"different", h)
+    True
+    ```
+
+    bcrypt ignores everything past 72 bytes. So a user with a 100-character passphrase has an
+    80-character password, and anyone who knows the first 72 bytes is in. It bites hardest in a
+    specific pattern: teams that pre-hash with SHA-256 and then base64 the result get 88 characters
+    of input, of which bcrypt uses 72 — usually still fine, but if you hex-encode instead you get
+    64 characters of hex representing only 36 bytes of entropy. argon2id has no such limit, which
+    is one more reason it is the default recommendation.
+
+    ### OWASP API Security Top 10 (2023), with the check that catches each
+
+    | Rank | Risk | The control |
+    | --- | --- | --- |
+    | API1 | Broken object-level authorisation (IDOR) | Ownership in the `WHERE` clause; a cross-tenant test per route |
+    | API2 | Broken authentication | Rate-limited login, argon2id, no user enumeration, refresh rotation with reuse detection |
+    | API3 | Broken object property-level authorisation | `extra="forbid"` on inputs, narrow `response_model` on outputs |
+    | API4 | Unrestricted resource consumption | Body size cap, page-size cap, query timeouts, rate limits, per-request cost budget |
+    | API5 | Broken function-level authorisation | Scope dependencies on every route; deny by default |
+    | API6 | Unrestricted access to sensitive business flows | Per-flow limits (one password reset per hour, not one request per second) |
+    | API7 | Server-side request forgery | Allowlist outbound hosts; block link-local `169.254.169.254`, which is the cloud metadata endpoint |
+    | API8 | Security misconfiguration | CORS not `*` with credentials; debug off; stack traces never returned |
+    | API9 | Improper inventory management | Old `/v1` still live and unpatched; keep a route inventory in CI |
+    | API10 | Unsafe consumption of third-party APIs | Validate responses from partners with the same rigour as user input |
+
+    API7 deserves a line of its own because it is the one that ends careers: if your API fetches a
+    URL the user supplied, an attacker sends `http://169.254.169.254/latest/meta-data/iam/security-credentials/`
+    and receives your cloud role's credentials. Allowlist destinations; do not blocklist.
+
+    ### Rate limiting and body limits, with arithmetic
+
+    A token bucket per account plus a coarser one per IP. Sizing from the hashing measurements:
+    login at argon2id costs 51 ms of CPU, so **10 login attempts per minute per account** caps one
+    account at 0.85% of a core, and 1,000 attackers at 8.5 cores — survivable. Without a limit,
+    100 requests per second consumes 5.1 cores from a single laptop.
+
+    Body size is the other cheap win. FastAPI does not limit request size by default; a 2 GB JSON
+    body will be read into memory. Cap it at the reverse proxy (`client_max_body_size 1m` in nginx)
+    *and* in the app, and cap JSON nesting depth — a deeply nested payload can exhaust the parser's
+    recursion before any of your code runs.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | IDOR | Nothing. It is silent until someone tries | A test that iterates every route with a path parameter and asserts 404 for a second tenant |
+    | Secret in the repository | An old commit contains a signing key | `gitleaks`/`trufflehog` in CI; rotate anything that ever touched git history |
+    | `verify_signature: False` in a helper | Forged tokens accepted on one code path | Grep; ban the option with a lint rule |
+    | CORS `*` with credentials | Any site can make authenticated requests as the user | Browsers reject the combination, so it usually appears as an echo-any-origin bug instead |
+    | Password hashing on the event loop | Login latency collapses under concurrency | 65 ms of CPU in `async def`; use `def` or a threadpool |
+    | Login unlimited | CPU saturation from one attacker | Rate limit per account and per IP; alert on failed-login rate |
+    | Token TTL longer than the incident response window | A stolen token outlives the response | Short access TTL plus a `token_version` claim |
+    | Enumerable IDs plus 403 | Attacker maps your object space | Return 404 for unauthorised, and use non-sequential IDs |
+
+    ### Frontier and primary sources
+
+    - **OWASP API Security Top 10 (2023).** *Takeaway:* the top risk is authorisation at the object
+      level, not injection — API bugs are logic bugs, so scanners miss them and tests must be
+      written per route.
+    - **RFC 9106 (Argon2).** *Takeaway:* memory-hardness is the defence against GPU and ASIC
+      attackers, which is why the memory parameter matters as much as the time parameter.
+    - **RFC 8725, *JWT Best Current Practices*.** *Takeaway:* pin algorithms at the verifier,
+      validate `aud` and `iss`, and never trust the token's own header — every historical JWT break
+      is one of those three.
+    - **RFC 6749 / OAuth 2.1 draft.** *Takeaway:* the implicit flow is dead; authorisation code with
+      PKCE is the only browser flow to implement now.
+    - **Nate Lawson, "Optimal statistical timing attacks" / Crosby et al., *Opportunities and Limits
+      of Remote Timing Attacks* (2009).** *Takeaway:* microsecond timing differences are recoverable
+      over a LAN with enough samples, which is why constant-time comparison is required even when a
+      local microbenchmark shows nothing.
+
+    ### Stretch challenge
+
+    Take the deliberately vulnerable app in the lab and write an *exploit suite*, not a patch set:
+    a script that programmatically demonstrates IDOR, mass assignment, JWT tampering, user
+    enumeration by timing, and unbounded resource consumption — each with a measured proof (rows
+    read, fields set, response-time histogram, memory high-water mark). Then patch each hole and
+    make the same suite fail, and put both runs in a `SECURITY.md`.
+
+    The genuinely open part: decide which controls belong in the framework, which in the
+    repository layer, and which in the deployment (reverse proxy, WAF, network policy). There is no
+    single right split, and defending yours — particularly why you did *not* put a control in the
+    application — is the staff-level conversation. Then answer the follow-up: which of these
+    defences would still work if an attacker had a valid token for a real account? Most of them do
+    not, and knowing which is the difference between security theatre and a threat model.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Attack the provided vulnerable API: read another user's order (IDOR), grant yourself admin (mass
+assignment), and forge a token (JWT tampering). Record the exact request and response for each.
+Then patch each hole and write a test that fails on the unpatched version and passes on the fixed
+one. A patch without a failing test does not count.
+</Card>
+
+## The whiteboard
+
+T1 is the three-gate diagram with the IDOR bypass in red. The T2 build-up: (1) the request with a
+token, (2) authN resolving the identity, (3) route authZ checking the scope, (4) the object check —
+and the same sequence with gate 3 removed, showing the bypass.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p1-w06-m4-blank.svg) · [Editable source](/assets/diagrams/p1-w06-m4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    Put the exploit-then-patch write-up in a `SECURITY.md` with the three attacks, the exact
+    requests, and the tests that now prevent them. This is the single most memorable thing you can
+    put in a Phase 1 portfolio, because it shows you can think like an attacker and then fix it.
+    In an interview: "I measured argon2id at 65 ms per hash, which at 20 logins per second is one
+    core, so login has to be rate limited or it is a CPU amplification attack."
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **One:** write the cross-tenant test — for every route with a path parameter, authenticate as
+    tenant B and assert 404 for tenant A's object. Teams routinely find real IDORs the first time
+    they run it. **Two:** grep for `verify_signature` and for any JWT decode without an explicit
+    `algorithms` list. **Three:** check whether password hashing runs on the event loop; if login
+    latency degrades under concurrency while CPU is low, it does.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Users can read each other's data | No object-level check | Ownership in the `WHERE` clause; 404 for not-yours |
+| A user made themselves an admin | Mass assignment through a wide model | `extra="forbid"`; separate create/update/response models |
+| Login enumerates valid usernames | Fast path when the user does not exist | Hash a dummy value; identical message and timing |
+| Forged tokens accepted | `verify_signature: False`, or no explicit `algorithms` | Always pass `algorithms=[...]`; ban the option in lint |
+| "Log out everywhere" does not | Stateless JWT cannot be recalled | Short TTL plus a `token_version` claim, or server-side sessions |
+| Login collapses under load | Hashing on the event loop, or no rate limit | `def` endpoint or threadpool; limit per account and per IP |
+| Long passphrases behave oddly | bcrypt truncates at 72 bytes | argon2id, or document and enforce the limit |
+| CORS lets any site call your API | Origin echoed back, or `*` with credentials | Explicit allowlist; send `Vary: Origin` |
+| Cloud credentials stolen | SSRF through a user-supplied URL | Allowlist outbound hosts; block link-local addresses |
+
+## Assessment
+
+**Concept questions**
+
+1. Difference between authentication and authorisation, with the status code for each failure. *(401 vs 403.)*
+2. Why is SHA-256 unsuitable for passwords, and what makes argon2id suitable? *(Speed vs deliberate slowness and memory-hardness.)*
+3. Why return 404 rather than 403 for an object you do not own? *(403 confirms existence, which is an enumeration oracle.)*
+4. What does refresh-token rotation with reuse detection buy you? *(A replayed token proves theft, so the whole family can be revoked at the cost of one re-login.)*
+5. Why must `algorithms` be explicit in `jwt.decode`? *(Otherwise the attacker-controlled header picks the verification algorithm.)*
+6. Compute the CPU cost of 20 logins per second at 51 ms per verify. *(1.0 core, plus 64 MiB of memory per concurrent hash.)*
+7. What does bcrypt do with a 100-character password? *(Uses the first 72 bytes and ignores the rest.)*
+8. Why use `hmac.compare_digest` even when a local benchmark shows no timing difference? *(Constant time by construction rather than by an optimiser accident; the extra 30–60 ns is irrelevant next to a 51 ms verify.)*
+
+**Coding challenge.** Patch the vulnerable API: fix IDOR, mass assignment and token verification, add refresh rotation with reuse detection, and rate limit login. Hidden tests: tenant B gets 404 on every one of tenant A's objects; a payload with `is_admin` returns 422; a token with `verify_signature` disabled is never accepted anywhere; a reused refresh token revokes the family; 11 login attempts in a minute return 429 with `Retry-After`.
+
+**Interview questions**
+
+- *Junior:* "How do you store passwords, and why not SHA-256?"
+- *Mid:* "What is IDOR and how would you make it impossible to write in our codebase?"
+- *Senior:* "Design token revocation for a system with 12 services, 40 ms p99 auth budget, and a requirement that 'log out everywhere' takes effect within 30 seconds."
+
+**Draw it from memory.** Draw the three authorisation gates, mark which one IDOR bypasses, and write the measured hashing cost beside the password path.
+
+## Sources & further reading
+
+**Primary docs**
+
+- [OWASP API Security Top 10 (2023)](https://owasp.org/API-Security/editions/2023/en/0x11-t10/) — read API1 and API3 first; between them they cover most real API breaches.
+- [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html) — read it for the current recommended parameters, which change over time.
+- [FastAPI security documentation](https://fastapi.tiangolo.com/tutorial/security/) — read "OAuth2 with Password (and hashing), Bearer with JWT tokens"; it is the shape the lab expects.
+- [PyJWT documentation](https://pyjwt.readthedocs.io/) — read the API reference for `decode`, particularly `algorithms`, `audience`, `issuer` and `leeway`.
+
+**Specs and their takeaways**
+
+- **[RFC 8725 (JWT BCP).](https://www.rfc-editor.org/rfc/rfc8725)** *Takeaway:* pin algorithms at the verifier and validate `aud`/`iss`; every historical JWT break comes from trusting the token about itself.
+- **[RFC 9106 (Argon2).](https://www.rfc-editor.org/rfc/rfc9106)** *Takeaway:* memory cost is what defeats GPU attackers, so the memory parameter is not a tuning detail.
+- **[OAuth 2.1 draft.](https://datatracker.ietf.org/doc/draft-ietf-oauth-v2-1/)** *Takeaway:* implicit flow is removed and PKCE is mandatory for public clients — if you are copying a 2018 tutorial, you are implementing a deprecated flow.
+
+**Go deeper**
+
+- [*The Tangled Web*, Michal Zalewski](https://nostarch.com/tangledweb) — read the chapters on origins and cookies. It explains why browser security has the exact shape it does, which turns CORS, `SameSite` and CSRF from arbitrary rules into consequences of one design.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-06/p1-w06-m4">
+  Attempt the lab first. Seriously.
+</Card>

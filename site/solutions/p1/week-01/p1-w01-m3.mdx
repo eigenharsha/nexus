@@ -1,0 +1,144 @@
+---
+title: "Stack, heap, and pointers"
+description: "Reference solution — Week 1"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W01-M3`
+
+Two allocators in about 150 lines, benchmarked against `malloc`.
+
+```c
+/* arena.c — bump allocator. CONTEXT OWNS: nx_arena_free releases everything. */
+#include "arena.h"
+#include <stdlib.h>
+
+int nx_arena_init(nx_arena *a, size_t cap) {
+    a->base = malloc(cap);
+    if (!a->base) return -1;
+    a->cap = cap; a->used = 0; a->high_water = 0;
+    return 0;
+}
+
+void *nx_arena_alloc(nx_arena *a, size_t n, size_t align) {
+    size_t off = (a->used + (align - 1)) & ~(align - 1);
+    if (off > a->cap || n > a->cap - off) return NULL;   /* cannot overflow */
+    void *p = a->base + off;
+    a->used = off + n;
+    if (a->used > a->high_water) a->high_water = a->used;
+    return p;
+}
+
+void nx_arena_reset(nx_arena *a) { a->used = 0; }
+void nx_arena_free(nx_arena *a) { free(a->base); a->base = NULL; a->cap = a->used = 0; }
+```
+
+```c
+/* freelist.c — fixed-size-block free list over one slab. */
+typedef struct nx_pool {
+    unsigned char *slab;
+    void *head;                 /* singly-linked list of free blocks */
+    size_t block, count;
+} nx_pool;
+
+int nx_pool_init(nx_pool *p, size_t block, size_t count) {
+    if (block < sizeof(void *)) block = sizeof(void *);   /* room for the link */
+    block = (block + 15) & ~(size_t)15;                   /* 16-byte alignment */
+    p->slab = malloc(block * count);
+    if (!p->slab) return -1;
+    p->block = block; p->count = count; p->head = NULL;
+    for (size_t i = count; i-- > 0; ) {                   /* build the list */
+        void *b = p->slab + i * block;
+        *(void **)b = p->head;
+        p->head = b;
+    }
+    return 0;
+}
+
+void *nx_pool_alloc(nx_pool *p) {
+    void *b = p->head;
+    if (b) p->head = *(void **)b;
+    return b;
+}
+
+void nx_pool_free(nx_pool *p, void *b) {
+    *(void **)b = p->head;
+    p->head = b;
+}
+```
+
+The benchmark, with the discipline that gets graded:
+
+```c
+static double cpu_ns(void) {
+    struct timespec t; clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t);
+    return t.tv_sec * 1e9 + t.tv_nsec;
+}
+/* minimum of 5 runs; CPU time, not wall clock */
+```
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: the bounds check written as `if (off + n > a->cap)`.**
+
+This is the natural way to write it and it is wrong for exactly the reason Module 1 covered. If a caller passes `n = SIZE_MAX - 8`, then `off + n` wraps around to a small number, the check passes, and `nx_arena_alloc` returns a pointer into the middle of the arena with a promised size that runs off the end of the process. That is a heap overflow reachable from an integer the caller controls — the shape of a real CVE.
+
+The form `n > a->cap - off`, guarded by the prior `off > a->cap` check, cannot overflow because both operands of the subtraction are already known to be ordered. It is the same number of instructions.
+
+**Wrong turn 2: the free list storing the link outside the block.**
+
+The instinct is a separate array of "which blocks are free", or a `struct node { void *next; char data[]; }` wrapper. Both cost extra memory proportional to the block count.
+
+The trick in the reference is that a **free block's own memory is unused**, so the `next` pointer lives inside it. That is why `nx_pool_init` forces `block >= sizeof(void *)`: an 4-byte block cannot hold an 8-byte link. This is exactly how every real slab and pool allocator works, including the Linux kernel's SLUB and glibc's `tcache`, and it is why the free-list allocator has *zero* per-object overhead while `malloc` has 8–16 bytes.
+
+Note also that the list is built backwards (`for (size_t i = count; i-- > 0; )`) so the first allocation returns the *lowest* address. Building it forwards works identically but hands out addresses in descending order, which measurably hurts prefetching on a sequential workload — an easy thing to get wrong and a nice thing to measure.
+
+## The measured numbers this solution produces
+
+Apple M3 Pro, macOS 15, clang 15 `-O2`, 1,000,000 allocations of 24 bytes, minimum of 5 runs, CPU time:
+
+| Allocator | ns per allocation | Teardown |
+|---|---|---|
+| `malloc` + `free` | **31.85** | 1,000,000 calls |
+| free-list pool | ~3–5 (yours will vary; report it) | 1,000,000 pushes, or one slab `free` |
+| bump arena | **0.85** | one store: `a->used = 0` |
+
+**Arena is 37.3× faster per allocation than `malloc`.**
+
+Supporting measurements from the module:
+
+| Fact | Value |
+|---|---|
+| `malloc(1)` usable size, macOS `libmalloc` | 16 bytes (glibc: 32) |
+| Two consecutive `malloc(1)` addresses | 16 bytes apart |
+| `sizeof(struct { char; int; char; double; })` | 24 — offsets 0, 4, 8, 16 |
+| Same fields, reordered largest-first | **16** — 33% smaller |
+| Stack limit (`ulimit -s`) | 8,176 KB |
+| Recursion depth before `SIGSEGV` (64-byte locals) | **~87,000 frames**, ≈96 bytes per frame |
+
+## Grading notes
+
+**3/3 on correctness** means the overflow-safe bounds check, an explicit `align` parameter, and a test that proves alignment is honoured (allocate a `char` then a `double`; assert the `double`'s address is 8-byte aligned).
+
+**3/3 on performance** means CPU time, minimum of N, the load average reported, and both allocators measured in the same process against the same workload.
+
+**3/3 on explanation** means one paragraph naming exactly what the arena gave up — no individual `free`, peak-not-average memory, no intra-arena reuse — rather than only celebrating the 37×.
+
+The three most common ways submissions lose points:
+
+1. **Wall-clock timing on a loaded laptop.** We measured 1.0 s to 27.2 s for the same binary on the same input. Any benchmark without CPU time and min-of-N is a 1 on the Performance row regardless of how good the allocator is.
+2. **No alignment handling.** `p->used += n` with no rounding works for `char` and produces a misaligned `double` on the second allocation. On ARM64 this happens to work; on some architectures it faults; under `-fsanitize=undefined` it reports `misaligned address`.
+3. **Reporting the 37× without the caveat.** The arena is faster because it does less. A submission that presents it as a drop-in `malloc` replacement has missed the module. The trade-off paragraph is the deliverable.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

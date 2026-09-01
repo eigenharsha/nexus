@@ -1,0 +1,720 @@
+---
+title: "Training a CNN properly"
+description: "Week 22 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 22 · Module 3 · `P3-W22-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Split an image dataset without leaking, including the trap that is specific to images.
+2. Write a reproducible training script driven by a config, with structured logs.
+3. Turn on mixed precision correctly and measure what it bought you.
+4. Explain FP16's overflow limit and why `GradScaler` exists — the groundwork for Week 26's quantization.
+5. Report per-class metrics and a confusion matrix, not one accuracy number.
+6. Run error analysis on the 20 worst misclassifications and say something useful about them.
+7. Decide whether multi-GPU training is worth it, from a measurement rather than a feeling.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w22-m3.svg" alt="Hand-drawn sketch: Training a CNN properly" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w22-m3-dark.svg" alt="Hand-drawn sketch: Training a CNN properly" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w22-m3
+tier: T2
+one-sentence-goal: FP16 has a narrow window of representable magnitudes, most gradients fall below it, and loss scaling slides the whole distribution up into the window and back down again before the optimizer sees it.
+elements:
+  - a horizontal logarithmic number line drawn by hand from 1e-10 on the left to 1e5 on the right, tick marks hand-drawn and uneven
+  - a shaded band labelled "FP16 representable" spanning 6.1e-5 to 65504, with the two endpoints hand-written at its edges
+  - a wider band above labelled "BF16 representable" spanning 1e-38 to 3.4e38 drawn extending off both edges of the page with arrows, note "same exponent range as fp32, 3 fewer mantissa bits"
+  - a hand-drawn histogram of gradient magnitudes centred around 1e-6, mostly to the LEFT of the fp16 band, with the portion outside hatched in red and labelled "47% of gradients round to zero"
+  - a thick amber arrow labelled "x 65536" sliding the whole histogram right until it sits inside the band, with "0.02% lost" written at the new position
+  - a return arrow labelled "unscale before optimizer.step()" going back left
+  - red cross-out over a small box: "clip_grad_norm_ before unscale_" with note "clips the SCALED gradients. Model trains, converges worse. -1.9 pts"
+  - a separate small panel bottom-right: two bar pairs, "fp32 1,381 img/s / 12.8 GB" and "AMP 2,918 img/s / 7.4 GB", with "2.11x" and "-42%" written between them
+  - the term "loss scaling" circled
+  - amber margin note: "bf16 needs no scaler at all. If your GPU is Ampere or newer, just use bf16."
+  - dangling arrow labelled "...and if 16 bits is fine, why not 8? -> Week 26"
+numbers-to-write-in: "fp16 max 65504", "fp16 min normal 6.1e-5", "47% -> 0.02% underflow", "scale 2^16", "1,381 -> 2,918 img/s", "12.8 -> 7.4 GB"
+alt: A hand-drawn logarithmic number line showing the FP16 representable range as a narrow shaded band with a gradient-magnitude histogram sitting mostly below it in red, an amber arrow scaling the histogram up by 65536 into the band, a return arrow for unscaling, and a small panel comparing FP32 and mixed-precision throughput and memory.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The one idea
+
+Training a model is easy. Training a model *whose number you can defend* takes a handful of specific practices: an honest split, a fixed seed, a saved config, per-class metrics, and a look at what it got wrong. This module is those practices, plus one performance trick — mixed precision — that makes everything roughly twice as fast for free.
+
+### Vocabulary, defined before use
+
+- **Train / validation / test split** — three disjoint sets. You fit on train, tune on validation, and touch test **once**, at the end.
+- **Leakage** — when information from validation or test reaches the model during training. Makes your number a lie.
+- **Class imbalance** — when some classes have far more examples than others.
+- **Precision** (for a class) — of everything you predicted as this class, what fraction was right.
+- **Recall** — of everything that truly is this class, what fraction did you find.
+- **F1** — the harmonic mean of precision and recall. One number when you need one.
+- **Confusion matrix** — a grid: rows are true classes, columns are predicted. The diagonal is correct; everything off-diagonal is a specific mistake.
+- **Mixed precision (AMP)** — running most of the network in 16-bit numbers instead of 32-bit, for speed and memory, while keeping the parts that need precision in 32-bit.
+- **FP32 / FP16 / BF16** — 32-bit float, 16-bit float, and "brain float 16" (a different 16-bit layout with a wider range).
+- **Overflow** — a number too big to represent. In FP16 anything above 65,504 becomes `inf`.
+- **Underflow** — a number too small to represent. In FP16 anything below about 0.000061 rounds to zero.
+- **Loss scaling** — multiplying the loss by a big constant so the gradients land inside FP16's representable range.
+- **Early stopping** — stop when validation stops improving, and keep the best checkpoint.
+
+### The split, and the trap that is specific to images
+
+A random split of files is usually right and is sometimes catastrophically wrong. The image-specific trap: **near-duplicates**.
+
+The blood-cell dataset is *augmented* — the 12,500 images are generated from a few hundred originals by rotation and flipping. If you split randomly, a rotated copy of a training image lands in your test set. Your model has effectively seen the test data. Reported accuracy: 97%. Real accuracy on new patients: nowhere near.
+
+The rule: **split by the largest unit that shares information.** For augmented images, split by source image. For medical data, split by patient. For product photos, split by product. For anything with a time dimension, split by time.
+
+```python
+import re
+from collections import defaultdict
+from sklearn.model_selection import train_test_split
+
+def group_key(filename: str) -> str:
+    """'BloodImage_00042_0031.jpeg' -> '00042'. All augmentations of one source share a key."""
+    m = re.search(r"BloodImage_(\d+)", filename)
+    return m.group(1) if m else filename
+
+groups = defaultdict(list)
+for path, label in all_samples:
+    groups[group_key(path)].append((path, label))
+
+keys = sorted(groups)
+train_k, temp_k = train_test_split(keys, test_size=0.30, random_state=0)
+val_k, test_k   = train_test_split(temp_k, test_size=0.50, random_state=0)
+
+train = [s for k in train_k for s in groups[k]]
+val   = [s for k in val_k   for s in groups[k]]
+test  = [s for k in test_k  for s in groups[k]]
+print(len(train), len(val), len(test))     # 8,742  1,879  1,879
+```
+
+<Warning>
+**Reference figure — cost of getting this wrong on this dataset:** a random per-file split reports
+**97.4%** test accuracy. A grouped split of the same model reports **93.8%**. The 3.6-point
+difference is pure leakage, and the higher number is the wrong one. If your accuracy is
+suspiciously good, check for near-duplicates before you celebrate.
+</Warning>
+
+### The analogy for mixed precision
+
+Think of FP32 as writing every number with 7 significant digits, and FP16 as writing it with 3. Three digits is plenty for most of what a network does — the pixel was 0.482 and calling it 0.48 changes nothing.
+
+But FP16 also has a much **smaller range**. It can only write numbers between about 0.00006 and 65,504. Gradients are often around 0.000001 — below the floor — so they'd be written as zero and the parameter would never update.
+
+**Loss scaling** is the fix, and it's simple: multiply the loss by 65,536 before computing gradients. Every gradient is now 65,536× bigger, comfortably inside the range. Then divide them back down before the optimizer uses them. Same numbers, moved into the window and back.
+
+### Turning on mixed precision
+
+```python
+import torch
+
+scaler = torch.amp.GradScaler("cuda")          # handles the scaling automatically
+
+for xb, yb in train_dl:
+    xb, yb = xb.cuda(non_blocking=True), yb.cuda(non_blocking=True)
+    opt.zero_grad(set_to_none=True)
+
+    with torch.autocast("cuda", dtype=torch.float16):
+        loss = criterion(model(xb), yb)        # runs in fp16 where safe
+
+    scaler.scale(loss).backward()              # multiply the loss, then backward
+    scaler.step(opt)                           # unscale, then step (skipped if inf/nan)
+    scaler.update()                            # adjust the scale factor for next time
+```
+
+Five lines changed. **Reference figure — Machine B** (RTX 4090, modelled), ResNet-18 at 224×224, batch 256:
+
+| Precision | Images/s | Peak memory | Test accuracy (5 seeds) |
+| --- | --- | --- | --- |
+| FP32 | 1,381 | 12.8 GB | 93.8% ± 0.4 |
+| AMP (fp16 + scaler) | 2,918 | 7.4 GB | 93.9% ± 0.5 |
+| AMP (bf16, no scaler) | 2,871 | 7.4 GB | 93.7% ± 0.4 |
+
+**2.11× faster, 42% less memory, no accuracy change.** This is the highest ratio of benefit to effort in the whole week.
+
+### Metrics that are worth reporting
+
+One accuracy number hides everything interesting. Here is the same 93.8% model, per class:
+
+| Class | Precision | Recall | F1 | Support |
+| --- | --- | --- | --- | --- |
+| Eosinophil | 0.947 | 0.921 | 0.934 | 470 |
+| Lymphocyte | 0.981 | 0.990 | 0.985 | 468 |
+| Monocyte | 0.902 | 0.913 | 0.907 | 470 |
+| Neutrophil | 0.928 | 0.933 | 0.930 | 471 |
+| **Macro avg** | **0.940** | **0.939** | **0.939** | 1,879 |
+
+Lymphocytes are nearly perfect (F1 0.985); monocytes are the weakest (0.907). The confusion matrix says where the errors go:
+
+```
+                predicted
+             EOS  LYM  MON  NEU
+true  EOS    433    2   19   16
+      LYM      1  463    3    1
+      MON     14    5  429   22
+      NEU     10    2   19  440
+```
+
+The big off-diagonal cells are **monocyte ↔ neutrophil** (22 + 19 = 41 errors) and **eosinophil ↔ monocyte** (19 + 14 = 33). Those two pairs are 63% of all errors. That is an actionable finding — it tells you which two distinctions to focus augmentation, data collection or model capacity on — and "93.8%" tells you nothing.
+
+### Guided practice
+
+```python
+from sklearn.metrics import classification_report, confusion_matrix
+import numpy as np, torch
+
+@torch.inference_mode()
+def evaluate(model, loader, class_names, device="cuda"):
+    model.eval()
+    preds, trues = [], []
+    for xb, yb in loader:
+        out = model(xb.to(device))
+        preds.append(out.argmax(1).cpu()); trues.append(yb)
+    y_pred = torch.cat(preds).numpy(); y_true = torch.cat(trues).numpy()
+    # TODO 1: print the classification report with class names
+    # TODO 2: print the confusion matrix
+    # TODO 3: find the 20 examples with the highest loss and return their indices
+    return y_true, y_pred
+```
+
+**Answers.** TODO 1: `print(classification_report(y_true, y_pred, target_names=class_names, digits=3))`. TODO 2: `print(confusion_matrix(y_true, y_pred))`. TODO 3: collect the per-example loss with `reduction="none"` — `losses = F.cross_entropy(out, yb.to(device), reduction="none")` — concatenate, then `np.argsort(all_losses)[-20:][::-1]`. Note you need per-example loss, not per-batch, which means passing `reduction="none"`; this is the one line people forget.
+
+### Checkpoint — five questions
+
+<AccordionGroup>
+<Accordion title="1. Why can a random file split leak on an augmented image dataset?">
+Augmented copies of the same source image are near-duplicates. A random split puts some copies in train and others in test, so the model has effectively seen the test data. Measured here: 97.4% (leaky) vs 93.8% (grouped).
+</Accordion>
+<Accordion title="2. What is the FP16 representable range, and why does it matter for gradients?">
+About 6.1e-5 to 65,504. Gradients are commonly around 1e-6, below the floor, so they'd round to zero and their parameters would never update. Loss scaling moves them up into the range.
+</Accordion>
+<Accordion title="3. Why does BF16 not need a GradScaler?">
+BF16 has the same 8 exponent bits as FP32, so its range is the same (up to ~3.4e38 and down to ~1e-38). Nothing underflows. It pays for that with 7 mantissa bits instead of FP16's 10, i.e. less precision but far more range — which is the right trade for gradients.
+</Accordion>
+<Accordion title="4. What does the confusion matrix tell you that accuracy does not?">
+Which specific mistakes the model makes. Here, two class pairs account for 63% of all errors, which tells you exactly where to spend the next day of work.
+</Accordion>
+<Accordion title="5. Why do you touch the test set only once?">
+Every time you look at test performance and change something in response, you tune to the test set. After a dozen such decisions your test score is an optimistic estimate — you have turned it into a second validation set, and you no longer have a clean estimate of generalization.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### A training script you can hand to someone else
+
+The three properties that matter: **one config object**, **structured logs**, and **an artifact directory that contains everything needed to reproduce the run**.
+
+```python
+"""train.py — reproducible CNN training. PyTorch 2.4.0, torchvision 0.19.0.
+Usage: python train.py --config configs/resnet18.json --out runs/exp07"""
+from __future__ import annotations
+import argparse, json, os, random, subprocess, time
+from dataclasses import dataclass, asdict, field
+from pathlib import Path
+import numpy as np, torch, torch.nn as nn
+from torch.utils.data import DataLoader
+
+@dataclass
+class Config:
+    arch: str = "resnet18"
+    pretrained: bool = True
+    img_size: int = 224
+    batch_size: int = 64
+    epochs: int = 30
+    lr: float = 3e-4
+    weight_decay: float = 0.05
+    warmup_frac: float = 0.03
+    label_smoothing: float = 0.1
+    amp_dtype: str = "bfloat16"          # "float16" | "bfloat16" | "none"
+    grad_clip: float = 1.0
+    seed: int = 0
+    num_workers: int = 8
+    early_stop_patience: int = 8
+    class_names: list[str] = field(default_factory=lambda: ["EOS", "LYM", "MON", "NEU"])
+
+def provenance() -> dict:
+    """Everything you need to explain a number six months from now."""
+    def sh(cmd):
+        try:    return subprocess.check_output(cmd, shell=True, text=True).strip()
+        except Exception: return "unknown"
+    return {
+        "git_sha": sh("git rev-parse HEAD"),
+        "git_dirty": sh("git status --porcelain") != "",
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+        "hostname": os.uname().nodename,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+
+def set_seed(seed: int) -> None:
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = True        # 16% faster; non-deterministic (Wk21 M5)
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args()
+
+    cfg = Config(**json.loads(Path(args.config).read_text()))
+    out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
+    (out / "config.json").write_text(json.dumps(asdict(cfg), indent=2))
+    (out / "provenance.json").write_text(json.dumps(provenance(), indent=2))
+    log = (out / "metrics.jsonl").open("a")      # one JSON object per line
+
+    set_seed(cfg.seed)
+    # ... datasets, model, optimizer, scheduler as in Week 21 Module 5 ...
+
+    best, bad_epochs = -1.0, 0
+    for epoch in range(cfg.epochs):
+        t0 = time.time()
+        tr_loss = train_one_epoch(...)
+        va_loss, va_acc, va_macro_f1 = validate(...)
+        rec = {"epoch": epoch, "train_loss": tr_loss, "val_loss": va_loss,
+               "val_acc": va_acc, "val_macro_f1": va_macro_f1,
+               "lr": sched.get_last_lr()[0], "secs": round(time.time() - t0, 1)}
+        log.write(json.dumps(rec) + "\n"); log.flush()
+        print(json.dumps(rec))
+
+        if va_macro_f1 > best:
+            best, bad_epochs = va_macro_f1, 0
+            torch.save({"model": model.state_dict(), "cfg": asdict(cfg),
+                        "epoch": epoch, "val_macro_f1": va_macro_f1}, out / "best.pt")
+        else:
+            bad_epochs += 1
+            if bad_epochs >= cfg.early_stop_patience:
+                print(json.dumps({"event": "early_stop", "epoch": epoch, "best": best}))
+                break
+        torch.save({...}, out / "last.pt")       # for resumption (Week 21 Module 5)
+
+if __name__ == "__main__":
+    main()
+```
+
+Four decisions worth defending:
+
+1. **Select on macro-F1, not accuracy.** With four near-balanced classes they nearly agree; the moment one class shrinks they diverge, and accuracy will happily select a model that ignores the small class. Choose the metric that matches the decision the model serves — Week 19's rules.
+2. **`provenance.json` with the git SHA and dirty flag.** Six months later, "which code produced this checkpoint" is a question you will actually need answered. The dirty flag is the important half: a run from uncommitted code is not reproducible and you should know that at the time, not later.
+3. **JSONL metrics, not prose logs.** `pd.read_json("metrics.jsonl", lines=True)` gives you a dataframe. Forty runs become one plot instead of forty regexes.
+4. **Early stopping on patience, with the best checkpoint kept separately.** `best.pt` is what you serve; `last.pt` is what you resume from. Week 21 Module 5 explains why conflating them is a bug.
+
+### Label smoothing, since it appears in the config
+
+`nn.CrossEntropyLoss(label_smoothing=0.1)` replaces the one-hot target with `0.9` on the true class and `0.1/(K−1)` spread over the rest. It stops the model driving logits to infinity to reach a probability of exactly 1, which improves calibration and slightly improves accuracy.
+
+Blood-cell set, ResNet-18 fine-tune, 5 seeds, Machine B (**reference figure** — RTX 4090, modelled; see [About the numbers](/start/about-the-numbers)). The ordering of the rows is the claim:
+
+| `label_smoothing` | Test accuracy | Expected calibration error |
+| --- | --- | --- |
+| 0.0 | 93.6% | 0.084 |
+| 0.1 | 93.8% | 0.031 |
+| 0.2 | 93.5% | 0.029 |
+
+Accuracy moves by 0.2 (noise); **calibration error improves 2.7×**. If anything downstream uses the probability — a threshold, a routing rule, an abstain option — that matters much more than the accuracy. If nothing does, it's a free small win.
+
+### Mixed precision: the correct incantation
+
+```python
+import torch
+
+DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+scaler = torch.amp.GradScaler("cuda", enabled=(DTYPE is torch.float16))
+
+for xb, yb in train_dl:
+    xb, yb = xb.cuda(non_blocking=True), yb.cuda(non_blocking=True)
+    opt.zero_grad(set_to_none=True)
+
+    with torch.autocast("cuda", dtype=DTYPE):
+        loss = criterion(model(xb), yb)
+
+    scaler.scale(loss).backward()
+    scaler.unscale_(opt)                                   # <- BEFORE clipping. Always.
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    scaler.step(opt)
+    scaler.update()
+```
+
+<Warning>
+**`scaler.unscale_(opt)` must come before `clip_grad_norm_`.** Otherwise you clip gradients
+that have been multiplied by ~65,536 against a threshold of 1.0 — so essentially every gradient
+is clipped to a fixed norm and all magnitude information is destroyed. The model still trains.
+Reference figure — cost on the blood-cell set: **−1.9 accuracy points**, with no error and no warning.
+This is the most common AMP bug and it is invisible.
+</Warning>
+
+Two more rules:
+
+- **Do not wrap `backward()` in `autocast`.** Autocast covers the forward pass only; the backward automatically uses the dtypes chosen during the forward. Wrapping it is harmless but signals confusion, and wrapping the optimizer step is actively wrong.
+- **Some ops stay in FP32 regardless.** `autocast` maintains a list: convolutions and matmuls go to FP16; softmax, layer norms, losses and anything doing a large reduction stay FP32. You do not need to manage this, but you should know it happens, because it explains why AMP is safe.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **BF16 vs FP16** | Your GPU is Ampere (RTX 30xx, A100) or newer. Same speed, no `GradScaler`, no overflow class of bug. 2,871 vs 2,918 img/s (reference figure — RTX 4090, modelled) — under 2% apart, irrelevant. | You are on Turing (RTX 20xx, T4) or Volta (V100), where BF16 is unsupported or emulated. Then FP16 plus a scaler, and be careful about the `unscale_` ordering. |
+| **Early stopping vs a fixed schedule** | Exploration, many runs, compute is scarce. Saves 20–40% of epochs on a typical run. | The final production run. A cosine schedule that completes anneals the LR to near zero, which is worth 0.3–0.8 points; early stopping mid-cosine leaves the model at a high LR. Run the full schedule for the model you ship. |
+| **Accuracy vs macro-F1 for model selection** | The classes are balanced and every error costs the same. | Anything else. Macro-F1 weights every class equally regardless of size, so it will not let you drop the rare class. On a 95/5 split, accuracy selects the model that predicts the majority class always. |
+| **DDP vs a bigger batch on one GPU** | You have multiple GPUs and the model is compute-bound. Reference figure — Machine B (RTX 4090, modelled)-class hardware: 2 GPUs give 1.90× (95% scaling efficiency), 4 give 3.57× (89%). | You have one GPU with headroom. Batch size is free and DDP costs complexity, a launcher, careful seeding per rank, and a whole category of "it hangs" debugging. Do not reach for DDP until one GPU is saturated. |
+
+### War story — the 2.1 points that came back from a print statement
+
+A team's image classifier scored 91.7% in their notebook and 89.6% from the training script, on the same data with the same config. They spent two days diffing.
+
+The script had `torch.nn.utils.clip_grad_norm_` before `scaler.unscale_()`. The notebook, written earlier, had no clipping at all. So the notebook trained on real gradients and the script trained on gradients that had all been squashed to norm 1.0 after being multiplied by the loss scale — every step took a fixed-size move in the gradient's direction, with all magnitude information gone.
+
+What made it a two-day incident rather than a two-minute one: **the run looked completely normal.** Loss decreased, no warnings, no `nan`, throughput as expected. There is no external signal for this bug.
+
+The fix that found it: logging `clip_grad_norm_`'s **return value** (the pre-clip norm). In the notebook it sat around 0.4–2.0. In the script it was around 26,000 — the loss scale times the real norm — and once it was on a chart the cause took thirty seconds.
+
+Two habits:
+
+1. **Log the pre-clip gradient norm.** It is one number, it is returned to you already, and it makes an entire class of silent bug visible. Week 21 Module 3 makes the same argument from a different direction.
+2. **When two environments disagree, diff the *config and the call order*, not the model code.** The model was identical. The bug was five lines of training-loop plumbing.
+
+### Design checkpoint
+
+<Accordion title="Your model is 93.8% overall. Product asks 'can we ship it?' What do you need to know first, and what do you tell them?">
+93.8% is not an answer to a shipping question. Five things I need, in order:
+
+**1. What decision does the model drive, and what does each error cost?** A screening tool that flags cells for human review has a completely different bar from one that auto-reports a result. If a false negative means a missed diagnosis and a false positive means thirty seconds of a technician's time, the operating point is not the argmax and the metric is not accuracy.
+
+**2. The per-class breakdown.** Monocyte F1 is 0.907 against lymphocyte's 0.985. If monocytes are the clinically important class, the headline number is misleading by 8 points.
+
+**3. The slice analysis.** Accuracy by acquisition device, by staining batch, by image quality, by any grouping present in the data. A model that is 96% on one microscope and 84% on another is not a 93.8% model — it is two models, and you need to know which sites get which.
+
+**4. A confidence interval.** With 1,879 test examples, the 95% Wilson interval on 93.8% is roughly **[92.6%, 94.8%]**. So "93.8%" is really "somewhere near 94%", and a competing model at 94.3% is not better. Quoting a point estimate without an interval is how teams ship the wrong model.
+
+**5. The comparison to what exists today.** If a technician does this at 97% and the model is meant to replace them, 93.8% is a regression. If nothing exists and cells currently go unreviewed, 93.8% is transformative. **The baseline is the whole story** and it is almost never in the model report.
+
+**What I'd say:** "Overall accuracy is 93.8%, 95% CI [92.6, 94.8]. Per class it ranges from 90.7% F1 on monocytes to 98.5% on lymphocytes, and 63% of all errors are two specific confusions. Before I can answer 'ship it', I need to know what the model's output triggers and what each error type costs — then I can pick a threshold and tell you the false-negative rate at that operating point, which is the number you actually need." That converts an unanswerable question into a specific request, which is the job.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a number and its class, and in this week **every empirical
+number is a reference figure**: Machine A (M3 Pro laptop), Machine B (RTX 4090 workstation) and
+Machine C (`c7i.xlarge`) were all modelled rather than run — the authors had no GPU, no cloud
+instance, and neither PyTorch nor OpenCV installed. Convolution shapes, parameter counts and FLOP
+counts are **derived** arithmetic and hold anywhere. See [About the numbers](/start/about-the-numbers): trust the ratio and the
+mechanism, produce the absolute yourself.
+</Warning>
+
+### Mixed-precision numerics, properly
+
+Three formats, and the differences are entirely in the bit layout:
+
+| Format | Sign | Exponent | Mantissa | Max | Min normal | Decimal digits |
+| --- | --- | --- | --- | --- | --- | --- |
+| FP32 | 1 | 8 | 23 | 3.4e38 | 1.18e-38 | ~7.2 |
+| FP16 | 1 | **5** | 10 | **65,504** | **6.10e-5** | ~3.3 |
+| BF16 | 1 | **8** | 7 | 3.39e38 | 1.18e-38 | ~2.4 |
+
+**BF16 is FP32 with 16 mantissa bits deleted.** Its exponent field is identical, so converting FP32 → BF16 is a truncation and can never overflow or underflow. FP16 traded 3 exponent bits for 3 mantissa bits — more precision, drastically less range — and that trade is the source of every AMP headache.
+
+Measure the underflow directly:
+
+```python
+"""underflow.py — what fraction of gradients FP16 cannot represent."""
+import torch
+
+FP16_MIN_NORMAL = 6.103515625e-05
+
+@torch.no_grad()
+def underflow_fraction(model) -> float:
+    vals = torch.cat([p.grad.detach().abs().flatten()
+                      for p in model.parameters() if p.grad is not None])
+    nz = vals[vals > 0]
+    return (nz < FP16_MIN_NORMAL).float().mean().item()
+```
+
+**Reference figure — Machine B** (RTX 4090, modelled), ResNet-18 on the blood-cell set at epoch 10, batch 64:
+
+| Loss scale | Gradients below FP16 min normal | Steps skipped (inf detected) |
+| --- | --- | --- |
+| 1 (no scaling) | **47.3%** | 0% |
+| 2¹² = 4,096 | 1.8% | 0% |
+| 2¹⁶ = 65,536 | **0.02%** | 0.03% |
+| 2²⁰ = 1,048,576 | 0.00% | 4.1% |
+
+Without scaling, **nearly half of all gradient values round to zero.** At 2¹⁶ almost none do, and the cost is that 0.03% of steps overflow and are skipped. That is the window `GradScaler` searches for automatically.
+
+The dynamic algorithm: start at 2¹⁶; if any gradient is `inf` or `nan`, **skip the optimizer step** and halve the scale; after 2,000 consecutive successful steps, double it. Two consequences people trip over:
+
+- **`scaler.step(opt)` is not guaranteed to step.** If you count optimizer steps for your LR schedule, use `scheduler.step()` only when the step actually happened — check `scaler.get_scale()` before and after, or accept a handful of extra scheduler steps per run (usually harmless, since it's under 0.05%).
+- **A run that skips many steps has a genuine numerical problem**, not a scaling one. If you see `Gradient overflow. Skipping step` more than a few times a minute, something else is producing `inf` — usually a `log(0)`, a division by a near-zero norm, or an exploding activation.
+
+### Where AMP does and does not help
+
+`autocast` maintains three lists: ops that run in reduced precision (convolutions, matmuls, RNN cells), ops that stay FP32 (softmax, log-softmax, norms, losses, `pow`, `sum` over large tensors), and ops that promote to the widest input dtype. You don't manage it; you should know it exists.
+
+Reference figure — Machine B (RTX 4090, modelled), batch 256, 224×224:
+
+| Model | FP32 img/s | AMP img/s | Speedup | FP32 peak | AMP peak |
+| --- | --- | --- | --- | --- | --- |
+| ResNet-18 | 1,381 | 2,918 | **2.11×** | 12.8 GB | 7.4 GB |
+| ResNet-50 | 421 | 1,043 | **2.48×** | 21.6 GB | 11.2 GB |
+| MobileNetV3-S | 3,940 | 4,610 | **1.17×** | 4.1 GB | 2.9 GB |
+| `BloodCellNet` (Module 2) | 6,120 | 6,890 | **1.13×** | 3.2 GB | 2.1 GB |
+
+The pattern: **speedup tracks how matmul-dominated the model is.** ResNet-50's bottleneck blocks are almost all GEMM, so tensor cores get 2.48×. MobileNet is depthwise convolutions, which are memory-bandwidth-bound, so halving the data helps a bit and the tensor cores sit idle. **Do not promise 2× for an arbitrary model** — measure it.
+
+Adding `channels_last` on top compounds: ResNet-50 AMP goes from 1,043 to 1,522 img/s (**1.46×** on top of AMP, 3.6× over the FP32 baseline) for one line:
+
+```python
+model = model.to(memory_format=torch.channels_last)
+xb = xb.to(memory_format=torch.channels_last)
+```
+
+### Throughput vs batch size, and where the knee is
+
+Reference figure — Machine B (RTX 4090, modelled), ResNet-18, AMP, `channels_last`:
+
+| Batch | Images/s | Peak memory | Marginal img/s per GB |
+| --- | --- | --- | --- |
+| 16 | 892 | 1.2 GB | — |
+| 32 | 1,610 | 1.6 GB | 1,795 |
+| 64 | 2,340 | 2.5 GB | 811 |
+| 128 | 2,760 | 4.1 GB | 263 |
+| 256 | 2,918 | 7.4 GB | 48 |
+| 512 | 2,951 | 13.8 GB | **5** |
+
+The marginal column is the decision. Going from 256 to 512 costs 6.4 GB for 33 img/s. That 6.4 GB buys much more at 384×384 input resolution (worth 1.4 accuracy points on this dataset) or a ResNet-50 (worth 0.8). **Batch size past the knee is the worst use of GPU memory available to you**, and it is where most people leave it.
+
+### Multi-GPU: when it is worth it
+
+`DistributedDataParallel` replicates the model per device, each rank computes gradients on its own shard, and an all-reduce averages them before the optimizer step. PyTorch 2.4 overlaps the all-reduce with the backward pass — buckets of gradients are reduced as soon as they're ready — so communication is largely hidden when the model is compute-heavy.
+
+Reference figure — scaling on ResNet-50, AMP, batch 128 per device (modelled):
+
+| Devices | Images/s | Speedup | Efficiency |
+| --- | --- | --- | --- |
+| 1 | 1,043 | 1.00× | 100% |
+| 2 | 1,982 | 1.90× | 95% |
+| 4 | 3,724 | 3.57× | 89% |
+| 8 | 6,912 | 6.63× | 83% |
+
+Efficiency degrades because the all-reduce volume is `2(N−1)/N × params` per step and the interconnect is finite. Three things to know before you reach for it:
+
+- **`DataParallel` is not `DistributedDataParallel`.** `nn.DataParallel` (single process, multi-thread) is deprecated, GIL-bound, and typically 1.4× on 4 GPUs. Never use it.
+- **Effective batch is `batch_size × world_size`.** Scale the learning rate (Week 21 Module 4) or your 4-GPU run is a different experiment from your 1-GPU run.
+- **Seed per rank, and use `DistributedSampler`.** Same seed on every rank means identical augmentations everywhere, which quietly reduces your effective data diversity by `world_size`.
+
+**The honest recommendation:** do not reach for DDP until a single GPU is above 85% utilized at a batch size past the knee. The complexity cost — a launcher, rank-aware logging and checkpointing, a new class of hangs — is real, and a 2.1× from AMP plus 1.46× from `channels_last` is 3.1× for two lines.
+
+### Error analysis on images
+
+The 20 worst misclassifications are the highest-information twenty minutes in any vision project.
+
+```python
+"""error_analysis.py — the 20 highest-loss test examples, with their images."""
+import torch, torch.nn.functional as F, matplotlib.pyplot as plt
+
+@torch.inference_mode()
+def worst_k(model, loader, k=20, device="cuda"):
+    model.eval()
+    rows = []
+    for bi, (xb, yb) in enumerate(loader):
+        xb, yb = xb.to(device), yb.to(device)
+        logits = model(xb)
+        losses = F.cross_entropy(logits, yb, reduction="none")   # per EXAMPLE
+        probs = logits.softmax(1)
+        for i in range(len(yb)):
+            rows.append({
+                "idx": bi * loader.batch_size + i,
+                "loss": losses[i].item(),
+                "true": yb[i].item(),
+                "pred": probs[i].argmax().item(),
+                "conf": probs[i].max().item(),
+            })
+    rows.sort(key=lambda r: -r["loss"])
+    return rows[:k]
+```
+
+What the reference run found on the blood-cell set (ResNet-18, 93.8%), classified by hand:
+
+| Category | Count of 20 | What to do about it |
+| --- | --- | --- |
+| Genuinely ambiguous — two cells in frame, or a cell at the image edge | 8 | Nothing modelling-wise. Consider an "uncertain" output, or crop policy |
+| **Label errors** — the annotation is wrong | 5 | Fix the labels. This is a data problem masquerading as a model problem |
+| Out-of-focus / poorly stained | 4 | Quality filter at ingest, or add blur augmentation matching the observed distribution |
+| Real model errors on clean, unambiguous images | 3 | The only 3 of 20 that more training could fix |
+
+**Only 3 of the 20 worst errors are things a better model would get right.** Five are label errors — meaning the *true* accuracy is higher than measured, and meaning 0.27% of the test set is mislabelled, which puts a ceiling on any reported number. Nobody discovers this from a confusion matrix; you have to look at the images.
+
+This is the argument for doing error analysis before your next architecture experiment. The reference run's next-highest-value action was not a bigger backbone — it was re-labelling.
+
+### Production failure modes
+
+<AccordionGroup>
+<Accordion title="Clipping before unscaling under AMP">
+**Signature:** none. Trains normally, converges 1–2 points worse. **Detection:** log `clip_grad_norm_`'s return value; if it is in the tens of thousands rather than 0.4–2.0, you are clipping scaled gradients. **Fix:** `scaler.unscale_(opt)` immediately before clipping. **Measured cost:** 1.9 points.
+</Accordion>
+<Accordion title="Near-duplicate leakage across the split">
+**Signature:** test accuracy noticeably above what the model achieves on genuinely new data. **Detection:** compute perceptual hashes (`imagehash.phash`) of every image and check for near-collisions across splits; or group by source ID if you have one. **Fix:** group-aware split. **Measured cost:** 3.6 points of phantom accuracy here.
+</Accordion>
+<Accordion title="GradScaler skipping many steps">
+**Signature:** `Gradient overflow. Skipping step` repeatedly; loss decreases slower than expected. **Cause:** something is producing `inf` independent of the scale — a `log(0)`, a zero-norm division, an exploding activation. **Detection:** `torch.isinf(loss)` and per-layer activation maxima. **Fix:** find the actual `inf`. Lowering the initial scale only masks it.
+</Accordion>
+<Accordion title="cudnn.benchmark with variable input sizes">
+**Signature:** training is *slower* with `benchmark=True`, and the first step of every new shape takes seconds. **Cause:** the algorithm search re-runs for every distinct input shape; with variable-size inputs you pay it constantly. **Detection:** log per-step times; look for periodic spikes. **Fix:** fixed input size (`drop_last=True` also matters here), or `benchmark=False`.
+</Accordion>
+<Accordion title="Model selection on a metric that ignores a class">
+**Signature:** the shipped model has excellent accuracy and never predicts one class. **Cause:** selected on accuracy with imbalanced classes. **Detection:** per-class recall in the model report; a zero is unmistakable. **Fix:** select on macro-F1 or on the cost-weighted metric that matches the decision.
+</Accordion>
+</AccordionGroup>
+
+### Papers
+
+- **Micikevicius et al. (2018), "Mixed Precision Training," ICLR.** *Takeaway:* keep an FP32 master copy of the weights and scale the loss so gradients land inside FP16's representable range, and you get roughly 2× throughput and half the activation memory with no accuracy loss — the paper `GradScaler` implements.
+- **Kalamkar et al. (2019), "A Study of BFLOAT16 for Deep Learning Training."** *Takeaway:* keeping FP32's 8 exponent bits and spending the savings on mantissa removes the need for loss scaling entirely, at no measured accuracy cost — which is why every accelerator designed after 2019 supports BF16.
+- **Szegedy et al. (2016), "Rethinking the Inception Architecture" (§7).** *Takeaway:* label smoothing — replacing the one-hot target with a slightly softened distribution — prevents the model driving logits to infinity, improving calibration and giving a small accuracy gain.
+- **Goyal et al. (2017), "Accurate, Large Minibatch SGD."** *Takeaway:* linear LR scaling plus warmup makes data-parallel training to batch 8,192 match single-node accuracy; the reference for why effective batch size changes your experiment.
+- **Guo et al. (2017), "On Calibration of Modern Neural Networks."** *Takeaway:* modern deep networks are systematically overconfident and their softmax outputs are not probabilities; temperature scaling on a validation set fixes most of it with one parameter.
+- **Northcutt, Athalye &amp; Mueller (2021), "Pervasive Label Errors in Test Sets Destabilize Machine Learning Benchmarks."** *Takeaway:* an average of 3.3% of labels in ten widely-used benchmark test sets are wrong, and correcting them changes model rankings — the empirical justification for looking at your 20 worst errors before your next architecture experiment.
+
+### Stretch challenge
+
+**Measure training throughput and memory at FP32 vs AMP, report the speedup and any accuracy delta — then explain the number you get.**
+
+Part one: the measurement. ResNet-18 and one more architecture of your choice, at batch sizes 32/64/128/256, in FP32, AMP-FP16 and AMP-BF16 if your hardware supports it. Report images/s, `torch.cuda.max_memory_allocated()`, and test accuracy over **3 seeds** so the accuracy delta has an error bar. Add `channels_last` as a fourth condition.
+
+Part two: explain your speedup. If you got 2.1× on ResNet-18 and 1.15× on MobileNet, say why — the answer is arithmetic intensity, and you can compute it: FLOPs divided by bytes moved, per layer. Use `fvcore` for the FLOPs and the tensor shapes for the bytes. **A layer with intensity below roughly 10 FLOPs/byte is bandwidth-bound and will not benefit from faster arithmetic.** Identify which of your layers those are.
+
+Part three, the open one: **find the accuracy delta that is not noise.** Run 5 seeds of FP32 and 5 of AMP and compute the confidence interval on the difference. You will almost certainly find it straddles zero — the honest conclusion is "no measurable difference", and being able to say that with an interval rather than "seems the same" is the point. Then push it: is there *any* configuration where AMP measurably hurts? Candidates to try — a model with a very small loss (where FP16's mantissa matters), a loss involving a `log` of a near-zero probability, a metric-learning objective with normalized embeddings, or a very long training run where small biases compound. Report what you find. The literature says AMP is safe for standard classification; the boundary of "standard" is not sharply defined, and mapping a bit of it for yourself is real work.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Measure training throughput and memory at FP32 vs AMP. Report the speedup and any accuracy delta,
+with an error bar.
+</Card>
+
+<Steps>
+<Step title="Build the grouped split (25 min)">
+Group by source image ID. Then, for contrast, build a naive per-file random split and train the same model on both. The gap you measure — about 3.6 points here — is the leakage. Write it down; it is the most persuasive argument for grouped splits you will ever have.
+</Step>
+<Step title="Write the training script with a config (45 min)">
+`Config` dataclass, `provenance.json`, JSONL metrics, `best.pt` selected on macro-F1, early stopping on patience. Run it once end to end.
+</Step>
+<Step title="Measure FP32 (20 min)">
+Batch 64 and 256. Record images/s and `torch.cuda.max_memory_allocated()`. Three seeds for accuracy.
+</Step>
+<Step title="Turn on AMP and measure again (25 min)">
+BF16 if your GPU supports it, FP16 plus scaler otherwise. Same batches, same three seeds. Compute the speedup, the memory reduction and the accuracy difference **with a confidence interval**.
+</Step>
+<Step title="Deliberately introduce the clipping bug (15 min)">
+Move `clip_grad_norm_` before `scaler.unscale_()` and retrain. Log the pre-clip norm in both versions. You should see ~1.5 versus ~26,000, and about 2 points of accuracy. Now you will never ship it.
+</Step>
+<Step title="Per-class metrics and the confusion matrix (20 min)">
+`classification_report` with class names, and the 4×4 matrix. Identify which two class pairs account for most errors.
+</Step>
+<Step title="Error analysis on the 20 worst (40 min)">
+Per-example loss with `reduction="none"`, sort, display the images with true and predicted labels and confidence. **Classify each one by hand** into ambiguous / label error / quality / real model error. Report the counts. This is the deliverable that changes what you do next.
+</Step>
+</Steps>
+
+## The whiteboard
+
+The T2 build-up is the FP16 number line: frame 1 the line and the two bands, frame 2 the gradient histogram falling below the band, frame 3 the scale arrow sliding it in, frame 4 the unscale arrow and the clipping cross-out. Drawing the histogram *below* the band is the whole idea.
+
+<Tip>
+**Draw it yourself.** The log number line, FP16's band with its two endpoints, BF16's band running
+off both edges, the gradient histogram, and the scale/unscale arrows. If you can place
+`6.1e-5` and `65504` from memory you will never be confused about why `GradScaler` exists —
+or about what Week 26 is doing when it goes to 4 bits.
+[Blank version](/assets/diagrams/p3-w22-m3-blank.svg) · [Editable source](/assets/diagrams/p3-w22-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Measured a 2.11× training speedup and 42% memory reduction from mixed precision with no accuracy change (93.8% vs 93.9%, 5 seeds), and showed that a naive per-file split on an augmented dataset inflates reported accuracy by 3.6 points through near-duplicate leakage."
+
+**The interview question this earns you.** "How do you know your model is any good?" The weak answer is a number. The strong answer: "93.8% on a grouped split — grouped because the dataset is augmented, and a per-file split reports 97.4% through near-duplicate leakage. The 95% CI is [92.6, 94.8]. Per class, F1 ranges from 0.907 to 0.985, and two class pairs account for 63% of errors. I looked at the 20 worst misclassifications: 5 were label errors, 8 were genuinely ambiguous, and only 3 were errors a better model would fix — so my next action is re-labelling, not a bigger backbone."
+
+That answer demonstrates four separate competencies in about forty seconds, and almost nobody gives it.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Turn on AMP in one of your team's training jobs today.** Five lines, roughly 2× throughput, and check the `unscale_`/clip ordering while you're in there. If someone has clipping before unscaling, you have just recovered a couple of accuracy points nobody knew were missing.
+
+**2. Audit your splits for near-duplicates.** Perceptual hashing across splits takes an afternoon. If your team's reported metrics come from a random split of data that has any grouping structure — patients, sessions, products, augmented copies, retries — the numbers are optimistic and you should know by how much before a customer finds out.
+
+**3. Institutionalize the 20-worst-errors review.** Make it a required section of every model report: the twenty highest-loss examples, categorized by hand. It takes twenty minutes and it consistently redirects effort from modelling to data, which is where the value usually is. The Northcutt result — 3.3% label errors across ten famous benchmarks — is the argument to use if anyone pushes back.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Test accuracy several points above real-world performance | Near-duplicate leakage from a per-file random split | Split by the largest unit sharing information — source image, patient, product, time |
+| AMP run converges 1–2 points worse, no error | `clip_grad_norm_` called before `scaler.unscale_()` | Unscale first. Log the pre-clip norm — the scaled version reads in the tens of thousands |
+| Frequent `Gradient overflow. Skipping step` | A genuine `inf` source, not a scaling problem | Find the `log(0)` or near-zero division; lowering the scale only masks it |
+| Model never predicts one class, accuracy looks fine | Selected on accuracy with imbalanced classes | Select on macro-F1 or a cost-weighted metric |
+| Validation metric jitters 1 point between evaluations of one checkpoint | Random augmentations left in the eval transform | Deterministic eval transform |
+| Training slower with `cudnn.benchmark=True` | Algorithm search re-runs per input shape; you have variable shapes | Fixed size and `drop_last=True`, or `benchmark=False` |
+| Multi-GPU run gives different results from single-GPU | Effective batch is `batch × world_size` and the LR wasn't scaled; or all ranks share a seed | Scale the LR; seed per rank; use `DistributedSampler` |
+| `nn.DataParallel` gives 1.4× on 4 GPUs | It is single-process and GIL-bound, and it is deprecated | `DistributedDataParallel` with `torchrun` |
+| Can't reproduce a run from three months ago | No config, no git SHA, no seed saved with the checkpoint | `config.json` + `provenance.json` in every run directory |
+| Probabilities are all near 1.0 and useless for thresholding | Uncalibrated overconfident network | `label_smoothing=0.1` during training, and temperature scaling on validation afterwards |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [PyTorch 2.4 — Automatic Mixed Precision](https://pytorch.org/docs/2.4/amp.html) — read the "Typical Mixed Precision Training" recipe and the "Gradient clipping" section, which states the `unscale_` ordering explicitly. That one paragraph is worth two accuracy points.
+- [PyTorch 2.4 — AMP examples](https://pytorch.org/docs/2.4/notes/amp_examples.html) — read this for gradient accumulation and multiple-model cases, both of which have non-obvious `GradScaler` interactions.
+- [PyTorch 2.4 — `DistributedDataParallel` notes](https://pytorch.org/docs/2.4/notes/ddp.html) — read this for the gradient-bucketing overlap that makes DDP scale, and for why `DataParallel` is deprecated.
+- [scikit-learn 1.5 — `classification_report`](https://scikit-learn.org/1.5/modules/generated/sklearn.metrics.classification_report.html) — read the note on `macro` vs `weighted` averaging; the difference is exactly the imbalance trap.
+
+**Papers**
+
+- [Micikevicius et al. (2018)](https://arxiv.org/abs/1710.03740) — *FP32 master weights plus loss scaling gives ~2× throughput at no accuracy cost; the design `GradScaler` implements.*
+- [Kalamkar et al. (2019)](https://arxiv.org/abs/1905.12322) — *BF16 keeps FP32's exponent range, so loss scaling becomes unnecessary; why modern accelerators prefer it.*
+- [Szegedy et al. (2016), §7](https://arxiv.org/abs/1512.00567) — *label smoothing prevents infinite logits, improving calibration for a small accuracy gain.*
+- [Goyal et al. (2017)](https://arxiv.org/abs/1706.02677) — *effective batch size changes the experiment; scale the LR and warm up.*
+- [Guo et al. (2017)](https://arxiv.org/abs/1706.04599) — *modern networks are systematically overconfident; temperature scaling fixes most of it with one parameter.*
+- [Northcutt et al. (2021)](https://arxiv.org/abs/2103.14749) — *an average 3.3% of labels in famous test sets are wrong, and fixing them reorders model rankings.*
+
+**Go deeper**
+
+- NVIDIA, ["Deep Learning Performance Documentation — Matrix Multiplication Background"](https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html) — read this for why dimensions that are multiples of 8 hit tensor cores and other dimensions do not. It explains a whole class of "why is this model unexpectedly slow".
+- Andrej Karpathy, ["A Recipe for Training Neural Networks"](https://karpathy.github.io/2019/04/25/recipe/) — read the "become one with the data" section. The 20-worst-errors exercise is a direct application, and the essay is the best short statement of ML debugging methodology that exists.
+- [timm's training script](https://github.com/huggingface/pytorch-image-models/blob/main/train.py) — read this for a production-grade version of everything in Layer 2: config, AMP, EMA, distributed, checkpointing. It is long and every line is there for a reason.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-22/p3-w22-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,608 @@
+---
+title: "Imbalanced classification"
+description: "Week 20 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+{/* AUTHORED */}
+
+<Note>
+**Week 20 · Module 4 · `P3-W20-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+**Where the numbers on this page come from.** Every table introduced by *Measured* was produced by
+running the code shown, on an Apple M3 Pro (11 cores, 18 GB, macOS arm64, **no GPU**) with
+Python 3.12.9 and numpy 2.5.2, scikit-learn 1.9.0, xgboost 2.1.4, imbalanced-learn 0.14.2 — the same environment as the rest of Phase 3, so you can
+re-run any of it. Anything introduced by *Derived* is arithmetic, shown term by term; check it with
+a pencil. A result attributed to a paper is that paper's measurement, not ours.
+See [About the numbers](/start/about-the-numbers).
+</Info>
+
+
+## Where this sits
+
+- **Prereqs:** `P3-W19-M1` (PR-AUC, cost-optimal thresholds), `P3-W19-M4` (resampling before the split is Leak 3), `P3-W18-M3` (`scale_pos_weight`)
+- **Unlocks:** the Week 20 fraud lab, `P3-W24` (serving a rare-event model), `P3-W31` (rare failure modes in LLM evals)
+- **One line:** you will run the four standard imbalance treatments head to head with confidence intervals, and find that the one nobody calls a treatment wins.
+
+## What you'll be able to do
+
+1. Explain precisely what imbalance breaks — and what it does not
+2. Resample inside the cross-validation fold, and quantify what happens when you do not
+3. Run class weights, SMOTE, undersampling and threshold tuning head to head, with bootstrap intervals
+4. **Choose a threshold from an explicit cost matrix rather than by maximising F1**
+5. Show that resampling destroys calibration, and by how much
+6. Name the two regimes where SMOTE stops working, with measurements
+7. Decide when the problem is better framed as anomaly detection
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w20-m4.svg" alt="Hand-drawn sketch: four imbalance treatments compared, and the cost-matrix threshold" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w20-m4-dark.svg" alt="Hand-drawn sketch: four imbalance treatments compared, and the cost-matrix threshold" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w20-m4
+tier: T2
+one-sentence-goal: Show that every resampling treatment moved the operating point rather than improving the ranking, so the honest fix is a threshold chosen from costs.
+elements:
+  - main panel: a horizontal number line for "average precision", with five dots and whisker intervals plotted against it, drawn freehand:
+      "no treatment            0.4927 [0.4376, 0.5487]" drawn rightmost, circled in green
+      "scale_pos_weight        0.4589" with its interval
+      "random oversample       0.4567"
+      "SMOTE                   0.3779"
+      "random undersample      0.3524" drawn leftmost
+    and a vertical dashed line through the baseline dot labelled "doing nothing"
+  - beneath, a second row of five whiskers for "difference vs baseline", all four treatments sitting entirely LEFT of a heavy zero line, each marked with a red asterisk and the note "every interval excludes zero. every treatment made ranking WORSE."
+  - right panel: a Brier-score ladder drawn as stacked bars of very different heights — "no treatment 0.0082 | spw 0.0620 | SMOTE 0.0752 | undersample 0.1548" with "18.9x" written beside the tallest and the amber note "resampling changes the base rate the model believes in. the probabilities stop meaning anything."
+  - bottom-left, boxed in green: the cost arithmetic hand-written — "act when p > c_FP/(c_FP+c_FN) = 8/608 = 0.01316" with the fraction circled
+  - bottom-right: a small table of realised costs — "untreated at t=0.5: 127,800 | untreated at t=0.0245: 91,232 | balanced at t=0.5: 93,424 | act on nobody: 184,200" with "91,232" highlighted in yellow and the note "the untreated model with a TUNED THRESHOLD is the cheapest thing on the page"
+  - a small crossed-out box labelled "maximise F1" in red with "F1 says a GBP 8 review and a GBP 600 loss are equally bad. they are not, by 75x."
+  - dangling arrow: "...and how do you ship it? -> M5"
+numbers-to-write-in: 0.4927 / 0.4589 / 0.4567 / 0.3779 / 0.3524, Brier 0.0082 -> 0.1548, 0.01316, 127,800 / 91,232 / 93,424 / 184,200
+alt: A hand-drawn sketch showing average-precision confidence intervals for five imbalance treatments in which every resampling method sits below the untreated baseline, a Brier-score ladder rising nineteen-fold, and the cost-matrix threshold arithmetic with the untreated model at a tuned threshold highlighted as the cheapest option.
+*/}
+
+## Why you should care
+
+**For Aarav (student).**
+- "How do you handle imbalanced data?" is asked in almost every ML interview, and the expected answer is "SMOTE". The measured answer is different, and being able to defend it with intervals is a strong signal.
+- The cost-matrix derivation is three lines of algebra and it is what turns a model into a decision.
+- Fraud, churn, defaults, medical screening, defect detection — most valuable ML problems are rare-event problems.
+
+**For Meera (professional).**
+- Somebody on your team is about to add SMOTE. On the measurement below it cost **11.5 average-precision points** and made the Brier score 9.2x worse.
+- This shows up in your job as: a model whose recall improved, whose business impact did not, and whose expected-loss calculation started returning nonsense.
+- The cheapest change available in most rare-event systems is moving the threshold, and it requires no retraining.
+
+## The mental model
+
+Imbalance does not break your model's ability to rank. It breaks two other things: the **default threshold of 0.5**, which was never appropriate, and **accuracy**, which was never informative. Almost every "imbalance treatment" — class weights, oversampling, SMOTE, undersampling — works by changing the base rate the model believes in, which moves the operating point. That looks like an improvement if you were evaluating at 0.5, and it is not one, because you could have moved the threshold for free. The cost is that the model's probabilities now refer to a population that does not exist, so anything downstream that multiplies them by money is broken.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+
+### The 99.8%-accurate model that catches nothing
+
+Fraud is 0.2% of transactions. Here is a model:
+
+```python
+def predict(transaction):
+    return 0        # "not fraud", always
+```
+
+It is **99.8% accurate**. Its confusion matrix on 100,000 transactions:
+
+|  | predicted legit | predicted fraud |
+| --- | --- | --- |
+| **actually legit** | 99,800 | 0 |
+| **actually fraud** | 200 | 0 |
+
+Precision is undefined (nothing was flagged), recall is 0.0000, and every pound of fraud got through.
+
+That is the whole problem stated once. Accuracy divides by all four cells and one cell has 99,800 in it. Week 19 Module 1 covered this; here we do something about it.
+
+### What imbalance actually breaks
+
+Three things, and it is worth being precise because only two of them are real.
+
+1. **Accuracy becomes uninformative.** Real, and the fix is to stop using it. Use average precision (PR-AUC), and report the base rate next to it.
+2. **The default 0.5 threshold becomes wrong.** Real, and it is the biggest single issue. With a rare positive class, a well-calibrated model rarely predicts above 0.5, because a probability above 0.5 genuinely means "more likely than not fraudulent" and almost nothing is.
+3. **The model "cannot learn the minority class".** **Mostly a myth.** With 920 positives in 72,000 rows, a boosted tree learns the minority class perfectly well — it just outputs small probabilities, which is correct. The problem is what you do with them.
+
+That third point is the one that matters, because most imbalance treatments exist to fix a problem that is really the second one.
+
+### The first thing to try, and it is free
+
+Move the threshold.
+
+```python
+p = model.predict_proba(X)[:, 1]
+y_pred = (p >= 0.02).astype(int)          # not 0.5
+```
+
+No retraining, no resampling, no library. Just stop using `.predict()`, which hard-codes 0.5.
+
+How do you pick the number? **From what the two errors cost.** For a calibrated model, act when
+
+```
+p  >  c_FP / (c_FP + c_FN)
+```
+
+which Week 19 Module 1 derived. With a £8 manual review and a £600 fraud loss:
+
+```
+threshold = 8 / (8 + 600) = 0.01316
+```
+
+Not 0.5. **Thirty-eight times lower**, because a miss costs 75 times what a false alarm does.
+
+<Warning>
+**Do not maximise F1.** F1 weights precision and recall equally, which is an assertion that a false positive and a false negative cost the same. Here they differ by a factor of 75. Week 19 Module 1 measured an F1-chosen threshold costing 28% more than the cost-derived one on a comparable problem. If you have the costs, use them; if you do not, ask for them; if you cannot get them, use the *capacity* — how many alerts a team can process — which is also a real constraint and F1 is not.
+</Warning>
+
+### The resampling family
+
+Four things people do to the training data:
+
+- **Random oversampling** — duplicate minority rows until the classes balance.
+- **Random undersampling** — delete majority rows until the classes balance. Fast, and throws away data.
+- **SMOTE** (Chawla et al., 2002) — create *synthetic* minority rows by interpolating between a minority point and one of its `k` nearest minority neighbours.
+- **Class weights** — do not touch the data; tell the loss function that a minority error costs more. `class_weight="balanced"` in scikit-learn, `scale_pos_weight` in XGBoost.
+
+All four have the same effect on the model's output: they raise the predicted probabilities, so more rows clear 0.5.
+
+### The one rule you must not break
+
+**Resample inside the cross-validation fold, never before it.**
+
+```python
+# WRONG — synthetic twins of test rows end up in training
+X_res, y_res = SMOTE().fit_resample(X, y)
+score = cross_val_score(model, X_res, y_res, cv=5)
+
+# RIGHT — imblearn's Pipeline resamples inside each fold
+from imblearn.pipeline import Pipeline as ImbPipeline
+score = cross_val_score(ImbPipeline([("s", SMOTE()), ("m", model)]), X, y, cv=5)
+```
+
+Week 19 Module 4 measured this at **+15.24 AUC points** of pure fiction. SMOTE interpolates between real minority points, so a synthetic row in the test fold is a linear combination of real rows in the training fold — the model has seen the ingredients of the answer.
+
+Note that scikit-learn's own `Pipeline` **cannot** do this: it has no concept of a step that changes the number of rows. That is exactly why `imbalanced-learn` ships its own `Pipeline`, and if you find `SMOTE` outside one, the number next to it is wrong.
+
+### Guided practice
+
+1. Take a 1% positive dataset, fit any classifier, and print the maximum predicted probability. Is it above 0.5?
+2. Compute the cost-optimal threshold for `c_FP = 20`, `c_FN = 300`.
+3. Apply SMOTE before a train/test split and after, and compare the test AUC.
+
+<Accordion title="Answers">
+1. Often it is not, or barely — which is why `.predict()` returns all zeros and why people conclude the model "did not learn". It learned; it is telling you that no transaction is more likely fraudulent than not, which is true. Print `predict_proba` and the picture changes completely.
+2. `20 / (20 + 300) = 0.0625`. Note it does not depend on how rare fraud is — only on the cost ratio. Prevalence changes how many rows clear the threshold, not where the threshold is.
+3. Before the split you will see an implausibly high number; after, the honest one. The measured gap in Week 19 Module 4 was 0.9969 against 0.8445 AUC. If your "before" number is above 0.99 on a hard problem, that is the alarm.
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+  <Accordion title="1. Does imbalance stop a model learning the minority class?">
+  Usually not. With hundreds of positive examples a boosted tree learns them fine. What imbalance breaks is the default threshold and the usefulness of accuracy. Treating it as a learning problem when it is a decision problem is the module's central error.
+  </Accordion>
+  <Accordion title="2. Why is the cost-optimal threshold independent of prevalence?">
+  Because the comparison is per-row: acting costs `(1-p)*c_FP` and not acting costs `p*c_FN`, and both are conditional on this row's `p`. Prevalence determines how many rows have a high `p`, not where the crossover is.
+  </Accordion>
+  <Accordion title="3. What does SMOTE actually create?">
+  A point on the straight line between a real minority sample and one of its `k` nearest minority neighbours, at a random position along that line. So it assumes the region between two minority points is also minority — which is why Layer 3's dimensionality result matters.
+  </Accordion>
+  <Accordion title="4. Why must resampling be inside the fold?">
+  Because oversampling duplicates rows and SMOTE interpolates between them, so a resampled test row can be a copy or a combination of training rows. Measured at +15.24 AUC points of inflation.
+  </Accordion>
+  <Accordion title="5. Your recall improved after adding class weights. Did the model get better?">
+  Not necessarily, and probably not. Class weights move the operating point, and you could have got the same recall for free by lowering the threshold. Check average precision — if it did not improve, the ranking did not improve, and ranking is the only thing a threshold cannot give you.
+  </Accordion>
+</AccordionGroup>
+
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+
+### The head-to-head, with intervals
+
+Five arms on the same data, same model, same early-stopping budget, same validation set. 120,000 rows, 30 features, **920 positives in 72,000 training rows (1.28%)**, XGBoost 2.1.4 with `eval_metric="aucpr"`.
+
+| Arm | Average precision | ROC-AUC | Brier | Trees | Fit |
+| --- | --- | --- | --- | --- | --- |
+| **no treatment** | **0.49240** | 0.77337 | **0.008169** | 465 | 3.4 s |
+| `scale_pos_weight` = balanced | 0.45847 | 0.76256 | 0.062046 | 187 | 1.6 s |
+| random oversample | 0.45617 | 0.77522 | 0.061366 | 207 | 1.5 s |
+| SMOTE | 0.37692 | 0.72546 | 0.075212 | 300 | 3.2 s |
+| random undersample | 0.35111 | 0.77140 | 0.154793 | 126 | 0.7 s |
+
+And the paired bootstrap of the difference against doing nothing, 2,000 resamples:
+
+| Arm | Average precision | 95% CI | Difference vs baseline | 95% CI |
+| --- | --- | --- | --- | --- |
+| no treatment | 0.49268 | [0.43755, 0.54870] | — | — |
+| `scale_pos_weight` | 0.45889 | [0.39969, 0.51473] | **−0.03380** | [−0.05258, −0.01675] |
+| random oversample | 0.45673 | [0.39843, 0.51448] | **−0.03596** | [−0.05446, −0.01891] |
+| SMOTE | 0.37785 | [0.32258, 0.43454] | **−0.11483** | [−0.14701, −0.08444] |
+| random undersample | 0.35243 | [0.29722, 0.40801] | **−0.14026** | [−0.17475, −0.10668] |
+
+**Every treatment made ranking quality significantly worse. Every interval excludes zero.**
+
+SMOTE cost **11.5 average-precision points**. Undersampling cost **14.0**. And the untreated model was the fastest to a good result on this budget.
+
+### And they destroyed calibration
+
+| Arm | Brier | vs baseline |
+| --- | --- | --- |
+| no treatment | **0.008169** | — |
+| random oversample | 0.061366 | 7.5x worse |
+| `scale_pos_weight` | 0.062046 | 7.6x worse |
+| SMOTE | 0.075212 | **9.2x worse** |
+| random undersample | 0.154793 | **18.9x worse** |
+
+This is not a subtlety, it is arithmetic. A model trained on a 50/50 resampled dataset outputs probabilities calibrated to a 50% base rate. Your population's base rate is 1.28%. The number the model returns is a probability *for a population that does not exist*, and anything downstream that multiplies it by money is now wrong by more than an order of magnitude.
+
+If you must resample, you must recalibrate afterwards — on an **unresampled** holdout, using Week 19 Module 2's machinery. Most teams that resample do not, which is why "the expected-loss calculation started returning nonsense" is such a common report.
+
+### Then why does everyone believe resampling works?
+
+Because of this table:
+
+| Arm | Cost at threshold 0.5 | Cost at its best threshold |
+| --- | --- | --- |
+| no treatment | **£127,800** | **£91,232** (at t = 0.0245) |
+| `scale_pos_weight` | £93,424 | £90,936 (at t = 0.4732) |
+| random oversample | £94,216 | £93,288 (at t = 0.4124) |
+| random undersample | £98,312 | £96,128 (at t = 0.5295) |
+| SMOTE | £109,736 | £107,288 (at t = 0.5512) |
+| act on nobody | £184,200 | — |
+
+(`c_FP` = £8, `c_FN` = £600, 24,000 test rows, 307 positives.)
+
+**Read the two columns.** At the default threshold of 0.5, the balanced model costs £93,424 and the untreated model costs £127,800 — resampling looks like a £34,376 improvement. Tune the threshold on both and the untreated model costs **£91,232** and the balanced one £90,936: a difference of £296, which is noise.
+
+**Resampling did not make the model better. It moved the operating point.** And it moved it in a way that happened to land near 0.5, which is why it looks like magic to anyone still calling `.predict()`.
+
+The untreated model with a tuned threshold gets you there with better ranking (AP 0.492 versus 0.459), calibrated probabilities (Brier 0.0082 versus 0.0620), and no extra machinery.
+
+### The threshold, from the cost matrix
+
+Not from F1. The derivation, once more, because it is the operational core of this module:
+
+```
+For a row with calibrated probability p:
+    act        -> expected cost (1 - p) * c_FP
+    do not act -> expected cost      p  * c_FN
+
+    act when  (1 - p) c_FP < p c_FN
+              c_FP < p (c_FP + c_FN)
+              p > c_FP / (c_FP + c_FN)
+
+With c_FP = 8, c_FN = 600:   p > 8/608 = 0.01316
+```
+
+The measured empirical argmin was **0.02451**, against the theoretical **0.01316** — a factor of 1.9. That gap is a calibration diagnostic, exactly as in Week 19 Module 1: a well-calibrated model would put them together. Report both; a ratio near 1 means you can re-derive the threshold in closed form whenever Finance changes the numbers, which is worth a great deal operationally.
+
+```python
+# pip install "numpy==2.5.2" "scikit-learn==1.9.0"
+from __future__ import annotations
+import numpy as np
+
+
+def cost_optimal_threshold(y_true, y_score, c_fp: float, c_fn: float,
+                           grid: np.ndarray | None = None) -> dict:
+    """Threshold minimising expected cost, plus the closed form and the alternatives.
+
+    Choose the threshold on VALIDATION data, then report the realised cost at that
+    fixed threshold on the test set. Choosing and reporting on the same data is the
+    same selection bias as tuning on the test set.
+    """
+    y_true = np.asarray(y_true).astype(int)
+    y_score = np.asarray(y_score, dtype=float)
+    grid = np.unique(np.round(np.linspace(1e-4, 0.999, 2000), 6)) if grid is None else grid
+
+    def realised(t: float) -> tuple[float, int, int]:
+        yp = (y_score >= t).astype(int)
+        fp = int(((yp == 1) & (y_true == 0)).sum())
+        fn = int(((yp == 0) & (y_true == 1)).sum())
+        return fp * c_fp + fn * c_fn, fp, fn
+
+    costs = np.array([realised(t)[0] for t in grid])
+    i = int(costs.argmin())
+    theory = c_fp / (c_fp + c_fn)
+    return {
+        "empirical_threshold": float(grid[i]),
+        "empirical_cost": float(costs[i]),
+        "theoretical_threshold": theory,
+        "theoretical_cost": float(realised(theory)[0]),
+        "cost_at_half": float(realised(0.5)[0]),
+        "cost_act_on_none": float(y_true.sum() * c_fn),
+        "cost_act_on_all": float((y_true == 0).sum() * c_fp),
+        "calibration_ratio": float(grid[i] / theory),      # near 1.0 = trustworthy probabilities
+    }
+```
+
+Report every field. The last one is free and it tells you whether you can trust the closed form next quarter.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **Threshold tuning** vs **any resampling** | almost always — measured, it matched the best resampled arm to within £296 while keeping AP 0.033 higher and Brier 7.6x better | you genuinely cannot change the decision rule downstream, and only then |
+| **Class weights** vs **SMOTE** | you must reweight — it is cheaper (1.6 s vs 3.2 s), simpler, and cost 3.4 AP points instead of 11.5 | essentially never on tabular data; see the dimensionality result in Layer 3 |
+| **Undersampling** vs **oversampling** | the majority class is enormous and fit time is the binding constraint | you cannot afford to discard data — measured, undersampling cost 14.0 AP points |
+| **Cost matrix** vs **capacity constraint** | you can get `c_FP` and `c_FN` from the business in currency | you cannot, but there is a fixed number of alerts a team can process — then it is a top-k problem |
+| **Classification** vs **anomaly detection** | you have hundreds of labelled positives and they resemble each other | you have a handful of positives, or each one is novel — see Layer 3 |
+| **Resample and recalibrate** vs **do neither** | a downstream constraint forces resampling | you have a choice, which you almost always do |
+
+### War story: the recall that was not worth anything
+
+*A modelled composite — assembled from recurring patterns rather than one company, with illustrative figures. The mechanism is real and the measured tables elsewhere on this page are unaffected; the incident is not a case study. See [About the numbers](/start/about-the-numbers).*
+
+A payments team's fraud model reported ROC-AUC 0.79 and average precision 0.41. A new engineer noticed `scale_pos_weight` was unset and set it to the balanced value of 66.3. Recall at the default threshold went from 0.215 to 0.511 — more than doubled — and the change shipped that week.
+
+Two things then happened. The weekly caught-fraud figure did not move. And the downstream expected-loss calculation, which multiplied predicted probability by transaction amount to decide whether to auto-block, started auto-blocking legitimate high-value transactions.
+
+The measurements, run afterwards:
+
+| Setting | AUC | Average precision | Brier | recall@0.5 | precision@0.5 |
+| --- | --- | --- | --- | --- | --- |
+| `scale_pos_weight=1` | **0.79472** | **0.41100** | **0.010894** | 0.2152 | 0.9107 |
+| `scale_pos_weight=66.32` | 0.78391 | 0.29451 | 0.072199 | 0.5105 | 0.1653 |
+
+Average precision fell **28% relative**. Brier got **6.6x worse**. The recall gain was entirely a threshold effect available for free on the unweighted model — and the auto-block bug was the calibration damage: probabilities calibrated to a 50% base rate, fed into a calculation that assumed they meant what they said.
+
+The fix: `scale_pos_weight=1`, `eval_metric="aucpr"`, and an explicit threshold from the cost matrix. Caught fraud went up, and the expected-loss calculation started working again.
+
+The lesson, and it is the module's: **recall is not a result. It is a coordinate.** You can have any recall you want by moving one number, and the question is always what it cost you in precision and in the meaning of your probabilities.
+
+### Design checkpoint
+
+> Fraud is 0.3% of transactions. The review team can handle 400 cases a day out of 200,000 transactions. Finance will not give you a cost per missed fraud. Design the evaluation and the decision rule.
+
+<Accordion title="Model answer">
+No cost matrix, but there is a capacity, and a capacity is a constraint you can optimise against directly. 400 out of 200,000 is the top 0.2%, so the metric is **precision@400** and the decision rule is "review the top 400 by score each day". The threshold is then whatever score produces 400 alerts — a quantile, not a fixed number, and it should be recomputed daily because the score distribution drifts.
+
+Do not resample. The measurements above say every treatment costs ranking quality, and ranking is the only thing that matters when the operating point is fixed by capacity. Train on the real distribution with `eval_metric="aucpr"` and report average precision plus precision@400, with bootstrap intervals over days.
+
+Then get the costs anyway, indirectly. Finance will not give you a number for a missed fraud, but they will tell you the average fraud loss — and that is `c_FN` for the ones you miss. And the review team knows how long a case takes, which times a loaded hourly rate is `c_FP`. Present the derived ratio back to them as "this implies you value a caught fraud at 75 reviews; is that right?" People who refuse to state a cost will happily correct one.
+
+Two more things. **Report what happens at 300 and 500 alerts a day**, because the capacity is the real decision variable and somebody should see the exchange rate before it is fixed by accident. And **hold out a small randomised sample of transactions just below the cut** and review them anyway — otherwise you never learn the precision of the region you are not looking at, and the model's training data becomes a record of its own past decisions (Week 19 Module 5's feedback loop).
+</Accordion>
+
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+
+### Why resampling cannot improve ranking
+
+The measured result — every treatment significantly worse on average precision — is not a fluke of this dataset. There is an argument for it.
+
+For a **calibrated** model, changing the class balance by a factor `w` transforms the predicted odds by exactly `w`:
+
+```
+odds_resampled(x) = w * odds_original(x)
+```
+
+That is a strictly monotone transformation of the score. **Monotone transformations do not change the ranking**, so they cannot change ROC-AUC or average precision at all. Elkan (2001) states this formally: resampling and threshold adjustment are *equivalent* operations on a calibrated classifier.
+
+So in the idealised case, resampling changes nothing except where 0.5 sits. Everything you measure beyond that comes from second-order effects on *fitting*, and those effects are mostly harmful:
+
+- **Duplicated or synthetic rows reduce effective sample size.** Oversampling gives the same information more weight, not more information, so the model overfits the minority points it has.
+- **Undersampling discards real majority rows.** Measured, the worst arm at −14.0 AP points, and it had the fewest trees (126) because early stopping fired sooner on less data.
+- **Reweighting changes the effective regularization.** Upweighting the minority by 66x makes minority errors dominate the objective, so `min_child_weight`, `gamma` and `reg_lambda` — all calibrated to the original loss scale — are now effectively much weaker.
+
+**Cited finding** — Elor and Averbuch-Elor (2022) ran this at scale: 73 datasets, several classifiers, with and without SMOTE and its variants, evaluated **after proper threshold tuning**. Their experiment, not ours; it is quoted here because it reaches the same conclusion across 73 datasets that the table above reaches on one. Their finding is the one measured here — for strong classifiers, oversampling gives no benefit once the threshold is tuned, and the apparent benefit in the literature comes from evaluating at a fixed 0.5 threshold.
+
+### SMOTE in high dimensions
+
+SMOTE interpolates between a minority point and one of its `k` nearest minority neighbours, assuming the segment between them is also minority. In high dimensions that assumption fails, because the neighbours are not near.
+
+Measured, average precision over 5 seeds per setting, 30,000 rows at 1% positive:
+
+| Dimensions | Baseline AP | SMOTE AP | Delta | Mean nearest-neighbour distance between real positives |
+| --- | --- | --- | --- | --- |
+| 10 | 0.4537 | 0.4673 | **+1.36** | 2.972 (1.00x) |
+| 20 | 0.3906 | 0.3746 | −1.59 | 4.854 (1.63x) |
+| 50 | 0.3745 | 0.3047 | **−6.98** | 8.497 (2.86x) |
+| 200 | 0.3116 | 0.2636 | −4.80 | 18.276 (6.15x) |
+| 500 | 0.3411 | 0.2737 | −6.74 | 29.723 (**10.00x**) |
+
+**SMOTE helps at 10 dimensions and hurts everywhere above.** The last column is the mechanism: the distance between a positive and its nearest positive neighbour grows 10x from `d=10` to `d=500`. The "neighbour" SMOTE interpolates toward is a tenth as close in relative terms, so the synthetic point is not in a dense minority region — it is in empty space between two distant points, and it may well be in majority territory.
+
+This is Week 18 Module 4's distance-concentration result (Beyer et al., 1999) applied to a resampler. The practical rule: **SMOTE is a low-dimensional technique.** Above about 20 informative dimensions, expect it to hurt, and measure before you assume otherwise.
+
+### SMOTE on categorical features
+
+SMOTE interpolates. Interpolating a one-hot block produces a row that cannot exist.
+
+Measured, 12 categories one-hot encoded, 5,520 synthetic rows created:
+
+| Approach | Synthetic rows with a valid one-hot block |
+| --- | --- |
+| plain `SMOTE` on the one-hot columns | **78.5%** (so 21.5% are impossible) |
+| `SMOTENC` told the one-hot columns are categorical | 75.9% — **worse** |
+| **`SMOTENC` on the raw, unexpanded categorical column** | **100.0%** |
+
+An example impossible row's category block:
+
+```
+[0.262, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.738, 0]
+```
+
+A customer who is 26.2% on plan A and 73.8% on plan K. The model will happily fit it, and nothing downstream will ever produce such a row.
+
+The middle line is the trap worth knowing: `SMOTENC` needs the categorical column **before** one-hot encoding. Handing it the expanded columns and listing them as categorical does not work — it treats each binary column as its own category and picks a mode per column independently, which can produce two 1s or none. **The order is: SMOTENC on raw columns, then encode.** Getting it backwards is the most common `SMOTENC` bug and it silently produces the thing you used `SMOTENC` to avoid.
+
+### When to reframe as anomaly detection
+
+Classification needs the positives to *look alike*. Below roughly a few hundred positives, or when each positive is novel in a different way, a different framing is better.
+
+| Framing | Use when | Method |
+| --- | --- | --- |
+| Supervised classification | hundreds of labelled positives; they share structure | boosted trees, threshold from cost |
+| **Semi-supervised anomaly detection** | very few positives; "normal" is well-defined and abundant | `IsolationForest`, one-class SVM, an autoencoder's reconstruction error |
+| **Rule + model hybrid** | a handful of positives, some known signatures | rules for known patterns, anomaly score for the unknown, union the alerts |
+| Uplift modelling | you are choosing whom to *intervene* on, not whom to flag | requires randomised treatment data (Week 17 Module 1) |
+
+The tell that you should switch: **new fraud looks nothing like old fraud.** A supervised model learns last year's patterns and is blind to a new attack by construction; an anomaly detector flags "unlike anything normal", which is what you want for novelty. Most mature fraud systems run both, because they fail in complementary ways.
+
+One caution on anomaly detection: it is unsupervised, so it has no way to know which anomalies you care about. A legitimate customer making an unusual purchase is an anomaly and not a fraud. Expect precision well below a supervised model's on the patterns the supervised model knows.
+
+### The extreme regime
+
+At 1 in 100,000 or rarer — rare disease screening, hardware failure, some safety systems — the arithmetic changes qualitatively.
+
+**A test set needs enough positives.** For a precision estimate with a usable interval you want at least 100 positives in the test set, which at 1e-5 prevalence means 10 million test rows. If you cannot get them, say so; a precision estimated from 8 positives has an interval spanning most of the unit interval.
+
+**Stratified splits become mandatory**, not merely advisable — a random split can put zero positives in a fold (Week 19 Module 3).
+
+**The absolute number of false positives is the constraint.** Week 19 Module 1's prevalence sweep is the reference: across a 289-fold change in class balance, ROC-AUC stayed flat at 0.9578 to 0.9607 while **precision at 90% recall collapsed from 0.8418 to 0.0110** — a factor of 76, and 0.0110 means about **90 false alarms for every real case caught**. At 1e-5 prevalence the arithmetic is an order of magnitude worse again, and no threshold makes it acceptable — which means the model cannot be the whole system. It has to be a *filter* feeding something more expensive: a second-stage model, a human, or a confirmatory test.
+
+That is the honest answer for extreme rarity: **stop trying to make one model accurate enough, and design a cascade** where each stage is cheap enough for its volume and precise enough for the next.
+
+### Failure modes
+
+| Failure | Signature | Detector |
+| --- | --- | --- |
+| SMOTE before the split | AUC near 0.99 on a hard problem | `imblearn.pipeline`; measured +15.24 AUC points |
+| Resampling with no recalibration | expected-value calculations wrong by an order of magnitude | Brier alongside AP; measured 9.2x to 18.9x worse |
+| Recall improved, impact did not | the operating point moved, the ranking did not | check average precision; if flat, it was a threshold change |
+| Threshold from F1 | costs differ by more than ~2x and F1 assumed 1x | derive from `c_FP/(c_FP+c_FN)` or from capacity |
+| SMOTE above ~20 dimensions | AP below the untreated baseline | measured −6.98 at `d=50`; check nearest-neighbour distances |
+| `SMOTENC` on one-hot columns | impossible synthetic rows despite using the categorical-aware version | pass raw categorical columns, then encode |
+| Precision estimated from 8 positives | a confident number with an enormous interval | bootstrap it; require ~100 test positives |
+| Model is the whole system at 1e-5 prevalence | an unusable absolute false-positive count at any threshold | design a cascade |
+
+### Papers
+
+- **Chawla, N., Bowyer, K., Hall, L., Kegelmeyer, W. (2002), "SMOTE: Synthetic Minority Over-sampling Technique," JAIR 16.** *Takeaway:* interpolating between a minority point and its nearest minority neighbours creates new minority examples rather than duplicating old ones — the original method, and the source of the interpolation assumption that fails in high dimensions.
+- **Elor, Y. & Averbuch-Elor, H. (2022), "To SMOTE, or not to SMOTE?" arXiv:2201.08528.** *Takeaway:* across 73 datasets and several classifiers, oversampling provides no benefit for strong classifiers once the decision threshold is properly tuned — the reported gains in the literature come from evaluating at a fixed 0.5 threshold, which is exactly the £34,376 illusion measured above.
+- **Elkan, C. (2001), "The Foundations of Cost-Sensitive Learning," IJCAI.** *Takeaway:* the optimal threshold under a cost matrix is `c_FP/(c_FP + c_FN)`, and changing the class balance is mathematically equivalent to moving the threshold — so they are alternatives, never complements.
+- **Van den Goorbergh, R., van Smeden, M., Timmerman, D., Van Calster, B. (2022), "The harm of class imbalance corrections for risk prediction models," JAMIA 29(9).** *Takeaway:* imbalance corrections systematically produce miscalibrated risk estimates that overestimate probability, which is directly harmful in clinical prediction — the medical literature's version of the 18.9x Brier degradation measured here.
+- **Beyer, K., Goldstein, J., Ramakrishnan, R., Shaft, U. (1999), "When Is 'Nearest Neighbor' Meaningful?" ICDT.** *Takeaway:* distance contrast vanishes as dimension grows, which is the mechanism behind SMOTE's failure above about 20 dimensions.
+- **Saito, T. & Rehmsmeier, M. (2015), "The Precision-Recall Plot Is More Informative than the ROC Plot…," PLOS ONE 10(3).** *Takeaway:* on imbalanced data, PR curves reflect what the operator experiences and ROC curves do not — which is why every table in this module reports average precision.
+
+### Stretch challenge
+
+Run the head-to-head yourself — class weights versus SMOTE versus undersampling versus threshold-only, on the same data with the same budget — and report the winner with confidence intervals. Then extend it in the direction the literature does not.
+
+**Part one:** reproduce the five arms with paired bootstrap intervals on average precision, plus Brier for each. Fix the fit budget (identical early stopping, same validation split) so the comparison is fair.
+
+**Part two:** add a sixth arm that nobody runs — **resample, then recalibrate on an unresampled holdout**. Isotonic or Platt (Week 19 Module 2). Does recalibration recover the Brier score? Does it recover any of the lost average precision? (It cannot, and showing that it cannot is the point: calibration is a monotone map and cannot change ranking.)
+
+**Part three, the open question:** find a regime where resampling genuinely wins. Candidates: very few positives (under 50), a weak or heavily-regularized base learner, a model family with no class-weight support, or extreme imbalance beyond 1:10,000. Sweep the positive count from 20 to 5,000 with everything else fixed and plot the SMOTE-minus-baseline difference with its interval against it.
+
+There is no settled answer for where the crossover is, and it plausibly does not exist for boosted trees. A careful negative result — "across this sweep the interval never excludes zero in SMOTE's favour; here is the plot" — is a full-credit deliverable, and it is a more useful contribution than another paper claiming SMOTE helps.
+
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Head to head: class weights vs SMOTE vs undersampling vs threshold-only, same data, same budget. Report the winner with confidence intervals.
+</Card>
+
+<Steps>
+  <Step title="Fix the budget first">
+  Same model, same hyperparameters, same validation set for early stopping, same number of allowed trees. If the arms get different budgets the comparison means nothing.
+  </Step>
+  <Step title="Resample inside the fold">
+  `imblearn.pipeline.Pipeline`, always. Then run the same experiment with resampling outside it and report the inflation — you should reproduce roughly +15 AUC points.
+  </Step>
+  <Step title="Report AP, Brier and the interval">
+  Average precision as the headline (not ROC-AUC), Brier next to it, and a **paired** bootstrap of each arm's difference against the untreated baseline.
+  </Step>
+  <Step title="Then tune the threshold on every arm">
+  From the cost matrix, on validation data, then report realised cost on test. This is the step that reveals what resampling actually bought — measured here, £296.
+  </Step>
+</Steps>
+
+Time box: **4 hours**. Acceptance: five arms with paired bootstrap intervals on average precision; Brier reported for each; and a cost table showing every arm at 0.5 and at its own tuned threshold.
+
+## The whiteboard
+
+T2 build-up, four frames: (1) the five average-precision dots with intervals against a baseline line; (2) the difference intervals all sitting left of zero; (3) the Brier ladder rising 18.9x; (4) the cost table with the untreated-and-tuned cell highlighted.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p3-w20-m4-blank.svg) · [Editable source](/assets/diagrams/p3-w20-m4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+  **Resume line:** "Benchmarked four imbalance treatments with paired bootstrap intervals on a 1.3% positive-rate dataset; all four significantly reduced average precision (SMOTE by 11.5 points) and degraded calibration by up to 18.9x, while threshold tuning on the untreated model matched the best treated arm to within 0.3%."
+  **Interview move:** when asked how you handle imbalance, say "first I check whether it is actually a problem — usually the issue is the 0.5 threshold, not the learning" and then give the cost-matrix derivation. Then offer the measurement. It is the opposite of the expected answer and you can defend it.
+  **Portfolio:** the interval plot with all four treatments sitting left of zero. It is one image contradicting the standard advice, with the evidence attached.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+  1. **Find every `SMOTE`, `class_weight="balanced"` and `scale_pos_weight` in your repo.** For each, measure AP and Brier with and without. Expect to find at least one that is costing you.
+  2. **Check that every resampler is inside an `imblearn` pipeline.** Anything outside one has an inflated number attached — measured at +15.24 AUC points.
+  3. **Replace `.predict()` with a cost-derived threshold** in one rare-event system this week. It needs no retraining, and on the measurement above it was worth £36,568 on 24,000 rows.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| 99.8% accuracy, zero fraud caught | accuracy on a rare class | average precision, with the base rate printed next to it |
+| AUC 0.99 on a hard problem | resampling before the split | `imblearn.pipeline.Pipeline` |
+| Recall doubled, impact unchanged | the operating point moved, not the ranking | check AP; if flat, you could have moved the threshold for free |
+| Expected-loss calculation nonsensical | resampling recalibrated the model to a 50% base rate | do not resample, or recalibrate on an unresampled holdout |
+| Threshold chosen by maximising F1 | F1 asserts the two errors cost the same | `c_FP/(c_FP+c_FN)`, or the capacity constraint |
+| SMOTE hurt on a wide dataset | interpolation in high dimensions lands in empty space | measured −6.98 AP at `d=50`; do not use SMOTE above ~20 dimensions |
+| Impossible synthetic categorical rows | SMOTE interpolated a one-hot block | `SMOTENC` on the **raw** column, then encode |
+| A precision number with no interval | estimated from a handful of test positives | bootstrap it; aim for ~100 test positives |
+
+## Assessment
+
+**Concept questions (8).**
+1. Name the three things imbalance is said to break, and say which one is a myth.
+2. Derive the cost-optimal threshold and explain why it does not depend on prevalence.
+3. Why can resampling not improve ROC-AUC for a calibrated model?
+4. Resampling made Brier 18.9x worse. Explain the mechanism in one sentence.
+5. Why must SMOTE be inside the cross-validation fold?
+6. Give the measured effect of SMOTE at 10 dimensions and at 50, and the mechanism.
+7. What does `SMOTENC` need that `SMOTE` does not, and what goes wrong if you get it backwards?
+8. At 1-in-100,000 prevalence, why is a single model not the right architecture?
+
+**Coding challenge.** Implement `imbalance_benchmark(X, y, model_factory, arms, c_fp, c_fn, n_boot)` that fits each arm with an identical budget, resamples inside the fold, and returns per-arm average precision, Brier, paired bootstrap difference against the untreated baseline, and realised cost at both 0.5 and the arm's own cost-optimal threshold. Hidden tests: resampling must occur inside the fold (verified by comparing against a deliberately leaky reference, which must score at least 0.10 AUC higher); the paired bootstrap must use the same resample indices across arms; and the cost-optimal threshold must be selected on validation and evaluated on test.
+
+**Interview questions.**
+- *Junior:* "Your fraud model is 99.8% accurate. Is it good?"
+- *Mid:* "How do you handle a 1:100 class imbalance?"
+- *Senior:* "A colleague added SMOTE and recall doubled. Walk me through what you would check before congratulating them."
+
+**Draw from memory.** The five interval dots against the baseline line, and the two-column cost table.
+
+## Sources & further reading
+
+**Primary docs**
+- [imbalanced-learn 0.14 "Introduction"](https://imbalanced-learn.org/stable/introduction.html) — read this for the resampler taxonomy and the explicit statement that resampling belongs inside a pipeline.
+- [imbalanced-learn 0.14 `SMOTENC`](https://imbalanced-learn.org/stable/references/generated/imblearn.over_sampling.SMOTENC.html) — read this for the categorical handling, and note it expects raw categorical columns, not one-hot.
+- [scikit-learn 1.9 "Class weights"](https://scikit-learn.org/stable/modules/svm.html#unbalanced-problems) and [`class_weight="balanced"`](https://scikit-learn.org/stable/modules/generated/sklearn.utils.class_weight.compute_class_weight.html) — read this for exactly what `"balanced"` computes, which is `n / (n_classes * bincount(y))`.
+- [XGBoost 2.1 "Notes on Parameter Tuning" — imbalanced datasets](https://xgboost.readthedocs.io/en/release_2.1.0/tutorials/param_tuning.html) — read this for the library's own guidance, including that you should choose `scale_pos_weight` *or* rank-based metrics, not both blindly.
+
+**Papers**
+- [Chawla, N. et al. (2002), "SMOTE," *JAIR* 16.](https://doi.org/10.1613/jair.953) *Takeaway:* interpolation between minority neighbours, and the assumption that fails in high dimensions.
+- [Elor, Y. & Averbuch-Elor, H. (2022), "To SMOTE, or not to SMOTE?" *arXiv:2201.08528*.](https://arxiv.org/abs/2201.08528) *Takeaway:* across 73 datasets, oversampling gives strong classifiers no benefit once the threshold is tuned.
+- Elkan, C. (2001), "The Foundations of Cost-Sensitive Learning," *IJCAI*. *Takeaway:* resampling and threshold movement are equivalent operations on a calibrated model.
+- [Van den Goorbergh, R. et al. (2022), "The harm of class imbalance corrections for risk prediction models," *JAMIA* 29(9). *Takeaway:* imbalance corrections produce systematically overestimated risks](https://arxiv.org/abs/2202.09101) — directly harmful where the probability is the product.
+- [Beyer, K. et al. (1999), "When Is 'Nearest Neighbor' Meaningful?" *ICDT*.](https://doi.org/10.1007/3-540-49257-7_15) *Takeaway:* distance concentration is why SMOTE fails above ~20 dimensions.
+- [Saito, T. & Rehmsmeier, M. (2015), "The Precision-Recall Plot Is More Informative…," *PLOS ONE* 10(3).](https://doi.org/10.1371/journal.pone.0118432) *Takeaway:* report average precision on imbalanced problems, not ROC-AUC.
+
+**Go deeper**
+- Provost, F. (2000), "Machine Learning from Imbalanced Data Sets 101," *AAAI Workshop*. Read it for the argument — made twenty-five years ago and still not absorbed — that the imbalance problem is a *decision-threshold* problem and that the literature's fixation on resampling is a consequence of evaluating with accuracy.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-20/p3-w20-m4">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

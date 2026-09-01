@@ -1,0 +1,654 @@
+---
+title: "Relational model & normalization"
+description: "Week 7 · Module 1 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 7 · Module 1 · `P1-W07-M1`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Take a messy spreadsheet and produce a 3NF schema, showing the tables at each step.
+2. Name the anomaly a normalization step removes — insert, update or delete — rather than reciting the rule.
+3. Write primary, foreign, unique and check constraints as *correctness guarantees* the database enforces for every writer, not just your application.
+4. Denormalize on purpose, and state the cost you are accepting in writes and staleness.
+5. Explain how the planner uses your constraints to rewrite queries, with a measured example where a whole join disappears.
+
+## Where this sits
+
+| | |
+| --- | --- |
+| **Prereqs** | `P1-W03-M2` (data structures), a willingness to draw tables on paper |
+| **Unlocks** | `P1-W07-M2` (ER modelling), everything in Week 8 |
+| **One-line** | After this you can design a schema that makes wrong data impossible to store. |
+
+## Why you should care
+
+### For Aarav (student)
+
+- Normalization is the most reliably asked database interview topic, and most candidates recite "1NF, 2NF, 3NF" without being able to name a single anomaly.
+- A well-designed schema is the part of a portfolio project a senior engineer looks at first. It reveals whether you thought before typing.
+- The constraint-driven rewrite in Layer 3 — where PostgreSQL deleted an entire join because a foreign key made it provably redundant — is a fact that makes constraints feel like leverage rather than paperwork.
+
+### For Meera (working professional)
+
+- This shows up in your job as: "we have three different spellings of the same customer's city and the report is wrong". That is an update anomaly, and it is a schema bug, not a data-cleaning task.
+- Application-level validation protects the one code path you remembered. A `CHECK` constraint protects every writer forever, including the migration script someone runs at 2 a.m.
+- Denormalizing without stating the cost is how read paths get fast and write paths get subtly wrong. This module gives you the vocabulary to make that trade in a design review.
+
+## The mental model
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p1-w07-m1.svg" alt="Hand-drawn sketch: one wide table splitting into normalized tables" className="block dark:hidden" />
+  <img src="/assets/diagrams/p1-w07-m1-dark.svg" alt="Hand-drawn sketch: one wide table splitting into normalized tables" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p1-w07-m1
+tier: T2
+one-sentence-goal: Show that each normalization step removes a specific anomaly by splitting out facts that depend on something other than the whole key.
+elements:
+  - top: one wide spreadsheet-style table with repeating customer name and city across three rows, with the duplicated city values circled in red and labelled "change this in one row and the data now disagrees with itself"
+  - three numbered arrows downward, each labelled with what it removes - (1) "1NF - no repeating groups: split the comma-separated skus into rows", (2) "2NF - remove partial dependencies on part of a composite key", (3) "3NF - remove transitive dependencies: city depends on customer, not on the order"
+  - bottom: three separate tables - customers, orders, order_items - with key lines drawn between them and the FK arrows hand-drawn
+  - amber margin note beside the arrows: "each step removes ONE named anomaly - say which one, or you are just reciting"
+  - a small green box bottom right: "denormalize on purpose" with a copied column shown twice and the note "cost: every write must update both"
+  - circled key term "functional dependency"
+  - dangling arrow labelled "...and what does the PLANNER do with these keys?"
+numbers-to-write-in: LEFT JOIN to customers eliminated entirely by the planner - 0.060 ms; the join that stayed cost 9.5 ms; a fan-out join inflated SUM from 507,507,500 to 1,522,492,500 (3.0x)
+alt: A hand-drawn diagram showing one wide denormalized table with duplicated values circled in red, three numbered arrows for first, second and third normal form each labelled with the anomaly it removes, and the resulting three normalized tables with hand-drawn foreign key links.
+*/}
+
+A relational schema is a set of claims about reality that the database will enforce for you. Every
+normalization rule is a way of saying **each fact should be stored exactly once**, and every
+anomaly is what happens when it is stored twice and the copies disagree.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Plain English
+
+    A **relation** — in practice, a **table** — is a set of rows with named, typed columns. A
+    **key** is a column or set of columns whose values are unique for every row, so a key value
+    identifies exactly one row. The **primary key** is the one you designate as *the* identifier.
+
+    Here is a spreadsheet a real business would send you:
+
+    | order_id | order_date | customer_name | customer_city | items | total |
+    | --- | --- | --- | --- | --- | --- |
+    | 1001 | 2026-01-04 | Meera Rao | Pune | "SKU-000123 x2, SKU-000456 x1" | 14997 |
+    | 1002 | 2026-01-05 | Meera Rao | Pune | "SKU-000123 x1" | 4999 |
+    | 1003 | 2026-01-05 | Aarav Sharma | Punee | "SKU-000456 x3" | 15000 |
+
+    Three things are already broken.
+
+    - **Insert anomaly.** You cannot record a new customer until they place an order. There is
+      nowhere to put a customer who exists but has not bought anything.
+    - **Update anomaly.** Meera moves to Mumbai. Her city appears in every row she has ever
+      appeared in, so you must update all of them, and if you miss one your data disagrees with
+      itself. Row 1003 already shows this failure in miniature: `Punee` is a typo nothing prevented.
+    - **Delete anomaly.** Delete order 1003 — the only order Aarav ever placed — and you have also
+      deleted the fact that Aarav exists and lives in Pune.
+
+    Normalization removes these by splitting the table so each fact lives in exactly one place.
+
+    ### The analogy
+
+    A contacts list where you write a friend's phone number next to every appointment you have ever
+    had with them. It works until the number changes. Then you must find every appointment, and any
+    one you miss becomes a wrong number you will trust later. The fix is obvious and it is exactly
+    normalization: store the number once, in the contact, and have appointments *refer* to the
+    contact.
+
+    ### Smallest working example: normalize it, step by step
+
+    **Step 1 — First Normal Form (1NF): no repeating groups.** Each cell holds one value. The
+    `items` column holds a list, so split it into its own table with one row per item.
+
+    ```sql
+    -- after 1NF
+    CREATE TABLE orders_1nf (
+      order_id      bigint,
+      order_date    date,
+      customer_name text,
+      customer_city text,
+      sku           text,
+      qty           integer,
+      PRIMARY KEY (order_id, sku)      -- composite key: an order has many skus
+    );
+    ```
+
+    **Step 2 — Second Normal Form (2NF): no partial dependencies.** With the composite key
+    `(order_id, sku)`, ask of each other column: does it depend on the *whole* key, or only part of
+    it? `order_date`, `customer_name` and `customer_city` depend only on `order_id` — that is a
+    **partial dependency**. Split them out.
+
+    ```sql
+    CREATE TABLE orders_2nf (
+      order_id      bigint PRIMARY KEY,
+      order_date    date NOT NULL,
+      customer_name text NOT NULL,
+      customer_city text NOT NULL
+    );
+    CREATE TABLE order_items_2nf (
+      order_id bigint NOT NULL,
+      sku      text   NOT NULL,
+      qty      integer NOT NULL,
+      PRIMARY KEY (order_id, sku)
+    );
+    ```
+
+    **Step 3 — Third Normal Form (3NF): no transitive dependencies.** In `orders_2nf`,
+    `customer_city` does not really depend on the order — it depends on the *customer*, who depends
+    on the order. That indirection (`order_id → customer → city`) is a **transitive dependency**.
+    Split the customer out.
+
+    ```sql
+    CREATE TABLE customers (
+      id   bigserial PRIMARY KEY,
+      name text NOT NULL,
+      city text NOT NULL,
+      UNIQUE (name, city)
+    );
+    CREATE TABLE orders (
+      id          bigserial PRIMARY KEY,
+      customer_id bigint NOT NULL REFERENCES customers(id),
+      order_date  date   NOT NULL
+    );
+    CREATE TABLE order_items (
+      order_id bigint  NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+      sku      text    NOT NULL,
+      qty      integer NOT NULL CHECK (qty > 0),
+      PRIMARY KEY (order_id, sku)
+    );
+    ```
+
+    All three anomalies are gone. A customer can exist with no orders. Meera's city lives in one
+    row and changing it is one `UPDATE`. Deleting an order does not delete a person.
+
+    ### Line by line
+
+    - `bigserial PRIMARY KEY` — an auto-incrementing 64-bit integer. `PRIMARY KEY` means unique and
+      not null, and creates an index automatically.
+    - `REFERENCES customers(id)` — a **foreign key**. The database now refuses to store an order
+      whose `customer_id` does not exist. That is not a convention; it is enforced on every insert
+      and update by every client forever.
+    - `ON DELETE CASCADE` on `order_items` — deleting an order removes its items. Use it where the
+      child cannot meaningfully exist without the parent, and *not* where you want the delete to
+      fail loudly instead.
+    - `UNIQUE (name, city)` — the *natural* key. It says two customers cannot share both name and
+      city. Whether that is true in your business is a question you must actually ask.
+    - `CHECK (qty > 0)` — a rule the database enforces. Your application also checks it; the
+      constraint is what protects you from the script that does not.
+    - `NOT NULL` — the cheapest, most under-used constraint in databases. Every nullable column is a
+      question your queries must answer: what does absent mean here?
+
+    ### Guided practice
+
+    Given this table, produce the 3NF schema. Write it before reading the answer.
+
+    | ticket_id | opened | agent_name | agent_email | agent_team | customer | tags |
+    | --- | --- | --- | --- | --- | --- | --- |
+    | 5001 | 2026-02-01 | Sam | sam@co.com | Billing | Meera | "urgent,refund" |
+
+    <Accordion title="Answer">
+      ```sql
+      CREATE TABLE teams (
+        id   bigserial PRIMARY KEY,
+        name text NOT NULL UNIQUE
+      );
+      CREATE TABLE agents (
+        id      bigserial PRIMARY KEY,
+        name    text NOT NULL,
+        email   text NOT NULL UNIQUE,          -- the natural key
+        team_id bigint NOT NULL REFERENCES teams(id)
+      );
+      CREATE TABLE customers (
+        id   bigserial PRIMARY KEY,
+        name text NOT NULL
+      );
+      CREATE TABLE tickets (
+        id          bigserial PRIMARY KEY,
+        opened_at   timestamptz NOT NULL,
+        agent_id    bigint NOT NULL REFERENCES agents(id),
+        customer_id bigint NOT NULL REFERENCES customers(id)
+      );
+      CREATE TABLE tags (
+        id   bigserial PRIMARY KEY,
+        name text NOT NULL UNIQUE
+      );
+      CREATE TABLE ticket_tags (                -- M:N junction table
+        ticket_id bigint NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+        tag_id    bigint NOT NULL REFERENCES tags(id),
+        PRIMARY KEY (ticket_id, tag_id)
+      );
+      ```
+
+      The three moves: `tags` was a repeating group, so it becomes a junction table (1NF);
+      `agent_email` and `agent_team` depend on the agent, not the ticket (3NF); and `agent_team`
+      itself becomes a table because a team is a thing with its own identity, not a string.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+      **1. What is an update anomaly, in one sentence?**
+      The same fact is stored in several rows, so updating some and not others makes the data
+      disagree with itself.
+
+      **2. What does 2NF remove that 1NF does not?**
+      Partial dependencies — columns that depend on only part of a composite key.
+
+      **3. What is a transitive dependency?**
+      A column that depends on a non-key column, which in turn depends on the key: `order → customer → city`.
+
+      **4. Why is a foreign key better than "we always set it correctly in the app"?**
+      It is enforced for every writer, including migrations, admin scripts and the next service,
+      and it cannot be forgotten.
+
+      **5. When is `ON DELETE CASCADE` wrong?**
+      When you want the delete to fail rather than silently remove children — for example orders
+      under a customer you are trying to delete. Use `ON DELETE RESTRICT` there.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The real theory: functional dependencies, said precisely
+
+    `X → Y` ("X determines Y") means: any two rows agreeing on X must agree on Y. Normal forms are
+    statements about which dependencies are allowed.
+
+    - **2NF:** no non-key column depends on only *part* of a composite key.
+    - **3NF:** every non-key column depends on the key, the whole key, and nothing but the key.
+    - **BCNF:** for every dependency `X → Y`, X is a superkey. Strictly stronger than 3NF, and the
+      difference is a real, if uncommon, anomaly — Layer 3 has the counterexample.
+
+    The practical target is **3NF for anything transactional**, with deliberate exceptions.
+    Denormalization is a decision, not a failure — but it must be written down with its cost.
+
+    ### The production surface: constraints as correctness
+
+    PostgreSQL 16. Every one of these is a bug class you are choosing not to have.
+
+    ```sql
+    CREATE TABLE orders (
+      id            bigserial PRIMARY KEY,
+      customer_id   bigint      NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+      status        text        NOT NULL
+                    CHECK (status IN ('pending','paid','shipped','refunded','cancelled')),
+      total_cents   bigint      NOT NULL CHECK (total_cents >= 0),
+      currency      char(3)     NOT NULL DEFAULT 'INR',
+      placed_at     timestamptz NOT NULL DEFAULT now(),
+      shipped_at    timestamptz,
+      deleted_at    timestamptz,
+
+      CONSTRAINT shipped_after_placed CHECK (shipped_at IS NULL OR shipped_at >= placed_at),
+      CONSTRAINT shipped_implies_paid CHECK (shipped_at IS NULL OR status <> 'pending')
+    );
+
+    -- one active cart per customer, enforced by the database
+    CREATE UNIQUE INDEX one_open_cart_per_customer
+      ON carts (customer_id) WHERE closed_at IS NULL;
+    ```
+
+    That partial unique index is worth pausing on. "A customer may have at most one open cart" is
+    the kind of rule normally implemented as a `SELECT` then an `INSERT` in application code — which
+    is a race condition, as Week 8 will demonstrate with two concurrent sessions. As a partial unique
+    index it is enforced atomically by the database, and the concurrent second insert fails with a
+    unique violation your code can catch.
+
+    **Surrogate versus natural keys.** A surrogate key (`bigserial`, UUID) has no business meaning.
+    A natural key (`email`, `sku`, `isbn`) does.
+
+    - Use a surrogate as the **primary key**, because business meaning changes: people change email
+      addresses, products get re-SKU'd, countries merge.
+    - Add the natural key as a **`UNIQUE` constraint**, because it is still true and you want it
+      enforced.
+
+    That combination gives you stable foreign keys and enforced business identity. Using a natural
+    key as the primary key means a change to it cascades through every referencing table.
+
+    **Nullable columns are questions.** Before allowing `NULL`, answer: does absent mean "unknown",
+    "not applicable", or "not yet"? If it means more than one of those, you need a different design,
+    because `NULL` cannot tell them apart — and `NULL` propagates silently through `=`, `NOT IN` and
+    aggregates.
+
+    ### Trade-offs
+
+    | Decision | Choose the first when… | Choose the second when… |
+    | --- | --- | --- |
+    | **Surrogate vs natural primary key** | Almost always — business identifiers change, and you want foreign keys that never have to be rewritten. | The natural key is genuinely immutable and you have a strong reason to avoid a join (a country code table). |
+    | **3NF vs deliberate denormalization** | Anything written frequently. Correctness by construction; one place to update. | A read path measured to be too slow *after* trying indexes, where staleness is acceptable and you write down the invalidation rule. |
+    | **`CHECK` constraint vs application validation** | Both, always — but the constraint is what survives a migration script, a second service and an intern with `psql`. | Only application validation when the rule needs data the row does not contain, or changes per tenant. |
+    | **`ON DELETE CASCADE` vs `RESTRICT`** | The child is meaningless without the parent: order items, comment votes. | The child is evidence: orders under a customer, invoices under an account. Fail loudly and make the operator decide. |
+    | **Enum type vs `CHECK (x IN (...))` vs a lookup table** | A small, stable set: `CHECK` is simplest and adding a value is a cheap `ALTER`. | A set that changes at runtime, or one that needs attributes (a label, a sort order, an active flag): use a lookup table. Native `ENUM` types are hardest to change — adding is easy, removing needs a type rewrite. |
+
+    ### Reference implementation: normalizing 30 columns without losing data
+
+    The lab gives you a 30-column export. The procedure that works:
+
+    ```sql
+    -- 1. Find the functional dependencies empirically, before designing anything.
+    --    If this returns 0, then customer_email -> customer_city holds in the data.
+    SELECT customer_email, count(DISTINCT customer_city) AS distinct_cities
+    FROM staging_orders
+    GROUP BY customer_email
+    HAVING count(DISTINCT customer_city) > 1;
+
+    -- 2. Extract dimensions, deduplicating as you go.
+    INSERT INTO customers (email, name, city)
+    SELECT DISTINCT ON (lower(customer_email))
+           lower(customer_email), customer_name, customer_city
+    FROM staging_orders
+    ORDER BY lower(customer_email), order_date DESC;   -- most recent wins on conflict
+
+    -- 3. Load facts, resolving foreign keys by the natural key.
+    INSERT INTO orders (id, customer_id, placed_at, total_cents)
+    SELECT s.order_id, c.id, s.order_date, s.total_cents
+    FROM staging_orders s
+    JOIN customers c ON c.email = lower(s.customer_email);
+
+    -- 4. PROVE no data was lost. This is the part people skip.
+    SELECT
+      (SELECT count(*) FROM staging_orders)                   AS source_rows,
+      (SELECT count(*) FROM orders)                           AS loaded_orders,
+      (SELECT sum(total_cents) FROM staging_orders)           AS source_total,
+      (SELECT sum(total_cents) FROM orders)                   AS loaded_total,
+      (SELECT count(DISTINCT lower(customer_email)) FROM staging_orders) AS source_customers,
+      (SELECT count(*) FROM customers)                        AS loaded_customers;
+    ```
+
+    Step 1 is the one that separates a design from a guess. Step 4 is the deliverable: a migration
+    without a reconciliation query is a hope. Note that step 2 chose a winner when the data
+    contradicted itself (`Pune` versus `Punee`) — and that choice must be *stated*, because it
+    silently changes rows.
+
+    ### What breaks in the real world
+
+    A subscription business stored the plan price on the subscription row — denormalized, for speed,
+    so the billing job did not need a join. It worked for two years. Then marketing ran a promotion
+    that changed the price of the "Pro" plan for new customers only.
+
+    The billing job read the *plan* table for the price, because whoever wrote it assumed the
+    denormalized copy was a cache. Every existing Pro customer was billed the new promotional price
+    for one cycle. The refund and reconciliation took three weeks, and the finance team lost trust in
+    the numbers for a quarter.
+
+    The bug was not the denormalization. The bug was that the copy had **no stated owner and no
+    stated meaning**. Two valid designs existed and nobody chose: either `subscriptions.price_cents`
+    is a *historical record* of the price agreed at signup — in which case it is not a cache at all,
+    it is the truth, and billing must read it — or it is a cache of `plans.price_cents`, in which
+    case something must keep it in sync and billing may read either.
+
+    They chose the first, renamed the column to `agreed_price_cents`, added a comment in the DDL, and
+    added a `CHECK` that it is not null. The rename was the most valuable part: **a denormalized
+    column needs a name that says which kind of copy it is.**
+
+    <Accordion title="Design checkpoint — model answer inside">
+      **Question.** A reviewer says your `orders` table should store `customer_email` "so we do not
+      have to join for the receipts report". How do you respond?
+
+      **Model answer.** Ask what the column *means*, because the answer decides everything. If it
+      means "the email we sent this receipt to", it is a historical fact about the order, it should
+      never change when the customer changes their address, and it is correctly stored on the order —
+      that is not denormalization at all, it is a different fact that happens to look similar. If it
+      means "the customer's current email", it is a cache, and it needs an owner, an invalidation
+      rule and a backfill plan, and the join it saves is measurably cheap: on 1M orders the equivalent
+      join ran in 9.5 ms for a 55-row result, and the planner can eliminate the join entirely when the
+      columns are not selected — measured at 0.060 ms. So: name it `receipt_email` and store it
+      deliberately, or do not store it and keep the join. Do not store `customer_email` and leave the
+      meaning to the reader.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    ### BCNF versus 3NF: the concrete counterexample
+
+    3NF permits a dependency `X → Y` where X is not a superkey, provided Y is part of *some*
+    candidate key. BCNF does not. Here is a schema that is in 3NF and still broken.
+
+    A tutoring service: each `(student, subject)` pair is assigned exactly one tutor, and each tutor
+    teaches exactly one subject.
+
+    ```
+    Enrolment(student, subject, tutor)
+    ```
+
+    Dependencies: `(student, subject) → tutor` and `tutor → subject`.
+
+    Candidate keys: `(student, subject)` and `(student, tutor)`. Every non-prime attribute depends on
+    a key — in fact every attribute is part of some candidate key — so this is in 3NF. But
+    `tutor → subject` has a determinant, `tutor`, that is not a superkey, so it violates BCNF. The
+    anomalies are real:
+
+    - **Insert:** you cannot record that "Ravi teaches Physics" until some student enrols with Ravi.
+    - **Delete:** if Ravi's only student drops the course, the fact that Ravi teaches Physics is gone.
+    - **Update:** if Ravi switches to Chemistry, every row mentioning Ravi must change together.
+
+    The BCNF decomposition:
+
+    ```sql
+    CREATE TABLE tutors     (tutor text PRIMARY KEY, subject text NOT NULL);
+    CREATE TABLE enrolments (student text, tutor text REFERENCES tutors(tutor),
+                             PRIMARY KEY (student, tutor));
+    ```
+
+    And the honest footnote: this decomposition **loses the ability to enforce**
+    `(student, subject) → tutor` with a single constraint, because student and subject are now in
+    different tables. That is the classic BCNF trade-off — BCNF decomposition is always lossless on
+    *data* but not always **dependency-preserving**. In PostgreSQL you can recover it with a
+    generated column plus a unique index, or with a trigger, and either way you should note in the
+    DDL which constraint you are enforcing by hand and why.
+
+    ### How the planner uses your constraints
+
+    Constraints are not just checks; they are *facts* the optimizer reasons with. Measured on
+    PostgreSQL 16.14 over 1,000,000 orders and 200,000 customers.
+
+    **Join elimination.** A `LEFT JOIN` to a table whose columns are not selected, on a unique key,
+    is provably redundant — the join cannot add or remove rows — so the planner deletes it:
+
+    ```sql
+    EXPLAIN (ANALYZE)
+    SELECT o.id FROM orders o
+    LEFT JOIN customers c ON c.id = o.customer_id
+    WHERE o.customer_id = 4242;
+    ```
+
+    ```
+    Index Scan using idx_orders_customer on orders o  (actual time=0.022..0.031 rows=5 loops=1)
+      Index Cond: (customer_id = 4242)
+    Planning Time: 5.945 ms
+    Execution Time: 0.060 ms
+    ```
+
+    **The `customers` table does not appear in the plan at all.** The join was removed because the
+    primary key on `customers.id` guarantees at most one match. Drop the primary key and the planner
+    must perform the join, because without the uniqueness guarantee the `LEFT JOIN` could multiply
+    rows. This is the strongest practical argument for declaring constraints you "know" are true:
+    the planner does not know them unless you say so.
+
+    **Uniqueness and `DISTINCT`.** With an equality predicate on an indexed column, the planner can
+    satisfy `SELECT DISTINCT customer_id ... WHERE customer_id = 4242` with a `Limit` over an
+    index-only scan — 0.064 ms, no sort at all — because at most one distinct value can exist. It
+    does *not* eliminate `SELECT DISTINCT id, total_cents` even though `id` is the primary key: that
+    plan still shows `Unique` over `Sort` at 0.245 ms. Worth reporting honestly: the optimizer
+    exploits some implications of your keys and not others, and `EXPLAIN` is how you find out which,
+    rather than assuming.
+
+    ### Denormalization, priced
+
+    The read saving is the join you avoid. Measured: the nested-loop join for 55 rows cost 9.5 ms;
+    a parallel hash join of 200,000 orders against 40,000 customers cost 1,148 ms cold.
+
+    The write cost is every place the copy must be maintained, plus the correctness cost of the
+    window where the copies disagree. And there is a cost nobody counts: **a denormalized column
+    invites a fan-out bug.** Measured on the real dataset: 5,002 orders joined to their items became
+    15,000 rows, and `SUM(total_cents)` went from the correct 507,507,500 to 1,522,492,500 — **3.0×
+    inflated**, with no error and no warning. Every duplicated column is another opportunity for a
+    reader to aggregate at the wrong grain.
+
+    The rule that keeps this manageable: **denormalize into a separate table or a materialized view,
+    not into the transactional row.** Then the copy is obviously a copy, it has a refresh mechanism,
+    and nobody mistakes it for the source of truth.
+
+    ### OLTP versus OLAP schema shapes
+
+    The 3NF advice is for **OLTP** — many small transactions, writes as frequent as reads,
+    correctness paramount. **OLAP** — few huge scans, append-mostly, aggregation paramount — wants
+    the opposite: a star schema with wide denormalized dimension tables, because a join per row
+    across a billion rows is the dominant cost and dimensions barely change.
+
+    Both are correct for their workload, and the mistake is running one shape under the other's load.
+    A 3NF schema serving analytics produces the 1,148 ms hash joins above on every dashboard refresh.
+    A star schema serving transactions produces update anomalies at speed. Week 15 builds the
+    pipeline that maintains the second from the first, which is the normal resolution.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Fan-out join inflating sums | Revenue figures too high by an integer-ish factor | Compare `count(*)` before and after adding a join; measured 5,002 → 15,000 rows, 3.0× on `SUM` |
+    | Missing foreign key | Orphan rows referencing deleted parents | `SELECT count(*) FROM child c LEFT JOIN parent p ON ... WHERE p.id IS NULL` |
+    | `NULL` in a `NOT IN` subquery | The whole query silently returns zero rows | `NOT IN (SELECT x ...)` where `x` can be `NULL`; use `NOT EXISTS` |
+    | Denormalized copy drifting | Two reports disagree, both "correct" | A reconciliation query in CI comparing the copy to its source |
+    | Natural key as primary key | A business identifier change cascades into ten tables | Look for `PRIMARY KEY (email)` and similar |
+    | Enum stored as `text` with no `CHECK` | Typos become new statuses; `WHERE status = 'paid'` misses rows | `SELECT DISTINCT status FROM ...` — the answer is always longer than expected |
+
+    ### Frontier and primary sources
+
+    - **Codd, "A Relational Model of Data for Large Shared Data Banks" (1970).** *Takeaway:* separating
+      the logical model from physical storage is what allows a query optimizer to exist at all — you
+      say what you want, not how to get it.
+    - **Codd (1971) and Boyce–Codd (1974) on normal forms.** *Takeaway:* each normal form removes a
+      specific class of update anomaly, so "which anomaly does this prevent" is the only question worth
+      asking about a normalization step.
+    - **Kimball, *The Data Warehouse Toolkit*.** *Takeaway:* denormalized star schemas are correct for
+      analytical workloads for the same reason 3NF is correct for transactional ones — the read/write
+      ratio inverts.
+    - **PostgreSQL documentation, "Constraints" and "Planner/Optimizer".** *Takeaway:* constraints are
+      inputs to query planning, not merely validation, which is why an unstated truth costs you
+      performance as well as correctness.
+
+    ### Stretch challenge
+
+    Take a schema you did not design — an open-source project's, or your employer's — and produce
+    two artefacts. First, its functional dependencies, derived *empirically* from the data with
+    `GROUP BY ... HAVING count(DISTINCT ...) > 1` queries rather than from the documentation, and
+    every place the data contradicts the declared schema. Second, the smallest set of constraints
+    that would have prevented each contradiction, along with what it would cost to add them to a live
+    table — measured: `ADD CONSTRAINT ... NOT VALID` took 51 ms and the subsequent `VALIDATE` took
+    133 ms on 1M rows, while a naive `ADD CONSTRAINT` takes the strong lock for the whole scan.
+
+    Then the interesting question, which has no clean answer: which of the contradictions you found
+    are *bugs*, and which are the business being more complicated than the schema? Every real system
+    has both, and telling them apart requires talking to someone who is not an engineer.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Take the 30-column un-normalized export in `labs/p1/week-07/staging_orders.csv`. Derive its
+functional dependencies with `GROUP BY ... HAVING` queries, produce a 3NF schema, write the
+migration SQL, and finish with a reconciliation query proving no rows, no money and no distinct
+entities were lost. The reconciliation query is the deliverable; the schema is the easy part.
+</Card>
+
+## The whiteboard
+
+T1 is the one-wide-table-to-three-tables sketch with the anomaly each arrow removes. The T2
+build-up frames are the four states: original, after 1NF, after 2NF, after 3NF — each with the
+anomaly it just eliminated crossed out in red.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p1-w07-m1-blank.svg) · [Editable source](/assets/diagrams/p1-w07-m1.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    Put the before-and-after schema in your README with the three anomalies named. In an interview,
+    do not recite the normal forms — say "this column depended on the customer, not the order, so a
+    customer's address change would have had to be written to every one of their orders". That
+    sentence demonstrates understanding; the list of normal forms demonstrates memorisation, and
+    interviewers can tell the difference instantly.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **One:** run `SELECT DISTINCT status FROM <your busiest table>` — if there are values you did
+    not expect, you have a missing `CHECK` and probably a query that silently misses rows.
+    **Two:** find every denormalized column and ask what it *means*; the ones with no answer are
+    incidents waiting. **Three:** check for missing foreign keys with a `LEFT JOIN ... IS NULL`
+    orphan query on your top three relationships. Adding an FK to a live table is cheap if you use
+    `NOT VALID` then `VALIDATE` — measured 51 ms and 133 ms on a million rows.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Revenue report is an integer multiple too high | Fan-out join aggregating at the wrong grain | Aggregate the child first, then join; measured 3.0× inflation |
+| Two spellings of the same city | The value is stored per row instead of per entity | Normalize to 3NF; add a `UNIQUE` on the natural key |
+| Cannot add a customer with no orders | Insert anomaly — entities live only inside facts | Give the entity its own table |
+| A `NOT IN` subquery returns nothing | A `NULL` in the subquery makes every comparison unknown | `NOT EXISTS`, or filter the `NULL`s |
+| Changing a business identifier requires ten migrations | Natural key used as the primary key | Surrogate primary key plus a `UNIQUE` on the natural key |
+| Deleting a customer deletes their invoices | `ON DELETE CASCADE` where evidence should be preserved | `ON DELETE RESTRICT`, and an explicit archival path |
+| A status value nothing recognises | Enum stored as free text with no constraint | `CHECK (status IN (...))` or a lookup table |
+| The planner does a join you thought was free | Constraints not declared, so uniqueness is unknown | Declare the keys; measured, a declared PK let the planner delete the join entirely |
+
+## Assessment
+
+**Concept questions**
+
+1. Name the three anomalies and give an example of each. *(Insert: a customer with no orders cannot be recorded. Update: a city stored per row disagrees after a partial update. Delete: removing the last order removes the customer.)*
+2. What does 2NF remove? *(Partial dependencies on part of a composite key.)*
+3. Give a 3NF schema that is not in BCNF. *(`Enrolment(student, subject, tutor)` with `tutor → subject`.)*
+4. Why is BCNF decomposition sometimes undesirable? *(It can lose dependency preservation — a constraint spanning the split can no longer be declared with one key.)*
+5. Why declare a foreign key you "know" is satisfied? *(It is enforced for every writer, and the planner uses it — measured, it eliminated a join entirely.)*
+6. Surrogate or natural primary key, and why? *(Surrogate, because business identifiers change; keep the natural key as a `UNIQUE` constraint.)*
+7. When is denormalization correct? *(When a read path is measured too slow after indexing, staleness is acceptable, and the invalidation rule is written down — preferably in a separate table or materialized view.)*
+8. What is the cost of adding a `CHECK` to a live 1M-row table? *(Measured 51 ms with `NOT VALID`, then 133 ms to `VALIDATE` under a weaker lock; a plain `ADD CONSTRAINT` holds the strong lock for the whole scan.)*
+
+**Coding challenge.** Normalize the supplied 30-column table to 3NF with a migration script and a reconciliation proof. Hidden tests: row counts and sums match the source; no orphan foreign keys; every declared `UNIQUE` actually holds; and a supplied set of 10 questions can be answered from the new schema.
+
+**Interview questions**
+
+- *Junior:* "What is normalization and what problem does it solve?"
+- *Mid:* "When would you denormalize, and what would you write down before doing it?"
+- *Senior:* "Give me a schema that is in 3NF but still has an update anomaly, and decompose it."
+
+**Draw it from memory.** Draw the wide table, then the three normalized tables, and label each arrow with the anomaly it removes.
+
+## Sources & further reading
+
+**Primary docs**
+
+- [PostgreSQL 16: Constraints](https://www.postgresql.org/docs/16/ddl-constraints.html) — read it end to end once; it is short, and partial unique indexes alone are worth the time.
+- [PostgreSQL 16: Planner/Optimizer](https://www.postgresql.org/docs/16/planner-optimizer.html) — read this to see why declared constraints change plans, not just validity.
+- [PostgreSQL 16: ALTER TABLE](https://www.postgresql.org/docs/16/sql-altertable.html) — read the lock-level notes; they decide whether a migration is a blip or an outage.
+
+**Papers and their takeaways**
+
+- **[Codd (1970), "A Relational Model of Data for Large Shared Data Banks."](https://doi.org/10.1145/362384.362685)** *Takeaway:* declaring *what* you want rather than *how* to fetch it is what makes an optimizer — and therefore the last fifty years of database performance — possible.
+- **Codd (1971) / Boyce–Codd (1974).** *Takeaway:* each normal form is defined by the anomaly it eliminates, so a normalization argument that cannot name an anomaly is not an argument.
+- **[Kimball, *The Data Warehouse Toolkit* (3rd ed.), chapter 1.](https://www.kimballgroup.com/data-warehouse-business-intelligence-resources/books/data-warehouse-dw-toolkit/)** *Takeaway:* the right schema shape is a function of the read/write ratio, which is why OLAP and OLTP correctly disagree.
+
+**Go deeper**
+
+- *Database Design for Mere Mortals*, Michael Hernandez — read the chapters on field and table design. It teaches the questions to ask about each column ("what does absent mean here?") rather than the rules to recite, which is the part that transfers to real schemas.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-07/p1-w07-m1">
+  Attempt the lab first. Seriously.
+</Card>

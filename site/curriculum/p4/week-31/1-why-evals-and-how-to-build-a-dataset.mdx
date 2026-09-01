@@ -1,0 +1,613 @@
+---
+title: "Why evals, and how to build a dataset"
+description: "Week 31 · Module 1 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 31 · Module 1 · `P4-W31-M1`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Weeks 29–30 (you need a system whose failures you can collect), Week 12 (sampling, confidence intervals, statistical power), Week 19 (precision, recall, thresholds).
+- **Unlocks:** every remaining module of this week and of Week 32. An eval suite is the instrument every later measurement reads from.
+- **One-line:** after this you can build a 100-case eval set out of real failures, know exactly what size of regression it can detect, and stop shipping on vibes.
+
+## Why you should care
+
+**For Aarav (student).** Evals are the single largest gap between a student project and a
+professional one, and they are free to build. A repository containing `evals/cases.yaml` with 120
+cases derived from a documented error taxonomy, running in CI, is worth more in an interview than
+another feature. It is also the thing that lets you say "I changed the prompt and success went from
+73% to 81%" instead of "it seems better now".
+
+**For Meera (working professional).** You cannot get an LLM feature through a normal change-control
+process without a regression test, and "we tried it and it looked fine" is not one. The eval suite
+is what converts an unownable prompt into a normal piece of software that a team can change on a
+Tuesday. It is also, less pleasantly, the thing that will tell you the feature was never as good as
+the demo suggested.
+
+## The mental model
+
+An eval suite is a **test suite for behaviour that is not deterministic**. That changes two things
+and nothing else. First, a case is scored rather than asserted — you get a rate, not a pass or fail.
+Second, because you get a rate, you need enough cases to distinguish a real change from noise. The
+discipline is otherwise identical to testing: cases come from real failures, they are versioned,
+they run in CI, and they gate merges.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p4-w31-m1.svg" alt="Hand-drawn sketch: the eval pyramid" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w31-m1-dark.svg" alt="Hand-drawn sketch: the eval pyramid" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w31-m1
+tier: T2
+one-sentence-goal: Show the eval pyramid with cost and coverage on opposite axes, and make it obvious that the cheap deterministic base catches most regressions for almost nothing.
+elements:
+  - a hand-drawn pyramid, four horizontal bands, widest at the bottom
+  - band 1 (bottom, widest, green): "ASSERTIONS - format, length, required entities, refusals, no PII" with "$0.00 / 120 cases / 0.8 s" written in
+  - band 2 (blue): "REFERENCE - exact or fuzzy match to a known-good answer" with "$0.00 / 40 cases"
+  - band 3 (amber): "LLM JUDGE - rubric-scored, validated against humans" with "$1.80 / 100 cases / 12 min" and a small warning triangle
+  - band 4 (top, narrowest, red outline): "HUMAN - 20 cases, weekly" with "the only ground truth"
+  - two arrows running up the side of the pyramid: left arrow "cost per case" pointing up, right arrow "coverage" pointing down
+  - to the right, a small hand-drawn power curve: x = number of cases (20, 50, 100, 500), y = "smallest change you can detect", with points labelled 24 pts, 15 pts, 11 pts, 5 pts
+  - the 100-case point circled with amber note "a 100-case suite CANNOT see a 3-point change. Say that out loud before someone ships on one."
+  - red cross-out over a box "20 hand-written cases we made up" with red note "cases come from FAILURES, not imagination"
+  - a loop arrow at the bottom from a box "production failure" into the pyramid's base, labelled "every incident becomes a case"
+  - the phrase "error taxonomy" circled
+numbers-to-write-in: 120 assertions in 0.8 s for $0.00; judge 100 cases $1.80; 100 cases detects 11 pts, 20 cases detects 24 pts; offline 91% vs online 78%
+alt: A hand-drawn four-band eval pyramid from cheap deterministic assertions at the base to human review at the top, with cost and coverage arrows on either side and a small statistical-power curve to the right showing the smallest detectable change for 20, 50, 100 and 500 cases.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+### The words, defined
+
+- **Eval (evaluation).** Running your system over a fixed set of inputs and scoring the outputs. The LLM version of a test suite.
+- **Case.** One input plus whatever you need to score the output: an expected answer, a set of required facts, or a rubric.
+- **Assertion.** A deterministic check on the output. "Is it valid JSON?" "Does it contain the order reference?" "Is it under 200 words?" Exact, instant, free.
+- **Reference answer.** A known-good output to compare against. Useful when there is one right answer.
+- **Judge.** A model that scores an output against a rubric. Flexible, expensive, and untrustworthy until validated (Module 2).
+- **Regression.** Something that used to work and no longer does.
+- **Error taxonomy.** Your named categories of failure, derived by reading real outputs. The most valuable artifact in this module.
+- **Ground truth.** What is actually correct, established by a human. Everything else is an approximation of it.
+
+### The analogy
+
+Imagine a chef whose dishes vary a bit each time. You cannot test "is this dish identical to the
+reference" — it never is. But you can check the salt level, whether the chicken is cooked through,
+and whether it contains the ingredient the customer is allergic to. Those checks are cheap, exact
+and catch the disasters. For "is it *good*", you need someone to taste it, and tasting is slow and
+expensive, so you do it on a few dishes and you check the cheap things on all of them.
+
+That is the eval pyramid. Most of your protection comes from the boring checks at the bottom.
+
+### The experiment that makes the case
+
+Do this before reading anything else in the module. It takes fifteen minutes.
+
+```python
+# tiny_eval.py — 20 saved cases, one changed word
+import json, yaml, anthropic
+client = anthropic.Anthropic()
+
+CASES = yaml.safe_load(open("cases.yaml"))     # 20 real inputs with expected substrings
+
+def run(prompt_version: str) -> tuple[int, list[str]]:
+    system = open(f"prompts/{prompt_version}.txt").read()
+    passed, failures = 0, []
+    for c in CASES:
+        r = client.messages.create(model="claude-opus-5", max_tokens=800,
+                                   system=system,
+                                   messages=[{"role": "user", "content": c["input"]}])
+        out = "".join(b.text for b in r.content if b.type == "text")
+        ok = all(s.lower() in out.lower() for s in c["must_contain"])
+        passed += ok
+        if not ok:
+            failures.append(c["id"])
+    return passed, failures
+
+before, fb = run("v1")
+after,  fa = run("v2")     # v2 differs from v1 by ONE word: "concise" -> "brief"
+print(f"v1: {before}/20   v2: {after}/20")
+print("newly failing:", sorted(set(fa) - set(fb)))
+```
+
+Our run:
+
+```
+v1: 18/20   v2: 15/20
+newly failing: ['ord-multi-item', 'refund-partial', 'shipping-delay']
+```
+
+One synonym. Three regressions. All three were cases where the shorter output dropped the order
+reference — the thing the downstream system parses. Nobody would have caught this by reading a few
+outputs, because each individual output looks perfectly reasonable.
+
+**That is the entire argument for evals** and it is why this experiment comes before the theory.
+
+### Line by line
+
+- **`cases.yaml` is data, not code.** It is versioned, reviewable, and editable by someone who is not an engineer — a support lead can add a case.
+- **`must_contain` is an assertion**, not a judge. It costs nothing, runs instantly, and is completely reliable about the thing it checks. Start here.
+- **The prompt is a file, not a string in the source.** `prompts/v1.txt`. You are going to compare versions constantly; make that cheap from day one.
+- **The output is `set(fa) - set(fb)`** — *newly* failing cases, not the total. A total that stays at 15 while three cases regress and three others start passing is a change you must not miss.
+- **Twenty cases is enough to demonstrate the point and not enough to ship on.** Layer 3 has the arithmetic; the short version is that 20 cases can only detect a change of roughly 24 percentage points.
+
+### Guided practice
+
+```python
+# 1. Build your own cases.yaml with 20 entries. Rules:
+#    - every case comes from something that actually happened
+#    - `must_contain` holds only things a correct answer MUST have
+#    - include at least 3 cases where the correct answer is a refusal
+#      ("I don't have that information") — these are the ones people forget
+#
+# 2. Add three assertions that need no expected answer at all:
+#      - output parses as JSON (if you ask for JSON)
+#      - output is under N words
+#      - output contains no email address (a cheap PII check)
+#    TODO: how many of your 20 cases fail one of these today? ____
+#
+# 3. Change one word in your system prompt. Re-run. Record newly-failing ids.
+#
+# 4. Now do the thing that makes it a suite: put the run in a script that
+#    exits non-zero when any case that passed on `main` fails on your branch.
+```
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **Why can you not use ordinary assertions for everything?** Because for many outputs there is no single correct string — but you can almost always assert *something*, and you should.
+2. **Where do cases come from?** Real failures and real traffic. Cases you invent test your imagination, not your system.
+3. **Why report newly-failing cases rather than the total?** A stable total can hide three regressions offset by three improvements.
+4. **Why are refusal cases important?** Because a system that answers everything confidently scores well on cases where an answer exists and is dangerous everywhere else.
+5. **What is the cheapest, most reliable layer?** Deterministic assertions. Free, instant, exact, and they catch most real regressions.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+### Build the error taxonomy first, by reading fifty outputs
+
+You cannot decide what to measure until you know how your system fails. So do the unglamorous thing:
+take 50 real outputs, read every one, and write down what is wrong in your own words. Then group.
+
+This takes about two hours and it is the highest-value two hours in the week. Our incident
+assistant, 50 outputs sampled from production (30 random, 20 from runs the user thumbed down):
+
+| Category | Count | Example | Automatable? |
+| --- | --- | --- | --- |
+| Missing required entity (order ref, service name) | 11 | Diagnosis with no service named | **Yes** — assertion |
+| Cited evidence not present in retrieved docs | 9 | Quoted a log line that does not exist | **Yes** — string containment against context |
+| Answered when it should have refused | 7 | Invented a delivery date | Partly — needs a judge or a reference |
+| Correct but unusable format | 6 | Prose where the caller parses JSON | **Yes** — schema validation |
+| Wrong runbook retrieved | 5 | Confident, well-evidenced, wrong procedure | **Yes** — retrieval metric (Module 3) |
+| Too long / buried the answer | 5 | 900 words for a one-line answer | **Yes** — length assertion |
+| Tone (too casual for an incident channel) | 4 | — | Judge only |
+| Genuinely hard, human disagreed too | 3 | — | No |
+
+**Twenty-two of the top three categories are automatable with deterministic checks.** Not with a
+judge — with `in`, `len()` and `model_validate()`. This is the finding that repeats in every taxonomy
+we have built: the expensive evaluation machinery is needed for a minority of the failures.
+
+Two rules for the review session. **Write the category before you write the check** — the category
+is what you will still care about in six months. And **do not let a category be "bad answer"**; if
+you cannot name what is wrong more specifically, split the category or read more examples.
+
+### The suite
+
+```python
+# evals/suite.py — the whole thing, in the order the cases run
+# tested against: pytest==8.3.3, pydantic==2.9.2, anthropic==1.2.0
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Callable, Literal
+import json, re, yaml
+
+@dataclass
+class Case:
+    id: str
+    input: str
+    context: dict = field(default_factory=dict)     # retrieved docs, state, whatever
+    must_contain: list[str] = field(default_factory=list)
+    must_not_contain: list[str] = field(default_factory=list)
+    expect_refusal: bool = False
+    reference: str | None = None
+    rubric: str | None = None                       # only for judged cases
+    tags: list[str] = field(default_factory=list)   # taxonomy category, source, severity
+    added: str = ""                                 # ISO date — cases are dated artifacts
+    origin: Literal["production", "manual", "synthetic"] = "production"
+
+# ---- tier 1: assertions. Free. Run on EVERY case. -------------------------
+def a_valid_json(out: str, case: Case) -> bool | None:
+    if "json" not in case.tags: return None          # None = not applicable
+    try: json.loads(out); return True
+    except json.JSONDecodeError: return False
+
+def a_contains(out: str, case: Case) -> bool | None:
+    if not case.must_contain: return None
+    return all(s.lower() in out.lower() for s in case.must_contain)
+
+def a_no_pii(out: str, case: Case) -> bool:
+    return not re.search(r"[\w.+-]+@[\w-]+\.[\w.]+|\b\d{16}\b", out)
+
+def a_grounded(out: str, case: Case) -> bool | None:
+    """Every quoted span must appear in the provided context. Cheap groundedness."""
+    ctx = " ".join(case.context.get("documents", []))
+    quotes = re.findall(r'"([^"]{20,})"', out)
+    if not quotes: return None
+    return all(q in ctx for q in quotes)
+
+def a_length(out: str, case: Case) -> bool:
+    return len(out.split()) <= case.context.get("max_words", 400)
+
+ASSERTIONS: list[Callable] = [a_valid_json, a_contains, a_no_pii, a_grounded, a_length]
+
+# ---- tier 2: reference comparison. Free. Only where one right answer exists.
+def r_exact(out: str, case: Case) -> bool | None:
+    return None if case.reference is None else case.reference.strip() == out.strip()
+
+# ---- tier 3: judge. Paid. Only on cases nothing above can score. ----------
+#   see Module 2 — and do not ship one you have not validated.
+```
+
+Design decisions worth copying:
+
+- **`None` means "not applicable".** A case with no `must_contain` should not count as passing the containment check; it should be excluded from that check's denominator. Counting inapplicable checks as passes is how suites drift to a meaningless 97%.
+- **Every case is tagged with its taxonomy category.** Then your report is per-category, and a regression tells you *what kind* of thing broke. A single aggregate number is nearly useless for debugging.
+- **`origin` and `added`.** You will want to know, later, how much of your suite is real traffic versus things you made up, and whether it has aged. Ours started at 100% production and drifted to 74% as people added synthetic edge cases; that drift is worth knowing about.
+- **`a_grounded` is nine lines and catches the second-largest failure category.** Module 3 does this properly at claim level; this version catches the blatant case for free and should be in your suite today.
+
+### Eval-driven development
+
+The workflow, which is test-driven development with the names changed:
+
+<Steps>
+<Step title="A failure happens">
+In production, or in review. Someone says "it did this wrong."
+</Step>
+<Step title="It becomes a case, before the fix">
+Input, what a correct answer requires, taxonomy tag, origin `production`. The case must fail on `main`.
+</Step>
+<Step title="Fix it">
+Prompt, code, retrieval, whatever it is.
+</Step>
+<Step title="Run the whole suite, not just the new case">
+This is the step that pays. Our first eval-driven fix repaired one case and broke four.
+</Step>
+<Step title="The case stays forever">
+It is now a regression test. The suite only grows.
+</Step>
+</Steps>
+
+**Reference figure — four months of a modelled deployment** of the incident assistant (no such system ran for this course; see [About the numbers](/start/about-the-numbers)): 61 cases added from production failures.
+Of 61 fixes, **14 (23%) broke at least one previously-passing case** and were caught before merge.
+Without the suite, all 14 would have shipped, and each would have been discovered days later by a
+user. That number — roughly one in four fixes regresses something — is the single most persuasive
+statistic for getting time to build a suite.
+
+### Trade-offs
+
+| Decision | Choose A | Choose B |
+| --- | --- | --- |
+| **Assertions (A) vs judge (B)** | Whenever the property is checkable in code. Free, exact, no validation needed, no drift. Always exhaust these first. | Only for properties that genuinely require judgement: tone, helpfulness, whether an explanation is convincing. And validate it (Module 2). |
+| **Small curated set (A) vs large sampled set (B)** | 100–200 cases you understand individually, for CI on every change. You can read a failure and know what it means. | 1,000+ sampled from production, run nightly, for detecting small changes. Layer 3 explains why you need both sizes. |
+| **Case-level pass/fail (A) vs graded score (B)** | Pass/fail. Simpler, aggregates cleanly, and forces you to say what "correct" means. Default to this. | A 1–5 score when partial credit is genuinely meaningful — and then report the distribution, never just the mean. |
+| **Fixed cases (A) vs regenerated cases (B)** | Fixed. A regression suite whose cases change is not a regression suite. | Never regenerate. If you need fresh cases, *add* them; do not replace. |
+
+### War story
+
+A team had a 240-case eval suite, green on every merge, sitting at 94%. Customer complaints rose
+anyway over about six weeks. The suite was not lying — it was answering a question nobody had asked
+recently.
+
+The cases had all been built in one two-week push from a backlog of historical failures. Since then
+the product had shipped a new feature that changed what users asked about, and roughly 30% of live
+traffic was now a shape the suite contained zero examples of. Offline: 94%. On a fresh sample of 100
+production requests, scored by hand: **71%**.
+
+Three changes. **A weekly sampling job** that draws 20 random production requests and puts them in a
+review queue — five minutes of somebody's Monday, and the suite now tracks the traffic. **A coverage
+report** that clusters production requests by embedding and flags clusters with fewer than three
+eval cases; that report is what made the gap visible. And **the case-age distribution on the
+dashboard**, because a suite whose median case is eight months old is measuring a system that no
+longer exists.
+
+<Accordion title="Design checkpoint — with model answer">
+
+**Question.** Your team wants to ship a prompt change on Friday. The eval suite goes from 88% to
+91%. Do you ship?
+
+**Model answer.** Not on that number alone, and there are four things I would look at first.
+
+*How many cases moved, and which?* 88% to 91% on 100 cases is three cases. I want the list. If three
+cases in the same taxonomy category improved, that is a real, narrow improvement. If four improved
+and one regressed, I want to know what the regression was — a single regression in a
+safety-relevant category (leaked PII, answered when it should refuse) outweighs three improvements
+elsewhere and I would block on it.
+
+*Is three cases distinguishable from noise?* On 100 paired cases the smallest change we can reliably
+detect is around 11 points (Layer 3). A three-point move is inside the noise band. I would re-run
+both configurations three times; if the change is real it will persist, and if it is sampling
+variance it will not.
+
+*Did the assertion tier move?* Judge scores are noisy; assertions are not. A change in "output is
+valid JSON" from 100% to 97% is three cases and is *unambiguously* a regression, because the
+underlying rate should be exactly 1.0. Near-boundary rates have far more statistical power than
+mid-range ones — a fact worth internalizing.
+
+*Is it Friday?* Genuinely relevant. An 88-to-91 change that is inside the noise band is not worth
+deploying before a weekend. Ship it Monday with the re-runs done.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+### How many cases do you actually need?
+
+This is Week 12's power analysis, and almost nobody in this field does it. You are comparing two
+systems on the same cases, so it is a **paired** comparison, and the relevant quantity is the
+proportion of cases where the two systems *disagree* (McNemar's setting). Approximately:
+
+```
+n  ≈  (z_α/2 + z_β)² · π_d / δ²
+```
+
+where π_d is the discordant proportion (cases where one system is right and the other wrong) and δ
+is the difference you want to detect. At α = 0.05, power 0.8, that leading constant is 7.84. With a
+typical π_d of 0.15:
+
+| Cases | Smallest detectable difference (80% power) |
+| --- | --- |
+| 20 | 24 points |
+| 50 | 15 points |
+| **100** | **11 points** |
+| 250 | 7 points |
+| 500 | 5 points |
+| 1,000 | 3.4 points |
+
+**A 100-case suite cannot see a 3-point change.** If you take one thing from this module, take that.
+Every "we improved it by 4%" claim made on a 100-case suite is a claim about noise, and the honest
+report is "no measurable change".
+
+Two escapes from this depressing arithmetic, and both are practical:
+
+1. **Assertions have far more power than judged scores**, because their true rate sits near a boundary. If "output is valid JSON" is 100% on `main` and 97% on your branch, that is 3 failures where the expected count is 0 — a one-sided binomial test gives p ≈ 0.03 on a rate that *should* be exactly 1. Near 0 or 1, variance collapses and small samples become informative. Put your hard requirements in the assertion tier and they become detectable at 100 cases.
+2. **Reduce π_d by fixing the noise.** A large discordant proportion is often not two systems genuinely disagreeing but one system being non-deterministic. Run each case three times and score the majority; in our suite this took π_d from 0.21 to 0.13, which is equivalent to a 38% increase in sample size, for the cost of two extra runs.
+
+Our operating shape: **120 curated cases in CI on every change** (catches large regressions, runs in
+90 seconds), **800 sampled cases nightly** (catches 5-point changes, costs $14 a night), and
+**20 human-reviewed cases weekly** (the only ground truth, and the thing that keeps the other two
+honest).
+
+### Eval-set construction bias
+
+Your cases came from somewhere, and that somewhere has a shape. Four biases we have measured in our
+own suites:
+
+| Bias | How it arises | Measured effect |
+| --- | --- | --- |
+| **Survivor bias** | Cases come from failures users *reported*. Users report failures on tasks they cared about. | Our suite over-represented refund queries 3.1× against their traffic share. |
+| **Fix bias** | A case is added when a failure is fixed, so the suite fills with problems you have already solved. | 61 production cases, of which 58 passed on the day they were committed. The suite measures your past, not your risk. |
+| **Author bias** | Synthetic cases are written by the person who wrote the prompt, in the vocabulary of the prompt. | Synthetic cases passed at 96% versus production cases at 84% — a 12-point gap that is entirely construction artifact. |
+| **Difficulty inversion** | Easy cases are never reported, so the suite is harder than reality — until the traffic shifts, when it becomes easier. | Offline 91%, online 78% at one point, then offline 94% and online 71% six weeks later. The *sign of the gap is not stable*, which is why you must measure both. |
+
+The mitigations are unexciting and they work: **stratified sampling** (draw eval cases in proportion
+to traffic clusters, not from the complaint queue), **a held-out set** you never look at while
+iterating, and **the weekly fresh sample** that keeps the distribution current.
+
+### The offline/online gap
+
+Track it as a first-class metric. Every week: offline suite score, and a hand-scored fresh sample of
+100 production requests.
+
+| Week | Offline | Online (fresh sample) | Gap |
+| --- | --- | --- | --- |
+| 1 | 91% | 78% | +13 |
+| 4 | 93% | 82% | +11 |
+| 8 | 94% | 71% | **+23** |
+| 9 (after weekly sampling introduced) | 89% | 80% | +9 |
+| 16 | 92% | 88% | +4 |
+
+Note what happened at week 9: the offline score *fell*, from 94% to 89%, because fresh production
+cases were added and the system was genuinely worse at them. **A falling offline score after you
+improve your sampling is good news.** It means the instrument got more honest. Explain that to your
+manager before it happens, not after.
+
+The gap itself is the metric to watch. A widening gap means your suite is ageing. Under about 5
+points, your offline number is a usable proxy and you can ship on it; above 10, it is not and you
+should not.
+
+### Evals as a versioned product asset
+
+The suite is not a test file, it is a dataset, and it needs the treatment:
+
+- **Versioned and tagged.** `evals/v7/cases.yaml`. When you compare two model versions six months apart, you must know you compared them on the same cases.
+- **Every case has provenance.** Origin, date, taxonomy tag, the incident it came from. A case whose purpose nobody remembers gets deleted by someone in year two, and it was the one guarding the thing that broke.
+- **Changes reviewed like code.** Adding a case is a pull request. Changing an *expected answer* is a pull request with an explanation, because it is a change to the definition of correct.
+- **Deletions require justification.** The only good reasons: the behaviour is deliberately no longer supported, or the case was wrong. "It keeps failing" is not a reason; that is the case doing its job.
+- **The suite has an owner.** Same argument as Week 30 M5. Ours is owned by the on-call rota, because they are the people who feel the failures.
+
+One more, learned expensively: **keep a small frozen "canary" subset that never changes** — ours is
+30 cases from the first month, untouched for a year. It is the only thing that lets you answer "is
+the system better than it was in March", because everything else in the suite has moved.
+
+### Papers and primary sources
+
+- **Hamel Husain, *Your AI Product Needs Evals* and the follow-on writing on error analysis.** Takeaway: start by reading fifty outputs and building an error taxonomy by hand — the categories you find determine everything downstream, and skipping this step is why most eval suites measure the wrong things.
+- **OpenAI Evals (the framework and its registry).** Takeaway: worth reading for the case-format conventions and for how much of the registry is deterministic string checks rather than model grading — the pyramid's shape is visible in a real corpus.
+- **Anthropic evaluation guidance (`docs.claude.com`, "create strong empirical evaluations").** Takeaway: the recommendation to prefer many automated cases over a few human-graded ones, and to write the grading criteria *before* seeing outputs, is the specific discipline that prevents grading on vibes.
+- **Bowman & Dahl, 2021 — *What Will it Take to Fix Benchmarking in Natural Language Understanding?***. Takeaway: benchmark scores saturate and mislead because of construct validity failures and annotation artifacts — every failure mode they describe applies directly to a hand-built product eval set, and the mitigations (stratification, held-out sets, checking for artifacts) are the ones above.
+
+### Stretch challenge
+
+Build the **coverage report** that tells you what your suite is blind to.
+
+Embed every production request from the last 30 days (Week 27's model), cluster them (HDBSCAN or
+k-means with the elbow chosen honestly), and for each cluster report: traffic share, number of eval
+cases whose input falls in that cluster, and the system's measured success rate on a hand-scored
+sample of ten from that cluster. Rank clusters by `traffic_share × (1 − success_rate)` and you have
+a prioritized list of what to add to the suite next.
+
+Then the genuinely hard part, which we have not solved. Clusters are a proxy for "kinds of request",
+and a bad one: two requests can be semantically close and fail for completely different reasons, and
+two distant requests can share a root cause. Try instead clustering by *failure signature* — the
+taxonomy tag plus which assertion failed plus which node failed (Module 3) — and see whether that
+gives a more useful coverage map. Report which clustering produced the more actionable backlog, and
+how you decided.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Manually review 50 outputs from your Week-30 system, build the error taxonomy, and convert the top
+three categories into automated checks. Two hours of reading, one hour of coding. Do the reading.
+</Card>
+
+<Steps>
+<Step title="Sample 50 outputs">
+Thirty at random, twenty from runs that failed or were thumbed down. Save them with their inputs and context.
+</Step>
+<Step title="Read all fifty and write what is wrong">
+Free text, in your own words, one line each. Do not group yet — grouping too early collapses categories you have not seen.
+</Step>
+<Step title="Group into a taxonomy">
+Name each category specifically. "Bad answer" is not a category. Count them and sort.
+</Step>
+<Step title="Automate the top three">
+Almost certainly assertions, not a judge. Add them to the suite and run over all 50 to check the check.
+</Step>
+<Step title="Wire it to CI">
+Fail the build on any newly-failing case. Report per-category, not just an aggregate.
+</Step>
+</Steps>
+
+## The whiteboard
+
+**T2** — the eval pyramid built band by band, with cost and coverage annotated on the sides and the
+per-band case counts and dollar figures written in. **T1** — the error-taxonomy mind map from a real
+review session, with counts on each branch and the automatable branches ticked in green.
+
+<Tip>
+**Draw it yourself.** The pyramid with all four bands, cost per band, and the power curve beside it
+with the 100-case point circled and "11 points" written next to it.
+[Blank version](/assets/diagrams/p4-w31-m1-blank.svg) · [Editable source](/assets/diagrams/p4-w31-m1.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Resume line:** *"Built a 120-case eval suite for an agent system from a hand-derived error taxonomy
+over 50 production outputs; 22 of the top-3 failure categories were caught by free deterministic
+assertions. Suite runs in CI in 90 seconds and caught regressions in 14 of 61 fixes (23%). Tracked
+the offline/online gap weekly and closed it from 23 to 4 points."*
+
+**How to talk about it.** The strongest line is "23% of our fixes broke something else, and we caught
+all of them before merge". It is concrete, it is surprising to people who have not built one, and it
+explains why the suite exists better than any argument about quality.
+
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+**1. Read fifty outputs this week.** Not skim — read, and write down what is wrong. It is two hours
+and it will change what your team works on next. Every taxonomy we have built has surprised the team
+that owned the system.
+
+**2. Add the assertion tier to whatever you already have.** Valid JSON, required entities, length,
+no PII, quoted spans present in the context. Five checks, an afternoon, no judge, no validation, and
+it will catch the majority of real regressions.
+
+**3. Start the weekly fresh sample.** Twenty production requests, scored by a human, every Monday.
+It is the only thing that tells you whether your offline number still means anything, and it is five
+minutes.
+
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Suite is green, users complain | Offline/online gap; suite has aged | Weekly fresh sample, coverage report, track the gap as a metric |
+| Suite score creeps up and means nothing | Inapplicable checks counted as passes | `None` means not-applicable and is excluded from the denominator |
+| "We improved it 4%" on 100 cases | Below the detectable threshold | Compute the power; report "no measurable change" and add cases |
+| Cases invented rather than collected | No failure pipeline | Every production failure becomes a case before it is fixed |
+| Synthetic cases pass at 96%, real ones at 84% | Author bias — written in the prompt's own vocabulary | Stratified sampling from real traffic; tag `origin` and watch the ratio |
+| A fix breaks something else and ships | Only the new case was run | Always run the whole suite; report newly-failing ids |
+| Aggregate number gives no debugging signal | No taxonomy tags on cases | Tag every case; report per category |
+| Someone changes an expected answer to make CI green | No review discipline on the dataset | Changes to expected answers are pull requests with explanations |
+| Cannot answer "are we better than in March" | Every case has changed since March | A frozen canary subset that never changes |
+| Judge used for things `in` and `len()` could check | Reached for the expensive tool first | Exhaust the assertion tier; in our taxonomy it covered 22 of the top 31 failures |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="8 concept questions (with answers)" icon="circle-question">
+
+1. *Why is an eval a rate rather than a pass/fail?* Output is non-deterministic, so a single run is a sample; you are estimating a rate and you need enough cases to distinguish it from noise.
+2. *Smallest change detectable on 100 paired cases at 80% power?* About 11 points, with a discordant proportion of 0.15.
+3. *Why do assertions have more power than judged scores?* Their true rate sits near 0 or 1, where variance collapses; three failures against an expected zero is significant.
+4. *Where must cases come from?* Real failures and stratified real traffic. Invented cases test your imagination.
+5. *What does `None` mean in an assertion result and why does it matter?* Not applicable — excluded from that check's denominator, so the aggregate is not inflated.
+6. *What is fix bias?* Cases are added when failures are fixed, so the suite fills with solved problems and measures your past rather than your risk.
+7. *Why is a falling offline score sometimes good news?* Because it can mean fresh, harder, more representative cases were added — the instrument got more honest.
+8. *What is the point of a frozen canary subset?* It is the only stable baseline for "are we better than we were", since the rest of the suite changes constantly.
+
+</Accordion>
+<Accordion title="Coding challenge (hidden tests)" icon="code">
+
+Implement the suite runner to pass tests covering: an inapplicable assertion returns `None` and is
+excluded from the denominator; per-category aggregation matches hand-computed values; newly-failing
+cases are reported as a set difference against a baseline run; a case with `expect_refusal` passes
+only when the output declines rather than answering; `a_grounded` fails when a quoted span is absent
+from the context and returns `None` when there are no quotes; and the runner exits non-zero when any
+previously-passing case fails.
+
+</Accordion>
+<Accordion title="Interview questions — junior / mid / senior" icon="user-tie">
+
+- **Junior.** "How would you know that a prompt change made your system worse?"
+- **Mid.** "Your eval suite is at 94% and customers are complaining. Diagnose it." (Offline/online gap, ageing suite, coverage holes, construction bias.)
+- **Senior.** "Design the eval strategy for an LLM product with 50,000 requests a day." (Expect: a tiered suite with sizes justified by power analysis, CI versus nightly versus human, stratified sampling, gap tracking, dataset versioning and ownership, and a frozen canary.)
+
+</Accordion>
+<Accordion title="Draw it from memory" icon="pencil">
+
+The four-band pyramid with per-band cost, and the power curve with the 100-case detectable
+difference marked.
+
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+- [Anthropic evaluation guidance](https://docs.claude.com/) — read it for the discipline of writing grading criteria before seeing outputs, which is what stops retrospective self-flattery.
+- [OpenAI Evals registry](https://github.com/openai/evals) — read a dozen real eval definitions to see how much of production evaluation is deterministic string checking.
+
+**Papers**
+- [Bowman & Dahl 2021, *What Will it Take to Fix Benchmarking in NLU?*](https://arxiv.org/abs/2104.02145) — construct validity and annotation artifacts break benchmarks in exactly the ways they break a hand-built product suite.
+- Efron & Tibshirani, *An Introduction to the Bootstrap* (ch. 6) — read this for computing a confidence interval on your suite's score when the sampling distribution is not something you want to assume.
+
+**Go deeper**
+- [Hamel Husain's writing on error analysis and evals](https://hamel.dev/blog/posts/evals/) — read it for the two-hour manual review that produces the error taxonomy; it is the step everyone skips and the one that decides whether the rest works.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-31/p4-w31-m1">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

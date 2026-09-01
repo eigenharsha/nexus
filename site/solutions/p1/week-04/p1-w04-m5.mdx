@@ -1,0 +1,205 @@
+---
+title: "Reliability patterns for I/O-heavy systems"
+description: "Reference solution — Week 4"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W04-M5`
+
+Three clients against a flaky, rate-limited server — and the measurement that shows the middle one attacking the server.
+
+```python
+"""client.py — naive vs retry vs retry+token-bucket. Fresh server per run."""
+from __future__ import annotations
+
+import asyncio
+import random
+import subprocess
+import sys
+import time
+
+import aiohttp
+
+URL = "http://127.0.0.1:8098/f"
+
+
+class TokenBucket:
+    """rate tokens/second, `capacity` burst. monotonic clock; sleep OUTSIDE the lock."""
+
+    def __init__(self, rate: float, capacity: float | None = None) -> None:
+        self.rate = rate
+        self.capacity = capacity if capacity is not None else rate
+        self._tokens, self._ts = self.capacity, time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, n: float = 1.0) -> None:
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                self._tokens = min(self.capacity, self._tokens + (now - self._ts) * self.rate)
+                self._ts = now
+                if self._tokens >= n:
+                    self._tokens -= n
+                    return
+                wait = (n - self._tokens) / self.rate
+            await asyncio.sleep(wait)          # never hold the lock while sleeping
+
+
+class Stats:
+    def __init__(self) -> None:
+        self.ok = self.fail = self.retries = self.rl = 0
+        self.lat: list[float] = []
+
+
+async def naive(sess: aiohttp.ClientSession, st: Stats) -> None:
+    t0 = time.perf_counter()
+    async with sess.get(URL) as r:
+        st.lat.append(time.perf_counter() - t0)
+        if r.status == 200:
+            st.ok += 1
+        else:
+            st.fail += 1
+            st.rl += r.status == 429
+
+
+async def attempt(sess, st: Stats, sem: asyncio.Semaphore,
+                  bucket: TokenBucket | None, max_attempts: int = 6) -> None:
+    t0, delay = time.perf_counter(), 0.05
+    for _ in range(max_attempts):
+        if bucket:
+            await bucket.acquire()             # meter OURSELVES, before we send
+        async with sem:
+            try:
+                async with sess.get(URL) as r:
+                    if r.status == 200:
+                        st.ok += 1
+                        st.lat.append(time.perf_counter() - t0)
+                        return
+                    if r.status == 429:
+                        st.rl += 1
+                        delay = max(delay, float(r.headers.get("Retry-After", "1")))
+            except Exception:
+                pass
+        st.retries += 1
+        await asyncio.sleep(random.uniform(0, min(delay, 4.0)))     # FULL JITTER
+        delay *= 2
+    st.fail += 1
+    st.lat.append(time.perf_counter() - t0)
+
+
+async def run(mode: str, n: int = 400, cap: int = 25, rate: float = 8.0) -> None:
+    st, sem = Stats(), asyncio.Semaphore(cap)
+    bucket = TokenBucket(rate) if mode == "bucket" else None
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=0)) as s:
+        t = time.perf_counter()
+        if mode == "naive":
+            await asyncio.gather(*(naive(s, st) for _ in range(n)))
+        else:
+            await asyncio.gather(*(attempt(s, st, sem, bucket) for _ in range(n)))
+        el = time.perf_counter() - t
+    lat = sorted(st.lat)
+    print(f"{mode:9s} ok={st.ok:>4}/{n} failed={st.fail:>4} retries={st.retries:>5} "
+          f"429s={st.rl:>5} wall={el:6.2f}s {st.ok/el:7.1f} ok/s "
+          f"p50={lat[len(lat)//2]*1000:7.1f}ms p99={lat[int(len(lat)*0.99)]*1000:8.1f}ms")
+
+
+async def main() -> None:
+    for mode in ("naive", "retry", "bucket"):
+        proc = subprocess.Popen([sys.executable, "flaky_server.py"])   # FRESH rate-limit window
+        await asyncio.sleep(2.5)
+        try:
+            await run(mode)
+        finally:
+            proc.terminate(); proc.wait()
+        await asyncio.sleep(0.5)
+
+
+asyncio.run(main())
+```
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: reusing one server across all three runs.**
+
+The first version of this benchmark ran all three clients against a single long-lived server. The results were nonsense: the naive run consumed 400 of the server's 500-per-minute budget, so the retry run started with almost no budget left and recorded **1,616 rate-limit responses** and a 3.8 ok/s throughput that had nothing to do with its retry strategy.
+
+**A rate limit is state**, and any benchmark that touches it must reset that state between runs. The reference starts a fresh server process per mode and waits for it to bind. It is four lines, and without them the comparison measures the order you ran things in.
+
+The general form of this mistake: a benchmark whose runs share a resource with memory — a cache, a connection pool, a rate limiter, a JIT warm-up — measures the sequence, not the alternatives.
+
+**Wrong turn 2: sleeping while holding the bucket's lock.**
+
+```python
+async def acquire(self, n=1.0):
+    async with self._lock:
+        ...
+        if self._tokens < n:
+            await asyncio.sleep(wait)      # WRONG: every other waiter is now serialised
+        self._tokens -= n
+```
+
+Holding the lock across the `await` means the second caller waits for the first caller's *entire sleep* before it can even check the token count — so a bucket meant to allow 8 concurrent-ish requests per second degenerates into a strictly serial queue, and measured throughput collapses to roughly one request per sleep interval.
+
+The correct shape computes the wait **inside** the lock, releases, sleeps, and loops to re-check. The `while True` matters: after sleeping, another coroutine may have taken the token, so you must re-acquire and re-test rather than assuming.
+
+This is the async analogue of Module 2's lock-granularity rule — the critical section should contain the arithmetic, never the waiting.
+
+**A third thing worth knowing: the bucket rate is the ceiling you chose.**
+
+The server allows 500/minute = **8.33 req/s**. We set the bucket to 8. That means 400 requests has a hard floor of 400 / 8 = **50 seconds**, and the measured 68.59 s is that floor plus retries. There was no way to be faster.
+
+Set it to 10 and you exceed the server's budget, get 429s, and become the middle row. Set it to 4 and you take 100 seconds for no benefit. **The bucket rate is the single most important parameter and it is not derivable from the client side** — you need to know your share of the server's budget, which in a multi-tenant deployment means dividing by the number of client instances, which changes when someone scales the deployment.
+
+That is the honest limitation to state in the write-up: this design converts a server-side failure mode into a client-side latency cost, and it requires knowledge the client does not intrinsically have.
+
+## The measured numbers this solution produces
+
+CPython 3.13.2, aiohttp 3.14.3, Apple M3 Pro, macOS 15. Server: 30% failure rate, 10–90 ms random latency, 500 req/min limit with `Retry-After`. Client: 400 requests, concurrency 25, fresh server per run.
+
+| Client | Succeeded | Failed | Retries | Server 429s | Wall | Throughput | p50 | p99 |
+|---|---|---|---|---|---|---|---|---|
+| **naive** | 285/400 (71.3%) | 115 | 0 | 0 | **0.16 s** | 1,813 ok/s | 87 ms | 132 ms |
+| **retry + full jitter** | 358/400 (89.5%) | 42 | 327 | **185** | 14.20 s | 25.2 ok/s | 612 ms | **12,885 ms** |
+| **retry + bucket (8/s)** | **400/400 (100%)** | 0 | 156 | **0** | 68.59 s | 5.8 ok/s | 34,342 ms | 68,164 ms |
+
+**The 185 in the middle row is the finding.** Of 327 retries, 185 were answered with a rate-limit response — the client's own retries pushed it over the server's budget, so more than half its retry attempts were spent being told to go away rather than on the underlying 30% failure. That is retry amplification in a single process, at small scale.
+
+Jitter simulation, 1,000 clients failing simultaneously, peak arrivals in any 100 ms window:
+
+| Strategy | Busiest window | Peak reduction |
+|---|---|---|
+| no jitter | **1,000** | 1× |
+| equal jitter | ~215 | 4.7× |
+| **full jitter** | **~118** | **8.5×** |
+
+Supporting figures: p50-to-p99 spread of **21×** in the retry row (612 ms → 12,885 ms), which is why the mean would have described nobody's experience.
+
+## Grading notes
+
+**3/3 on correctness** means three configurations measured against a **freshly started server each time**, with all five metrics reported per configuration, and a bucket-rate sweep with the chosen value justified.
+
+**3/3 on robustness** means full jitter (`random.uniform(0, delay)`, not `delay ± 10%`), errors classified before retrying, `Retry-After` honoured and capped, `time.monotonic()` in the bucket, and the sleep outside the lock.
+
+**3/3 on explanation** means you name the 185 self-inflicted 429s and explain them, you state which configuration you would ship and for what caller, and you acknowledge that the bucket rate requires knowledge the client does not have.
+
+The six most common ways submissions lose points:
+
+1. **One server across all runs.** The rate-limit window carries over and the comparison measures ordering. This is the most common error and it produces confidently wrong conclusions.
+2. **Sleeping inside the bucket's lock.** Throughput collapses to serial and the bug looks like "async is slow".
+3. **`delay ± 10%` presented as jitter.** That is not full jitter and it does not de-synchronise clients; the simulation in step 4 shows the difference plainly.
+4. **`time.time()` in the limiter.** An NTP adjustment grants or revokes tokens. `time.monotonic()`, always.
+5. **The 429s not noticed.** A submission reporting the retry row's 89.5% as a success without observing that 185 of its retries were rate-limited has missed the module's central point.
+6. **One configuration declared "best".** There is no best row. Naive is right for best-effort work, the bucket is right when completeness matters, and the write-up must say which caller each serves.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

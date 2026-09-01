@@ -1,0 +1,643 @@
+---
+title: "Putting it together: a correct, fast data layer"
+description: "Week 8 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 8 · Module 5 · `P1-W08-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Put data access behind a repository interface, and swap it for a fake in tests without touching a handler.
+2. Isolate database tests with a transaction that always rolls back, so tests cannot see each other.
+3. Generate test data with factories instead of fixtures full of literals.
+4. Add a cache in front of the hottest query, measure the hit rate, and demonstrate a stale read — then fix it.
+5. Recognise and prevent a cache stampede, which is the same request-coalescing pattern you will use for semantic caching in Week 28.
+
+## Where this sits
+
+| | |
+| --- | --- |
+| **Prereqs** | `P1-W08-M1` to `M4` — this module assembles them |
+| **Unlocks** | The Week 8 lab and the Phase 1 exit checkpoint; Week 28 (semantic caching is this module's stampede fix) |
+| **One-line** | After this you can build a data layer that is correct, testable, observable and fast — in that order. |
+
+## Why you should care
+
+### For Aarav (student)
+
+- This is where the week becomes a repo you can show someone. Everything before it was a technique; this is the assembly.
+- Transactional test isolation makes your test suite fast and deterministic, which is what makes a project pleasant to keep working on.
+- The stampede demonstration — 40 threads, 40 database calls, then 1 — is a 20-line experiment with a memorable result: **1,784 ms down to 85 ms**.
+
+### For Meera (working professional)
+
+- This shows up in your job as: "we added a cache and the database load did not drop". That is a stampede on cold keys, and it is measured below.
+- Test isolation via rollback removes the entire class of "tests pass locally and fail in CI" flakiness caused by shared data.
+- Cache invalidation is where correctness bugs hide behind good latency numbers. Being the person who demonstrates the stale read *before* it reaches a customer is valuable.
+
+## The mental model
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p1-w08-m5.svg" alt="Hand-drawn sketch: the repository boundary, and a cache stampede collapsing into one loader" className="block dark:hidden" />
+  <img src="/assets/diagrams/p1-w08-m5-dark.svg" alt="Hand-drawn sketch: the repository boundary, and a cache stampede collapsing into one loader" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p1-w08-m5
+tier: T2
+one-sentence-goal: Show that a cold cache key turns N concurrent readers into N identical database queries, and that one loader plus N waiters turns it back into one.
+elements:
+  - top band: three stacked layers - "handler (FastAPI)", "repository interface (a Protocol)", "SQLAlchemy / fake" - with a vertical dashed line marking the swap point and an amber note "tests replace the bottom layer, not the top"
+  - middle band: a cold cache box with 40 arrows all missing it and all hitting the database cylinder, annotated "40 threads, 40 DB calls, 1,784 ms" and crossed out in red
+  - below it, the same 40 arrows converging on ONE arrow through a small box labelled "single-flight: first caller loads, the rest WAIT on the same future", annotated "1 DB call, 85 ms" in green
+  - a small clock on the right showing a TTL expiring with an amber note "every key expiring at the same second recreates the stampede - jitter the TTL"
+  - a stale-read strip at the bottom - write to DB at t=0, cache still serving the old value until t=TTL, with the window shaded red and labelled "this window is a business decision, not an accident"
+  - circled key term "single-flight"
+  - dangling arrow labelled "...and what happens when the cache is a different machine?"
+numbers-to-write-in: no cache 2,510 ms / 15.9 rps; cache-aside 90% hit rate, 692 ms / 57.8 rps; stampede 40 DB calls, 1,784 ms; single-flight 1 DB call, 85 ms (21x, 40x fewer queries); pool_size=5 with pool_timeout=1s failed 20 of 40 requests
+alt: A hand-drawn diagram with a three-layer stack showing a repository interface as the swap point for tests, a cold cache with forty concurrent readers all hitting the database, and the same readers collapsed into a single loader with the rest waiting, annotated with measured timings.
+*/}
+
+Correct first, then observable, then fast. The repository gives you a seam to test and cache
+*behind*; transactional isolation makes the tests trustworthy; and only once both exist does adding
+a cache stop being a way to hide bugs behind good latency numbers.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### Plain English
+
+    A **repository** is an object that owns all the data access for one kind of thing. Instead of
+    your request handler writing SQL or ORM queries, it calls `orders.get(order_id)` and
+    `orders.list_for_customer(customer_id)`.
+
+    Why bother? Three reasons, in order of how much they matter.
+
+    1. **Testability.** Swap the real repository for a fake in tests, and the handler's tests need no
+       database at all.
+    2. **One place for the rules.** Every query goes through the repository, so "always filter by
+       tenant" is enforced in one file rather than remembered in fifty. That is the IDOR defence from
+       `P1-W06-M4`, made structural.
+    3. **One place to add caching, logging or metrics.** You will add a cache in Layer 2 by changing
+       one class.
+
+    A **cache** is a fast store holding a copy of something expensive to compute. **Cache-aside** is
+    the usual pattern: look in the cache; on a miss, load from the database and put it in the cache;
+    on a hit, return it. The **hit rate** is the fraction of lookups that found something.
+
+    ### The analogy
+
+    A pharmacy counter. The repository is the counter: customers do not walk into the storeroom, they
+    ask at the counter, and the counter's staff know where everything is and which shelves customers
+    may not touch. The cache is the small tray of common items kept behind the counter — fetching
+    from it is instant, but if a batch is recalled you must remember to clear the tray as well as the
+    storeroom. Forgetting the tray is a stale read.
+
+    ### Smallest working example
+
+    ```python
+    from typing import Protocol
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    class OrderRepository(Protocol):
+        async def get(self, order_id: int, owner_id: int) -> Order | None: ...
+        async def list_for_customer(self, customer_id: int, limit: int = 20) -> list[Order]: ...
+        async def add(self, order: Order) -> Order: ...
+
+    class SqlOrderRepository:
+        def __init__(self, session: AsyncSession) -> None:
+            self._session = session
+
+        async def get(self, order_id: int, owner_id: int) -> Order | None:
+            # ownership is IN the query, so an unfiltered read is not expressible here
+            return await self._session.scalar(
+                select(Order).where(Order.id == order_id, Order.customer_id == owner_id))
+
+        async def list_for_customer(self, customer_id: int, limit: int = 20) -> list[Order]:
+            rows = await self._session.scalars(
+                select(Order).where(Order.customer_id == customer_id)
+                             .order_by(Order.placed_at.desc()).limit(limit))
+            return list(rows)
+
+        async def add(self, order: Order) -> Order:
+            self._session.add(order)
+            await self._session.flush()      # assigns the id; does NOT commit
+            return order
+    ```
+
+    Note `flush()` rather than `commit()`. **The repository never commits** — the transaction belongs
+    to the caller, exactly as argued in `P1-W08-M4`. That is what lets a handler create an order and
+    write an audit row in one atomic unit.
+
+    The fake, for tests:
+
+    ```python
+    class FakeOrderRepository:
+        def __init__(self) -> None:
+            self._rows: dict[int, Order] = {}
+            self._next = 1
+
+        async def get(self, order_id, owner_id):
+            o = self._rows.get(order_id)
+            return o if o and o.customer_id == owner_id else None    # same ownership rule
+
+        async def list_for_customer(self, customer_id, limit=20):
+            return [o for o in self._rows.values() if o.customer_id == customer_id][:limit]
+
+        async def add(self, order):
+            order.id = self._next; self._next += 1
+            self._rows[order.id] = order
+            return order
+    ```
+
+    ### Line by line
+
+    - `Protocol` — Python's structural typing. Anything with these methods satisfies the interface;
+      no inheritance and no registration. `mypy` checks both implementations against it.
+    - Ownership in the `WHERE` clause — the fake enforces the same rule, so a test that passes
+      against the fake is testing the real behaviour rather than a convenient fiction.
+    - `flush()` not `commit()` — the repository participates in the caller's transaction.
+    - The fake stores objects in a dict — fast, no database, and good enough to test handler logic.
+      It is *not* good enough to test SQL, constraints or transactions, which is why those get real
+      database tests.
+
+    ### Guided practice
+
+    Wire it into FastAPI and write two tests.
+
+    ```python
+    async def get_order_repo(session: SessionDep) -> OrderRepository:
+        return SqlOrderRepository(session)
+
+    OrderRepo = Annotated[OrderRepository, Depends(get_order_repo)]
+
+    @router.get("/orders/{order_id}", response_model=OrderOut)
+    async def get_order(order_id: int, repo: OrderRepo, user: CurrentUser):
+        order = await repo.get(order_id, owner_id=user.id)
+        if order is None:
+            raise HTTPException(404, "Order not found")
+        return order
+    ```
+
+    ```python
+    def test_returns_404_for_another_users_order(client):
+        app.dependency_overrides[get_order_repo] = lambda: prefilled_fake_repo()
+        r = client.get("/orders/1", headers=auth_as(user_id=999))
+        assert r.status_code == 404          # no database involved, and it runs in ~1 ms
+    ```
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+      **1. Why does the repository use `flush()` rather than `commit()`?**
+      The transaction belongs to the caller, so several repository calls can be one atomic unit.
+
+      **2. What does putting ownership in the `WHERE` clause buy you?**
+      An unfiltered read is not expressible through the interface, so IDOR cannot be written by
+      accident.
+
+      **3. What can a fake repository not test?**
+      SQL correctness, constraints, transactions, concurrency. Those need a real database.
+
+      **4. What is cache-aside?**
+      Check the cache; on a miss load from the source and populate it; on a hit return it.
+
+      **5. Why `Protocol` rather than an abstract base class?**
+      Structural typing — the fake does not need to inherit anything, and the type checker still
+      verifies both implementations.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### Test isolation by rollback
+
+    Every test runs inside a transaction that is always rolled back. No cleanup code, no ordering
+    dependencies, and tests can run in parallel on separate connections.
+
+    ```python
+    # conftest.py
+    @pytest.fixture
+    async def session(engine) -> AsyncSession:
+        connection = await engine.connect()
+        transaction = await connection.begin()        # the outer transaction
+        maker = async_sessionmaker(bind=connection, expire_on_commit=False)
+        async with maker() as s:
+            yield s                                   # the test's commits become savepoints
+        await transaction.rollback()                  # everything the test did vanishes
+        await connection.close()
+    ```
+
+    The mechanism: the Session is bound to a **connection with an open transaction**, so a `commit()`
+    inside the code under test commits to that outer transaction rather than to the database. The
+    outer rollback erases all of it. Your application code can call `commit()` normally and the test
+    still leaves nothing behind.
+
+    Data comes from factories, not literals:
+
+    ```python
+    import factory
+    class OrderFactory(factory.Factory):
+        class Meta: model = Order
+        customer_id = factory.SubFactory(CustomerFactory)
+        status      = "pending"
+        total_cents = factory.Faker("pyint", min_value=100, max_value=1_000_000)
+        placed_at   = factory.Faker("date_time_this_year", tzinfo=timezone.utc)
+    ```
+
+    A test then writes `OrderFactory(status="refunded")` and names only what it cares about. Every
+    other field is valid and irrelevant — which is exactly what a reader of the test needs, and it
+    removes the "unique constraint violated because two tests used the same email" flakiness.
+
+    ### Observability: see the queries
+
+    ```python
+    from sqlalchemy import event
+    import time, structlog
+
+    log = structlog.get_logger()
+
+    @event.listens_for(engine.sync_engine, "before_cursor_execute")
+    def _before(conn, cursor, statement, params, context, executemany):
+        conn.info.setdefault("query_start", []).append(time.perf_counter())
+        conn.info["query_count"] = conn.info.get("query_count", 0) + 1
+
+    @event.listens_for(engine.sync_engine, "after_cursor_execute")
+    def _after(conn, cursor, statement, params, context, executemany):
+        elapsed = (time.perf_counter() - conn.info["query_start"].pop()) * 1000
+        if elapsed > 50:
+            log.warning("slow_query", duration_ms=round(elapsed, 1),
+                        statement=statement[:200])
+    ```
+
+    Two signals from twenty lines. A slow-query log with your application's request ID attached, and
+    a per-request **query count** — which is the only way to see the N+1 problem from `P1-W08-M4`,
+    because a thousand fast queries never appear in a slow-query log.
+
+    Also turn on the database side: `pg_stat_statements` from `P1-W07-M5`, ordered by
+    `total_exec_time` rather than mean, and PostgreSQL's `log_min_duration_statement`.
+
+    ### Cache-aside, measured
+
+    ```python
+    async def get_category_summary(self, key: int) -> list[Row]:
+        cached = await self._cache.get(f"summary:{key}")
+        if cached is not None:
+            return cached                                  # hit
+        rows = await self._db_query(key)                   # miss
+        await self._cache.set(f"summary:{key}", rows, ttl=60)
+        return rows
+    ```
+
+    Measured against a real query joining 3,000,000 `order_items` to `products`:
+
+    | Approach | 40 requests | Throughput | Detail |
+    | --- | --- | --- | --- |
+    | No cache | **2,510 ms** | 15.9 rps | 62.8 ms per query |
+    | Cache-aside, 4 distinct keys | **692 ms** | 57.8 rps | **90% hit rate**, 4 misses |
+
+    **3.6× on throughput at a 90% hit rate.** The arithmetic is worth internalising: at hit rate
+    `h`, average latency is `h × cache_latency + (1 − h) × db_latency`. With 62.8 ms and roughly
+    0.5 ms, a 90% hit rate gives about 6.7 ms — and a 50% hit rate gives 31.7 ms. **Hit rate matters
+    non-linearly**, which is why measuring it is not optional.
+
+    ### The stampede
+
+    Now the failure mode that makes teams say "we added a cache and nothing improved". 40 concurrent
+    requests arrive for a key that is not cached:
+
+    | Approach | DB calls | Time |
+    | --- | --- | --- |
+    | Naive cache-aside, cold key, 40 threads | **40** | 1,784 ms |
+    | Single-flight coalescing | **1** | **85 ms** |
+
+    **21× faster and 40× fewer database queries.** Every one of the 40 threads checked the cache,
+    missed, and issued the same query. The cache did nothing at exactly the moment it was needed
+    most.
+
+    ```python
+    class SingleFlight:
+        """One loader per key; every other caller waits on the same result."""
+        def __init__(self) -> None:
+            self._inflight: dict[str, asyncio.Future] = {}
+
+        async def do(self, key: str, loader):
+            fut = self._inflight.get(key)
+            if fut is not None:
+                return await fut                     # someone else is already loading it
+            fut = asyncio.get_running_loop().create_future()
+            self._inflight[key] = fut
+            try:
+                value = await loader()
+                fut.set_result(value)
+                return value
+            except Exception as exc:
+                fut.set_exception(exc)
+                raise
+            finally:
+                self._inflight.pop(key, None)
+    ```
+
+    Three details that make it correct. The future is registered **before** awaiting the loader, or
+    two callers can both find nothing and both load. Exceptions are propagated to every waiter, so a
+    failure does not leave 39 threads hanging. And the `finally` removes the entry, so the next
+    request after a failure retries rather than awaiting a dead future.
+
+    **This exact pattern returns in Week 28 as semantic caching for LLM calls**, where the loader
+    costs money rather than milliseconds and the stampede is 40 identical model invocations.
+
+    ### Trade-offs
+
+    | Decision | Choose the first when… | Choose the second when… |
+    | --- | --- | --- |
+    | **TTL expiry vs explicit invalidation** | The data tolerates bounded staleness and there are many writers — a TTL needs no coordination and cannot leak. | Correctness needs freshness right after a write. Then invalidate on write, and accept that you must find every place that writes. |
+    | **Cache-aside vs write-through** | The usual choice: simple, and the cache can be lost without data loss. | Reads must never miss after a write, and you accept that every write pays the cache's latency and failure modes. |
+    | **In-process cache vs Redis** | Single instance, or data that may differ per instance. Nanoseconds, no network. | Several instances that must agree, or a cache that should survive a deploy. The cost is a network hop and a new dependency to fail. |
+    | **Cache the query vs fix the query** | The query is already optimal and simply expensive — an aggregate over millions of rows. | You have not looked at the plan yet. An index gave a measured 1,970× in `P1-W08-M3`; a cache gave 3.6× here. **Index first.** |
+    | **Repository interface vs calling the ORM directly** | Multiple implementations matter: tests, caching, a future read replica. And you want the tenant filter in one place. | A small service where the indirection costs more than it saves — but keep the tenant filter somewhere structural regardless. |
+
+    ### What breaks in the real world
+
+    A product team cached a "user permissions" lookup in Redis with a 15-minute TTL. Latency improved
+    and everyone was pleased. Six weeks later a customer reported that a contractor removed from a
+    project could still read its documents.
+
+    Two bugs, and the second is the interesting one. The obvious one: revoking access wrote to the
+    database and did not invalidate the cache, so the stale entry served for up to 15 minutes. The
+    subtle one: the invalidation they added afterwards deleted `perms:{user_id}` — but permissions
+    were also cached under `perms:{user_id}:{project_id}` by a different code path added later. One
+    key was invalidated and the other was not, so the bug persisted at a lower rate and was much
+    harder to find.
+
+    Three changes came out of it. All cache keys for one entity moved behind a single
+    `CacheKeys.for_user(user_id)` helper that returns every key, so invalidation cannot miss one. The
+    TTL on anything security-related dropped to 60 seconds, because **the TTL is the worst-case
+    exposure window and that is a business decision, not a performance setting**. And a test was
+    added that writes, then immediately reads through the cache, and asserts the new value — which
+    would have caught both bugs in the first week.
+
+    The general rule: **a cache without a written invalidation rule is a correctness bug with good
+    latency.**
+
+    <Accordion title="Design checkpoint — model answer inside">
+      **Question.** A colleague proposes caching the product catalogue in Redis with a 1-hour TTL to
+      fix a slow endpoint. What do you ask first?
+
+      **Model answer.** "What does the query plan say?" Caching an unindexed query hides the problem
+      and doubles your systems: measured, an index gave **1,970×** on a point lookup while a cache
+      gave **3.6×** on an already-optimised aggregate. Index first, cache second, and only cache what
+      is genuinely expensive after that.
+
+      If it is genuinely expensive, then four questions. **What staleness is acceptable?** A 1-hour
+      TTL means a price change takes an hour to appear, and that is a decision for whoever owns
+      pricing, not for us. **What happens on a cold cache?** 40 concurrent misses measured 40
+      database calls and 1,784 ms; without single-flight, a deploy or a Redis restart produces a
+      thundering herd exactly when the system is already stressed. **What is the invalidation rule,
+      and where does it live?** One helper returning every key for an entity, or you will miss one.
+      **And what happens when Redis is down?** Fail open to the database with a circuit breaker and
+      an alert — a cache outage should degrade latency, never availability. If we cannot answer all
+      four, we are not ready to add the cache.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    ### Connection pooling at scale: PgBouncer
+
+    Application pools are per process. With `--workers 4` and `pool_size=20, max_overflow=10`, one
+    service opens up to **120** connections; PostgreSQL's default `max_connections` is **100**, and
+    every connection costs roughly 5–10 MB of server memory plus a backend process. Ten services
+    exhaust a database that is not remotely busy.
+
+    **PgBouncer** sits between them and multiplexes. Its three modes are not interchangeable:
+
+    | Mode | A server connection is held for | Safe with | Notes |
+    | --- | --- | --- | --- |
+    | **Session** | the whole client connection | everything | least pooling benefit; roughly a proxy |
+    | **Transaction** | one transaction | almost everything | the usual choice; huge multiplexing win |
+    | **Statement** | one statement | nothing with multi-statement transactions | rarely appropriate |
+
+    **Transaction mode breaks anything that assumes session state.** Prepared statements, `SET`
+    session variables, advisory locks held across statements, `LISTEN`/`NOTIFY`, temporary tables,
+    and `current_setting('app.tenant_id')` for row-level security — all of these live on a server
+    connection that a different client may get next. Concretely: the RLS pattern from `P1-W07-M2`
+    that sets `app.tenant_id` per connection **is broken by transaction-mode pooling** unless you set
+    it inside every transaction with `SET LOCAL`. That interaction has caused real cross-tenant data
+    exposure, and it is the single most important thing to know before putting PgBouncer in front of
+    an existing application.
+
+    For SQLAlchemy with psycopg behind PgBouncer in transaction mode, disable client-side prepared
+    statements (`prepare_threshold=None` for psycopg, or `statement_cache_size=0` for asyncpg), or
+    you will get "prepared statement does not exist" errors at random.
+
+    Sizing with PgBouncer: `default_pool_size` is per (database, user) pair, and 20–50 is typical for
+    a workload where transactions are short. The application's own pool can then be small, because it
+    is talking to a local proxy rather than to the database.
+
+    ### Cache stampede: the three mitigations
+
+    Measured baseline: 40 concurrent readers of a cold key produced **40 database calls in
+    1,784 ms**; single-flight produced **1 call in 85 ms**.
+
+    Single-flight solves the *cold key* case within one process. Two more problems remain.
+
+    **Synchronised expiry.** If 10,000 keys are all written at startup with a 60-second TTL, they all
+    expire in the same second and you get 10,000 simultaneous misses. Fix: jitter every TTL —
+    `ttl = base * (0.8 + 0.4 * random())` — which spreads expiry over a 20% window and costs nothing.
+
+    **The multi-process case.** Single-flight is per process. Four workers each coalesce internally
+    and you still get four database calls, not one. For a shared cache the standard tool is a
+    **distributed lock**: the first process to `SET key NX` loads and populates; the others poll
+    briefly or serve stale. That adds a failure mode — a process that dies holding the lock — so the
+    lock needs a short TTL and the waiters need a timeout that falls back to loading directly.
+
+    The most elegant option avoids the miss entirely. **Probabilistic early expiry** (Vattani,
+    Chierichetti & Lowenstein, 2015) recomputes a value *before* it expires, with a probability that
+    rises as expiry approaches:
+
+    ```python
+    # refresh early with probability proportional to how long the recompute takes
+    if now - delta * beta * math.log(random.random()) >= expiry:
+        value = await recompute()
+    ```
+
+    where `delta` is the measured recompute time and `beta` is a tuning constant around 1. Expensive
+    values get refreshed earlier, cheap ones later, and the herd never forms because each caller
+    decides independently. It is a handful of lines and it beats a distributed lock for read-heavy
+    keys.
+
+    ### Consistency versus staleness, priced
+
+    Every caching decision is a choice about how wrong you are willing to be, and for how long.
+
+    | Strategy | Staleness window | Cost |
+    | --- | --- | --- |
+    | No cache | 0 | measured 62.8 ms per read, 15.9 rps |
+    | TTL only | up to the TTL | measured 3.6× throughput at a 90% hit rate |
+    | TTL + invalidate on write | ~0 in the happy path, up to the TTL if an invalidation is missed | every writer must know every key |
+    | Write-through | ~0 | every write pays cache latency and can fail |
+    | Read replica | replication lag (typically 1–50 ms, unbounded under load) | a "read your own write" bug class |
+
+    The last row deserves a warning because it is the most common way this goes wrong at scale. A
+    read replica is a cache with no invalidation and unbounded staleness under load. The classic
+    symptom: a user updates their profile, the write goes to the primary, the redirect reads from a
+    replica that has not caught up, and the user sees their old data and updates it again. The fixes
+    are all deliberate: route reads-after-writes to the primary for a few seconds, or pass the
+    write's LSN and wait for the replica to reach it. Choosing neither means choosing the bug.
+
+    ### Production failure modes
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Stampede on a cold key | Database load spikes right after a deploy or cache restart | Measured 40 concurrent misses → 40 queries; add single-flight and jittered TTLs |
+    | Synchronised expiry | Periodic load spikes at a fixed interval | All keys written together with the same TTL; jitter it |
+    | Stale read after a write | "I changed it and it did not change" | Missing invalidation, or a second key nobody knew about. One key helper per entity |
+    | Cache outage becomes an availability outage | Everything 500s when Redis restarts | Fail open to the database with a circuit breaker; cache errors must not propagate |
+    | RLS bypassed behind PgBouncer | Cross-tenant data appearing intermittently | Session variables do not survive transaction-mode pooling. Use `SET LOCAL` inside the transaction |
+    | "Prepared statement does not exist" | Random errors behind PgBouncer | Disable client-side prepared statements in transaction mode |
+    | Tests pass locally, fail in CI | Shared state and ordering | Transactional rollback isolation plus factories with unique sequences |
+    | Read-your-own-write violated | User updates and sees the old value | Replica lag; route reads-after-writes to the primary |
+    | Caching a query that needed an index | Latency improves 3×, database load unchanged | Look at the plan first — an index gave 1,970× versus a cache's 3.6× |
+
+    ### Frontier and primary sources
+
+    - **Vattani, Chierichetti & Lowenstein (2015), "Optimal Probabilistic Cache Stampede
+      Prevention."** *Takeaway:* recomputing early with a probability tied to the recompute cost
+      beats locking, because no coordination is needed and expensive values are protected most.
+    - **Nishtala et al. (2013), "Scaling Memcache at Facebook."** *Takeaway:* leases and stale-serving
+      are the production answers to stampedes and stale sets at scale — the paper is a catalogue of
+      every caching failure you will hit.
+    - **PgBouncer documentation, pooling modes.** *Takeaway:* transaction mode's restrictions are not
+      edge cases; session variables, prepared statements and advisory locks all break, and one of
+      them is the RLS pattern.
+    - **Fowler, Repository pattern.** *Takeaway:* the value is the seam, not the abstraction — one
+      place to enforce the tenant filter, add caching, and substitute a fake.
+
+    ### Stretch challenge
+
+    Build the complete data layer and prove each property with a measurement.
+
+    Concretely: a repository interface with a SQL implementation, a fake, and a **caching decorator**
+    that wraps either. Then demonstrate, with numbers, all six of these. A cache-aside hit rate above
+    90% on a realistic key distribution. A stampede — 40 concurrent cold readers producing 40
+    database calls — and its elimination by single-flight. A **stale read**: write to the database,
+    read through the cache, show the old value, then show the fix. Synchronised expiry causing a
+    periodic spike, and jittered TTLs removing it. A Redis outage degrading latency but not
+    availability. And test isolation: 200 tests running in parallel with zero shared state.
+
+    Then the genuinely open part. Add a second application instance and show that single-flight no
+    longer coalesces — you now get one database call per process. Implement two solutions, a
+    distributed lock and probabilistic early expiry, and measure both under a cold-start burst.
+    Report which you would ship. The interesting answer is usually "early expiry, because the lock's
+    failure mode is worse than the problem it solves" — but only if your measurements say so, and
+    arriving at that conclusion with your own numbers is the point of the exercise.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Add a cache in front of your hottest query. Measure the hit rate and the latency. Then demonstrate a
+stale read deliberately — write to the database, read through the cache, show the old value — and fix
+it. Finally reproduce the stampede with 40 concurrent cold readers and show the database call count
+before and after single-flight.
+</Card>
+
+## The whiteboard
+
+T1 is the three-layer stack with the stampede band underneath. The T2 build-up frames: (1) the
+repository seam, (2) cache-aside on a warm key, (3) 40 concurrent misses on a cold key, (4) the same
+40 collapsed into one loader with 39 waiters.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p1-w08-m5-blank.svg) · [Editable source](/assets/diagrams/p1-w08-m5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    The stampede demonstration is a small, complete, memorable artifact: 40 threads, 40 database
+    calls, 1,784 ms — then 1 call and 85 ms. Put it in the README with the code. In an interview,
+    "we added a cache and database load did not drop, because every cold key produced N concurrent
+    misses" is a diagnosis, not a fact you memorised.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **One:** find your caches and write down each one's invalidation rule; the ones with no answer
+    are incidents waiting. **Two:** check whether a cache outage takes your service down — if cache
+    errors propagate, that is an availability bug wearing a performance hat. **Three:** if you use
+    PgBouncer in transaction mode, verify that nothing depends on session state — especially any
+    row-level security policy reading `current_setting`, which needs `SET LOCAL` inside each
+    transaction.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Cache added, database load unchanged | Stampede on cold keys | Single-flight; measured 40 calls → 1, 1,784 ms → 85 ms |
+| Periodic load spikes | All keys expiring in the same second | Jitter the TTL by ±20% |
+| Stale data after a write | Missing invalidation, or a second key path | One key-helper per entity returning every key |
+| Redis down, service down | Cache errors propagating | Fail open with a circuit breaker |
+| Cross-tenant data behind PgBouncer | Session variables do not survive transaction-mode pooling | `SET LOCAL` inside each transaction |
+| Random "prepared statement does not exist" | Client-side prepared statements in transaction mode | Disable them in the driver |
+| Tests pass locally, fail in CI | Shared data and implicit ordering | Transactional rollback plus factories |
+| Repository commits internally | Callers cannot compose atomic operations | `flush()` in the repository; commit at the edge |
+| User sees their own write revert | Read replica lag | Route reads-after-writes to the primary |
+| Caching a query that needed an index | Modest gain, database still hot | Check the plan first — 1,970× versus 3.6× |
+
+## Assessment
+
+**Concept questions**
+
+1. Why should a repository `flush()` rather than `commit()`? *(The transaction belongs to the caller, so several repository calls can form one atomic unit.)*
+2. How does transactional rollback isolation work? *(The Session is bound to a connection with an open outer transaction; the test's commits become savepoints and the outer rollback erases them.)*
+3. What is a cache stampede and what causes it? *(N concurrent readers all missing the same cold key; measured 40 database calls in 1,784 ms.)*
+4. Give two fixes for a stampede and their limits. *(Single-flight — per process only; a distributed lock — adds a failure mode; probabilistic early expiry — needs no coordination.)*
+5. Why does hit rate matter non-linearly? *(Average latency is `h × cache + (1−h) × db`; at 62.8 ms per miss, 90% gives ~6.7 ms and 50% gives ~31.7 ms.)*
+6. What breaks under PgBouncer transaction mode? *(Session state: prepared statements, `SET` variables, advisory locks, temporary tables, and RLS via `current_setting`.)*
+7. Why is a read replica a cache? *(It serves stale data with no invalidation and unbounded staleness under load, producing read-your-own-write bugs.)*
+8. Index or cache first, and why? *(Index — measured 1,970× versus a cache's 3.6×, and a cache on an unindexed query hides the problem while doubling your systems.)*
+
+**Coding challenge.** Build the repository, its fake, a caching decorator with single-flight and jittered TTLs, and the test fixtures. Hidden tests: 200 tests run in parallel with no shared state; a cold-key burst of 40 produces exactly one database call; a write followed by a read through the cache returns the new value; a simulated cache outage degrades latency without failing requests.
+
+**Interview questions**
+
+- *Junior:* "What is a cache-aside pattern?"
+- *Mid:* "We added a cache and database load did not drop. What is happening?"
+- *Senior:* "Design the caching and invalidation strategy for a permissions lookup, and tell me the worst-case exposure window."
+
+**Draw it from memory.** Draw the repository seam with the test swap point, then the stampede with 40 arrows and the single-flight version with one.
+
+## Sources & further reading
+
+**Primary docs**
+
+- [SQLAlchemy 2.0: joining a Session to an external transaction](https://docs.sqlalchemy.org/en/20/orm/session_transaction.html#joining-a-session-into-an-external-transaction-such-as-for-test-suites) — the canonical transactional-test recipe; copy it exactly.
+- [PgBouncer: pooling modes](https://www.pgbouncer.org/features.html) — read the transaction-mode restrictions before deploying it, not after.
+- [Redis: key eviction and expiration](https://redis.io/docs/latest/develop/use/keyspace/) — read how expiry is actually implemented; it is lazier than most people assume.
+
+**Papers and their takeaways**
+
+- **[Vattani et al. (2015), "Optimal Probabilistic Cache Stampede Prevention."](https://doi.org/10.14778/2757807.2757813)** *Takeaway:* early recomputation with a probability tied to recompute cost eliminates herds without any coordination.
+- **[Nishtala et al. (2013), "Scaling Memcache at Facebook."](https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala)** *Takeaway:* leases, stale-serving and careful invalidation ordering are the production answers; the paper is a catalogue of caching failures worth reading before you meet them.
+- **[Fowler, Repository / Unit of Work.](https://martinfowler.com/eaaCatalog/repository.html)** *Takeaway:* the value of a repository is the seam it creates for testing, caching and policy — not the abstraction for its own sake.
+
+**Go deeper**
+
+- [*Architecture Patterns with Python*, Percival & Gregory (free online)](https://www.cosmicpython.com/) — read the repository and unit-of-work chapters. It is written against SQLAlchemy, and it is the clearest treatment of why these seams pay for themselves, with the honest counter-argument included.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-08/p1-w08-m5">
+  Attempt the lab first. Seriously.
+</Card>

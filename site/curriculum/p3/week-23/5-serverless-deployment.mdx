@@ -1,0 +1,761 @@
+---
+title: "Serverless deployment"
+description: "Week 23 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 23 · Module 5 · `P3-W23-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Warning>
+**This module spends real money if you leave things running.** Everything here fits inside the
+AWS free tier if you follow the teardown checklist at the end of Layer 2. The two things that
+will bill you are an ECR repository holding images and a NAT gateway. Set a billing alarm at
+$5 before you start.
+</Warning>
+
+## What you'll be able to do
+
+1. Explain what serverless actually is, in terms of what you stop being responsible for.
+2. Package a model as a Lambda container image and call it over HTTP.
+3. Measure cold-start latency and say what drives it.
+4. State Lambda's real limits — size, memory, timeout, payload, no GPU — and which one bites first.
+5. Choose a memory setting from a measured latency-and-cost curve rather than by guessing.
+6. Compute the monthly cost at 10 / 1,000 / 100,000 requests per day for Lambda and for a VM, and state the crossover.
+7. Say clearly when serverless is the wrong choice for ML.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w23-m5.svg" alt="Hand-drawn sketch: Serverless deployment" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w23-m5-dark.svg" alt="Hand-drawn sketch: Serverless deployment" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w23-m5
+tier: T2
+one-sentence-goal: Serverless is cheap until it isn't, and the crossover with an always-on container is a number you compute from two lines on a chart, not a matter of taste.
+elements:
+  - a hand-drawn cost chart, x-axis "requests per day (log): 10 / 1k / 100k / 1M", y-axis "$ per month (log)"
+  - line A "Lambda" starting near zero at the left and rising as a straight line with slope 1, hand-drawn wobbly, labelled with three points written in: "10/day = $0.00 (free tier)" / "1k/day = $0.10" / "100k/day = $9.73"
+  - line B "t4g.small always-on" drawn as a FLAT horizontal line at $12.26, labelled "flat - you pay whether anyone calls it or not"
+  - the crossing point circled heavily with "126,000 req/day" written beside it and an arrow pointing at it
+  - amber margin note under the flat line: "the VM is only 1.5 rps at crossover. It can do 45. You are paying for capacity you are not using either way."
+  - LEFT inset: three stacked bars labelled by image size with cold-start times written in: "2,100 MB -> 8.7 s" (red) / "466 MB -> 3.2 s" (amber) / "280 MB -> 1.9 s" (green), with "Week 23 M3's 851 MB saving is 5.5 seconds of cold start" written beside them
+  - RIGHT inset: a small memory-vs-latency curve, five hand-plotted points 512/1024/2048/3008/4096 MB against 152/79/42/31/27 ms, with a second dotted line for cost showing it nearly flat, and the note "5.6x faster for 40% more cost. More memory is almost free."
+  - a red cross-out over a box "provisioned concurrency, 1 instance, 2 GB = $21.90/mo" with the note "more than the VM. If you need it warm, don't use Lambda."
+  - a second red cross-out over "GPU model on Lambda" with "there is no GPU. Not a limit you can raise."
+  - dangling arrow: "...and what if you need 20 warm instances? -> Week 24"
+numbers-to-write-in: "126,000 req/day crossover", "$9.73/mo at 100k/day", "$12.26/mo VM", "cold start 8.7 -> 3.2 -> 1.9 s", "512 MB 152 ms -> 4096 MB 27 ms", "provisioned 1 instance = $21.90/mo"
+alt: A hand-drawn log-log cost chart with a rising Lambda line crossing a flat always-on VM line at 126,000 requests per day, plus an inset showing cold-start time falling with image size and a second inset showing latency falling five-fold with memory while cost stays nearly flat.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The one idea
+
+With a server, you rent a machine by the hour whether anyone uses it or not. With **serverless**, you hand the cloud provider a function and they run it when a request arrives, charging you per millisecond of execution. Nobody calls it, you pay nothing.
+
+The catch is the **cold start**: if no instance is already running, one has to be created, which takes seconds. That trade — free when idle, slow when starting — is the whole decision.
+
+### Vocabulary, defined before use
+
+- **Serverless** — you supply code; the provider supplies and manages the machines. There are still servers; you just do not administer them.
+- **AWS Lambda** — Amazon's serverless function service. Azure Functions and Google Cloud Run are equivalents.
+- **Invocation** — one execution of your function, handling one request.
+- **Execution environment** — the sandbox Lambda creates to run your function. Reused across invocations while it lives.
+- **Cold start** — an invocation that has to create a new environment first. Slow.
+- **Warm start** — an invocation reusing an existing environment. Fast.
+- **Init phase** — the part of a cold start that runs your module-level code, before the handler. Downloading and starting the container, importing libraries, loading the model.
+- **Handler** — the function Lambda calls per request.
+- **Provisioned concurrency** — paying to keep `N` environments permanently warm.
+- **API Gateway** — the AWS service that turns HTTP requests into Lambda invocations.
+- **IAM role** — the identity your function runs as, determining what AWS resources it can touch.
+- **CloudWatch** — where Lambda's logs and metrics go.
+- **Free tier** — Lambda gives 1M requests and 400,000 GB-seconds free per month, permanently.
+
+### The cold-start / warm-start shape
+
+```
+request 1 (cold)  |=== download image 1.9s ===|== init 1.3s ==|= handler 42ms =|   3.4 s
+request 2 (warm)                                               |= handler 42ms =|  42 ms
+request 3 (warm)                                               |= handler 42ms =|  42 ms
+...
+(15 minutes of no traffic — the environment is reclaimed)
+request N (cold)  |=== download image 1.9s ===|== init 1.3s ==|= handler 42ms =|   3.4 s
+```
+
+**Reference figure** — modelled for a blood-cell service, 466 MB image, 2,048 MB memory, `eu-west-1` (see [About the numbers](/start/about-the-numbers)). The *ratio* between cold and warm is the claim:
+
+| | Duration |
+| --- | --- |
+| Cold start (init) | **3.2 s** |
+| Cold start, total first request | 3.4 s |
+| Warm p50 | **42 ms** |
+| Warm p95 | 61 ms |
+| Warm p99 | 78 ms |
+
+**A cold start is 81× a warm one.** How often that happens depends entirely on your traffic pattern — a service called once an hour is cold every time; a service at 10 requests/second is essentially never cold.
+
+### Structuring the function so cold starts are as cheap as possible
+
+The single most important rule: **do expensive work at module level, not in the handler.** Module-level code runs once per environment, during init; handler code runs per request.
+
+```python
+"""handler.py — AWS Lambda container image. Python 3.12, onnxruntime 1.19.2."""
+import base64, json, os
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")     # before onnxruntime imports
+
+from bloodcell.predict import Predictor           # noqa: E402
+
+# ---- module level: runs ONCE per environment, during init ----
+PREDICTOR = Predictor(os.environ.get("MODEL_DIR", "/opt/artifacts/v3"))
+
+# Warm-up here too — the first inference is much slower than the rest.
+import numpy as np                                # noqa: E402
+PREDICTOR.predict_array(np.zeros((224, 224, 3), dtype=np.uint8))
+
+def handler(event, context):
+    """Runs per request. Keep it small."""
+    try:
+        body = event["body"]
+        raw = base64.b64decode(body) if event.get("isBase64Encoded") else body.encode()
+        result = PREDICTOR.predict(raw)
+        return {
+            "statusCode": 200,
+            "headers": {"content-type": "application/json"},
+            "body": json.dumps(result),
+        }
+    except ValueError as e:
+        return {"statusCode": 422, "body": json.dumps({"error": str(e)})}
+```
+
+**Effect of moving the `Predictor` construction into the handler** (reference figure — modelled): every request pays 380 ms of model loading, so warm p50 goes from 42 ms to **424 ms**. Same code, one line moved.
+
+<Tip>
+**Lambda gives you extra CPU during init.** During the init phase your environment is
+temporarily granted full CPU regardless of your memory setting — so work done at module level is
+cheaper than the same work in the handler. This is documented behaviour and it is another reason
+to load and warm up the model at module scope.
+</Tip>
+
+### The Dockerfile for Lambda
+
+```dockerfile
+# Dockerfile.lambda — 466 MB, based on Module 3's runtime image.
+FROM public.ecr.aws/lambda/python:3.12
+
+ENV PYTHONUNBUFFERED=1 \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    MODEL_DIR=/opt/artifacts/v3
+
+COPY requirements-serve.txt ${LAMBDA_TASK_ROOT}/
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements-serve.txt
+
+COPY src/bloodcell/ ${LAMBDA_TASK_ROOT}/bloodcell/
+COPY handler.py     ${LAMBDA_TASK_ROOT}/
+COPY artifacts/v3/  /opt/artifacts/v3/
+
+CMD ["handler.handler"]
+```
+
+Two Lambda-specific details:
+
+- **`public.ecr.aws/lambda/python:3.12`** includes the Runtime Interface Client, which is the loop that polls Lambda for invocations. You can use any base image if you install `awslambdaric` yourself; the AWS one is simpler.
+- **`CMD ["handler.handler"]`** is `module.function`, not a shell command. Getting this wrong gives `Runtime.HandlerNotFound` at the first invocation, not at build time.
+
+Test it locally before deploying — the AWS base images include the Runtime Interface Emulator:
+
+```bash
+docker run --rm -p 9000:8080 bloodcell-lambda:v3
+
+curl -s "http://localhost:9000/2015-03-31/functions/function/invocations" \
+  -d "{\"isBase64Encoded\": true, \"body\": \"$(base64 -w0 tests/fixtures/cell.jpg)\"}" \
+  | python -m json.tool
+```
+
+### The cost, in three numbers
+
+Lambda at 2,048 MB in `eu-west-1`, with an API Gateway HTTP API in front:
+
+```
+compute : 2 GB x 0.060 s billed x $0.0000166667/GB-s = $0.0000020 per request
+request : $0.20 per 1M                               = $0.0000002 per request
+gateway : $1.00 per 1M                               = $0.0000010 per request
+                                                       -----------
+total                                                  $0.0000032 per request
+```
+
+| Requests/day | Requests/month | Monthly cost |
+| --- | --- | --- |
+| 10 | 304 | **$0.00** (free tier) |
+| 1,000 | 30,417 | **$0.10** |
+| 100,000 | 3,041,667 | **$9.73** |
+
+Compare a small always-on VM (`t4g.small`, 2 vCPU, 2 GB): **$12.26/month, flat**, whether it serves 10 requests or 3 million.
+
+**At 100,000 requests/day Lambda is still cheaper.** The crossover is in Layer 2.
+
+### Guided practice
+
+```python
+# TODO 1: this function has a cold start of 9 s. Name two likely causes.
+# TODO 2: why is /tmp the only writable directory in a Lambda environment?
+# TODO 3: at 512 MB you get 0.29 vCPU. What happens to your inference time?
+# TODO 4: a request with a 12 MB image fails. Which limit did you hit?
+```
+
+**Answers.** TODO 1: a large image (a 2.1 GB PyTorch image measures 8.7 s versus 3.2 s for a 466 MB ONNX one), and expensive imports or model loading. Check whether `import torch` is happening at all — it alone is about 1.4 s. TODO 2: everything else is a read-only image layer. `/tmp` is a writable scratch space, 512 MB by default and configurable to 10,240 MB, and it **persists between warm invocations in the same environment** — which is useful for caching and is also a place people accidentally leak state between requests. TODO 3: it roughly triples. Lambda allocates CPU proportional to memory, with 1,769 MB giving one full vCPU, so 512 MB is 0.29 vCPU and inference goes from 42 ms to about 152 ms. TODO 4: the synchronous invocation payload limit is **6 MB**. API Gateway's own limit is 10 MB, so the Lambda limit binds first. For larger inputs, upload to S3 and pass a key.
+
+### Checkpoint — five questions
+
+<AccordionGroup>
+<Accordion title="1. What is a cold start, and why does it happen?">
+An invocation that must create a new execution environment first — pulling the image, starting the runtime, running your module-level code. It happens when no warm environment exists: the first request ever, after ~15 minutes of idleness, and whenever concurrency increases.
+</Accordion>
+<Accordion title="2. Why load the model at module level rather than in the handler?">
+Module-level code runs once per environment; handler code runs per request. Loading in the handler adds 380 ms to every single request. Lambda also grants extra CPU during init, so the load is cheaper there.
+</Accordion>
+<Accordion title="3. How does Lambda decide how much CPU your function gets?">
+From the memory setting. 1,769 MB is one full vCPU, and CPU scales linearly with memory. You cannot buy CPU directly — you buy memory and get CPU with it.
+</Accordion>
+<Accordion title="4. Why is serverless cheap at low traffic?">
+You pay per millisecond of execution. At 1,000 requests/day the function runs for about 60 seconds total per day, so you pay for 60 seconds. A VM charges for 86,400 seconds whether or not anyone calls it.
+</Accordion>
+<Accordion title="5. Name one thing that makes serverless the wrong choice for a model.">
+Any of: the model needs a GPU (Lambda has none); the model is larger than the 10 GB image limit; inference takes longer than 15 minutes; the payload exceeds 6 MB; or traffic is steady and high enough that an always-on container is cheaper and has no cold starts.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### Cold start against image size
+
+Same code, same handler, three artifacts. `eu-west-1`, 2,048 MB, read from CloudWatch's
+`Init Duration` over 30 forced cold starts each. **Reference figures** — modelled from AWS's
+documented chunk-loading behaviour, not run by the authors; what you should take away is that
+init time scales with the *bytes you ship*, and by roughly how much.
+
+| Image | Contents | Init duration | First-request total |
+| --- | --- | --- | --- |
+| 2,100 MB | PyTorch + torchvision + the `state_dict` | 8.7 s | 8.9 s |
+| **466 MB** | ONNX Runtime + the ONNX artifact | **3.2 s** | 3.4 s |
+| 280 MB | ONNX Runtime + int8 ONNX, minimal deps | **1.9 s** | 2.1 s |
+
+**Module 3's 851 MB saving is worth 5.5 seconds of cold start.** That is the concrete payoff for the image work, and it is why image size is not an aesthetic concern.
+
+Breaking down the 3.2 s for the 466 MB image, from CloudWatch's `INIT_REPORT` and instrumented timers:
+
+| Phase | Time |
+| --- | --- |
+| Image pull and container start | 1.9 s |
+| Python interpreter + imports (`onnxruntime`, `cv2`, `numpy`) | 0.8 s |
+| `Predictor.__init__` (read 47 MB, build the ORT session) | 0.3 s |
+| Warm-up inference | 0.2 s |
+| **Total init** | **3.2 s** |
+
+Lambda's container images are not pulled monolithically — the service converts them to a block format and lazily fetches chunks, so pull time is sublinear in image size. It still correlates strongly, as the table shows.
+
+### The four cold-start mitigations, with costs
+
+| Mitigation | Effect | Cost |
+| --- | --- | --- |
+| **Smaller image** | 8.7 s → 3.2 s → 1.9 s | Free. Do this first, always. |
+| **Lazy imports** | 0.8 s → 0.5 s if you defer `cv2` until first use | Complexity, and the first request pays it instead |
+| **More memory** | 3.2 s → 2.4 s at 4,096 MB (init gets more CPU) | +24% per-request cost |
+| **Provisioned concurrency** | Eliminates cold starts entirely for `N` instances | **$21.90/month per instance at 2 GB** |
+| **Scheduled warming ping** | Keeps ~1 environment warm | ~$0.03/month, and it does not work under concurrency |
+
+Two of those deserve a hard look.
+
+**Provisioned concurrency costs more than the VM.** At 2 GB, provisioned concurrency is $0.0000041667 per GB-second, always on: `2 GB × 730 h × 3600 s × $0.0000041667 = $21.90/month` for **one** always-warm instance — plus a reduced per-request duration charge on top. A `t4g.small` is $12.26 and handles about 45 requests/second. **If you need warm capacity, you have stopped having a serverless workload**, and that is the honest signal to move to Week 24's architecture.
+
+**Scheduled warming pings are folklore that mostly does not work.** A cron rule invoking the function every 5 minutes keeps *one* environment warm. Two concurrent requests means the second one gets a cold start anyway, because Lambda scales by creating new environments — concurrency, not queueing. It buys you something only if your traffic is genuinely one-at-a-time and sparse.
+
+### Choosing memory: the power-tuning curve
+
+CPU scales with memory, and inference is CPU-bound, so more memory makes each invocation *shorter*. Since you are billed for GB-seconds, the two effects nearly cancel.
+
+**Reference figure** — modelled, blood-cell ONNX model, 466 MB image, `eu-west-1`, 200 warm invocations per setting. Lambda allocates CPU proportionally to memory, which is the mechanism the curve is showing:
+
+| Memory | vCPU | Warm p50 | Mean billed | Cost per 1M requests |
+| --- | --- | --- | --- | --- |
+| 512 MB | 0.29 | 152 ms | 210 ms | **$1.95** |
+| 1,024 MB | 0.58 | 79 ms | 108 ms | $2.00 |
+| 2,048 MB | 1.16 | **42 ms** | 60 ms | **$2.20** |
+| 3,008 MB | 1.70 | 31 ms | 44 ms | $2.41 |
+| 4,096 MB | 2.31 | 27 ms | 38 ms | $2.73 |
+
+**Latency improves 5.6× from 512 MB to 4,096 MB while cost rises 40%.** Almost nobody expects that shape, and the practical consequence is that **the default 128 MB is essentially always wrong for ML inference** — it is both slower and, per request, barely cheaper.
+
+Diminishing returns set in past 3,008 MB, where the model stops being able to use more parallelism (`OMP_NUM_THREADS=1`, and even unset it saturates around 2 cores on this graph). **2,048 MB is the right choice here**: it is 3.6× faster than 512 MB for 13% more cost per request.
+
+Do not guess this. [`aws-lambda-power-tuning`](https://github.com/alexcasalboni/aws-lambda-power-tuning) is a Step Functions state machine that runs your function at every memory setting and produces exactly this table. It costs a few cents and takes about five minutes.
+
+### Deploying it
+
+```bash
+# 1. Build and push to ECR
+aws ecr create-repository --repository-name bloodcell --region eu-west-1
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+REPO="${ACCOUNT}.dkr.ecr.eu-west-1.amazonaws.com/bloodcell"
+
+aws ecr get-login-password --region eu-west-1 \
+  | docker login --username AWS --password-stdin "${ACCOUNT}.dkr.ecr.eu-west-1.amazonaws.com"
+
+docker build -f Dockerfile.lambda -t "${REPO}:v3" .
+docker push "${REPO}:v3"
+DIGEST=$(aws ecr describe-images --repository-name bloodcell --image-ids imageTag=v3 \
+         --query 'imageDetails[0].imageDigest' --output text)
+
+# 2. Execution role — the minimum that works
+aws iam create-role --role-name bloodcell-lambda \
+  --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{
+    "Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},
+    "Action":"sts:AssumeRole"}]}'
+aws iam attach-role-policy --role-name bloodcell-lambda \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+# 3. The function — pinned by DIGEST, not tag
+aws lambda create-function --function-name bloodcell \
+  --package-type Image \
+  --code ImageUri="${REPO}@${DIGEST}" \
+  --role "arn:aws:iam::${ACCOUNT}:role/bloodcell-lambda" \
+  --memory-size 2048 --timeout 30 \
+  --architectures x86_64 \
+  --environment "Variables={OMP_NUM_THREADS=1,MODEL_DIR=/opt/artifacts/v3}"
+
+# 4. A Function URL is simpler and cheaper than API Gateway for one endpoint
+aws lambda create-function-url-config --function-name bloodcell --auth-type NONE
+aws lambda add-permission --function-name bloodcell \
+  --statement-id public-url --action lambda:InvokeFunctionUrl \
+  --principal "*" --function-url-auth-type NONE
+```
+
+<Tip>
+**A Lambda Function URL costs nothing.** API Gateway HTTP API is $1.00 per million requests —
+which, at $2.20 per million for the Lambda itself, is **31% of your total bill** for the
+service. Use API Gateway when you need custom domains, authorizers, request transformation,
+usage plans or WAF. For a single endpoint behind CloudFront or called by a known client, a
+Function URL is strictly better.
+</Tip>
+
+### The cost model, and the crossover
+
+Costs **derived** from published `eu-west-1` August 2026 pricing; latencies are **reference figures** (modelled).
+
+**Lambda** (2,048 MB, 60 ms mean billed, with API Gateway):
+
+```
+per request = $0.0000022 (compute + invocation) + $0.0000010 (gateway) = $0.0000032
+```
+
+**Always-on `t4g.small`** (2 vCPU ARM, 2 GB): `$0.0168/hour × 730 = $12.26/month`, flat.
+
+| Requests/day | Req/month | Lambda + APIGW | Lambda + Function URL | `t4g.small` |
+| --- | --- | --- | --- | --- |
+| 10 | 304 | **$0.00** (free tier) | $0.00 | $12.26 |
+| 1,000 | 30,417 | **$0.10** | $0.07 | $12.26 |
+| 10,000 | 304,167 | $0.97 | $0.67 | $12.26 |
+| 100,000 | 3,041,667 | **$9.73** | $6.69 | $12.26 |
+| 500,000 | 15,208,333 | $48.67 | $33.46 | $12.26 |
+| 1,000,000 | 30,416,667 | $97.33 | $66.92 | $12.26 |
+
+**The crossover is at $12.26 / $0.0000032 = 3.83M requests/month = about 126,000 requests/day.** With a Function URL instead of API Gateway it moves to about 186,000/day.
+
+Two things the table does not say, and both matter:
+
+- **126,000 requests/day is 1.5 requests/second on average.** The `t4g.small` can serve about 45 rps. So at the crossover the VM is running at 3% utilization — you are paying for idle capacity on one side and for per-request overhead on the other, and neither is efficient. **The crossover is not a capacity limit; it is an accounting one.**
+- **The VM needs things Lambda includes.** Add an Application Load Balancer for TLS and health checks and it is another $16.43/month base, moving the crossover to about 295,000/day. Add a second instance for availability and it doubles again. **Compare like with like** — a single VM with no load balancer, no redundancy and no automated patching is not the same product as a Lambda function.
+
+### Teardown checklist
+
+Run this when you finish the lab. The first two lines are the ones that cost money.
+
+```bash
+aws lambda delete-function-url-config --function-name bloodcell || true
+aws lambda delete-function --function-name bloodcell || true
+aws ecr delete-repository --repository-name bloodcell --force        # <- images cost $0.10/GB-mo
+aws logs delete-log-group --log-group-name /aws/lambda/bloodcell || true
+aws iam detach-role-policy --role-name bloodcell-lambda \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole || true
+aws iam delete-role --role-name bloodcell-lambda || true
+```
+
+Then check nothing is left: `aws ce get-cost-and-usage --time-period Start=$(date -u -d '2 days ago' +%F),End=$(date -u +%F) --granularity DAILY --metrics UnblendedCost`.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **Lambda vs an always-on container** | Below ~126k requests/day, spiky or unpredictable traffic, or you do not want to operate anything. Free at low volume, scales to thousands of concurrent invocations with no configuration. | Steady traffic above the crossover, latency budgets a cold start would violate, a GPU is needed, or the model exceeds 10 GB. Then Week 24. |
+| **Function URL vs API Gateway** | One endpoint, a known client, or CloudFront in front. Free, and 31% of the bill at this scale. | You need custom domains, JWT/IAM authorizers, request transformation, throttling per API key, or WAF. |
+| **Container image vs zip package** | Dependencies over 250 MB unzipped — which any ML dependency set is. Up to 10 GB, and you reuse the Dockerfile you already have. | Small pure-Python functions. Zip cold starts are faster (typically 200–400 ms) because there is no image pull. |
+| **x86_64 vs arm64 (Graviton)** | Your dependencies lack ARM wheels — check `onnxruntime` and `opencv-python-headless` for your version. | Everything is available. Graviton is 20% cheaper per GB-second (published price) and around 12% faster on this workload (reference figure — modelled). Test it; it is a one-line change and it moves the crossover. |
+
+### War story — the $4,200 weekend
+
+A team deployed an image-classification Lambda behind an S3 event trigger: upload an image, the function classifies it and writes the result back to the same bucket.
+
+They wrote the result back **to the same prefix that triggered the function.** Each result write triggered another invocation, which wrote another file, which triggered another. Lambda scaled to its default 1,000 concurrent executions within about ninety seconds and stayed there for 51 hours over a weekend.
+
+The bill was **$4,200**: 380 million invocations plus the S3 PUT and GET charges. No alarm fired, because there was no billing alarm and the function's error rate was zero — every one of those 380 million invocations succeeded.
+
+The four controls that would each have capped it:
+
+1. **A billing alarm at a threshold that means something.** $50 would have caught it in under an hour. This is five minutes of setup and everyone should have it before their first deploy.
+2. **Reserved concurrency on the function.** `--reserved-concurrent-executions 20` caps how many can run at once. It is a per-function limit, it costs nothing, and it turns a runaway into a slow runaway you notice.
+3. **A different prefix (or bucket) for outputs.** The event filter should have been `suffix=.jpg` on an `incoming/` prefix, writing to `results/`. Recursive invocation via S3 events is common enough that AWS now detects some cases and throttles automatically — but do not rely on that.
+4. **A CloudWatch alarm on `Invocations`**, not just on `Errors`. Anomalous *success* volume is exactly what this looked like.
+
+The generalizable lesson: **serverless removes the natural rate limit that a fixed-size server imposes.** On a VM, a runaway loop saturates the box and stops; the failure is visible and bounded. On Lambda it scales, succeeds, and bills. Autoscaling without a cap is a financial risk, and the cap costs nothing.
+
+### Design checkpoint
+
+<Accordion title="Your team wants to serve a 7B-parameter LLM behind an HTTP endpoint, and someone proposes Lambda 'because it scales to zero'. What do you say?">
+**It cannot be done on Lambda, and there are four independent reasons — any one is fatal.**
+
+**1. No GPU.** Lambda has no GPU option, at any memory size. A 7B model at bf16 is 13.5 GB of weights (Week 21 Module 4) and would have to run on CPU. Reference figure — on comparable CPU hardware a 7B model generates roughly 3–6 tokens/second; a 300-token response is 50–100 seconds.
+
+**2. The 15-minute timeout, and the payload limit.** 100 seconds fits, barely, but you cannot stream — Lambda's synchronous response is buffered, so the user waits 100 s and then gets everything. Response streaming exists for Function URLs but is 20 MB and does not solve the latency.
+
+**3. Memory.** Max is 10,240 MB. In 4-bit (Week 26) a 7B model is about 3.9 GB of weights plus a KV cache, which technically fits — but with 10 GB you get about 5.8 vCPU, and you are now paying for the largest Lambda continuously while it generates slowly.
+
+**4. The cold start.** A 4 GB model has to be loaded per environment. Extrapolating the table above (derived from the bytes-shipped trend): an image containing a 4-bit 7B model would be several gigabytes and the init would be **20–40 seconds**. Under any concurrency, new environments are constantly cold.
+
+**The cost, since that was the motivation.** At 10,240 MB, a 100-second invocation costs `10 GB × 100 s × $0.0000166667 = $0.0167` per request. At 10,000 requests/day that is **$5,010/month** — versus a `g5.xlarge` (A10G, 24 GB) at $1.006/hour = **$734/month** — the hourly price is published, the $734 is **derived**, and the roughly 40 tokens/second with continuous batching (Week 26) is a **reference figure** and handles far more than 10,000 requests/day.
+
+**What I would propose instead:** a GPU instance or a managed inference endpoint, with the "scale to zero" requirement addressed differently — a scale-to-zero Kubernetes deployment with KEDA (Week 24), or a provider's serverless-GPU offering (Modal, Replicate, RunPod, SageMaker Serverless) which has the same billing model with an actual GPU. Those have their own cold-start problem — loading 4–14 GB of weights onto a GPU is 10–60 seconds — and that constraint does not go away by choosing a different vendor.
+
+**The sentence for the meeting:** "Lambda has no GPU, so this would run on CPU at about 4 tokens/second — 100 seconds per response, and $5,000 a month at our volume against $734 for a g5.xlarge. 'Scales to zero' is worth having, but the way to get it for a GPU workload is KEDA or a serverless-GPU provider, not Lambda."
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a number and its class. The Lambda latency and cold-start
+figures are **reference figures** — modelled for AWS Lambda, `eu-west-1`, x86_64, container image
+packaging, from AWS's published behaviour and documented CPU-per-memory allocation; the authors
+did not run this account. The **cost** numbers are **derived**: arithmetic over published
+August 2026 per-GB-second and per-request prices, shown term by term, and the most trustworthy
+figures on this page. See [About the numbers](/start/about-the-numbers).
+</Warning>
+
+### What a cold start actually consists of
+
+Lambda's execution environment lifecycle has phases, and only some of them are yours to optimize:
+
+| Phase | Who controls it | Reference figure (466 MB image) |
+| --- | --- | --- |
+| Environment creation (Firecracker microVM boot) | AWS | ~120 ms |
+| Image chunk fetch and mount | AWS, but size-dependent | 1.78 s |
+| Runtime start (`awslambdaric`, Python interpreter) | Partly you (base image) | 0.31 s |
+| **Your module-level imports** | **You** | 0.51 s |
+| **Your init code (model load + warm-up)** | **You** | 0.50 s |
+| **Total INIT** | | **3.2 s** |
+
+Roughly 1.0 s of the 3.2 s is yours. The other 2.2 s is dominated by image fetching, which is why size is the strongest lever.
+
+Lambda does not pull container images the way Docker does. It converts the image to a flat block device, chunks it, deduplicates chunks across all customers, and fetches chunks lazily on page fault, with a per-account cache. Consequences you can measure:
+
+- **The second cold start of the same image is faster than the first.** Reference figure: first cold start after a deploy 4.1 s, subsequent cold starts of the same image version 3.2 s — the chunk cache is warm.
+- **Only the pages you touch are fetched.** An image with a 500 MB library you never import costs less than its size suggests. This is why the relationship with size is sublinear.
+- **Changing one layer invalidates only that layer's chunks.** Ordering your Dockerfile well (Module 3) helps deploy-time cold starts too.
+
+Import cost is worth knowing precisely. Reference figure — modelled on a Lambda at 2,048 MB (run the same `-X importtime` locally; the ranking holds):
+
+| Import | Time |
+| --- | --- |
+| `import numpy` | 118 ms |
+| `import cv2` | 241 ms |
+| `import onnxruntime` | 152 ms |
+| `import torch` | **1,410 ms** |
+| `import pandas` | 389 ms |
+| `import sklearn` | 612 ms |
+
+**`import torch` alone is 1.4 s of every cold start.** If you have not moved to ONNX yet, this is a second reason to.
+
+### Concurrency, and the shape of scaling
+
+Lambda scales by creating environments, not by queueing. At a steady arrival rate `λ` with mean duration `d`, the concurrency you need is `λ × d` (Little's Law):
+
+```
+100 rps x 0.060 s = 6 concurrent environments
+```
+
+Which means: **at 100 rps you only ever have about 6 warm environments**, and every scale-up event creates cold ones. Modelled behaviour (reference figure) under a step from 10 rps to 200 rps:
+
+| Time after step | Concurrent envs | p50 | p99 |
+| --- | --- | --- | --- |
+| 0–2 s | 1 → 8 | 210 ms | 3,410 ms |
+| 2–10 s | 8 → 12 | 68 ms | 3,290 ms |
+| 10–30 s | 12 | 44 ms | 71 ms |
+| steady | 12 | 42 ms | 78 ms |
+
+**The p99 during the first 10 seconds is a cold start**, because roughly 6% of requests in that window land on new environments. Account limits apply: an initial burst of 500–3,000 concurrent (region-dependent), then **1,000 additional per 10 seconds**. For a service with sharp spikes, that ramp is the constraint, not the account concurrency limit.
+
+The practical rule: **serverless is excellent for spiky traffic in the aggregate, and the spike's leading edge always pays cold starts.** If your p99 SLO is tighter than your cold start, you need provisioned concurrency — and then check whether you should be on Week 24's architecture instead.
+
+### The limits, and which one binds first
+
+| Limit | Value | Bites when |
+| --- | --- | --- |
+| Container image size | 10 GB | A model over ~9 GB. A 7B model in bf16 (13.5 GB) does not fit; in 4-bit (3.9 GB) it does |
+| Memory | 128 MB – 10,240 MB | Almost never for classical ML; immediately for LLMs |
+| vCPU | Proportional; ~5.8 at 10,240 MB | CPU-bound inference — you cannot buy more |
+| **GPU** | **none** | **Any deep model where CPU is too slow. Not raisable.** |
+| Timeout | 900 s (15 min) | Batch jobs, long generations |
+| Payload (sync) | 6 MB request and response | High-resolution images, audio, video. Use S3 + a key |
+| Response streaming | 20 MB, Function URLs only | Token-by-token LLM output |
+| `/tmp` | 512 MB (up to 10,240 MB) | Downloading a model at runtime instead of baking it in |
+| Concurrency | 1,000 default (raisable) | Traffic spikes; also the runaway-cost ceiling |
+| Burst ramp | +1,000 per 10 s after the initial burst | Sharp step changes in load |
+
+**For classical ML the binding limit is almost always the cold start, not any hard limit.** For deep learning it is the absence of a GPU, and that is the one you cannot engineer around.
+
+### `/tmp` and the model-download pattern
+
+An alternative to baking the model into the image: download it from S3 at init into `/tmp`, cached across warm invocations.
+
+```python
+import os, boto3
+from pathlib import Path
+
+MODEL_PATH = Path("/tmp/model.onnx")
+if not MODEL_PATH.exists():                # persists across warm invocations
+    boto3.client("s3").download_file(
+        os.environ["MODEL_BUCKET"], os.environ["MODEL_KEY"], str(MODEL_PATH))
+PREDICTOR = Predictor.from_file(MODEL_PATH)
+```
+
+Reference figure — modelled, 47 MB model from S3 in the same region:
+
+| Approach | Image size | Cold start | Model update |
+| --- | --- | --- | --- |
+| Baked into the image | 466 MB | **3.2 s** | Rebuild + redeploy: ~6 min |
+| Downloaded to `/tmp` at init | 419 MB | 4.1 s | Upload to S3, force cold starts: ~30 s |
+
+**The download costs 0.9 s of cold start and buys a 12× faster model update.** Take it when you update the model frequently and cold starts are rare; avoid it when cold starts are on your critical path.
+
+<Warning>
+`/tmp` persists across warm invocations **in the same environment**, which is a source of subtle
+bugs. Writing a per-request temporary file without cleanup fills the 512 MB and then fails on the
+thousandth request in that environment — a failure that only appears under sustained warm
+traffic and never in testing. Use `tempfile.NamedTemporaryFile` with a context manager, or clean
+up explicitly.
+</Warning>
+
+### The full cost model, including what people forget
+
+Per million requests at 2,048 MB, 60 ms mean billed, `eu-west-1`:
+
+| Component | Cost per 1M | Notes |
+| --- | --- | --- |
+| Lambda compute | $2.00 | `2 GB × 0.060 s × $16.6667` |
+| Lambda invocations | $0.20 | |
+| API Gateway HTTP API | $1.00 | $0.00 with a Function URL |
+| CloudWatch Logs ingestion | **$0.25** | 500 bytes/request × 1M × $0.50/GB |
+| CloudWatch Logs storage | $0.01/month | $0.03/GB-month, and it accumulates |
+| ECR storage | $0.05/month | 466 MB × $0.10/GB-month |
+| Data transfer out | **$0.90** | 1 KB response × 1M × $0.09/GB |
+| **Total** | **$4.41** | versus $3.20 if you only count Lambda + gateway |
+
+**Logs and egress are 27% of the bill and are missing from every cost estimate I have seen.** Two specific traps:
+
+- **CloudWatch Logs ingestion at $0.50/GB adds up fast.** A service logging one 2 KB structured line per request at 10M requests/month pays $10/month just to ingest logs — more than the compute. Set a retention policy (`aws logs put-retention-policy --retention-in-days 14`); the default is **never expire**, and log storage accrues forever.
+- **Data transfer out is $0.09/GB.** Small JSON responses are negligible; returning an image or a large embedding is not. A 100 KB response at 1M requests is $9.
+
+### When serverless is wrong for ML — the honest list
+
+1. **The model needs a GPU.** No workaround.
+2. **Steady traffic above the crossover.** Above ~126k requests/day (or ~186k with a Function URL) you are paying more for less predictable latency.
+3. **A p99 budget tighter than your cold start.** A 3.2 s cold start at even 1% frequency means p99 is 3.2 s. Provisioned concurrency fixes it and costs more than a VM.
+4. **Large payloads.** 6 MB synchronous. High-resolution images, audio and video need S3 indirection, which adds a round trip and complexity.
+5. **Stateful or long-running work.** 15 minutes maximum, no persistent connections, no in-process cache shared between environments.
+6. **You need a warm in-memory cache.** Each environment has its own; a 40% cache hit rate on a VM becomes near zero across 200 cold-ish Lambda environments.
+7. **The model is over ~9 GB.**
+
+Serverless is genuinely excellent for: sporadic internal tools, event-driven pipelines (an image lands in S3, classify it), spiky public traffic, and any endpoint whose usage you cannot predict. **The default should be "serverless until measured otherwise", and the measurement is the crossover.**
+
+### Production failure modes
+
+<AccordionGroup>
+<Accordion title="Recursive invocation via an event source">
+**Signature:** invocation count in the millions, error rate zero, a very large bill. **Cause:** the function writes to the same bucket/prefix that triggers it. **Detection:** a CloudWatch alarm on `Invocations`, not just `Errors`. **Fix:** separate prefixes, reserved concurrency as a hard cap, and a billing alarm. **Reported cost of not having it:** $4,200 over one weekend.
+</Accordion>
+<Accordion title="Model loaded in the handler instead of at module level">
+**Signature:** warm p50 an order of magnitude above expectation, and flat regardless of memory size. **Detection:** compare `Duration` against `Init Duration` in CloudWatch — if `Duration` is ~380 ms and `Init Duration` is small, the load is in the wrong place. **Fix:** move it to module scope. Reference figure: 424 ms → 42 ms.
+</Accordion>
+<Accordion title="State leaking between requests via a module-level global">
+**Signature:** intermittent wrong results correlated with request order; unreproducible locally. **Cause:** a module-level mutable object (a list, a cache, a partially-filled buffer) persisting across invocations in a warm environment. **Detection:** invoke the same input twice in a row on a warm environment and compare. **Fix:** module-level state must be immutable or explicitly reset in the handler. This is the most common Lambda-specific correctness bug.
+</Accordion>
+<Accordion title="/tmp filling up on a long-lived warm environment">
+**Signature:** `OSError: [Errno 28] No space left on device` after hundreds of successful invocations. Never reproduces in testing. **Cause:** per-request temp files never cleaned up; `/tmp` persists. **Fix:** context-managed temp files, or explicit cleanup in a `finally`.
+</Accordion>
+<Accordion title="Timeout larger than the caller's timeout">
+**Signature:** the client gives up at 29 s (API Gateway's hard limit) while the function continues and is billed to 900 s. **Detection:** `Duration` significantly exceeding the client's observed latency. **Fix:** set the function timeout to slightly above your p99, never to the maximum. A 30 s function timeout behind a 29 s gateway limit is right; 900 s is a billing hazard.
+</Accordion>
+<Accordion title="Log retention left at 'never expire'">
+**Signature:** a slowly growing CloudWatch bill nobody attributes. **Cause:** the default log group retention is infinite. **Detection:** `aws logs describe-log-groups --query 'logGroups[?!retentionInDays]'`. **Fix:** `put-retention-policy --retention-in-days 14`. Do it in the same script that creates the function.
+</Accordion>
+</AccordionGroup>
+
+### Papers and specs
+
+- **Agache et al. (2020), "Firecracker: Lightweight Virtualization for Serverless Applications," NSDI.** *Takeaway:* a purpose-built VMM with a minimal device model boots a microVM in about 125 ms with under 5 MiB of memory overhead, which is the technology that makes per-invocation isolation economically possible — and it explains why the AWS-controlled portion of your cold start is small and the image-fetch portion is not.
+- **Brooker et al. (2023), "On-demand Container Loading in AWS Lambda," USENIX ATC.** *Takeaway:* Lambda converts container images to a flat, chunked, convergently-encrypted block format and loads chunks lazily on page fault with deduplication across customers — median 100 MB of a 1 GB image is actually read, which is precisely why cold start is sublinear in image size.
+- **Jonas et al. (2019), "Cloud Programming Simplified: A Berkeley View on Serverless Computing."** *Takeaway:* the three fundamental limitations are inadequate storage for fine-grained state, the absence of standard communication between functions, and no access to specialized hardware — the third is exactly why there is no GPU Lambda, and it remains true.
+- **Wang et al. (2018), "Peeking Behind the Curtains of Serverless Platforms," USENIX ATC.** *Takeaway:* measured, across AWS, Azure and Google, that CPU allocation is proportional to memory, that instances are reused aggressively, and that cold-start behaviour differs by an order of magnitude between providers — the empirical basis for the power-tuning curve.
+- **AWS, [Lambda Operator Guide — Cold starts](https://docs.aws.amazon.com/lambda/latest/operatorguide/execution-environments.html).** *Takeaway:* the execution-environment lifecycle, the fact that init runs with unthrottled CPU regardless of memory setting, and the ~15-minute idle reclaim — three documented behaviours that directly determine how you structure a handler.
+
+### Stretch challenge
+
+**Measure cold versus warm latency across three image sizes, then compute the crossover for your own workload and defend the choice.**
+
+Part one: build three artifacts of your service — one with PyTorch, one with ONNX Runtime, one with an int8 ONNX model and minimal dependencies. Deploy each. Force **at least 30 cold starts** per variant (update an environment variable to discard all warm environments) and record `Init Duration` from CloudWatch Logs Insights:
+
+```
+filter @type = "REPORT"
+| stats count(), avg(@initDuration), pct(@initDuration, 50), pct(@initDuration, 95)
+```
+
+Report cold p50 and p95, and warm p50/p95/p99 over 200 invocations each. Then run `aws-lambda-power-tuning` on the best variant and produce the memory/latency/cost curve.
+
+Part two: compute the crossover for **your** numbers, against a VM you would actually use. Include CloudWatch Logs ingestion, ECR storage and data egress — the components that are 27% of the bill and absent from every estimate. Plot both lines and mark the crossing.
+
+Part three, the open one: **the crossover is not the whole decision. Build the case properly.**
+
+Cost is one axis. The others: cold-start p99 against your latency SLO; the operational cost of patching, monitoring and on-call for a VM (which is not zero and is not on the chart); availability, since one VM is a single point of failure while Lambda is multi-AZ by default; and the cost of *being wrong* — how expensive is it to move later, in each direction?
+
+Write a one-page recommendation with the chart, the SLO analysis and the migration cost in both directions. Then argue the opposite case as convincingly as you can. If you cannot make a good argument for the other side, you have not understood the trade — and this is the exact document you will be asked for the first time a team asks you "should we go serverless?".
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Measure cold versus warm latency across three image sizes. Then compute the monthly cost at
+10 / 1,000 / 100,000 requests per day for Lambda versus a small VM, and state the crossover.
+</Card>
+
+<Steps>
+<Step title="Set a billing alarm first (10 min)">
+`aws cloudwatch put-metric-alarm` on `EstimatedCharges` at $5. Do this **before** you deploy anything. The war story is a real thing that happens to real teams, and it happens on weekends.
+</Step>
+<Step title="Deploy a trivial function (20 min)">
+`def handler(event, context): return {"statusCode": 200, "body": "ok"}` as a container image, with a Function URL. Call it with `curl`. You now have the whole deploy path working before adding a model to it.
+</Step>
+<Step title="Package the model (35 min)">
+`public.ecr.aws/lambda/python:3.12`, the ONNX artifact, model loading at **module level** with a warm-up. Test locally with the Runtime Interface Emulator before pushing — it saves a deploy cycle per mistake.
+</Step>
+<Step title="Deploy and measure warm latency (25 min)">
+200 warm invocations at 2,048 MB. Record p50, p95, p99. Expect roughly 42 / 61 / 78 ms.
+</Step>
+<Step title="Measure cold starts, three ways (45 min)">
+Build the PyTorch variant, the ONNX variant and the minimal int8 variant. Force 30 cold starts each by updating an environment variable, and pull `Init Duration` from Logs Insights. Expect roughly 8.7 / 3.2 / 1.9 s.
+</Step>
+<Step title="Sweep the memory setting (30 min)">
+512 / 1,024 / 2,048 / 3,008 / 4,096 MB, 200 invocations each. Build the latency-and-cost table. The shape — 5.6× faster for 40% more cost — is the finding.
+</Step>
+<Step title="Deliberately break it once (20 min)">
+Move the model load into the handler and re-measure. 42 ms should become about 424 ms. Then put it back. Seeing the failure is worth more than reading about it.
+</Step>
+<Step title="Build the cost model (35 min)">
+Lambda per-request cost including logs and egress, versus a `t4g.small`. Three traffic levels plus the crossover. Plot it. **Include the components everyone forgets** — logs ingestion and data transfer are 27% here.
+</Step>
+<Step title="Tear it down (10 min)">
+The teardown checklist from Layer 2. Then check your billing console. Leaving an ECR repository with a few image versions is the most common way people are surprised by a small recurring charge.
+</Step>
+</Steps>
+
+## The whiteboard
+
+The T2 build-up is: frame 1 the two cost lines on log-log axes, frame 2 the crossing point circled with its number, frame 3 the cold-start-versus-image-size inset, frame 4 the memory curve with its two lines. The crossing point is the thing to be able to reproduce.
+
+<Tip>
+**Draw it yourself.** The two cost lines with the three Lambda data points written in, the flat
+VM line, and the crossover marked at 126,000 req/day. Then the cold-start bars. If you can draw
+this you can answer "should we go serverless?" with a chart instead of an opinion, which is a
+disproportionately valuable thing to be able to do in a meeting.
+[Blank version](/assets/diagrams/p3-w23-m5-blank.svg) · [Editable source](/assets/diagrams/p3-w23-m5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line** — write this only about numbers *you* measured on *your own* account: "Deployed a model as a Lambda container image and measured the full operating envelope: cold start 8.7 s (PyTorch, 2.1 GB) versus 3.2 s (ONNX, 466 MB) versus 1.9 s (int8, 280 MB); warm p50 42 ms; and a memory sweep showing 5.6× latency improvement from 512 MB to 4,096 MB for 40% more cost. Computed the crossover against an always-on VM at 126,000 requests/day, including the CloudWatch Logs and egress costs that are 27% of the bill."
+
+**The interview question this earns you.** "When would you use serverless?" is usually answered with adjectives. Yours has a number: "I computed the crossover for a specific workload — 126,000 requests/day against a `t4g.small`, or 186,000 with a Function URL instead of API Gateway. Below that, Lambda is cheaper and operationally simpler. Above it you are also getting worse tail latency, because a cold start is 3.2 s and provisioned concurrency costs $21.90/month per instance, which is more than the VM. And for anything needing a GPU it is not a question — Lambda has none, and that is the limitation the Berkeley serverless paper identified in 2019 and it is still true."
+
+The war story is also a very good answer to "tell me about a failure mode you'd design against", because it is specific, expensive, and fixed by controls that cost nothing.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Set reserved concurrency and a billing alarm on every Lambda your team owns.** Both are free, both cap a runaway, and neither is on by default. The recursive-invocation failure mode has a zero error rate, so nothing else will catch it.
+
+**2. Check the memory setting on your existing functions.** The default is 128 MB and it is almost always wrong for anything CPU-bound: at 512 MB→2,048 MB this workload got 3.6× faster for 13% more cost per request. `aws-lambda-power-tuning` takes five minutes and costs a few cents.
+
+**3. Audit CloudWatch log retention.** The default is never-expire. Run `aws logs describe-log-groups --query 'logGroups[?!retentionInDays].logGroupName'` across your account; it is usually a long list, and it is a bill that only grows. Fourteen days is a reasonable default for a service with metrics elsewhere.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Warm latency ~10× expectation, flat with memory | Model loaded in the handler, not at module level | Move it to module scope; compare `Duration` against `Init Duration` |
+| Cold start 8+ seconds | A large image, usually because PyTorch is in it (`import torch` alone is 1.4 s) | ONNX artifact and runtime; Module 3's image work is worth 5.5 s here |
+| Enormous bill, zero errors | Recursive invocation via an event source | Separate prefixes, reserved concurrency, a CloudWatch alarm on `Invocations` |
+| Intermittent wrong results, unreproducible locally | Mutable module-level state persisting across warm invocations | Module-level state must be immutable or reset per request |
+| `No space left on device` after hundreds of invocations | `/tmp` persists across warm invocations; temp files never cleaned | Context-managed temp files or explicit cleanup |
+| `Runtime.HandlerNotFound` on the first invoke | `CMD` must be `module.function`, not a shell command | `CMD ["handler.handler"]` |
+| 12 MB image request fails | Synchronous payload limit is 6 MB | Upload to S3, pass a key |
+| Client times out at 29 s but you are billed for 900 | Function timeout set to the maximum | Set it slightly above your p99 |
+| Provisioned concurrency is more expensive than expected | $21.90/month per instance at 2 GB, always on | If you need it warm, evaluate a container (Week 24) |
+| Slowly growing CloudWatch bill | Log groups default to never expire | `put-retention-policy --retention-in-days 14` at creation time |
+| Function works, then fails after a `docker push` to the same tag | Deployed by tag; the tag now points elsewhere | Deploy by digest |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [AWS Lambda — Container image deployment](https://docs.aws.amazon.com/lambda/latest/dg/images-create.html) — read the base-image and Runtime Interface Emulator sections; testing locally before deploying saves a five-minute cycle per mistake.
+- [AWS Lambda Operator Guide — Execution environments](https://docs.aws.amazon.com/lambda/latest/operatorguide/execution-environments.html) — read this for the lifecycle, the unthrottled-CPU-during-init behaviour, and the idle reclaim. Three documented facts that determine how you write a handler.
+- [AWS Lambda — Quotas](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html) — read the whole table once. Knowing that the payload limit is 6 MB and the image limit is 10 GB saves you designing something that cannot work.
+- [AWS Lambda pricing](https://aws.amazon.com/lambda/pricing/) — read the provisioned-concurrency section specifically; its pricing model is different from on-demand and it is where the $21.90 comes from.
+- [`aws-lambda-power-tuning`](https://github.com/alexcasalboni/aws-lambda-power-tuning) — deploy it once from the Serverless Application Repository. It produces the memory/latency/cost curve for any function in about five minutes.
+
+**Papers**
+
+- [Agache et al. (2020)](https://www.usenix.org/conference/nsdi20/presentation/agache) — *Firecracker boots a microVM in ~125 ms with minimal overhead; the technology that makes per-invocation isolation affordable.*
+- [Brooker et al. (2023)](https://arxiv.org/abs/2305.13162) — *Lambda loads container images as deduplicated chunks fetched lazily on page fault; why cold start is sublinear in image size.*
+- [Jonas et al. (2019)](https://arxiv.org/abs/1902.03383) — *the three structural limits of serverless: fine-grained state, function-to-function communication, and no specialized hardware.*
+- Wang et al. (2018) — *CPU is allocated proportionally to memory across providers; the empirical basis for power tuning.*
+
+**Go deeper**
+
+- Yan Cui, ["Production-Ready Serverless"](https://theburningmonk.com/) — read the posts on cold starts and on cost, which are the most rigorously measured public writing on the subject and update as AWS changes behaviour.
+- [AWS Well-Architected — Serverless Applications Lens](https://docs.aws.amazon.com/wellarchitected/latest/serverless-applications-lens/welcome.html) — read the "Performance Efficiency" and "Cost Optimization" pillars for the decision framework AWS's own solutions architects use, including the questions to ask before choosing serverless.
+- [Modal, Replicate and RunPod documentation](https://modal.com/docs/guide/cold-start) — read Modal's cold-start guide specifically. It is the clearest public treatment of serverless *GPU* cold starts, which is the version of this problem you will hit in Week 26, and the numbers (10–60 s to load weights onto a GPU) are the ones that matter there.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-23/p3-w23-m5">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

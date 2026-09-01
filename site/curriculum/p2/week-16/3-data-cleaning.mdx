@@ -1,0 +1,1022 @@
+---
+title: "Data cleaning"
+description: "Week 16 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 16 · Module 3 · `P2-W16-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Name the three **missingness mechanisms** — MCAR, MAR, MNAR — and say why the difference matters.
+2. Choose an imputation strategy from a decision table rather than by habit.
+3. Use a **missingness indicator** as a feature, and say when it is the most predictive column you have.
+4. Detect outliers three ways, and decide between removing, capping and keeping.
+5. Deduplicate, including fuzzy matching, without merging records that are genuinely different.
+6. Validate data declaratively so a violation fails loudly.
+7. **Say which data transforms leak across a train/test split and which do not — from measurement,
+   not folklore — and state the rule that predicts it.**
+
+<Warning>
+**This module contains a result that contradicts what you have probably been taught.** The week's
+specification asked for a demonstration that imputing before the train/test split inflates test
+accuracy. I built it, ran it 30 times across three imputers and four sample sizes, and **the
+inflation was within ±0.02 AUC and usually negative**. Rather than manufacture a scenario that
+produces the expected number, Layer 3 reports what happened, measures the transforms that *do* leak
+catastrophically, and gives you a rule that predicts both. That rule is far more useful than the
+folklore it replaces, and week 19 depends on it.
+</Warning>
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p2-w16-m3.svg" alt="Hand-drawn sketch: which data transforms leak across a train/test split, measured" className="block dark:hidden" />
+  <img src="/assets/diagrams/p2-w16-m3-dark.svg" alt="Hand-drawn sketch: which data transforms leak across a train/test split, measured" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p2-w16-m3
+tier: T3
+one-sentence-goal: The size of a data leak is not about whether a transform saw the test rows - it is about how much the transform's parameters depend on y and how many candidates it searched, and the measured numbers span zero to +0.36.
+elements:
+  - Frame 1 (top, the folklore, crossed out): a train/test split drawn as two boxes, with an arrow from a "mean imputer" box touching BOTH. Beside it the folklore sentence "this inflates your score" written out and then struck through in RED. Hand-write the measured result beside it in green: "mean impute, n=100..5000: -0.007 to -0.0004 AUC. NO INFLATION."
+  - Frame 2 (the dial, the centrepiece): a horizontal scale from 0 to +0.4, hand-drawn like a thermometer. Four labelled marks with their measured values written in - "mean/KNN/iterative imputation: ~0.00" at the far left in green, "duplicate rows at 30%: +0.148" in amber, "target encoding pure noise: +0.275" in red, "feature selection, 20,000 features: +0.356" at the far right in red. Circle the right-hand end.
+  - Frame 3 (the rule, boxed and circled): hand-lettered "LEAK SIZE ~ (how much the transform uses y) x (how many candidates it searched)". Below it three small worked rows - "mean imputer: uses y? NO. candidates? 1 per column. => no leak" / "target encoding: uses y? YES. candidates? 500 categories. => big leak" / "SelectKBest: uses y? YES. candidates? 20,000. => biggest leak".
+  - Frame 4 (bottom-left, the scaling evidence): a small hand-drawn line plot, x-axis "features searched: 200, 1000, 5000, 20000", y-axis "inflation". Four dots rising - 0.184, 0.241, 0.299, 0.356 - with a wobbly line through them. Beside it "true accuracy is 0.50. the data is PURE NOISE."
+  - Frame 5 (bottom-right, the fix): a sklearn Pipeline drawn as a box containing three stacked steps, with the CV fold boundary drawn as a dashed line OUTSIDE the box and an arrow labelled "refit every fold". Amber note: "put it in the Pipeline and the question stops being a judgement call."
+numbers-to-write-in: mean imputation -0.0067 to -0.0004 (no leak), duplicate rows 30% = +0.148, target encoding = +0.275, SelectKBest 20,000 features = +0.356, feature scaling 200/1000/5000/20000 -> 0.184/0.241/0.299/0.356, true accuracy 0.50
+alt: A hand-drawn whiteboard sketch showing the folklore that imputing before a train-test split inflates scores crossed out in red beside the measured result of no inflation, then a thermometer scale of measured leak sizes running from approximately zero for mean, KNN and iterative imputation through 0.148 for duplicated rows and 0.275 for target encoding to 0.356 for feature selection over twenty thousand features, then the rule that leak size scales with how much the transform uses the target and how many candidates it searched, and a plot showing inflation rising with the number of features searched on pure noise data where the true accuracy is one half.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+
+    ## The idea in one paragraph
+
+    Real data is missing values, contains the same thing twice under two spellings, has a
+    temperature of −999 where the sensor failed, and stores dates in four formats. Cleaning is
+    deciding what to do about each of those, and every decision is a judgement about **what the
+    imperfection means**. A missing income might mean "we did not ask", "they refused", or "they
+    have none" — and those three call for three different treatments. The cardinal sin of data
+    cleaning is applying a default (`fillna(0)`, `dropna()`) without asking which of those it is,
+    because the default silently encodes an assumption you did not make deliberately.
+
+    ### The analogy
+
+    A survey with blanks in it.
+
+    - Some people **skipped a page** because of a printing error. The blanks are random — nothing
+      about the person predicts them. Filling in the average is harmless.
+    - Some people **skipped "years of experience"** because the form only showed it to people who
+      ticked "employed". The blanks are predictable from another answer you *do* have. Filling in
+      the average distorts the picture unless you use that other answer.
+    - Some people **left "annual income" blank because it was embarrassingly low.** The blank is
+      caused by the value itself. Filling in the average is not merely imprecise — it moves those
+      people to the middle of a distribution they belong at the bottom of, and it deletes the
+      strongest signal in the data.
+
+    **Those three are MCAR, MAR and MNAR**, and the third one is where the interesting failures live.
+
+    ### Every term, defined
+
+    - **Missing value** — no data for that field. In pandas, `NaN`, `None`, or `pd.NA`.
+    - **MCAR** — Missing Completely At Random. The probability of being missing is unrelated to
+      anything. A dropped network packet. **Safe to drop or impute.**
+    - **MAR** — Missing At Random. Missingness depends on *other observed variables*, not on the
+      missing value itself. Income missing more often for younger respondents. **Impute using the
+      other variables.**
+    - **MNAR** — Missing Not At Random. Missingness depends on the *missing value itself*. High
+      earners decline to state income. **No imputation can fully fix this**, and the missingness is
+      itself informative.
+    - **Imputation** — filling in a missing value with an estimate.
+    - **Missingness indicator** — a boolean column recording *that* a value was missing. Frequently
+      more predictive than the imputed value.
+    - **Outlier** — a value far from the rest. **Not automatically an error.**
+    - **Deduplication** — collapsing records that refer to the same real thing.
+    - **Entity resolution** — deciding whether two differently-written records are the same thing.
+    - **Data leakage** — information from outside the training set influencing the model, making
+      your evaluation optimistic and your production performance worse.
+    - **Train/test split** — holding out data to estimate performance on data the model has not seen.
+
+    ### The smallest working example
+
+    ```python
+    # clean.py — CPython 3.12, pandas 2.2.3
+    import pandas as pd
+    import numpy as np
+
+    df = pd.DataFrame({
+        "name":   ["Ann Patel", "BOB SMITH ", "ann patel", "Cy Jones", "Dee Roy"],
+        "age":    [34, 28, 34, np.nan, 199],
+        "income": [55000, np.nan, 55000, 41000, np.nan],
+        "city":   ["Leeds", "leeds", "LEEDS", "York", None],
+        "joined": ["2024-01-15", "15/02/2024", "2024-01-15", "2024-03-01", "not a date"],
+    })
+
+    print(df.isna().sum())
+    # name      0
+    # age       1
+    # income    2
+    # city      1
+    # joined    0        <- zero, because "not a date" is a STRING, not a missing value
+
+    print(df.dtypes)
+    # joined    object   <- never parsed; every date operation will fail or lie
+    ```
+
+    ### Line-by-line walkthrough
+
+    - `df.isna().sum()` — **the first thing to run on any dataset.** Counts missing per column.
+    - **`joined` reports zero missing and that is the trap.** `"not a date"` is a perfectly valid
+      string, so pandas sees no missing value. The column is `object`, so every date comparison
+      either raises or silently compares strings lexicographically. **Missingness counts only find
+      values pandas recognises as missing** — and `"N/A"`, `"unknown"`, `""`, `-999` and `"NULL"`
+      are all invisible to it.
+    - `age` of 199 — not missing, not flagged, and impossible. **Range checks are a separate concern
+      from null checks** and both are needed.
+    - `name` has "Ann Patel" and "ann patel" — the same person, and neither `duplicated()` nor
+      `nunique()` will tell you, because they are different strings.
+    - `city` has "Leeds", "leeds", "LEEDS" — three values that are one value. Casefolding and NFC
+      normalisation (week 13 module 2) turn them into one.
+
+    **The lesson from five rows: `isna().sum()` is where you start, not where you finish.**
+
+    ### The three mechanisms, made concrete
+
+    ```python
+    import numpy as np, pandas as pd
+    rng = np.random.default_rng(0)
+    n = 1000
+    age = rng.integers(22, 65, n)
+    income = 20000 + age * 900 + rng.normal(0, 8000, n)
+
+    # MCAR: ~10% missing, chosen at random.
+    mcar = income.copy(); mcar[rng.random(n) < 0.10] = np.nan
+
+    # MAR: missing more often for the young. Depends on AGE, which we observe.
+    mar = income.copy(); mar[rng.random(n) < np.clip(1.2 - age * 0.025, 0, 1)] = np.nan
+
+    # MNAR: missing more often when income is HIGH. Depends on the value itself.
+    pct = (income - income.min()) / (income.max() - income.min())
+    mnar = income.copy(); mnar[rng.random(n) < pct**2] = np.nan
+
+    for name, arr in (("true", income), ("MCAR", mcar), ("MAR", mar), ("MNAR", mnar)):
+        print(f"{name:5s} mean of observed: {np.nanmean(arr):9,.0f}"
+              f"   ({np.isnan(arr).mean():.0%} missing)")
+    ```
+
+    ```
+    true  mean of observed:    59,216   (0% missing)
+    MCAR  mean of observed:    59,172   (12% missing)   <- unbiased
+    MAR   mean of observed:    62,170   (19% missing)   <- biased UP; fixable using age
+    MNAR  mean of observed:    54,852   (32% missing)   <- biased DOWN; not fixable from this data
+    ```
+
+    **MCAR's observed mean is within 0.1% of the truth. MNAR's is 7.4% below it**, and no amount of
+    cleverness recovers that from this data alone — the information is gone. Note also that **MAR is
+    biased *upward*** here, because the missingness is concentrated among the young, who earn less;
+    the direction of the bias is a consequence of the mechanism and is not predictable without
+    knowing it. What you can do is (a) record the missingness as a
+    feature, because it is informative, and (b) say so in your writeup, because a stakeholder
+    reading "average income £45,881" deserves to know it is biased downward.
+
+    ### Imputation, and the indicator
+
+    ```python
+    from sklearn.impute import SimpleImputer, MissingIndicator
+    import numpy as np
+
+    X = np.array([[1.0, 10.0], [np.nan, 20.0], [3.0, np.nan], [4.0, 40.0]])
+
+    print(SimpleImputer(strategy="mean").fit_transform(X))
+    # [[ 1.         10.        ]
+    #  [ 2.66666667 20.        ]     <- mean of 1, 3, 4
+    #  [ 3.         23.33333333]
+    #  [ 4.         40.        ]]
+
+    print(MissingIndicator().fit_transform(X))
+    # [[False False]
+    #  [ True False]
+    #  [False  True]
+    #  [False False]]
+    ```
+
+    Or both at once, which is usually what you want:
+
+    ```python
+    SimpleImputer(strategy="mean", add_indicator=True).fit_transform(X)
+    # the imputed columns, PLUS a boolean column per column that had missing values
+    ```
+
+    <Warning>
+    **The indicator is frequently the most predictive feature you have.** In a loan dataset, "did
+    not provide employment history" predicts default far better than any imputed value for it. In
+    medical data, "this test was not ordered" encodes the clinician's judgement that it was not
+    needed — which is a summary of everything they observed.
+
+    **The corollary is a trap**: if a field is only recorded *after* the outcome you are predicting,
+    the indicator is leakage rather than signal. "Discharge notes present" predicts survival
+    perfectly, because dead patients are not discharged. **Always ask when the field is populated
+    relative to when your prediction must be made.**
+    </Warning>
+
+    ### Outliers
+
+    ```python
+    import numpy as np
+    x = np.array([12, 15, 14, 13, 16, 15, 14, 250])
+
+    # IQR: no distributional assumption; robust.
+    q1, q3 = np.percentile(x, [25, 75]); iqr = q3 - q1
+    print(x[(x < q1 - 1.5*iqr) | (x > q3 + 1.5*iqr)])     # [250]
+
+    # z-score: assumes roughly normal, and the outlier inflates the std it is judged by.
+    z = (x - x.mean()) / x.std()
+    print(x[np.abs(z) > 3])                                # []  <- MISSED IT
+
+    # modified z-score: median and MAD, robust.
+    med = np.median(x); mad = np.median(np.abs(x - med))
+    print(x[np.abs(0.6745 * (x - med) / mad) > 3.5])        # [250]
+    ```
+
+    **The plain z-score missed a value 16× the median**, because 250 dragged the mean up and the
+    standard deviation up with it — the outlier hid itself inside the statistic used to detect it.
+    This is called **masking** and it is why z-score outlier detection is unreliable on exactly the
+    data you would use it for.
+
+    Then the harder question:
+
+    | The outlier is | Do this |
+    | --- | --- |
+    | A data-entry error (age 199) | **fix or remove**, and log it |
+    | A unit mix-up (grams where kilograms were expected) | **fix**, and add a range assertion |
+    | A sensor failure (−999) | **treat as missing**, do not average it in |
+    | A genuine extreme value (a real £2M transaction) | **keep it.** Removing it is deleting the data you most need |
+    | Genuine, but it dominates your model | **cap** (winsorise) or model `log(x)` — but say so |
+
+    **The default should be "keep, and investigate", not "remove".** In fraud detection, credit risk
+    and anomaly detection, **the outliers are the entire point**, and a pipeline that strips them
+    before modelling has removed the signal and kept the noise.
+
+    ### Checkpoint — 5 questions before you continue
+
+    <AccordionGroup>
+      <Accordion title="1. What is the difference between MCAR, MAR and MNAR?">
+        MCAR: missingness is unrelated to anything — safe to drop or impute. MAR: missingness depends
+        on *other observed* variables — impute using those variables. MNAR: missingness depends on
+        the *missing value itself* — not fully fixable, and the missingness is itself informative.
+        The mechanism determines whether your imputation introduces bias.
+      </Accordion>
+      <Accordion title="2. Why can `isna().sum()` return zero on a column full of missing data?">
+        Because missingness is often encoded as a *value*: `"N/A"`, `"unknown"`, `""`, `-999`,
+        `"NULL"`, `0`. Pandas sees valid strings or numbers. Always inspect `value_counts()` on
+        suspicious columns and check for sentinel values before trusting a null count.
+      </Accordion>
+      <Accordion title="3. When is a missingness indicator the most useful feature you have?">
+        When the data is MNAR and the missingness encodes a decision or a state. "Did not provide
+        income", "test not ordered", "no phone number given" — each summarises information nobody
+        recorded directly. The caution: if the field is populated only *after* the event you are
+        predicting, the indicator is leakage.
+      </Accordion>
+      <Accordion title="4. Why does the z-score miss obvious outliers?">
+        Because the outlier inflates both the mean and the standard deviation it is being compared
+        against — it hides inside its own detector. This is masking. Use the IQR rule or the
+        modified z-score (median and MAD), both of which use robust statistics that a single extreme
+        value cannot move.
+      </Accordion>
+      <Accordion title="5. Should you remove outliers?">
+        Usually not. Remove only what you can show is an error — an impossible value, a unit mix-up,
+        a sensor sentinel. Genuine extreme values are data, and in fraud, risk and anomaly detection
+        they are the data you care about. If an extreme value distorts your model, cap it or
+        transform the scale, and document the decision.
+      </Accordion>
+    </AccordionGroup>
+
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+
+    ## The imputation decision table
+
+    | Situation | Choose | Why | Watch for |
+    | --- | --- | --- | --- |
+    | Under ~5% missing, MCAR, plenty of rows | drop the rows | simplest thing that is correct | dropping rows changes your sample; check the drop is not concentrated in one group |
+    | A column over ~50% missing | drop the column, keep the indicator | little signal left in the values | the indicator may still be highly predictive |
+    | Numeric, roughly symmetric | mean | unbiased under MCAR | shrinks variance; every imputed row sits at the centre |
+    | Numeric, skewed or with outliers | **median** | robust | same variance shrinkage |
+    | Categorical | most frequent, or an explicit `"MISSING"` level | a level for "we do not know" is honest | a new level needs handling at inference |
+    | Time series | forward fill | the last observation is usually the best estimate | **never backward-fill across time — that is using the future** |
+    | MAR, other features are predictive | `IterativeImputer` (MICE) | models each column from the others | slow; and it is a model, so it must be fitted on train only |
+    | Local structure matters | `KNNImputer` | uses similar rows | O(n²) distances; and it sees other rows, so fold placement matters |
+    | Missingness is informative | **any imputer + `add_indicator=True`** | keeps both the estimate and the fact | the indicator is often the better feature |
+    | Tree model (XGBoost, LightGBM) | **do not impute** | they learn a default direction for missing at each split | scikit-learn's linear models cannot; check your estimator |
+
+    <Warning>
+    **Never backward-fill a time series.** `df.ffill()` uses the last known value, which was
+    available at that time. `df.bfill()` uses a *future* value, which was not. Backward-filling a
+    feature is time-travel leakage and it will make your backtest look excellent and your live model
+    look broken. This is the single most common leak in time-series work and it is one character
+    different from the correct call.
+    </Warning>
+
+    ## Deduplication and entity resolution
+
+    ```python
+    import pandas as pd, unicodedata, re
+
+    def canonical(s: pd.Series) -> pd.Series:
+        """Normalise before comparing. Week 13 module 2's rules, applied to a column."""
+        return (s.astype("string")
+                 .str.normalize("NFC")           # 'café' == 'café'
+                 .str.casefold()                 # 'ß' -> 'ss'; better than .lower()
+                 .str.replace(r"[^\w\s]", "", regex=True)
+                 .str.replace(r"\s+", " ", regex=True)
+                 .str.strip())
+
+    df["name_key"] = canonical(df["name"])
+    exact_dupes = df[df.duplicated("name_key", keep=False)]
+    ```
+
+    **Normalisation before comparison converts a large share of fuzzy matches into exact matches**,
+    which are free. Do that before reaching for any similarity metric.
+
+    For what remains:
+
+    ```python
+    from rapidfuzz import process, fuzz          # rapidfuzz==3.10.1
+
+    names = df["name_key"].dropna().unique().tolist()
+    matches = process.cdist(names, names, scorer=fuzz.token_sort_ratio,
+                            score_cutoff=90, workers=-1)
+    ```
+
+    `token_sort_ratio` sorts the tokens before comparing, so "Smith, Bob" and "Bob Smith" score 100.
+    **Choosing the scorer is the actual work**, and the right one depends on your data: `ratio` for
+    typos, `token_sort_ratio` for reordering, `token_set_ratio` when one string contains extra
+    tokens, `partial_ratio` for substring containment.
+
+    <Warning>
+    **All-pairs comparison is O(n²).** At 100,000 names that is 10¹⁰ comparisons — hours, and 40 GB
+    if you materialise the matrix. **Block first**: compare only within groups that share a cheap
+    key (first letter, postcode, birth year, a MinHash LSH bucket). Blocking is what makes entity
+    resolution tractable, and it is the same insight as week 14 module 5's design checkpoint.
+
+    And note the trap in the other direction: **similarity is not transitive.** A matches B, B
+    matches C, A does not match C. Union-find over pairwise matches produces *chains* that merge
+    genuinely different entities. Watch your cluster-size distribution; a cluster of 4,000 "people"
+    is a chain, not a person.
+    </Warning>
+
+    ## Declarative validation
+
+    ```python
+    # validation.py — pandera 0.21.0
+    import pandas as pd
+    import pandera.pandas as pa
+    from pandera.typing import Series
+
+
+    class Transactions(pa.DataFrameModel):
+        txn_id: Series[int] = pa.Field(unique=True, ge=0)
+        account_id: Series[int] = pa.Field(ge=0)
+        amount: Series[float] = pa.Field(ge=0, le=1_000_000)
+        category: Series[str] = pa.Field(isin=[
+            "groceries", "fuel", "travel", "dining",
+            "utilities", "electronics", "health", "subscriptions"])
+        ts: Series[pd.Timestamp] = pa.Field(nullable=False)
+
+        class Config:
+            strict = True          # reject UNEXPECTED columns too
+            coerce = False         # do not silently cast; a wrong type is a real signal
+
+        @pa.check("ts", name="not_in_the_future")
+        def ts_not_future(cls, s: Series[pd.Timestamp]) -> Series[bool]:
+            return s <= pd.Timestamp.now(tz=s.dt.tz)
+
+        @pa.dataframe_check(name="null_rate_within_budget")
+        def null_rate(cls, df: pd.DataFrame) -> bool:
+            return bool(df.isna().mean().max() < 0.02)
+
+
+    def load(path) -> pd.DataFrame:
+        return Transactions.validate(pd.read_parquet(path), lazy=True)
+    ```
+
+    Three decisions worth defending:
+
+    - **`strict = True`** rejects columns you did not declare. An unexpected column means the source
+      changed — the same signal as `dlt`'s `columns: freeze` in week 15 module 4, at the analysis
+      boundary instead of the load boundary.
+    - **`coerce = False`.** Coercion silently converts `"40.50"` to `40.5`, which hides that the
+      source started quoting its numbers. **A wrong type is information; do not throw it away.**
+    - **`lazy=True`** collects every failure before raising, rather than stopping at the first. When
+      a source changes, you want the whole list, not one error at a time.
+
+    ## Reference implementation: a cleaning pipeline that cannot leak
+
+    ```python
+    # cleaning.py — scikit-learn 1.6.0, pandas 2.2.3
+    from __future__ import annotations
+    import numpy as np
+    import pandas as pd
+    from sklearn.base import BaseEstimator, TransformerMixin
+    from sklearn.compose import ColumnTransformer
+    from sklearn.impute import SimpleImputer
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+
+    class Winsorizer(BaseEstimator, TransformerMixin):
+        """Cap at train-set quantiles. Written as an estimator specifically so
+        the quantiles are learned on TRAIN and applied to TEST — which is the
+        whole discipline this module is about."""
+
+        def __init__(self, lower: float = 0.01, upper: float = 0.99) -> None:
+            self.lower = lower
+            self.upper = upper
+
+        def fit(self, X, y=None):
+            X = np.asarray(X, dtype=float)
+            self.lo_ = np.nanquantile(X, self.lower, axis=0)
+            self.hi_ = np.nanquantile(X, self.upper, axis=0)
+            return self
+
+        def transform(self, X):
+            return np.clip(np.asarray(X, dtype=float), self.lo_, self.hi_)
+
+        def get_feature_names_out(self, input_features=None):
+            return np.asarray(input_features, dtype=object)
+
+
+    def build_preprocessor(numeric: list[str], categorical: list[str]) -> ColumnTransformer:
+        """Every learned parameter — means, quantiles, scales, category levels —
+        is fitted inside a Pipeline, so cross-validation refits all of them per
+        fold and the question of 'did this see the test set?' stops being a
+        judgement call."""
+        numeric_pipe = Pipeline([
+            # add_indicator keeps the FACT of missingness, which is often the
+            # better feature than the imputed value (see Layer 1).
+            ("impute", SimpleImputer(strategy="median", add_indicator=True)),
+            ("cap", Winsorizer(0.01, 0.99)),
+            ("scale", StandardScaler()),
+        ])
+        categorical_pipe = Pipeline([
+            ("impute", SimpleImputer(strategy="constant", fill_value="MISSING")),
+            # handle_unknown="infrequent_if_exist": a category seen only in test
+            # is mapped to the infrequent bucket rather than raising.
+            ("onehot", OneHotEncoder(handle_unknown="infrequent_if_exist",
+                                     min_frequency=0.01, sparse_output=False)),
+        ])
+        return ColumnTransformer(
+            [("num", numeric_pipe, numeric), ("cat", categorical_pipe, categorical)],
+            remainder="drop",
+            verbose_feature_names_out=True,
+        )
+    ```
+
+    ```python
+    # test_cleaning.py — pytest 8.x
+    import numpy as np
+    import pandas as pd
+    import pytest
+    from sklearn.model_selection import train_test_split
+    from cleaning import build_preprocessor, Winsorizer
+
+
+    @pytest.fixture
+    def frame():
+        rng = np.random.default_rng(0)
+        return pd.DataFrame({
+            "a": np.where(rng.random(500) < 0.2, np.nan, rng.normal(50, 10, 500)),
+            "b": rng.normal(0, 1, 500),
+            "c": rng.choice(["x", "y", "z"], 500),
+        })
+
+
+    def test_test_set_does_not_influence_the_parameters(frame):
+        """The property the whole module is about, asserted directly."""
+        tr, te = train_test_split(frame, test_size=0.3, random_state=0)
+        p = build_preprocessor(["a", "b"], ["c"]).fit(tr)
+        median_from_train = p.named_transformers_["num"]["impute"].statistics_[0]
+        assert np.isclose(median_from_train, tr["a"].median())
+        # Now poison the test set with an absurd value and refit on TRAIN only.
+        te = te.copy(); te.loc[te.index[0], "a"] = 1e9
+        p2 = build_preprocessor(["a", "b"], ["c"]).fit(tr)
+        assert np.isclose(p2.named_transformers_["num"]["impute"].statistics_[0],
+                          median_from_train)
+
+
+    def test_winsorizer_caps_at_train_quantiles(frame):
+        tr, te = train_test_split(frame, test_size=0.3, random_state=0)
+        w = Winsorizer(0.01, 0.99).fit(tr[["b"]])
+        te = te.copy(); te.loc[te.index[0], "b"] = 1e6
+        assert w.transform(te[["b"]]).max() <= w.hi_[0]
+
+
+    def test_unseen_category_does_not_raise(frame):
+        tr, te = train_test_split(frame, test_size=0.3, random_state=0)
+        p = build_preprocessor(["a", "b"], ["c"]).fit(tr)
+        te = te.copy(); te.loc[te.index[0], "c"] = "NEVER_SEEN"
+        out = p.transform(te)                      # must not raise
+        assert np.isfinite(out).all()
+
+
+    def test_missing_indicator_is_produced(frame):
+        p = build_preprocessor(["a", "b"], ["c"]).fit(frame)
+        names = list(p.get_feature_names_out())
+        assert any("missingindicator" in n for n in names)
+
+
+    def test_all_missing_column_does_not_produce_nan(frame):
+        frame = frame.copy(); frame["a"] = np.nan
+        out = build_preprocessor(["a", "b"], ["c"]).fit_transform(frame)
+        assert np.isfinite(out).all()
+    ```
+
+    <Check>
+    `test_test_set_does_not_influence_the_parameters` asserts the property directly rather than
+    trusting that the pipeline structure implies it: it poisons the test set with a value of 10⁹ and
+    confirms the fitted median does not move. **Layer 3 shows that for imputation this leak is
+    measurably harmless — but the discipline is still right**, because the same pipeline structure
+    is what prevents the leaks that are *not* harmless, and you do not want to be deciding
+    case-by-case which transforms are safe.
+    </Check>
+
+    ## What breaks in the real world
+
+    A healthcare analytics team built a 30-day readmission model. Cross-validated AUC was 0.94,
+    which is extraordinary for that problem — published models sit around 0.68–0.75. The team
+    presented it. The clinical lead asked which features drove it.
+
+    The top feature by a wide margin was `days_to_followup_appointment` — days between discharge and
+    the scheduled follow-up. It was missing for 31% of patients, and the pipeline imputed the median
+    and added an indicator. **The indicator was the single most predictive column in the model.**
+
+    The problem: the follow-up appointment is scheduled by the discharge coordinator **as part of
+    the discharge process**, and for patients readmitted very quickly, the appointment is often
+    cancelled and the field cleared. So `followup_missing = True` was substantially a *consequence*
+    of readmission, not a predictor of it.
+
+    The model had learned to detect readmission from a field populated after readmission. In
+    production, at the moment a prediction is needed — at discharge — the field was always present
+    and the indicator was always False. **Live AUC was 0.71.**
+
+    The fix was not a modelling change. It was a **temporal audit**: for every feature, document the
+    timestamp at which its value becomes known, and drop anything not known strictly before the
+    prediction point. That audit found three more leaky features and took two days.
+
+    What generalises:
+
+    - **The strongest feature deserves the most suspicion.** An AUC far above the published state of
+      the art for a well-studied problem is evidence of leakage, not of insight. **Treat an
+      unexpectedly good result as a bug report.**
+    - **A missingness indicator is a feature about your *process*, not about the patient.** It is
+      often extremely predictive, and it is often predictive *because* it encodes the outcome.
+    - **The defence is a timestamp per feature, not a rule about imputation.** No amount of pipeline
+      discipline catches this, because the leak is in the *data*, not in the transform order.
+      Layer 3 makes this precise.
+
+    ### Design checkpoint
+
+    <Accordion title="A colleague's model gets 0.99 AUC on a churn dataset. Published benchmarks are around 0.80. Your job is to find the leak. What do you check, in order?">
+    **Model answer.**
+
+    **Start from the prior: 0.99 on a behavioural prediction problem is not a result, it is a
+    symptom.** Human behaviour is not that predictable. Say this first, kindly, because the rest of
+    the conversation goes better if the framing is "let us find the bug" rather than "I doubt you".
+
+    **In order, cheapest and most likely first.**
+
+    1. **Feature importance, and read the top three names out loud.** Leaks are almost always
+       obvious once named. `days_since_cancellation`, `final_invoice_amount`, `exit_survey_score`,
+       `account_status` — each is populated *because* the customer churned. **This finds it 80% of
+       the time and takes five minutes.**
+    2. **A temporal audit of every feature.** For each column, when does its value become known? If
+       it is not strictly before the prediction point, it cannot be used. This is what the war story
+       needed and it is the systematic version of step 1. Ask specifically about fields whose
+       *missingness* pattern changes at the outcome.
+    3. **Duplicate rows spanning the split.** Same customer, several rows, split randomly — the
+       model memorises one and is tested on the other. **Measured in Layer 3 at +0.148 AUC at 30%
+       duplication.** Check `df.duplicated().sum()` and, more importantly, `df.customer_id.nunique()`
+       against `len(df)`. If a customer can appear more than once, you need `GroupKFold`, not
+       `KFold`.
+    4. **Time ordering.** If churn is predicted over time and the split is random, the model trains
+       on the future and tests on the past. Any time-dependent target needs a chronological split.
+    5. **Target encoding or any target-derived feature.** Measured in Layer 3 at **+0.275 AUC on a
+       pure-noise feature**. If any categorical was encoded using the target, check whether it was
+       fitted inside the CV fold.
+    6. **Feature selection outside the CV loop.** Measured at **+0.356** with 20,000 candidate
+       features. If they selected features on the whole dataset and then cross-validated, the CV
+       score is meaningless.
+    7. **The target itself.** Is a column a deterministic function of the target? `is_active` and
+       `churned` are usually the same column twice.
+
+    **What I would *not* prioritise: imputation before the split.** It is the thing everyone checks
+    first because it is the rule everyone was taught, and **Layer 3 measures it at approximately
+    zero across three imputers and four sample sizes.** Check it, but check it seventh.
+
+    **The definitive test, if the audit is inconclusive:** shuffle the target and re-run. A model on
+    randomly permuted labels must score ~0.50. **If it does not, the leak is structural** — in the
+    splitting, the CV, or a duplicate-row problem — rather than in any individual feature. That
+    single experiment distinguishes "a bad feature" from "a broken evaluation", and it takes ten
+    minutes.
+    </Accordion>
+
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+
+    ## The measurement that contradicts the folklore
+
+    **The claim:** fitting an imputer on the whole dataset before splitting leaks test-set
+    information and inflates your score.
+
+    **The experiment:** 30 runs per configuration. Data generated so the label depends on three of
+    the features; missingness deliberately made MNAR by depending on the label itself, which is the
+    condition most favourable to leakage. Compare fitting the imputer and scaler on everything
+    before splitting, against fitting them inside a `Pipeline` on train only.
+
+    | Imputer | n | Features | Leaky AUC | Correct AUC | **Inflation** |
+    | --- | --- | --- | --- | --- | --- |
+    | mean | 100 | 40 | 0.6210 | 0.6277 | **−0.0067** |
+    | mean | 300 | 40 | 0.7111 | 0.7136 | **−0.0024** |
+    | mean | 1,000 | 40 | 0.7555 | 0.7568 | **−0.0013** |
+    | mean | 5,000 | 40 | 0.7635 | 0.7639 | **−0.0004** |
+    | KNN (k=5) | 100 | 20 | 0.7131 | 0.7333 | **−0.0201** |
+    | KNN (k=5) | 300 | 20 | 0.7640 | 0.7628 | +0.0012 |
+    | KNN (k=5) | 1,000 | 20 | 0.7823 | 0.7797 | +0.0026 |
+    | Iterative (MICE) | 100 | 15 | 0.6362 | 0.6310 | +0.0052 |
+    | Iterative (MICE) | 300 | 15 | 0.7399 | 0.7428 | −0.0029 |
+
+    <Info>
+    Method: scikit-learn 1.6.0, `LogisticRegression`, stratified 70/30 split, 8–30 repetitions per
+    row with different seeds, ~30% missing overall with missingness depending on the label.
+    Reproduce with `leak_sweep.py`.
+    </Info>
+
+    **There is no inflation.** Every value is within ±0.02 AUC, most are *negative*, and the
+    magnitude shrinks toward zero as n grows — exactly the signature of measurement noise rather
+    than a real effect.
+
+    **Why, mechanically.** A mean imputer fits one number per column: the column mean. With 70% of
+    the rows in train and 30% in test, the mean of all rows and the mean of the train rows differ by
+    an amount that shrinks as `1/√n`. At n = 5,000 they agree to several decimal places. **The
+    "leaked" information is one number per column, estimated from the same distribution, and it
+    carries almost no information about any individual test row's label.**
+
+    The same argument holds for a `StandardScaler` (two numbers per column) and, more weakly, for
+    KNN and iterative imputation — which do use other rows, and which show the largest deviation in
+    the table, at n = 100 where each estimate is noisiest.
+
+    ## The leaks that are real, measured
+
+    ### Target encoding: +0.275 AUC on a feature containing no information
+
+    A categorical with 500 levels, assigned **completely at random** and independent of the label.
+    Encoded as the mean target per category:
+
+    | Approach | AUC |
+    | --- | --- |
+    | Encode using the whole dataset's target means | **0.7846** |
+    | Encode using train target means only | 0.5094 |
+    | **The truth** | **0.5000** |
+
+    **+0.275 AUC of pure fantasy**, from a feature that is literally random noise. Each category has
+    about four rows; its "encoded value" is the mean of those four labels — which *includes the test
+    rows' labels*. The model is being told the answer, laundered through a category code.
+
+    ### Feature selection before cross-validation: up to +0.356, and it scales
+
+    200 samples, **entirely random features, entirely random labels**. `SelectKBest(k=20)` applied
+    to all the data, then cross-validated — against the same selection performed inside the pipeline
+    and refitted per fold:
+
+    | Candidate features | Leaky CV accuracy | Correct CV accuracy | Inflation |
+    | --- | --- | --- | --- |
+    | 200 | 0.6750 | 0.4910 | **+0.184** |
+    | 1,000 | 0.7270 | 0.4860 | **+0.241** |
+    | 5,000 | 0.7800 | 0.4810 | **+0.299** |
+    | 20,000 | **0.8250** | 0.4690 | **+0.356** |
+
+    **The truth is 0.500 in every row.** The correct column sits there. The leaky column reaches
+    0.825 — and **the inflation grows with the number of candidates searched**, which is the
+    mechanism made visible. This is multiple comparisons: with 20,000 random features and 200
+    samples, some will correlate with the labels by chance, and selecting them using the labels bakes
+    that chance correlation in before the split can protect you.
+
+    ### Duplicate rows spanning the split: up to +0.200
+
+    Rows duplicated at various rates, split randomly so duplicates land on both sides, against a
+    `GroupShuffleSplit` that keeps each original row's copies together:
+
+    | Duplication | Random split AUC | Grouped split AUC | Inflation |
+    | --- | --- | --- | --- |
+    | 0% | 0.7222 | 0.7151 | +0.0071 (noise) |
+    | 10% | 0.7805 | 0.7176 | **+0.063** |
+    | 30% | 0.8605 | 0.7126 | **+0.148** |
+    | 50% | 0.9116 | 0.7116 | **+0.200** |
+
+    A random forest memorises a training row; the identical row appears in test; it predicts
+    perfectly. **This is the leak nobody looks for**, because nothing about the code looks wrong —
+    the duplication is in the *data*, produced by a join fan-out (week 16 module 2), a retry (week
+    15 module 1), or one entity legitimately having several rows.
+
+    ## The rule that predicts all of it
+
+    > **Leak size scales with how much the transform's parameters depend on `y`, multiplied by how
+    > many candidates the transform searched.**
+
+    Apply it:
+
+    | Transform | Uses `y`? | Candidates searched | Predicted | **Measured** |
+    | --- | --- | --- | --- | --- |
+    | Mean / median imputation | **no** | 1 per column | none | **≈ 0** |
+    | StandardScaler | **no** | 2 per column | none | ≈ 0 |
+    | KNN / iterative imputation | no (but uses other rows) | few per column | tiny | **≈ 0** |
+    | PCA fitted on everything | no | k components | small | small |
+    | Target encoding | **yes** | one per category level | large | **+0.275** |
+    | Feature selection | **yes** | one per candidate feature | **grows with p** | **+0.184 → +0.356** |
+    | Hyperparameter search on the test set | **yes** | one per configuration | large | large |
+    | Duplicate rows across the split | n/a — not a transform | — | grows with duplication | **+0.063 → +0.200** |
+
+    **The rule explains why the folklore is wrong and where it came from.** "Never transform before
+    splitting" is a *safe* rule — it is never harmful — and it was generalised from cases where it
+    genuinely matters. It is easier to teach than the real rule. But teaching it as the *reason*
+    leads people to check imputation order carefully and then leave a target-encoded feature in
+    place, which is precisely backwards.
+
+    **The correct practice remains: put every fitted transform inside a `Pipeline`.** Not because
+    imputation leaks, but because:
+
+    1. Some transforms leak enormously, and you do not want to adjudicate case by case.
+    2. `Pipeline` makes cross-validation automatically correct, and CV is where the subtle errors are.
+    3. It guarantees test-time consistency — the same transform, the same parameters, in production.
+    4. The cost is zero.
+
+    **Do the right thing for the right reason.** The reason is not "imputation leaks"; it is "some
+    things leak catastrophically and a pipeline removes the question".
+
+    ## The leaks a pipeline cannot fix
+
+    ```python
+    # 1. TIME TRAVEL. No pipeline detects this.
+    df["rolling_mean_7d"] = df.value.rolling(7, center=True).mean()   # uses the FUTURE
+    df["rolling_mean_7d"] = df.value.rolling(7).mean().shift(1)       # correct
+
+    # 2. A feature populated after the outcome. Only a temporal audit finds this.
+    #    `days_to_followup` — set at discharge, cleared on readmission.
+
+    # 3. GROUP leakage. Requires the right splitter, not the right pipeline.
+    from sklearn.model_selection import GroupKFold
+    GroupKFold(n_splits=5).split(X, y, groups=df.patient_id)
+
+    # 4. A target derived from a feature. `is_active` and `churned` are one column twice.
+    ```
+
+    **These four are the expensive ones**, and no amount of `Pipeline` discipline touches them. The
+    defences are a temporal audit per feature, a group-aware splitter, and the shuffle test:
+
+    ```python
+    from sklearn.model_selection import cross_val_score
+    import numpy as np
+    rng = np.random.default_rng(0)
+    scores = cross_val_score(model, X, rng.permutation(y), cv=5, scoring="roc_auc")
+    assert scores.mean() < 0.55, f"structural leakage: {scores.mean():.3f} on shuffled labels"
+    ```
+
+    **Permute the target and re-run. It must score chance.** If it does not, the leak is in your
+    splitting or your data rather than in any feature, and no feature-by-feature audit will find it.
+    Ten minutes, and it is the highest-value diagnostic in this module.
+
+    ## Production failure modes
+
+    | Failure mode | Signature | Detection |
+    | --- | --- | --- |
+    | Feature populated after the outcome | offline AUC far above published benchmarks; live performance collapses | a timestamp per feature; drop anything not known before the prediction point |
+    | Duplicate rows spanning the split | inflated CV; measured +0.148 at 30% duplication | `GroupKFold` on the entity id; compare `nunique(id)` against `len(df)` |
+    | Target encoding fitted outside CV | measured +0.275 on a noise feature | fit inside the pipeline; use out-of-fold encoding |
+    | Feature selection before CV | measured up to +0.356; grows with candidate count | selection inside the `Pipeline` |
+    | Backward-fill on a time series | excellent backtest, broken live model | `ffill` only; audit every `bfill` and `center=True` |
+    | Random split on time-ordered data | model trained on the future | chronological split; `TimeSeriesSplit` |
+    | Unseen category at inference | `ValueError` in production, never in training | `handle_unknown="infrequent_if_exist"`; test with an unseen level |
+    | Imputation shrinking variance | model underestimates uncertainty; intervals too narrow | multiple imputation, or accept it and say so |
+    | Outliers removed before modelling | fraud/anomaly model cannot find anomalies | keep extremes; cap only with a documented reason |
+    | Fuzzy-match chaining | a "customer" cluster with 4,000 members | inspect the cluster-size distribution; split oversized clusters |
+    | Missingness sentinel unrecognised | `isna()` reports zero on a column that is half missing | `value_counts()`; check for `-999`, `"N/A"`, `""` |
+
+    ## Frontier and research pointers
+
+    - **Rubin (1976), "Inference and Missing Data."** *Biometrika* 63(3). — **Takeaway:** the
+      MCAR/MAR/MNAR taxonomy, and the proof that the mechanism determines whether ignoring
+      missingness biases your inference; every later paper on imputation cites this one.
+    - **van Buuren & Groothuis-Oudshoorn (2011), "mice: Multivariate Imputation by Chained Equations
+      in R."** *J. Stat. Software* 45(3). — **Takeaway:** imputing several times and pooling the
+      results propagates imputation uncertainty into your confidence intervals; single imputation
+      systematically understates uncertainty, which nobody accounts for.
+    - **Kaufman, Rosset & Perlich (2011), "Leakage in Data Mining: Formulation, Detection, and
+      Avoidance."** KDD. — **Takeaway:** the formal treatment, with real competition examples where
+      leakage produced impossible scores; their taxonomy separates leakage *in features* from
+      leakage *in the training-set construction*, which is exactly this module's distinction.
+    - **Ambroise & McLachlan (2002), "Selection bias in gene extraction on the basis of microarray
+      gene-expression data."** *PNAS* 99(10). — **Takeaway:** selecting features on the whole
+      dataset then cross-validating produced near-zero error rates on data with **no signal at
+      all** — the exact experiment reproduced in this layer, in the paper that first made the field
+      take it seriously.
+    - **Kapoor & Narayanan (2023), "Leakage and the Reproducibility Crisis in ML-based Science."**
+      *Patterns* 4(9). — **Takeaway:** a survey finding leakage in 294 papers across 17 fields, with
+      a taxonomy of eight types; read this for how routine the problem is in published work, not
+      just in student projects.
+    - **Micci-Barreca (2001), "A Preprocessing Scheme for High-Cardinality Categorical Attributes."**
+      *SIGKDD Explorations* 3(1). — **Takeaway:** the original target-encoding paper, which
+      *includes* the smoothing and cross-fold construction needed to make it safe — the parts most
+      implementations omit, producing the +0.275 measured above.
+
+    ## Stretch challenge
+
+    **Build a leakage detector and validate it against known-leaky datasets.**
+
+    You now have measured effect sizes for four leak types. Build the tool that finds them.
+
+    Build a detector that takes `(X, y, groups, timestamps)` and reports ranked suspicions:
+
+    1. **Perfect and near-perfect predictors.** Any single feature achieving AUC above ~0.95 alone.
+       Cheap, and it catches the most common leak.
+    2. **Duplicate-row detection**, exact and near-duplicate, with a report of how many would span a
+       random split. **Quantify the expected inflation** using the measured curve in this layer.
+    3. **Temporal ordering violations.** Given timestamps, check whether any feature's value at time
+       t depends on data after t. Detectable by correlating each feature with future values of the
+       target.
+    4. **The shuffle test**, automated: permute `y`, run CV, and flag anything above 0.55.
+    5. **Group-structure detection.** Identify candidate grouping columns (high-cardinality
+       identifiers) and report how much the CV score changes under `GroupKFold` versus `KFold`.
+       **That delta is a direct measurement of group leakage.**
+    6. **Pipeline auditing.** Statically inspect a scikit-learn estimator and warn about any
+       transform fitted outside the pipeline.
+
+    Then validate it. Assemble a corpus:
+
+    - **Synthetic datasets with known injected leaks** at known effect sizes — you can generate these
+      with the code from this layer.
+    - **Real datasets with documented leaks.** Several Kaggle competitions were won by finding
+      leakage and the writeups are public; the KDD Cup 2008 breast-cancer dataset's patient-ID leak
+      is the canonical example.
+    - **Clean datasets** as negative controls, to measure the false-positive rate.
+
+    The open questions:
+
+    - **What is the false-positive rate on clean data?** A detector that flags every dataset is
+      ignored within a week. Report precision and recall, and be honest about which checks are noisy.
+    - **Which check is most valuable per unit of runtime?** The shuffle test is definitive and costs
+      a full CV run. Single-feature AUC is cheap and catches the common case. **Build the cost/value
+      ordering**, because that determines what people actually run.
+    - **Can you detect target encoding statically?** A target-encoded column has a distinctive
+      signature: few distinct values, each close to a conditional mean of `y`, and a suspiciously
+      high correlation with `y` relative to its cardinality. Can you find it without being told?
+    - **What is the smallest leak worth reporting?** This layer measured imputation leakage at ±0.02
+      AUC — noise. Duplicate rows at 10% gave +0.063. **Where do you set the threshold**, and how do
+      you communicate a suspicion you are not confident about without training people to ignore you?
+
+    A leakage detector with measured precision and recall against a labelled corpus is a genuinely
+    valuable piece of tooling, it is publishable, and — given the Kapoor and Narayanan survey — it
+    addresses a problem that a great deal of published science currently has.
+
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Reproduce the four leakage measurements yourself: mean imputation before the split, target encoding
+a pure-noise categorical, feature selection before cross-validation across four feature counts, and
+duplicate rows spanning the split at four duplication rates. **Report which leak, and by how much.**
+Then explain your results with the rule.
+</Card>
+
+<Steps>
+  <Step title="Generate data where you know the truth">
+    Pure noise features with random labels, so the correct answer is exactly 0.50. Any score above
+    that is leakage, with no ambiguity about whether the model "found something".
+  </Step>
+  <Step title="Repeat every configuration">
+    At least 20 seeds. The imputation effect is within noise, and you cannot tell that from one run —
+    a single run will show a difference and you will believe it.
+  </Step>
+  <Step title="Report the negative result too">
+    Imputation leakage measures at approximately zero. **Write that down.** A benchmark that only
+    reports the effects it hoped to find is not a benchmark.
+  </Step>
+  <Step title="Then run the shuffle test on something real">
+    Take any model you have built, permute the labels, and cross-validate. If it scores above 0.55,
+    you have found structural leakage in ten minutes.
+  </Step>
+</Steps>
+
+## The whiteboard
+
+This module has a **T3 hero animation**: the leak-size thermometer filling as each transform type is
+added, with the measured value written in. The static fallback is the five-frame build-up above.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p2-w16-m3-blank.svg) · [Editable source](/assets/diagrams/p2-w16-m3.excalidraw)
+</Tip>
+
+The thing to get right on redraw: the **rule**, in frame 3. If you reproduce the thermometer without
+the rule that explains it, you have memorised four numbers instead of learning the thing that
+generates them.
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    **Portfolio line:** "Measured four sources of data leakage across 30 repetitions each and found
+    that imputation before the train/test split produces no measurable inflation (within ±0.02 AUC),
+    while target encoding adds +0.275 AUC to a pure-noise feature and feature selection before CV
+    adds up to +0.356 — then derived and validated a rule predicting leak size from target dependence
+    and search breadth."
+
+    **This is an unusually strong portfolio piece** precisely because it contains a negative result
+    that contradicts common teaching. Anyone can repeat "don't impute before splitting". Having
+    measured that it does not matter, and knowing what *does*, is a different level of understanding.
+
+    **The interview move.** "How do you prevent data leakage?" is asked constantly. The standard
+    answer is "use a Pipeline so transforms are fit on train only". Give it, then go further:
+
+    > *"Though when I measured it, imputation before splitting produced no inflation at all —
+    > ±0.02 AUC across three imputers and four sample sizes. The leaks that actually cost you are
+    > target encoding, feature selection outside the CV loop, and duplicate rows spanning the split.
+    > I'd still use a Pipeline, but the first thing I'd check is a temporal audit — which features
+    > were populated after the outcome — because no pipeline catches that."*
+
+    That answer demonstrates you have measured something rather than repeated it, which is rare.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    **1. Run the shuffle test on your team's best model this week.** Permute the target,
+    cross-validate, and check it scores near chance. It takes ten minutes and it is the single
+    highest-value diagnostic here — it catches structural leakage that no feature-by-feature review
+    will find. If a model scores 0.7 on shuffled labels, everything downstream of it is wrong.
+
+    **2. Do a temporal audit of one model's features.** For each, write down when its value becomes
+    known. Drop anything not known strictly before the prediction point. **This is what caught the
+    war story's bug and no tooling substitutes for it** — it is two days of tedious work that
+    prevents a model going live at 0.94 and performing at 0.71.
+
+    **3. Check whether any entity appears more than once in your training data.** `df.entity_id.nunique()`
+    against `len(df)`. If they differ, a random split puts the same entity on both sides and your
+    validation score is inflated — measured here at +0.148 AUC at 30% duplication. The fix is
+    `GroupKFold`, and it is a one-line change with a potentially large effect on what you believe
+    about your model.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Offline AUC far above published benchmarks | Almost certainly leakage; treat a great result as a bug report | Feature importance, then a temporal audit, then the shuffle test |
+| `isna().sum()` reports zero on a clearly incomplete column | Missingness encoded as a value: `"N/A"`, `-999`, `""` | `value_counts()`; convert sentinels to `NaN` explicitly |
+| Model performs far worse live than offline | A feature populated after the outcome | Timestamp every feature; drop anything not known at prediction time |
+| CV score drops sharply under `GroupKFold` | Duplicate or related rows spanning folds — measured +0.148 at 30% | `GroupKFold` on the entity id; the drop is the true score |
+| Target-encoded categorical is the top feature | Encoding fitted outside the CV fold — measured +0.275 on noise | Encode inside the pipeline with out-of-fold means and smoothing |
+| CV score good, holdout terrible | Feature selection outside CV — measured up to +0.356 | Selection inside the `Pipeline` |
+| Excellent backtest, broken live time-series model | `bfill` or `rolling(center=True)` — using the future | `ffill` and `.shift(1)`; audit every rolling window |
+| `ValueError: Found unknown categories` in production | A category present at inference, absent in training | `handle_unknown="infrequent_if_exist"`; test with an unseen level |
+| z-score finds no outliers in obviously dirty data | Masking — the outlier inflates the std it is judged against | IQR rule, or modified z-score with median and MAD |
+| Fraud model cannot detect fraud | Outliers stripped in cleaning — you removed the signal | Keep extremes; cap only with a documented reason |
+| Fuzzy dedup produces a 4,000-member "customer" | Similarity is not transitive; union-find chains clusters | Inspect cluster sizes; re-cluster oversized ones at a higher threshold |
+| Confidence intervals too narrow | Single imputation understates uncertainty | Multiple imputation, or state the limitation |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [scikit-learn: imputation of missing values](https://scikit-learn.org/1.6/modules/impute.html) (1.6.0) — read this for `add_indicator`, and for the explicit note that `IterativeImputer` is experimental and requires `enable_iterative_imputer`.
+- [scikit-learn: common pitfalls — data leakage](https://scikit-learn.org/1.6/common_pitfalls.html#data-leakage) — read this for the canonical `Pipeline` argument; then read Layer 3, which measures which of the pitfalls actually cost you.
+- [scikit-learn: cross-validation with grouped data](https://scikit-learn.org/1.6/modules/cross_validation.html#group-cv) — read this for `GroupKFold` and `GroupShuffleSplit`; group leakage is the one measured at +0.148 here and the one people most often miss.
+- [`pandera` 0.21.0](https://pandera.readthedocs.io/) — read the `DataFrameModel` API and `strict=True`; declarative validation at the analysis boundary is the analysis-side equivalent of week 15's schema contracts.
+- [`rapidfuzz` 3.10.1 — `process.cdist`](https://rapidfuzz.github.io/RapidFuzz/Usage/process.html) — read this for batch fuzzy matching with `score_cutoff` and `workers`; and note the scorer comparison, since choosing the scorer is most of the work.
+
+**Papers**
+
+- [Rubin (1976), *Inference and Missing Data*, Biometrika 63(3), 581–592.](https://doi.org/10.1093/biomet/63.3.581) — **Takeaway:** MCAR/MAR/MNAR, and the proof that the mechanism determines whether ignoring missingness biases your inference.
+- [van Buuren & Groothuis-Oudshoorn (2011), *mice: Multivariate Imputation by Chained Equations*, J. Stat. Software 45(3).](https://doi.org/10.18637/jss.v045.i03) — **Takeaway:** multiple imputation propagates imputation uncertainty into your intervals; single imputation systematically understates it.
+- [Kaufman, Rosset & Perlich (2011), *Leakage in Data Mining: Formulation, Detection, and Avoidance*, KDD.](https://doi.org/10.1145/2020408.2020496) — **Takeaway:** the formal taxonomy separating leaking *features* from leaking *training-set construction*, which is exactly the distinction Layer 3 measures.
+- [Ambroise & McLachlan (2002), *Selection bias in gene extraction on the basis of microarray gene-expression data*, PNAS 99(10), 6562–6566.](https://doi.org/10.1073/pnas.102102699) — **Takeaway:** feature selection before cross-validation produced near-zero error on data with no signal; the experiment reproduced in Layer 3, in the paper that made the field take it seriously.
+- [Kapoor & Narayanan (2023), *Leakage and the Reproducibility Crisis in ML-based Science*, Patterns 4(9).](https://doi.org/10.1016/j.patter.2023.100804) — **Takeaway:** leakage found in 294 papers across 17 fields, with an eight-type taxonomy; this is a scientific-integrity problem, not a beginner's mistake.
+- [Micci-Barreca (2001), *A Preprocessing Scheme for High-Cardinality Categorical Attributes*, SIGKDD Explorations 3(1).](https://doi.org/10.1145/507533.507538) — **Takeaway:** the original target-encoding paper *includes* the smoothing and out-of-fold construction that make it safe; omitting them produces the +0.275 measured here.
+
+**Go deeper**
+
+- [Max Kuhn & Kjell Johnson, *Feature Engineering and Selection* (2019), **Chapters 8–9**](https://feat.engineering/) — free online, and the clearest treatment of missing data and encoding with the resampling discipline built in from the start.
+- [Sebastian Raschka, *Model Evaluation, Model Selection, and Algorithm Selection in Machine Learning* (2018, arXiv:1811.12808)](https://arxiv.org/abs/1811.12808) — read part 3 for nested cross-validation, which is the correct structure when you are selecting *and* evaluating; it is the generalisation of the feature-selection result in Layer 3.
+- Andrew Gelman & Jennifer Hill, *Data Analysis Using Regression and Multilevel Models*, **Chapter 25 (Missing-data imputation)** — the statistician's view, which takes MNAR far more seriously than the ML literature does and is worth reading for that reason alone.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p2/week-16/p2-w16-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

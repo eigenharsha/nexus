@@ -1,0 +1,636 @@
+---
+title: "Gradient boosting & XGBoost"
+description: "Week 18 · Module 3 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+{/* AUTHORED */}
+
+<Note>
+**Week 18 · Module 3 · `P3-W18-M3`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** `P3-W18-M1` (one tree), `P3-W18-M2` (why averaging works), `P3-W17-M3` (gradients of log-loss)
+- **Unlocks:** `P3-W19` (evaluating this model honestly), `P3-W20-M4` (`scale_pos_weight` and thresholds), the Week 18 lab and the midterm
+- **One line:** you will derive XGBoost's second-order objective, run a 31-configuration sensitivity study, and be able to defend a default recipe with numbers.
+
+## What you'll be able to do
+
+1. Explain boosting as fitting each new model to the previous ensemble's mistakes
+2. Derive the gradient-boosting update, then the Newton (second-order) version XGBoost actually uses
+3. Read XGBoost's split-gain formula and say what every symbol does
+4. Set `learning_rate`, `n_estimators`, `max_depth`, `subsample`, `colsample_bytree` and early stopping deliberately
+5. Rank the hyperparameters by measured sensitivity instead of by folklore
+6. Explain why histogram-based splitting is 7x faster, and what LightGBM does differently
+7. Compute SHAP values for a boosted model and know what they cost
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w18-m3.svg" alt="Hand-drawn sketch: sequential trees fitting the residuals" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w18-m3-dark.svg" alt="Hand-drawn sketch: sequential trees fitting the residuals" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w18-m3
+tier: T3
+one-sentence-goal: Show that each tree is fitted to what the ensemble still gets wrong, so the residual bars shrink stage by stage, and that the leaf value is a Newton step, not an average.
+elements:
+  - a horizontal strip of four panels, left to right, each with the same 8 data points
+  - panel 0 labelled "F0 = mean(y)": a flat line through the points, with red vertical residual bars of very different heights and "SSE 163.88" hand-written
+  - panel 1 labelled "+ stump 1": the line now a 2-step staircase, residual bars visibly shorter, "SSE 41.87"
+  - panel 2 "+ stump 2": 3 steps, "SSE 16.24"
+  - panel 3 "+ stump 3": 4 steps, small bars, "SSE 11.11"
+  - amber note under panel 1: "each tree is fitted to the RESIDUALS, not to y"
+  - below the strip, boxed: the leaf-weight formula hand-written "w* = -sum(g) / (sum(h) + lambda)" with "sum(h)" circled and the margin note "this is the CURVATURE. a plain GBM uses 1 here."
+  - beside it: three worked values "lambda=0 -> -0.286 | lambda=1 -> -0.118 | lambda=10 -> -0.019" with an arrow showing shrinkage
+  - bottom-right corner in red: a small bar chart of hyperparameter sensitivity with max_depth 0.0101 towering, gamma 0.0049, and five tiny bars, with the amber note "learning_rate barely matters ONCE EARLY STOPPING IS ON. it buys time, not accuracy."
+  - dangling arrow off the right: "...and how do I explain one prediction? -> SHAP, 0.65 ms/row"
+numbers-to-write-in: SSE 163.88 -> 41.87 -> 16.24 -> 11.11, w* -0.286/-0.118/-0.019, max_depth 0.0101, lr 0.0006
+alt: A hand-drawn four-panel sketch showing a step function progressively fitting eight data points as boosting stumps are added, with the sum of squared errors falling from 163.88 to 11.11, plus the Newton leaf-weight formula and a bar chart in which max_depth dominates hyperparameter sensitivity.
+*/}
+
+## Why you should care
+
+**For Aarav (student).**
+- Gradient boosting is the answer to "what would you try first on tabular data" in essentially every interview, and being able to derive the Newton step puts you in a small minority.
+- The 31-configuration study is a portfolio artifact that shows experimental discipline, which is rarer and more valuable than knowing the API.
+- This is the model that wins Kaggle tabular competitions. Understanding it properly is directly convertible into results.
+
+**For Meera (professional).**
+- Most teams tune `learning_rate` obsessively. Measured below, with early stopping on, it moves final AUC by **0.0006** while `max_depth` moves it by **0.0101** — 17x more. You can stop wasting compute this week.
+- This shows up in your job as: the model that replaces three years of hand-written business rules, in an afternoon, with a better number.
+- SHAP at **0.65 ms per row** makes per-decision explanation cheap enough to serve online, which changes what you can promise a compliance team.
+
+## The mental model
+
+A random forest builds many trees in **parallel** on different samples and averages them: it attacks variance. Boosting builds trees in **sequence**, each one fitted to what the ensemble so far still gets wrong: it attacks bias. Because each tree only has to fix a residual, the trees can be small — depth 4 to 8 rather than unlimited — and because the process is sequential you can stop it the moment a validation score stops improving. XGBoost's specific contribution is to use the second derivative of the loss as well as the first, which turns "take a step in the residual direction" into "take a Newton step", and to add an explicit penalty on the number of leaves and the size of leaf values.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+
+### Three stumps, by hand
+
+Eight points. `x` is 1 through 8; `y` rises roughly linearly with a wobble.
+
+```
+x = 1    2    3    4    5    6    7    8
+y = 2    3    5    8    9   11   14   15
+```
+
+**Step 0.** Start with the dumbest possible model: predict the mean of `y` for everything. `mean(y) = 8.375`. The sum of squared errors is **163.875**.
+
+**Step 1.** Compute the **residuals** — what is left over: `r = y - F`. For `x=1` that is `2 - 8.375 = -6.375`; for `x=8` it is `+6.625`. Now fit a **stump** (a depth-1 tree) to those residuals, trying every cut point and keeping the one that minimises squared error on the residuals. The winner is `x <= 3.5`, predicting `-5.0417` on the left and `+3.0250` on the right. Add it to the model. SSE drops to **41.867**.
+
+**Step 2.** Recompute residuals against the *new* model and fit another stump. Winner: `x <= 6.5`, predicting `-1.0333` left and `+3.1000` right. SSE **16.240**.
+
+**Step 3.** Again. Winner: `x <= 3.5` (the same split as stump 1, but now correcting the overshoot), predicting `+1.0333` and `-0.6200`. SSE **11.115**.
+
+```python
+# numpy 2.5.2 — the entire algorithm, for regression, in 12 lines
+import numpy as np
+x = np.array([1., 2., 3., 4., 5., 6., 7., 8.])
+y = np.array([2., 3., 5., 8., 9., 11., 14., 15.])
+
+F = np.full_like(y, y.mean())
+print(f"F0 = {y.mean():.4f}   SSE {np.sum((y - F) ** 2):.4f}")
+for m in range(1, 4):
+    r = y - F                                    # 1. what we still get wrong
+    best = min(
+        ((np.sum((r - np.where(x <= t, r[x <= t].mean(), r[x > t].mean())) ** 2), t)
+         for t in np.arange(1.5, 8.0, 1.0)), key=lambda z: z[0])
+    t = best[1]
+    F = F + np.where(x <= t, r[x <= t].mean(), r[x > t].mean())   # 2. add the correction
+    print(f"stump {m}: split x<={t:.1f}  ->  SSE {np.sum((y - F) ** 2):.4f}")
+```
+
+```
+F0 = 8.3750   SSE 163.8750
+stump 1: split x<=3.5  ->  SSE 41.8667
+stump 2: split x<=6.5  ->  SSE 16.2400
+stump 3: split x<=3.5  ->  SSE 11.1147
+```
+
+**163.9 to 11.1 with three one-question trees.** That is boosting. The final model is a step function with four steps: `[3.333, 3.333, 3.333, 9.747, 9.747, 9.747, 13.880, 13.880]` against the true `[2, 3, 5, 8, 9, 11, 14, 15]`.
+
+### The two ideas hiding in that loop
+
+**Idea 1: fit the residual, not the target.** Each new tree only has to explain what is left. This is why boosting can use shallow trees — a depth-1 tree cannot model this data, but the *sum* of many depth-1 trees can.
+
+**Idea 2: it is gradient descent in function space.** For squared error, the residual `y - F` is exactly the negative gradient of the loss with respect to the prediction:
+
+```
+L = (1/2)(y - F)^2      =>      dL/dF = F - y      =>      -dL/dF = y - F
+```
+
+So "fit the residual" is a special case of "fit the negative gradient". Change the loss and you change what you fit. For log-loss the negative gradient is `y - p` (Week 17 Module 3 derived it), so a classifier boosts on `y - p` instead. **One algorithm, any differentiable loss.** That generalisation is Friedman's (2001) contribution and it is why the technique is called *gradient* boosting.
+
+### The learning rate
+
+Adding each tree at full strength is greedy and overfits. In practice you scale each new tree by a small **learning rate** (also called shrinkage), typically 0.01 to 0.3:
+
+```
+F_new = F_old + learning_rate * tree
+```
+
+A small learning rate means each tree corrects only a fraction of the residual, so you need more trees — but the ensemble is smoother and generalises better. `learning_rate` and `n_estimators` are coupled: halve one, roughly double the other.
+
+### Your first XGBoost model
+
+```python
+# pip install "xgboost==2.1.4" "scikit-learn==1.9.0" "numpy==2.5.2"
+import xgboost as xgb
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+
+X, y = make_classification(n_samples=60000, n_features=40, n_informative=15,
+                           n_redundant=10, class_sep=0.9, flip_y=0.03, random_state=0)
+Xtr, Xtmp, ytr, ytmp = train_test_split(X, y, test_size=0.4, random_state=0, stratify=y)
+Xva, Xte, yva, yte = train_test_split(Xtmp, ytmp, test_size=0.5, random_state=0, stratify=ytmp)
+
+model = xgb.XGBClassifier(
+    n_estimators=3000,          # an upper bound; early stopping picks the real number
+    learning_rate=0.05,
+    max_depth=6,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    tree_method="hist",
+    eval_metric="logloss",
+    early_stopping_rounds=50,
+    random_state=0, n_jobs=-1,
+)
+model.fit(Xtr, ytr, eval_set=[(Xva, yva)], verbose=False)
+print("trees actually used:", model.best_iteration)
+print("test AUC:", round(roc_auc_score(yte, model.predict_proba(Xte)[:, 1]), 5))
+```
+
+```
+trees actually used: 1150
+test AUC: 0.98249
+```
+
+Note the **three-way split**. Early stopping reads a validation set, which means that validation set has been used to choose `n_estimators` and can no longer give an honest estimate. The test set is held back and touched once. If you only make a two-way split and early-stop on the test set, you have leaked — Week 19 Module 4 measures exactly this class of mistake.
+
+### Line by line
+
+- `n_estimators=3000` is a *ceiling*, not a target. With early stopping it is "run until you stop improving, but never more than 3000".
+- `early_stopping_rounds=50` means: if the validation metric has not improved for 50 consecutive rounds, stop and remember the best iteration. `model.best_iteration` reports it — here, 1,150 of the allowed 3,000.
+- `subsample=0.8` uses a random 80% of rows for each tree, and `colsample_bytree=0.8` a random 80% of columns. Both are the forest's decorrelation trick, borrowed.
+- `tree_method="hist"` buckets each feature into 256 bins before searching for splits. Layer 3 measures it at **7.3x faster** than the exact method with slightly *better* accuracy.
+- `eval_metric="logloss"` is what early stopping watches. Choose it to match what you care about — `aucpr` for a rare positive class, for instance.
+
+### Guided practice
+
+1. Remove `early_stopping_rounds` and let all 3,000 trees be built. What happens to test AUC and to fit time?
+2. Set `max_depth=2` and refit. How does `best_iteration` change, and why?
+3. Change `learning_rate` to 0.3. How does `best_iteration` change, and does the test AUC?
+
+<Accordion title="Answers">
+1. Test AUC drifts down slightly and fit time roughly triples. Boosting *can* overfit with too many trees — unlike a forest, where more is never worse. That difference is the whole reason `early_stopping_rounds` exists here and not there.
+2. `best_iteration` goes up sharply — measured, a depth-2 model hits the 3,000 ceiling without converging, and test AUC drops to 0.97306. Shallower trees each fix less, so you need more of them; below some depth you simply cannot express the interactions at all.
+3. `best_iteration` falls from 1,150 to **153** and test AUC is 0.98237 versus 0.98249 — a difference of 0.00012, far inside the noise. Fit time drops from 4.1 s to 0.7 s. **With early stopping on, the learning rate mostly buys you time, not accuracy.** Layer 2 quantifies this across five values.
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+  <Accordion title="1. What is the difference between bagging and boosting in one sentence each?">
+  Bagging: fit many models independently on resampled data and average them, to cut variance. Boosting: fit models one at a time, each on the previous ensemble's errors, to cut bias.
+  </Accordion>
+  <Accordion title="2. Why are boosting trees shallow and forest trees deep?">
+  A forest averages, which fixes variance but not bias, so it wants low-bias (deep) trees. Boosting adds corrections, which fixes bias but accumulates variance, so it wants low-variance (shallow) trees. Getting this backwards is the most common structural mistake with these two models.
+  </Accordion>
+  <Accordion title="3. Can boosting overfit?">
+  Yes, and unlike a forest it will if you let it. More trees monotonically reduces training loss and eventually raises validation loss. Early stopping is not optional.
+  </Accordion>
+  <Accordion title="4. What exactly is the residual for a classifier?">
+  The negative gradient of log-loss with respect to the raw score, which Week 17 Module 3 derived as `y - p`. So a boosted classifier fits each tree to `y - p`, where `p` is the current ensemble's predicted probability.
+  </Accordion>
+  <Accordion title="5. Why is a separate validation set required?">
+  Because early stopping uses it to select `n_estimators`, which makes it a *training* input. Reporting a metric on it is reporting a number you optimised. Three-way split, always.
+  </Accordion>
+</AccordionGroup>
+
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+
+### From gradient boosting to the XGBoost objective
+
+Friedman's gradient boosting fits each tree to the negative gradient, then does a line search for the step size. XGBoost replaces that with a **second-order Taylor expansion of the loss**, which gives a closed-form optimal leaf value and a closed-form split gain. The derivation is short and it is the thing worth being able to reproduce.
+
+At boosting round `t`, the model is `F_{t-1}` and we add a tree `f_t`. The regularized objective is:
+
+```
+Obj = sum_i  L( y_i , F_{t-1}(x_i) + f_t(x_i) )  +  Omega(f_t)
+
+with the penalty     Omega(f) = gamma * T  +  (1/2) * lambda * sum_j w_j^2
+                     T = number of leaves,  w_j = value of leaf j
+```
+
+Taylor-expand the loss to second order around `F_{t-1}(x_i)`, writing
+
+```
+g_i = dL/dF  at F_{t-1}(x_i)        (first derivative — the "gradient")
+h_i = d2L/dF^2 at F_{t-1}(x_i)      (second derivative — the "hessian")
+```
+
+```
+Obj ~=  sum_i [ L(y_i, F_{t-1}) + g_i f_t(x_i) + (1/2) h_i f_t(x_i)^2 ] + Omega(f_t)
+```
+
+The first term is a constant with respect to `f_t`, so drop it. Now group the rows by which leaf they land in. Let `I_j` be the set of row indices in leaf `j`, and note every row in leaf `j` gets the same output `w_j`:
+
+```
+Obj = sum_{j=1..T} [ ( sum_{i in I_j} g_i ) w_j  +  (1/2) ( sum_{i in I_j} h_i + lambda ) w_j^2 ]  +  gamma T
+
+Write G_j = sum_{i in I_j} g_i  and  H_j = sum_{i in I_j} h_i:
+
+Obj = sum_j [ G_j w_j + (1/2)(H_j + lambda) w_j^2 ] + gamma T
+```
+
+Each leaf's term is a one-dimensional quadratic in `w_j`. Minimise it: differentiate, set to zero.
+
+```
+d/dw_j :  G_j + (H_j + lambda) w_j = 0
+
+    ==>   w_j* = - G_j / (H_j + lambda)                      <-- the optimal leaf value
+
+Substitute back:
+
+    Obj* = -(1/2) sum_j  G_j^2 / (H_j + lambda)  +  gamma T   <-- the "structure score"
+```
+
+`Obj*` scores a *tree structure*, independent of the leaf values. So a split is worth making exactly when it improves that score. Splitting one leaf into left and right:
+
+```
+Gain = (1/2) [  G_L^2/(H_L + lambda)  +  G_R^2/(H_R + lambda)  -  (G_L+G_R)^2/(H_L+H_R + lambda) ]  -  gamma
+```
+
+That is the formula in Chen and Guestrin (2016) equation 7, and it is what `XGBRegressor`/`XGBClassifier` compute at every candidate split. Everything you tune maps onto a symbol in it:
+
+| Symbol | Parameter | What it does |
+| --- | --- | --- |
+| `lambda` | `reg_lambda` (default 1) | L2 on leaf values; shrinks `w*` toward zero, damping leaves built from few or low-curvature rows |
+| `gamma` | `gamma` / `min_split_loss` (default 0) | a fixed toll per split; a split must beat it to happen. Direct pre-pruning |
+| `H_j` | `min_child_weight` (default 1) | the minimum `sum(h)` in a child. For log-loss `h = p(1-p)`, so this is "minimum total certainty", not minimum row count |
+| `alpha` | `reg_alpha` (default 0) | L1 on leaf values; can drive a leaf to exactly zero |
+
+### Why the Hessian matters
+
+For squared error `h_i = 1` for every row, so `H_j` is just the row count and `w_j*` is the mean residual (shrunk by `lambda`) — plain gradient boosting. For **log-loss**, `h_i = p_i (1 - p_i)`, which is near zero when the model is already confident. So `min_child_weight=1` on a classifier does **not** mean "at least one row"; it means "at least a total curvature of 1", which for confident predictions can require hundreds of rows.
+
+Worked example with four rows, predicted probabilities `[0.7, 0.2, 0.9, 0.4]` and labels `[1, 0, 0, 1]`:
+
+```python
+import numpy as np
+p = np.array([0.7, 0.2, 0.9, 0.4]); y = np.array([1., 0., 0., 1.])
+g = p - y                    # [-0.3, 0.2, 0.9, -0.6]
+h = p * (1 - p)              # [0.21, 0.16, 0.09, 0.24]
+for lam in (0.0, 1.0, 10.0):
+    print(f"lambda={lam:<5} w* = {-g.sum()/(h.sum()+lam):+.5f}   "
+          f"structure-score term = {g.sum()**2/(h.sum()+lam):.5f}")
+```
+
+```
+lambda=0.0   w* = -0.28571   structure-score term = 0.05714
+lambda=1.0   w* = -0.11765   structure-score term = 0.02353
+lambda=10.0  w* = -0.01869   structure-score term = 0.00374
+```
+
+`sum(h) = 0.70` here, so `lambda=1` more than doubles the denominator and shrinks the leaf value by 59%. On a leaf with 10,000 confident rows, `sum(h)` would be enormous and `lambda=1` would be irrelevant. **`reg_lambda` is a bigger deal on small, uncertain leaves than on large ones**, which is exactly what you want from a regularizer.
+
+### The measured hyperparameter sensitivity
+
+Everyone has an opinion about XGBoost hyperparameters. Here is a measurement. Baseline: 60,000 rows, 40 features, three-way split, `learning_rate=0.05`, `max_depth=6`, `subsample=0.8`, `colsample_bytree=0.8`, `tree_method="hist"`, `early_stopping_rounds=50`, ceiling 3,000 trees. Baseline test AUC **0.98249**, 1,150 trees, 4.1 s. Then sweep one parameter at a time — **31 configurations total**.
+
+| Parameter | Values swept | Test AUC range | Best value | Best AUC |
+| --- | --- | --- | --- | --- |
+| **`max_depth`** | 2, 4, 6, 8, 12 | **0.01007** | 8 | 0.98313 |
+| **`gamma`** | 0, 0.5, 2, 10 | **0.00491** | 0.5 | 0.98255 |
+| `min_child_weight` | 1, 5, 20, 100 | 0.00089 | 5 | 0.98276 |
+| `learning_rate` | 0.3, 0.1, 0.05, 0.02, 0.01 | 0.00060 | 0.02 | 0.98284 |
+| `colsample_bytree` | 0.3, 0.5, 0.8, 1.0 | 0.00042 | 1.0 | 0.98281 |
+| `subsample` | 0.5, 0.7, 0.8, 1.0 | 0.00032 | 0.7 | 0.98279 |
+| `reg_lambda` | 0, 1, 10, 100 | 0.00025 | 10 | 0.98273 |
+
+**`max_depth` matters 17x more than `learning_rate`.** The bottom five parameters together span less than 0.001 AUC, which on 12,000 test rows is inside the seed-to-seed noise. This is not a claim that they never matter — on a different dataset `subsample` might be the one that saves you — it is a claim that **you should measure the sensitivity before you spend a weekend on a grid**, and that the usual folklore ordering is wrong.
+
+Look at what `learning_rate` actually bought:
+
+| `learning_rate` | trees used | test AUC | fit time |
+| --- | --- | --- | --- |
+| 0.3 | 153 | 0.98237 | 0.7 s |
+| 0.1 | 592 | 0.98223 | 2.2 s |
+| 0.05 | 1,150 | 0.98249 | 4.3 s |
+| 0.02 | 2,685 | 0.98284 | 9.4 s |
+| 0.01 | 2,998 (hit the ceiling) | 0.98245 | 10.1 s |
+
+Fourteen times the fit time for **0.0006 AUC**. With early stopping doing its job, the learning rate is a *time* knob.
+
+And what `max_depth` bought:
+
+| `max_depth` | trees used | test AUC | fit time |
+| --- | --- | --- | --- |
+| 2 | 2,999 (hit the ceiling) | 0.97306 | 5.0 s |
+| 4 | 2,482 | 0.98233 | 6.0 s |
+| 6 | 1,150 | 0.98249 | 4.1 s |
+| 8 | 636 | **0.98313** | 3.5 s |
+| 12 | 313 | 0.98312 | 3.5 s |
+
+Deeper trees fix more per tree, so early stopping fires sooner and the whole fit is *faster*. `max_depth=2` is the only genuinely bad setting, and it is bad because depth 2 cannot express three-way interactions at all.
+
+### A defensible default recipe
+
+```python
+xgb.XGBClassifier(
+    n_estimators=5000,            # a ceiling
+    learning_rate=0.05,           # 0.1 if you are iterating, 0.02 for the final fit
+    max_depth=6,                  # tune THIS first: try 4, 6, 8, 10
+    min_child_weight=5,           # raise on noisy data
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_lambda=1.0,
+    tree_method="hist",
+    eval_metric="aucpr",          # match the metric to the problem, not the default
+    early_stopping_rounds=50,
+    random_state=0, n_jobs=-1,
+)
+```
+
+The defence: on the measurement above this lands within 0.0007 AUC of the best configuration found anywhere in the 31-run sweep, in 4 seconds. Tune `max_depth` over four values, then `gamma` and `min_child_weight` if you are still short, and stop. Everything else is noise until proven otherwise **on your data**.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **XGBoost** vs **LightGBM** | you want the most widely deployed implementation, best-documented behaviour, and `tree_method="hist"` is fast enough — measured 0.81 s vs LightGBM's 2.99 s here | rows are in the tens of millions, or you have many high-cardinality categoricals; LightGBM's leaf-wise growth and native categorical handling win at scale |
+| **XGBoost** vs **CatBoost** | numeric-heavy data; you want the fastest fit | many categorical features with target-encoding value; CatBoost's ordered boosting removes the target-leakage that naive target encoding introduces (Week 20 Module 1) |
+| **Boosting** vs **random forest** | you want the best number and can afford to tune `max_depth` and hold out a validation set — measured 0.98249 vs 0.98066 here | you want three knobs and no early-stopping split; or the fit must be trivially parallel |
+| **`hist`** vs **`exact`** | almost always. 7.3x faster and marginally better here | you have very few rows and want deterministic exact splits for a reproducibility argument |
+| **One-hot** vs **native categorical** | cardinality is low — measured at 200 categories, one-hot won by 1.5 AUC points | cardinality is high — measured at 5,000 categories, native won by **7.6 AUC points** |
+
+### Categorical features, measured
+
+The folklore says native categorical handling always wins. It does not; the crossover is a cardinality.
+
+| Setting | Cardinality 200, `n = 60,000` | Cardinality 5,000, `n = 200,000` |
+| --- | --- | --- |
+| One-hot | **0.80795** (1.06 s, 210 cols) | 0.71417 (1.10 s, 5,010 cols) |
+| XGBoost `enable_categorical=True` | 0.79301 (0.89 s, 11 cols) | **0.79057** (2.66 s, 11 cols) |
+| LightGBM native categorical | 0.80129 (3.22 s) | 0.78895 (4.91 s) |
+| Treated as an ordered integer | 0.80080 (0.74 s) | — |
+
+At 200 categories one-hot is fine and slightly better. At 5,000 it collapses — **7.6 AUC points worse than native** — because each one-hot column is a single rare binary split and the tree cannot find the group structure. Note also that treating an unordered category as an *integer* scored 0.80080 at cardinality 200, only 0.7 points behind one-hot: trees are more forgiving of that abuse than linear models, because a sequence of splits can carve out any set of contiguous integer ranges. Do not rely on it, but do not panic when you find it in someone's pipeline either.
+
+### War story: the model that got worse when they fixed the imbalance
+
+A payments team had a fraud model at 0.79 ROC-AUC and 0.41 average precision on a 1:66 positive rate. A new engineer noticed `scale_pos_weight` was unset and did the textbook thing: set it to the balanced value, `(negatives/positives) = 66.32`. Recall at the default threshold jumped from 0.2152 to 0.5105 and everyone was pleased.
+
+Then the downstream expected-loss calculation — which multiplies predicted probability by transaction amount — started producing numbers that made no sense, and the weekly caught-fraud figure did not move.
+
+The measurement:
+
+| Setting | AUC | Average precision | Brier | recall@0.5 | precision@0.5 |
+| --- | --- | --- | --- | --- | --- |
+| `scale_pos_weight=1` | **0.79472** | **0.41100** | **0.010894** | 0.2152 | 0.9107 |
+| `scale_pos_weight=66.32` | 0.78391 | 0.29451 | 0.072199 | 0.5105 | 0.1653 |
+
+Average precision — the metric that actually reflects ranking quality on a rare class — fell by **28% relative**. Brier score got **6.6x worse**, because the model was now calibrated to a re-weighted population with a 50% base rate rather than the real 1.5%. The recall gain was entirely a threshold effect that could have been obtained for free by moving the threshold on the unweighted model, without destroying the probabilities.
+
+The fix: `scale_pos_weight=1`, `eval_metric="aucpr"`, and an explicit threshold chosen from the precision-recall curve against the team's cost matrix. Caught fraud went up and the expected-loss calculation started working again. Week 20 Module 4 runs this comparison properly with confidence intervals; the default to carry until then is **train on the real distribution and move the threshold**.
+
+### Design checkpoint
+
+> You have 90 seconds of fit budget per experiment and 60 experiments before the deadline. Design the search.
+
+<Accordion title="Model answer">
+Do not run a grid. First, spend three fits establishing the shape of the problem: one `max_depth=4`, one `=8`, one `=12`, all with `learning_rate=0.1` (fast) and early stopping. That is the parameter with 17x the sensitivity of the next-most-discussed one, and three points tell you which direction to go. Second, take the winning depth and spend about 12 fits on a `RandomizedSearchCV` over `min_child_weight`, `gamma`, `subsample`, `colsample_bytree` — random, not grid, because past three parameters random search dominates per unit of compute (Bergstra & Bengio 2012). Third, and only at the end, drop `learning_rate` to 0.02 for the final two or three fits: it buys about 0.0006 AUC and costs 3x the time, so it belongs at the end, not the beginning. That is roughly 18 fits, leaving 40 for the thing that will actually move the number more than any hyperparameter — feature engineering (Week 20). Also: fix your `eval_metric` to the business metric before fit one. Tuning to `logloss` and reporting `aucpr` is a common and silent mismatch.
+</Accordion>
+
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+
+### Histogram splitting: where the 7x comes from
+
+Exact split finding sorts each feature's values at each node and scans every candidate threshold: `O(n log n)` per feature per node. Histogram splitting buckets each feature into a fixed number of bins **once**, before training (XGBoost's `max_bin`, default 256), and then a node's split search is a scan over 256 bins instead of `n` values: `O(n + max_bin)` per feature.
+
+Two further wins fall out of that. Bin indices fit in one byte, so the feature matrix shrinks by 8x versus float64. And the histogram of a child can be obtained by **subtracting** its sibling's histogram from the parent's, so only the smaller child needs to be built from scratch — roughly halving the work again.
+
+Measured, 36,000 x 40, 300 trees, `max_depth=6`, XGBoost 2.1.4 on an M3 Pro:
+
+| `tree_method` | fit time | test AUC |
+| --- | --- | --- |
+| **`hist`** | **0.81 s** | **0.98192** |
+| `approx` | 3.01 s | 0.98177 |
+| `exact` | 5.94 s | 0.98101 |
+| LightGBM 4.7.0, leaf-wise, 63 leaves | 2.99 s | 0.98235 |
+| `sklearn.HistGradientBoostingClassifier` 1.9.0 | 2.39 s | 0.98109 |
+
+**7.3x faster than exact, and slightly more accurate.** The accuracy is not a fluke: binning is a mild regularizer, because it forbids splits that separate two nearly-identical values — exactly the splits most likely to be noise. This is why `hist` has been XGBoost's default since 2.0.
+
+### Leaf-wise versus level-wise
+
+XGBoost grows **level-wise** (also called depth-wise): it splits every node at depth `d` before considering depth `d+1`. LightGBM grows **leaf-wise**: at every step it splits whichever leaf, anywhere in the tree, offers the largest loss reduction.
+
+Leaf-wise reaches a lower training loss for the same number of leaves, because it never wastes leaves on unproductive branches. The cost is that the trees can become very deep and unbalanced, which overfits on small data. This is why LightGBM's primary capacity control is `num_leaves` rather than `max_depth`, and why the LightGBM documentation's first tuning advice is to keep `num_leaves` well below `2^max_depth`.
+
+The practical consequence: **`max_depth=6` in XGBoost and `num_leaves=63` in LightGBM are roughly comparable** (`2^6 - 1 = 63`), and if you port a config between the libraries by copying `max_depth` you will get a much more complex LightGBM model than you intended.
+
+### GOSS and EFB
+
+LightGBM's two other named techniques (Ke et al., 2017) are both about reducing the work per iteration:
+
+- **GOSS (Gradient-based One-Side Sampling).** Rows whose gradients are already small are nearly correct and contribute little to the next split's gain. GOSS keeps the top `a` fraction by gradient magnitude, samples a fraction `b` from the rest, and **up-weights the sampled small-gradient rows by `(1-a)/b`** so the gain estimate stays unbiased. The paper reports roughly 2x speed-up at essentially unchanged accuracy. (Note that GOSS is not LightGBM's default; `boosting_type="goss"` opts in.)
+- **EFB (Exclusive Feature Bundling).** In sparse data — one-hot encodings especially — many feature pairs are never non-zero on the same row. EFB packs such mutually exclusive features into a single bundled feature, reducing the effective feature count. Finding an optimal bundling is graph-colouring and therefore NP-hard, so LightGBM uses a greedy approximation.
+
+Both are answers to the same question: histogram construction costs `O(n * p)` per node, so you attack `n` (GOSS) or `p` (EFB).
+
+### SHAP for trees
+
+SHAP values assign each feature a contribution to a single prediction, with an additivity guarantee: `base_value + sum(shap_values) = model_output`. The generic algorithm (KernelSHAP) is exponential in the number of features and must be approximated by sampling. **TreeSHAP** (Lundberg et al., 2018/2020) exploits tree structure to compute *exact* Shapley values in polynomial time — `O(T * L * D^2)` for `T` trees with `L` leaves and depth `D`.
+
+Measured on the 1,151-tree, depth-6 model above, 40 features, shap 0.52.0:
+
+| Method | Cost per row | Notes |
+| --- | --- | --- |
+| **TreeSHAP** | **0.654 ms** | exact; scales linearly in rows (0.07 s for 100, 6.54 s for 10,000) |
+| KernelSHAP | 501.3 ms | model-agnostic, sampled, default `nsamples` |
+
+**767x.** Additivity check on 2,000 rows: `max |base + sum(shap) - margin| = 1.34e-05`, which is float32 accumulation noise across 1,151 trees, not an error.
+
+Two things to be careful about.
+
+**1. SHAP and gain importance disagree, and that is expected.** On the same model:
+
+```
+top features by mean |SHAP| : f20 (0.614), f36 (0.575), f19 (0.508), f35 (0.448), f37 (0.447)
+top features by 'gain'      : f35 (21.2),  f36 (12.7),  f8 (12.4),   f19 (12.1),  f22 (11.4)
+```
+
+Only three of the top five overlap. `gain` is total training-set loss reduction attributable to splits on the feature; mean `|SHAP|` is the average magnitude of the feature's contribution to individual predictions on the data you evaluated. They answer different questions and neither is "the importance".
+
+**2. Correlated features share credit in a specific, defined way.** TreeSHAP's default (`feature_perturbation="tree_path_dependent"`) follows the tree's own splits, which means it attributes credit along the paths the model actually took. The `interventional` option requires a background dataset and gives a different, causally-flavoured attribution. They can disagree substantially on correlated features. Pick one, state which, and never mix them in a single report.
+
+An individual explanation from the measured model:
+
+```
+row 0: base +0.0010, margin -8.1403, predicted p 0.0003
+  feature 36: value -4.4004   SHAP -1.9562
+  feature 19: value -4.3857   SHAP -1.5904
+  feature 37: value +3.3282   SHAP -1.1318
+  feature  2: value -2.3896   SHAP -0.6779
+  feature 20: value -2.0357   SHAP -0.6313
+```
+
+These are in **log-odds**, not probability. Summing them and applying a sigmoid recovers the prediction; adding them to a probability does not. Reporting SHAP values to a stakeholder as "this feature reduced the probability by 1.96" is wrong by construction, and it is the single most common way SHAP is misreported.
+
+### Why gradient-boosted trees still beat deep nets on tabular data
+
+Grinsztajn, Oyallon and Varoquaux (2022) benchmarked tree ensembles against modern neural architectures (including transformer-based tabular models) across 45 datasets, and found tree ensembles still won, with the gap persisting after a substantial hyperparameter budget. Their diagnosis is three specific inductive biases, and each one is measurable on your own data:
+
+1. **Neural networks are biased toward smooth functions.** Tabular targets are often piecewise-constant in a feature — a threshold in a business rule, a tax bracket, a tier boundary. Smoothing the target in their experiments hurt trees and barely affected neural networks, confirming the mechanism.
+2. **Uninformative features hurt neural networks more.** Removing uninformative features narrowed the gap; adding them widened it. Trees ignore a useless feature by simply never splitting on it.
+3. **Tabular data is not rotationally invariant.** This is Module 1's axis-alignment result seen from the other side: an MLP is (approximately) rotation-invariant, which is *wasted* capacity when the axes are `age`, `income` and `tenure` and carry real meaning. Their experiment rotating the features degraded tree performance and left neural performance unchanged — exactly the 0.9105-to-1.0000 measurement from Module 1, run in reverse.
+
+On the data used throughout this module: XGBoost 0.98249, random forest 0.98066, logistic regression 0.76442. The relevant number is not that boosting won — it is that the linear model lost by **21.8 AUC points**, which tells you the signal is in interactions, which is what tree ensembles are built to find.
+
+### Failure modes
+
+| Failure | Signature | Detector |
+| --- | --- | --- |
+| Early stopping on the test set | validation and test scores identical, production worse | three-way split; assert that the early-stopping set is not the reporting set |
+| `scale_pos_weight` destroys calibration | recall up, average precision down, Brier much worse | report AP and Brier next to AUC; measured 0.411 to 0.295 and 6.6x Brier |
+| `num_leaves` copied from `max_depth` | LightGBM model far more complex than the XGBoost one it replaced | `num_leaves <= 2^max_depth - 1`; log the realised leaf count |
+| High-cardinality one-hot | AUC far below native categorical; huge feature matrix | measured 7.6 AUC points at cardinality 5,000; use `enable_categorical` |
+| SHAP reported as probability | attributions do not sum to the predicted probability | SHAP for a classifier is in log-odds; state the units |
+| `best_iteration` equals `n_estimators` | early stopping never fired; the ceiling bound you | raise the ceiling or the learning rate; log the ratio |
+| Tuning to the wrong `eval_metric` | model tuned on `logloss`, reported on `aucpr` | set `eval_metric` from the business metric on day one |
+| Non-determinism across runs | `hist` with multiple threads sums gradients in varying order | pin `n_jobs`; XGBoost documents exact reproducibility only at fixed thread count |
+
+### Papers
+
+- **Friedman, J. H. (2001), "Greedy Function Approximation: A Gradient Boosting Machine," Annals of Statistics 29(5).** *Takeaway:* boosting is gradient descent in function space, so any differentiable loss can be boosted by fitting each new learner to the negative gradient — which is why "fit the residual" and "fit the gradient" are the same instruction.
+- **Chen, T. & Guestrin, C. (2016), "XGBoost: A Scalable Tree Boosting System," KDD.** *Takeaway:* a second-order Taylor expansion plus an explicit leaf-count and leaf-value penalty gives closed-form optimal leaf weights `-G/(H+lambda)` and a closed-form split gain, and sparsity-aware split finding handles missing values without imputation.
+- **Ke, G. et al. (2017), "LightGBM: A Highly Efficient Gradient Boosting Decision Tree," NeurIPS.** *Takeaway:* GOSS subsamples rows by gradient magnitude with a bias correction and EFB bundles mutually exclusive sparse features, together cutting per-iteration cost substantially at near-identical accuracy.
+- **Lundberg, S. et al. (2020), "From local explanations to global understanding with explainable AI for trees," Nature Machine Intelligence 2.** *Takeaway:* Shapley values can be computed exactly for tree ensembles in polynomial time — measured here at 0.65 ms/row against KernelSHAP's 501 ms/row, a 767x difference that is the reason SHAP is usable in production at all.
+- **Grinsztajn, L., Oyallon, E., Varoquaux, G. (2022), "Why do tree-based models still outperform deep learning on typical tabular data?" NeurIPS Datasets and Benchmarks.** *Takeaway:* across 45 datasets, tree ensembles beat tuned neural networks because of three specific inductive biases — robustness to uninformative features, ability to fit non-smooth targets, and non-rotation-invariance — and each can be tested on your own data.
+- **Prokhorenkova, L. et al. (2018), "CatBoost: unbiased boosting with categorical features," NeurIPS.** *Takeaway:* naive target statistics leak the label into the features; ordered boosting computes them from a prefix of a random permutation, which removes the bias — the same problem Week 20 Module 1 solves with out-of-fold encoding.
+
+### Stretch challenge
+
+Implement **your own second-order booster** and verify it against XGBoost. Write a `NewtonBooster` that: computes `g` and `h` for log-loss; grows depth-limited trees using the exact split-gain formula above (with `lambda`, `gamma` and `min_child_weight`); sets leaf values to `-G/(H + lambda)`; and applies a learning rate. Verify that with `subsample=1`, `colsample=1`, `tree_method="exact"`, `max_bin` irrelevant, and identical `lambda`/`gamma`/`max_depth`, your first tree's structure matches XGBoost's first tree exactly (dump it with `booster.get_dump()`).
+
+Then the open part. Replace the second-order step with a first-order one (`w = -G/(n + lambda)`, i.e. pretend `h = 1`) and measure the difference across three datasets: final AUC, number of trees to convergence, and wall clock. The Newton step is supposed to converge in fewer rounds — quantify by how many, and find a dataset where it does *not* help. Then argue: for log-loss, is the second-order term worth its cost, or is it mostly buying you the `min_child_weight` semantics? There is no settled answer and defending either side with your own numbers is the exercise.
+
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Run a hyperparameter study of 30+ configurations, report the sensitivity ranking, and defend a default recipe.
+</Card>
+
+<Steps>
+  <Step title="Set the protocol before you start">
+  Three-way split. Fixed `eval_metric`. Early stopping at 50 rounds with a 3,000-tree ceiling. Report test AUC, `best_iteration` and wall clock for every run. Write this down first — deciding it afterwards is how studies become unpublishable.
+  </Step>
+  <Step title="Sweep one parameter at a time">
+  `learning_rate`, `max_depth`, `subsample`, `colsample_bytree`, `min_child_weight`, `reg_lambda`, `gamma`. At least 30 configurations total.
+  </Step>
+  <Step title="Rank by measured sensitivity">
+  For each parameter report `max(AUC) - min(AUC)` across its swept values. Then state which of those ranges are larger than your seed-to-seed noise — run the baseline at five seeds to find out. Any parameter whose range is inside the noise is not tunable on this dataset, and saying so is the finding.
+  </Step>
+  <Step title="Defend a recipe">
+  One config, with a sentence per parameter saying why. Then report how far it is from the best configuration you found, and how long each takes.
+  </Step>
+</Steps>
+
+Time box: **4 hours**. Acceptance: 30+ configs; a sensitivity ranking with the noise floor marked; a recipe within 0.002 AUC of your best result.
+
+## The whiteboard
+
+This module earns a **T3 hero animation** (A26 in the visual spec): residuals shrinking as each tree is added. The static T1 fallback is the four-panel strip above with the SSE written under each panel.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p3-w18-m3-blank.svg) · [Editable source](/assets/diagrams/p3-w18-m3.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+  **Resume line:** "Ran a 31-configuration XGBoost sensitivity study establishing that `max_depth` moves test AUC 17x more than `learning_rate` under early stopping; defended a default recipe within 0.0007 AUC of the best result at a quarter of the fit cost."
+  **Interview move:** derive `w* = -G/(H + lambda)` from the second-order expansion. It takes four lines and almost nobody can do it. Then say what `H` is for log-loss and why that makes `min_child_weight` a curvature budget rather than a row count.
+  **Portfolio:** the sensitivity bar chart with the noise floor drawn on it. It demonstrates that you know a difference smaller than the noise is not a result.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+  1. **Check every `scale_pos_weight` and `class_weight` in your repo.** Report AP and Brier before and after. Measured here: AP fell 28% and Brier got 6.6x worse for a recall gain that a threshold change gives you free.
+  2. **Run the sensitivity study on your own most-tuned model.** If half your grid is parameters whose range is inside your seed noise, you can cut your tuning compute in half this week with no loss.
+  3. **Add TreeSHAP to a serving path.** At 0.65 ms per row it is affordable inline, and "the three factors that most affected this decision" is often exactly what a support or compliance team has been asking for.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Validation and test scores identical, production worse | early stopping on the reporting set | three-way split; the early-stopping set is a training input |
+| Recall improved, business impact did not | `scale_pos_weight` moved the operating point, not the ranking | check AP and Brier; prefer threshold tuning |
+| `best_iteration == n_estimators` | ceiling too low or learning rate too small | raise the ceiling; log the ratio and alert when it is 1.0 |
+| LightGBM overfits after porting from XGBoost | `num_leaves` set to `max_depth` | `num_leaves <= 2^max_depth - 1` |
+| Huge feature matrix from one-hot | high-cardinality categorical | `enable_categorical=True`; measured +7.6 AUC at cardinality 5,000 |
+| SHAP values do not sum to the probability | classifier SHAP is in log-odds | apply the sigmoid after summing; state the units in the report |
+| Tuning made no difference | you were sweeping parameters below the noise floor | measure the noise floor first with five seeds of the baseline |
+| Non-reproducible fits | `hist` accumulation order varies with thread count | pin `n_jobs`; document that exactness requires a fixed thread count |
+
+## Assessment
+
+**Concept questions (8).**
+1. Show that for squared error the negative gradient of the loss with respect to the prediction is the residual.
+2. Derive `w* = -G/(H + lambda)` from the second-order objective.
+3. What is `h_i` for log-loss, and what does that make `min_child_weight` mean?
+4. Why does a deeper `max_depth` often make the *whole fit* faster under early stopping?
+5. Explain the sibling-subtraction trick in histogram-based split finding.
+6. Give the relationship between LightGBM's `num_leaves` and XGBoost's `max_depth`.
+7. Why can boosting overfit with more trees when a forest cannot?
+8. TreeSHAP's additivity check gives `1.34e-05`. Is that a bug?
+
+**Coding challenge.** Implement `structure_score(g, h, leaf_assignments, lam, gamma)` returning the XGBoost objective `-(1/2) sum_j G_j^2/(H_j+lam) + gamma*T`, and `split_gain(gL, hL, gR, hR, lam, gamma)`. Hidden tests: for a single node your `split_gain` must match XGBoost's reported gain from `booster.trees_to_dataframe()` to within `1e-6` on a depth-1 model.
+
+**Interview questions.**
+- *Junior:* "What is the difference between a random forest and gradient boosting?"
+- *Mid:* "You have 90 seconds per fit and 60 fits. How do you tune XGBoost?"
+- *Senior:* "Explain why XGBoost uses a second-order approximation, what it buys, and how you would measure whether it was worth it on a given dataset."
+
+**Draw from memory.** The four-panel residual-shrinking strip with the SSE values, plus the leaf-weight formula.
+
+## Sources & further reading
+
+**Primary docs**
+- [XGBoost 2.1 Parameters](https://xgboost.readthedocs.io/en/release_2.1.0/parameter.html) — read this for the exact meaning of `min_child_weight` (a Hessian sum, not a row count) and the `tree_method` matrix.
+- [XGBoost 2.1 "Categorical Data"](https://xgboost.readthedocs.io/en/release_2.1.0/tutorials/categorical.html) — read this for `enable_categorical`, `max_cat_to_onehot`, and the partitioning algorithm used above a given cardinality.
+- [LightGBM 4.7 "Parameters Tuning"](https://lightgbm.readthedocs.io/en/stable/Parameters-Tuning.html) — read this for why `num_leaves` rather than `max_depth` is the primary capacity control under leaf-wise growth.
+- [SHAP documentation, `TreeExplainer`](https://shap.readthedocs.io/en/latest/generated/shap.TreeExplainer.html) — read this for the difference between `tree_path_dependent` and `interventional` perturbation, which changes the numbers you report.
+
+**Papers**
+- [Friedman, J. H. (2001), "Greedy Function Approximation: A Gradient Boosting Machine," *Annals of Statistics* 29(5).](https://doi.org/10.1214/aos/1013203451) *Takeaway:* boosting is gradient descent in function space, so any differentiable loss works.
+- [Chen, T. & Guestrin, C. (2016), "XGBoost: A Scalable Tree Boosting System," *KDD*.](https://arxiv.org/abs/1603.02754) *Takeaway:* second-order expansion gives closed-form leaf values and split gains; sparsity-aware splitting handles missing values natively.
+- [Ke, G. et al. (2017), "LightGBM: A Highly Efficient Gradient Boosting Decision Tree," *NeurIPS 30*.](https://papers.nips.cc/paper_files/paper/2017/hash/6449f44a102fde848669bdd9eb6b76fa-Abstract.html) *Takeaway:* GOSS and EFB attack the two terms of the histogram cost, rows and features.
+- [Lundberg, S. et al. (2020), "From local explanations to global understanding with explainable AI for trees," *Nature Machine Intelligence* 2.](https://doi.org/10.1038/s42256-019-0138-9) *Takeaway:* exact Shapley values for trees in polynomial time, which is what makes per-prediction explanation affordable.
+- [Grinsztajn, L. et al. (2022), "Why do tree-based models still outperform deep learning on typical tabular data?" *NeurIPS D&B*.](https://arxiv.org/abs/2207.08815) *Takeaway:* three inductive biases explain the gap, and each is testable on your own dataset.
+- [Prokhorenkova, L. et al. (2018), "CatBoost: unbiased boosting with categorical features," *NeurIPS 31*.](https://arxiv.org/abs/1706.09516) *Takeaway:* ordered target statistics remove the leakage that naive target encoding introduces.
+
+**Go deeper**
+- [Chen & Guestrin (2016), sections 2 and 3, read alongside the derivation above.](https://arxiv.org/abs/1603.02754) It is nine pages, it contains the entire objective and the sparsity-aware algorithm, and it is one of the most readable systems-and-maths papers in machine learning.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-18/p3-w18-m3">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

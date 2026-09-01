@@ -1,0 +1,595 @@
+---
+title: "Temporal, text & interaction features"
+description: "Week 20 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+{/* AUTHORED */}
+
+<Note>
+**Week 20 · Module 2 · `P3-W20-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+**Where the numbers on this page come from.** Every table introduced by *Measured* was produced by
+running the code shown, on an Apple M3 Pro (11 cores, 18 GB, macOS arm64, **no GPU**) with
+Python 3.12.9 and numpy 2.5.2, pandas 3.0.5, scikit-learn 1.9.0 — the same environment as the rest of Phase 3, so you can
+re-run any of it. Anything introduced by *Derived* is arithmetic, shown term by term; check it with
+a pencil. A result attributed to a paper is that paper's measurement, not ours.
+See [About the numbers](/start/about-the-numbers).
+</Info>
+
+
+## Where this sits
+
+- **Prereqs:** `P3-W20-M1`, `P3-W19-M3` (time-series splits), `P3-W19-M4` (leakage), Week 7 (SQL window functions — they pay off here)
+- **Unlocks:** `P3-W20-M5` (serving these features), **`P3-W28` (the sparse-versus-dense retrieval debate is this module's TF-IDF comparison, at scale)**
+- **One line:** you will build aggregate features that are correct as of the prediction moment, and know what a point-in-time bug costs when it reaches production.
+
+## What you'll be able to do
+
+1. Turn a timestamp into eight useful features, and encode cyclical ones so a linear model can use them
+2. Build lag, rolling and expanding features that never see the future
+3. Write the point-in-time-correct version of a cross-table aggregate, in SQL and in pandas
+4. Detect a point-in-time bug with a backtest, and quantify what it costs
+5. Build interaction and ratio features, and say why a tree needs them handed over
+6. Choose between TF-IDF and dense representations for a text column, with accuracy, latency and memory numbers
+7. Name training/serving skew as the mechanism behind most offline/online gaps
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w20-m2.svg" alt="Hand-drawn sketch: point-in-time correct aggregates and the training/serving gap" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w20-m2-dark.svg" alt="Hand-drawn sketch: point-in-time correct aggregates and the training/serving gap" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w20-m2
+tier: T2
+one-sentence-goal: Show that an aggregate computed "as of today" is a different feature from one computed "as of the row", and that the gap between them is exactly the offline/online gap.
+elements:
+  - top half: a horizontal timeline with a customer's transactions drawn as tick marks. A vertical dashed line labelled "PREDICTION MOMENT t" sits two thirds along. Two curly braces beneath the ticks:
+      one spanning ALL ticks, labelled "cust_mean_all -- what the training extract computed" drawn in red with a heavy cross-out over the portion right of t
+      one spanning only ticks LEFT of t, labelled "cust_mean_prior -- what serving can actually produce" drawn in green with a tick
+  - amber margin note between them: "the training pipeline could see the future. the serving pipeline cannot. that difference IS training/serving skew."
+  - a small ledger under the timeline, hand-written:
+      "reported CV (leaky feature)          0.8421"
+      "PRODUCTION (trained leaky, served correct)  0.8076"   circled in red
+      "honest model (correct both sides)    0.8303"
+      with an arrow from the first to the second labelled "-3.5 pts of promise" and from the third to the second labelled "-2.3 pts of REAL performance thrown away"
+  - bottom-left: a clock face with hour 23 and hour 0 drawn adjacent, an arrow between them labelled "distance 1", and beside it the same two hours on a number line drawn 23 apart with a red cross-out. Below: "ridge MAE raw 19.435 -> sin/cos 5.081" and "HistGB 4.764 either way"
+  - bottom-right: three stacked bars for a text column labelled "TF-IDF 51k sparse | LSA 300 dense | hashing 2^18", annotated "acc 0.845 / 0.842 / 0.742", "0.22 / 3.28 / 0.20 ms per doc", "2.8 / 124.1 / 8.4 MB artifact", with "124.1 MB" circled in red and the note "dense is not free"
+  - dangling arrow: "...and which of these 200 features do you keep? -> M3"
+numbers-to-write-in: 0.8421 / 0.8076 / 0.8303, 19.435 -> 5.081, 4.764, 0.845/0.842/0.742, 0.22/3.28/0.20 ms, 2.8/124.1/8.4 MB
+alt: A hand-drawn sketch showing a customer's transaction timeline with two aggregation windows — one spanning the whole history and crossed out in red, one stopping at the prediction moment and ticked — annotated with the AUC the leaky version reported, the AUC production actually delivered, and the higher AUC the correct version would have given.
+*/}
+
+## Why you should care
+
+**For Aarav (student).**
+- "How would you build features for a time-series problem?" is asked constantly and the answer that stands out is "point-in-time correct aggregates, and here is how I would test that they are".
+- Cyclical encoding is a two-line trick with a measurable 3.8x effect on a linear model. It is the kind of small concrete thing that makes a portfolio project look considered.
+- The TF-IDF versus dense comparison is the same argument you will have in Week 28 about retrieval, with smaller numbers and no GPU.
+
+**For Meera (professional).**
+- Training/serving skew is the **most common cause of an offline/online gap** in production ML, and it is almost always a window definition, not a bug in anyone's code.
+- This shows up in your job as: a feature called `total_orders` that the warehouse computes over all time and the serving path computes over the last 30 days, and nobody notices for a quarter.
+- The measurement below shows the leaky version reporting 0.8421, delivering 0.8076, when the correct version would have delivered 0.8303. **The bug did not just inflate the promise; it destroyed real performance.**
+
+## The mental model
+
+Every feature built from history has a window, and the window has an end. If the end is "now, when I ran the query" you have built a feature that your serving path cannot reproduce, because at serving time "now" is earlier. The discipline is to compute every aggregate **as of the prediction timestamp of the row it belongs to** — which in SQL is a window function with a range bounded by that timestamp, and in pandas is a `shift(1)` before an `expanding` or `rolling`. Everything else in this module — cyclical encoding, lags, TF-IDF, interactions — is ordinary feature engineering. The point-in-time rule is the one that decides whether the model works.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+
+### Eight features from one timestamp
+
+A timestamp is not a feature. `2025-11-14 23:47:00` as a Unix integer tells a model almost nothing useful, and worse, it is a proxy for time itself, which Week 19 Module 3 measured as worth 15.3 AUC points of fake performance under a shuffled split.
+
+Decompose it into things that mean something:
+
+```python
+# pip install "pandas==3.0.5" "numpy==2.5.2"
+import numpy as np, pandas as pd
+
+def datetime_features(ts: pd.Series) -> pd.DataFrame:
+    out = pd.DataFrame(index=ts.index)
+    out["hour"]         = ts.dt.hour                    # 0-23
+    out["dayofweek"]    = ts.dt.dayofweek               # 0=Monday
+    out["day"]          = ts.dt.day
+    out["month"]        = ts.dt.month
+    out["is_weekend"]   = (ts.dt.dayofweek >= 5).astype(int)
+    out["is_month_end"] = ts.dt.is_month_end.astype(int)
+    out["week_of_year"] = ts.dt.isocalendar().week.astype(int)
+    out["days_since_epoch"] = (ts - pd.Timestamp("1970-01-01")).dt.days   # careful: a trend
+    return out
+```
+
+Seven of those are safe. The eighth, `days_since_epoch`, is a **trend** feature — it lets the model learn "later is different", which is real if there is a genuine trend and is a leak if you validated with a shuffled split. Include it only with a forward split, and expect it to be useless for extrapolation because a tree cannot predict a value outside its training range (Week 18 Module 2).
+
+Add whatever your domain has: is it a public holiday, days until the next one, days since the customer's signup, minutes since their last action.
+
+### Cyclical encoding, and why it matters for some models
+
+Hour 23 and hour 0 are one hour apart. As integers they are 23 apart. A linear model reads the integer and concludes that midnight is maximally distant from 11 p.m.
+
+The fix is to place the value on a circle:
+
+```python
+out["hour_sin"] = np.sin(2 * np.pi * ts.dt.hour / 24)
+out["hour_cos"] = np.cos(2 * np.pi * ts.dt.hour / 24)
+```
+
+You need **both** — one alone is not injective, since `sin` gives the same value for hours 6 and 18.
+
+Measured on 40,000 rows of synthetic demand that peaks around midnight (so the wraparound is the whole signal), noise standard deviation 6, irreducible MAE 4.787:
+
+| Encoding | Ridge MAE | HistGB MAE |
+| --- | --- | --- |
+| raw integer hour | **19.435** | 4.764 |
+| **sin/cos cyclical** | **5.081** | 4.764 |
+| one-hot hour (24 columns) | 5.084 | 4.763 |
+
+**Ridge went from 19.435 to 5.081 — a 3.8x improvement — and the tree did not move at all.**
+
+The tree was already at the noise floor with the raw integer, because it can split `hour <= 0.5` and `hour >= 22.5` and carve out the peak by itself. The linear model could not, because it has one coefficient for `hour` and no way to express a bump.
+
+One-hot (5.084) does the same job as sin/cos (5.081) here and costs 24 columns instead of 2. Prefer sin/cos when the effect is smooth, one-hot when it is genuinely arbitrary per level, and note that for trees neither is necessary.
+
+### Lags, rolling and expanding windows
+
+For anything with an entity and a time, three families of feature:
+
+- **Lag**: the value `k` steps ago. `df.groupby("cust")["amt"].shift(1)`
+- **Rolling**: an aggregate over a fixed recent window. `...shift(1).rolling(7).mean()`
+- **Expanding**: an aggregate over all history so far. `...shift(1).expanding().mean()`
+
+**The `shift(1)` is not optional and it is the whole module.** Without it, `rolling(7).mean()` at row `i` includes row `i` itself — so the feature contains the current transaction's amount, and if the current transaction being large is what you are trying to predict, you have handed the model the answer.
+
+```python
+g = df.sort_values("ts").groupby("cust")["amt"]
+df["amt_lag1"]        = g.shift(1)
+df["amt_roll7_mean"]  = g.shift(1).rolling(7, min_periods=1).mean()
+df["amt_expand_mean"] = g.shift(1).expanding().mean()
+df["amt_vs_history"]  = df["amt"] / df["amt_expand_mean"]      # a RATIO — see below
+```
+
+Sort by time first, always. `groupby().shift()` respects row order, and if the frame is not sorted the "previous" row is whatever happened to be above it.
+
+### Interactions and ratios
+
+A **ratio** is the feature type most often missing from a tabular model, and the reason is structural. Week 18 Module 1 measured a depth-3 tree going from 0.9105 to 1.0000 on the same data after a 45-degree rotation — because trees split one feature at a time and cannot express `a / b` or `a - b` except as a staircase.
+
+So hand them over:
+
+```python
+df["amount_vs_customer_median"] = df["amount"] / df["cust_median_amount"]
+df["balance_to_limit"]          = df["balance"] / df["credit_limit"]
+df["price_change"]              = df["price_now"] - df["price_at_signup"]
+```
+
+Each of those is one split for a tree and a staircase of dozens otherwise. For a linear model the same applies with more force, since it cannot build the staircase at all.
+
+Two cautions. Divide-by-zero: use `np.where(denom != 0, num/denom, np.nan)` and let the model handle the missing value natively, rather than filling with a number that means something else. And **do not generate all pairwise ratios** — with 200 features that is 39,800 columns of mostly noise, and Module 3 is about the cost of every feature you keep.
+
+### Guided practice
+
+1. Encode `dayofweek` cyclically. Does it help as much as `hour` did?
+2. Compute `rolling(7).mean()` without the `shift(1)` and compare against the shifted version on a forward split.
+3. Build `amount / rolling_mean` and check what fraction of rows are `inf` or `nan`.
+
+<Accordion title="Answers">
+1. Usually much less, and often not at all. The wraparound between Sunday and Monday is real but weak — most weekly effects are "weekday versus weekend", which a single binary flag captures. Cyclical encoding pays when the *periodic distance* is the signal (hour of day, day of year, angle, phase); it does not pay just because a variable repeats.
+2. The unshifted version will score better in cross-validation and worse on a forward split — the same signature as the point-in-time bug in Layer 2. If your target is derived from the same column you are rolling, the unshifted version can be near-perfect, which is the loudest possible alarm.
+3. On a first-transaction row the rolling mean is `NaN` (there is no history), so the ratio is `NaN`. On a customer whose prior amounts were all zero it is `inf`. Both need handling, and the right handling is `NaN` plus a `has_history` indicator — `HistGradientBoosting`, XGBoost and LightGBM all learn a default direction for missing values (Week 18 Module 1) and will use the indicator too.
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+  <Accordion title="1. Why do you need both sin and cos?">
+  Because `sin` alone maps hours 6 and 18 to the same value. The pair `(sin, cos)` is a point on the unit circle and is unique for each hour, which is what makes the encoding injective.
+  </Accordion>
+  <Accordion title="2. Why does cyclical encoding do nothing for a tree?">
+  A tree splits on thresholds, so it can isolate `hour <= 0.5` and `hour >= 22.5` as separate regions and give both the same leaf value. It reconstructs the wraparound from the raw integer. Measured: 4.764 MAE either way.
+  </Accordion>
+  <Accordion title="3. What exactly does shift(1) prevent?">
+  It excludes the current row from its own aggregate. Without it, `rolling(7).mean()` at row `i` averages rows `i-6` through `i`, so the feature contains information from the row being predicted.
+  </Accordion>
+  <Accordion title="4. Is a days_since_epoch feature safe?">
+  Only under a forward split, and even then it cannot extrapolate — a tree's prediction is bounded by the leaf values it learned, so a value beyond the training range falls into the last leaf. Under a shuffled split it is a proxy for time and Week 19 Module 3 measured that at 15.3 AUC points of inflation.
+  </Accordion>
+  <Accordion title="5. Why hand a tree a ratio it could learn?">
+  Because it cannot, cheaply. `a/b` is an oblique boundary and a tree approximates it with an axis-aligned staircase — Week 18 Module 1 measured a depth-3 tree at 0.9105 on a diagonal boundary versus 1.0000 once the boundary was axis-aligned. One engineered column replaces dozens of splits.
+  </Accordion>
+</AccordionGroup>
+
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+
+### Point-in-time correctness, and what the bug costs
+
+Here is the bug, exactly as it occurs. You have a transactions table and you want a feature "this customer's average transaction amount". The obvious query:
+
+```sql
+-- WRONG: computes the aggregate as of NOW, for every historical row
+SELECT t.*, AVG(t2.amount) OVER (PARTITION BY t.customer_id) AS cust_mean
+FROM transactions t
+```
+
+Every row for a customer gets the same value — the mean over the customer's **entire** history, including transactions that happened *after* that row. At serving time, that number does not exist yet.
+
+The correct version bounds the window at the row's own timestamp:
+
+```sql
+-- RIGHT: as of each row's timestamp, excluding the row itself
+SELECT t.*,
+       AVG(t.amount) OVER (
+         PARTITION BY t.customer_id
+         ORDER BY t.ts
+         ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+       ) AS cust_mean_prior
+FROM transactions t
+```
+
+In pandas:
+
+```python
+# WRONG
+df["cust_mean_all"] = df.groupby("cust")["amt"].transform("mean")
+# RIGHT
+df["cust_mean_prior"] = df.groupby("cust")["amt"].transform(
+    lambda s: s.shift(1).expanding().mean())
+```
+
+Now measure it. 30,000 transactions, 600 customers, a latent per-customer switch into fraud after which their amounts are 3x larger:
+
+| What was measured | AUC |
+| --- | --- |
+| random-split CV with the leaky feature | **0.8421** ← the number that shipped |
+| random-split CV with the correct feature | 0.8526 |
+| forward backtest, leaky feature both sides | 0.8196 |
+| **PRODUCTION: trained on leaky, served with correct** | **0.8076** |
+| **honest model: trained on correct, served with correct** | **0.8303** |
+
+Read the last three rows, because they contain the whole lesson and it is worse than "the number was inflated".
+
+**The promise was 0.8421 and the delivery was 0.8076** — a 3.5-point gap, which is the visible part.
+
+**The honest model would have delivered 0.8303.** So the bug did not merely inflate the reported number; it **cost 2.3 AUC points of real, deliverable performance**, because the model was trained to rely on a feature that behaves differently at serving time. You paid twice: once in a broken promise and once in a worse model.
+
+That second cost is the part people miss. Training/serving skew is not a reporting problem.
+
+### Detecting it: the backtest
+
+The detector is not a code review. It is a comparison:
+
+```python
+cv_score      = cross_val_score(model, X, y, cv=KFold(5, shuffle=True)).mean()
+forward_score = fit_on(X[:cut], y[:cut]).score_on(X[cut:], y[cut:])
+```
+
+If `cv_score` exceeds `forward_score` by more than a point or two, something in your feature set is looking forward. Week 19 Module 3 measured 15.3 points on a time-index feature; here it is 2.2. **The size of the gap tells you how bad it is; the existence of the gap tells you to look.**
+
+The stronger test, which is what you should automate, is the **serving replay**: recompute every feature using the serving code path for a set of historical entity/timestamp pairs, and diff against what the training pipeline produced for those same rows. Any non-zero diff rate is the finding, and it catches skew that a backtest cannot — because a backtest computes both sides with the training code.
+
+### Cross-table aggregation, the pattern
+
+Most real feature engineering is "summarise a child table as of the parent row's timestamp". The Week 7 SQL pays off:
+
+```sql
+SELECT
+  a.application_id,
+  a.decision_ts,
+  COUNT(*)                                    AS n_txn_90d,
+  AVG(t.amount)                               AS avg_amt_90d,
+  MAX(t.amount)                               AS max_amt_90d,
+  COUNT(DISTINCT t.merchant_id)               AS n_merchants_90d,
+  SUM(CASE WHEN t.declined THEN 1 ELSE 0 END) AS n_declines_90d
+FROM applications a
+LEFT JOIN transactions t
+  ON  t.customer_id = a.customer_id
+  AND t.ts <  a.decision_ts                      -- STRICTLY before. this line is the module.
+  AND t.ts >= a.decision_ts - INTERVAL '90 days'
+GROUP BY a.application_id, a.decision_ts
+```
+
+Three things that go wrong here, in order of frequency:
+
+1. **`t.ts <= a.decision_ts` instead of `<`.** Includes an event at the same instant as the decision. Usually harmless, occasionally the event *is* the outcome.
+2. **No lower bound.** An unbounded window means the feature's meaning drifts as the dataset ages — a customer of five years has a different `n_txn` than the same customer had two years ago, and the model conflates tenure with behaviour.
+3. **The join done in pandas after loading both tables.** Fine at small scale; at 40 million transactions it is a memory error, and the temptation is then to aggregate first and join second, which loses the timestamp bound. Do the point-in-time join in the warehouse.
+
+### Text features: TF-IDF and the alternatives
+
+**TF-IDF** turns a document into a sparse vector: one dimension per vocabulary term, weighted by how often the term appears in the document and how rare it is across the corpus.
+
+```python
+# scikit-learn 1.9.0
+TfidfVectorizer(min_df=2, ngram_range=(1, 2), sublinear_tf=True)
+```
+
+- `min_df=2` drops terms appearing in one document — mostly typos and identifiers, and it roughly halves the vocabulary.
+- `ngram_range=(1, 2)` adds bigrams, which is where most of the gain is for short text.
+- `sublinear_tf=True` uses `1 + log(tf)` instead of raw counts, so a term appearing 50 times is not 50 times as important.
+
+Measured on four 20-newsgroups categories, 2,318 train / 1,545 test documents:
+
+| Representation | Accuracy | Fit | Per-doc predict | Artifact size |
+| --- | --- | --- | --- | --- |
+| **TF-IDF, 51,201 sparse dims** | **0.8453** | 0.65 s | **0.223 ms** | **2.84 MB** |
+| TF-IDF → LSA 300 dense | 0.8421 | 3.19 s | **3.284 ms** | **124.10 MB** |
+| HashingVectorizer 2^18 | 0.7417 | 3.59 s | 0.199 ms | 8.39 MB |
+
+**Sparse wins on every axis here**, and by a lot on two of them: the dense LSA version is **14.7x slower per document** and its artifact is **44x larger**, for 0.3 accuracy points *worse*. The 124 MB is the SVD components matrix — 51,201 × 300 float64 — which has to be loaded and multiplied at every request.
+
+Hashing loses 10.4 accuracy points (no IDF weighting, plus collisions — Module 1's table puts 2^18 buckets at a low collision rate for this vocabulary, so most of the loss is the missing IDF), but it has no vocabulary at all: nothing to fit, nothing to version, nothing to break on an unseen token. That is the right trade for a streaming or memory-constrained serving path.
+
+<Info>
+**This is the Week 28 argument in miniature.** There, "sparse" is BM25 and "dense" is a transformer embedding, the numbers are bigger, and the conclusion is different — dense wins on semantic matching, sparse wins on exact terms and rare tokens, and hybrid fusion beats both. The structure of the trade-off is identical: sparse is cheap, exact and brittle to vocabulary; dense is expensive, generalising and opaque.
+</Info>
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **sin/cos** vs **one-hot** for a cyclical variable | the effect is smooth around the circle; you want 2 columns not 24 | the effect is arbitrary per level (hour 9 is special because the market opens) — measured, both reached ~5.08 MAE here |
+| **Cyclical encoding** vs **nothing** | linear or distance-based model — measured 3.8x MAE improvement | tree-based model — measured exactly zero |
+| **Rolling** vs **expanding** window | recent behaviour is what matters, and you want the feature's meaning stable over time | you genuinely want lifetime behaviour and have controlled for tenure separately |
+| **TF-IDF sparse** vs **dense embedding** | classification of a text column inside a tabular model; latency matters — measured 0.223 ms vs 3.284 ms | you need semantic similarity rather than term overlap, which is Week 27 |
+| **TF-IDF** vs **hashing** | you can afford to fit and version a vocabulary | streaming, fixed memory, or no `fit` step at serving — costs 10.4 accuracy points here |
+| **Warehouse point-in-time join** vs **pandas** | production, or more than a few million child rows | a one-off analysis on a small table |
+
+### War story: the feature that was computed on Tuesdays
+
+*A modelled composite — assembled from recurring patterns rather than one company, with illustrative figures. The mechanism is real and the measured tables elsewhere on this page are unaffected; the incident is not a case study. See [About the numbers](/start/about-the-numbers).*
+
+A lending team's application-scoring model used a feature `n_declines_90d` — the customer's declined transactions in the previous 90 days. It was built in the warehouse by a nightly job and it worked. Offline AUC 0.81, and the first month in production matched.
+
+Then, over about six weeks, live performance drifted down to 0.74 with no deploy and no schema change.
+
+The cause was a scheduling change nobody connected to the model. The nightly feature job had been moved from 02:00 to 22:00 to make room for another pipeline. The serving path read the most recent materialised feature row, so applications arriving between midnight and 22:00 were now being scored with features that were **up to 22 hours stale**, rather than up to 2. For a feature whose whole point is recent decline activity — and where a burst of declines in the last few hours is the strongest signal there is — that staleness removed most of the signal.
+
+The training data was unaffected, because the training pipeline recomputed the feature as of each application's timestamp from raw transactions. So offline the model still measured 0.81, and online it was 0.74, and the two pipelines disagreed about what `n_declines_90d` meant.
+
+Three fixes. The serving path started computing the feature from the transaction log directly for the last 24 hours, unioned with the materialised older window. A **feature freshness SLA** was written down — "at serving time, `n_declines_90d` must be no more than 15 minutes stale" — and monitored. And a **serving replay test** ran nightly: recompute 1,000 historical applications through the serving path and diff against the training pipeline, alerting above a 0.1% mismatch rate.
+
+The lesson: **a feature is not a column, it is a column plus a freshness guarantee**, and the guarantee is part of the definition. Nobody had written it down, so nobody knew it had been broken by a cron change.
+
+### Design checkpoint
+
+> You need `customer_lifetime_value` as a feature for a model that scores customers daily. The warehouse has a `customer_ltv` table refreshed nightly. What do you check before using it?
+
+<Accordion title="Model answer">
+Four questions, and the first one usually ends it.
+
+**What is the table's `as_of` semantics?** If `customer_ltv` is *overwritten* nightly with the current value, then the historical rows in your training extract have today's LTV attached to a year-old event. That is a straightforward point-in-time violation and the feature is unusable as-is — you need either a versioned history table with an `as_of` column, or to recompute LTV from raw orders with a timestamp bound. This is by far the most common answer and it is why "the feature store had it" is not a justification.
+
+**Does LTV include the outcome you are predicting?** If you are predicting churn and LTV is computed from all orders including the ones after the churn decision, the feature contains the label. Week 19 Module 4 measured the laundered version of exactly this at +24.82 accuracy points.
+
+**Is it a tenure proxy?** LTV grows with time held, so a model using it may be learning "old customer" rather than "valuable customer". Add `tenure_days` explicitly and check whether LTV still carries independent signal — often it does not, and Week 18 Module 2's war story is the same mistake with an id column.
+
+**What is the freshness at serving time, and does the training pipeline match it?** If training computes LTV as of the exact scoring timestamp and serving reads a table that is up to 24 hours old, you have skew by construction. Either add the staleness to the training computation — deliberately compute the feature as of `t - 24h` so training matches serving — or fix serving. Matching training to serving's *worse* behaviour feels wrong and is usually correct: the model should be trained on the data it will actually get.
+</Accordion>
+
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+
+### Training/serving skew is the number one production ML bug
+
+The offline/online gap has three causes (Week 19 Module 5), and this one is the largest and the most fixable. It happens because the same feature is computed twice, by two different pieces of code, for two different purposes:
+
+| | Training | Serving |
+| --- | --- | --- |
+| Written in | SQL, in the warehouse | Python or Java, in the request path |
+| Input | a batch of historical rows | one entity, now |
+| Window end | the row's timestamp (if you are careful) | now |
+| Nulls | whatever the warehouse produced | whatever the API returned |
+| Latency budget | minutes | milliseconds |
+| Owner | the data team | the platform team |
+
+Six opportunities for the two to disagree, and every one of them has produced an incident somewhere. The measured cost in this module: a reported 0.8421 delivering 0.8076, when the correct pipeline would have delivered 0.8303.
+
+**The three architectural responses**, in increasing order of cost and effectiveness:
+
+1. **Replay testing.** Keep the two implementations, and test that they agree. Sample historical entity/timestamp pairs, run both paths, diff. Cheap, catches regressions, does not prevent them. This is the minimum.
+2. **One definition, two execution modes.** Write the feature once — as a function, or a declarative spec — and have both paths execute the same definition against different backends. This is what a **feature store** is actually for, and it is the reason to adopt one. The store's caching and low-latency lookup are secondary; the definition being singular is the point.
+3. **Log the serving features and train on those.** The strongest guarantee: at serving time, write the exact feature vector you computed to a log, and build training data from those logs rather than from the warehouse. Now training and serving are the same code by construction. The cost is that you cannot train until you have logged, so a new feature takes a full label-horizon to become usable — which is a real and often prohibitive constraint.
+
+Most teams should be at (1) with a plan for (2). Option (3) is the right answer for high-volume systems where a point of AUC matters, and it is what large recommendation systems do.
+
+### The minimal feature store, and what it must have
+
+You do not need a vendor product. You need four things:
+
+**An `as_of` column on every feature value, and no updates in place.** A row says "the value of `feature_x` for `entity_e` as of time `t`". Updating a value destroys the history you need for point-in-time joins. This single constraint is what most home-grown feature tables get wrong.
+
+**A point-in-time join primitive.** Given a list of `(entity, timestamp)` pairs, return the feature values that were current at each timestamp. This is an `ASOF JOIN` in DuckDB, ClickHouse and Snowflake; a window function elsewhere.
+
+**A freshness SLA per feature, monitored.** The war story above. "No more than 15 minutes stale at serving time" is part of the feature's definition, not an operational detail.
+
+**A definition that both paths execute.** Even if it is just a shared Python function with two backends, having one place where the window is written down is what prevents the two implementations from drifting.
+
+### Feature computation cost is the real latency budget
+
+A common mistake is to optimise model inference. Measured in Module 3: a boosted tree predicts a row in **1.5 microseconds** batched, and cutting the feature count from 200 to 25 changed that to 1.8 microseconds — i.e. nothing.
+
+Meanwhile a single point-in-time aggregate over a child table costs a network round trip plus a query. **Reference figure, not measured here:** a warehouse or feature-store lookup of this shape is conventionally 1 to 20 ms depending on where the store sits relative to the caller, and we did not run one — there is no warehouse in this course's environment. What *is* measured is the model side, and the gap is three to four orders of magnitude however you resolve the lookup. **Measure your own lookup before designing around this number.** **Your latency budget is entirely feature computation.**
+
+That reframes the engineering:
+
+- **Precompute what you can.** Aggregates over windows longer than an hour can be materialised on a schedule; only the recent tail needs to be computed live.
+- **Batch the lookups.** Twenty features from one store is one round trip if you ask for them together and twenty if you do not.
+- **Count the dependencies, not the columns.** Twenty features derived from one aggregate are one lookup. Two features from two different systems are two, plus two failure modes.
+- **Budget per feature and enforce it.** If the request budget is 50 ms and you have 12 features, no feature gets more than about 3 ms including the model, and a feature that needs a 40 ms query is not a feature you can have.
+
+### TF-IDF versus dense, at the scale where it stops being obvious
+
+The measurement in Layer 2 has TF-IDF winning on every axis. That is the honest result for a 2,318-document corpus and 4 topic classes, and it will not generalise to Week 27 and 28.
+
+Where it flips:
+
+- **Vocabulary mismatch.** TF-IDF matches terms. A query for "car" does not match a document about "automobile"; a dense embedding does. This is the whole reason retrieval moved to embeddings.
+- **Corpus size.** At 2,318 documents the TF-IDF vocabulary is 51,201 terms and the artifact is 2.84 MB. At 10 million documents the vocabulary is millions of terms and the inverted index is the right structure — which is BM25 and Lucene, not a scikit-learn matrix.
+- **Transfer.** A dense encoder pretrained on billions of tokens brings knowledge your corpus does not contain. TF-IDF knows only what you gave it.
+
+Where sparse keeps winning, and why hybrid exists:
+
+- **Exact terms.** Product codes, error identifiers, names, numbers. A dense model maps `ERR-4471` and `ERR-4472` to nearly the same vector; a sparse one does not.
+- **Rare tokens.** IDF explicitly up-weights them. A dense encoder has seen them rarely and represents them poorly.
+- **Cost.** 0.223 ms and 2.84 MB against a transformer forward pass and hundreds of megabytes of weights.
+
+**That is why Week 28 fuses them** rather than choosing. Carry the structure of the trade-off, not this dataset's answer.
+
+### Automatic feature generation, and why it usually loses
+
+Tools exist that generate features automatically — `featuretools` and its "deep feature synthesis", polynomial expansion, autoencoders. They generate a lot of features, and the honest assessment is that they rarely win on tabular problems.
+
+Three reasons, each measurable:
+
+1. **They generate leaks.** Automatic aggregation over a child table defaults to the whole table unless you configure a cutoff time correctly. `featuretools` supports `cutoff_time` precisely because the naive version is a point-in-time violation, and configuring it correctly is exactly as hard as writing the SQL.
+2. **The multiple-comparisons problem.** Generate 2,000 features on 5,000 rows and some will correlate with the target by chance. Week 19 Module 4 measured selection on 10,000 noise features at +33.50 accuracy points of inflation.
+3. **Every feature has a maintenance cost.** Module 3 makes this concrete: 200 features means 200 upstream dependencies to monitor, version and page someone about.
+
+Where they do earn their place: **as a hypothesis generator on a relational schema you do not know well.** Generate, select ruthlessly inside cross-validation, and then hand-write the twenty that survive so you understand and own them.
+
+### Failure modes
+
+| Failure | Signature | Detector |
+| --- | --- | --- |
+| Aggregate computed as of "now" | shuffled CV beats a forward backtest | run both; a gap above ~2 points means a feature looks forward |
+| Missing `shift(1)` on a rolling feature | near-perfect CV when the target derives from the same column | inspect the feature's correlation with the target at lag 0 |
+| Feature staleness at serving | live metric drifts with no deploy | a freshness SLA per feature, monitored |
+| Training and serving compute differently | offline/online gap with no other explanation | serving replay: recompute historical rows through the serving path and diff |
+| Unbounded aggregation window | the feature's meaning drifts as the dataset ages; tenure is confounded | bound every window; add `tenure` explicitly |
+| `<=` instead of `<` on the timestamp join | tiny, stubborn inflation | strict inequality; unit-test with an event at exactly the decision timestamp |
+| Dense text representation in a latency path | p99 blowout at the vectoriser | measured 3.284 ms vs 0.223 ms; profile the transform, not the model |
+| Auto-generated features | huge feature count, CV far above a forward split | select inside CV; hand-write the survivors |
+
+### Papers
+
+- **Kaufman, S., Rosset, S., Perlich, C. (2011), "Leakage in Data Mining: Formulation, Detection, and Avoidance," KDD.** *Takeaway:* legitimacy is defined relative to the deployment scenario, which is exactly why an aggregate's window must end at the prediction timestamp and not at extract time.
+- **Sculley, D. et al. (2015), "Hidden Technical Debt in Machine Learning Systems," NeurIPS 28.** *Takeaway:* data dependencies cost more than code dependencies and are harder to detect, so each additional feature carries a maintenance liability that no accuracy metric shows.
+- **Polyzotis, N., Roy, S., Whang, S., Zinkevich, M. (2018), "Data Lifecycle Challenges in Production Machine Learning: A Survey," SIGMOD Record 47(2).** *Takeaway:* training/serving skew is identified as a primary production failure mode, and the durable fix is a single feature definition executed by both paths rather than two implementations kept in sync by discipline.
+- **Robinson, D. et al. / Kanter, J. & Veeramachaneni (2015), "Deep Feature Synthesis: Towards Automating Data Science Endeavors," DSAA.** *Takeaway:* automated relational feature generation works and requires an explicit cutoff time per row — the automation does not remove the point-in-time obligation, it relocates it into a parameter.
+- **Ramos, J. (2003), "Using TF-IDF to Determine Word Relevance in Document Queries."** *Takeaway:* the IDF weighting is what makes rare, discriminative terms count more than common ones, and it is precisely what the hashing trick discards — measured here at 10.4 accuracy points.
+
+### Stretch challenge
+
+Build a feature with a subtle point-in-time bug, detect it via a backtest, then fix it — and then **build the detector that would have caught it without you knowing the answer.**
+
+Part one is the hands-on: construct a dataset where a customer-level aggregate is computed as of extract time, and measure the four numbers from Layer 2 — leaky CV, correct CV, production reality (trained leaky, served correct), and the honest model.
+
+Part two is the interesting half. Write `point_in_time_audit(df, entity_col, time_col, feature_cols, target_col)` that flags a feature as suspect without being told which one is wrong. Candidate signals: (a) the feature's value for an entity is constant across all of that entity's rows, which is the signature of a whole-history aggregate; (b) the feature's correlation with the target is higher for *early* rows of an entity than for late ones, which should be impossible for a causally-valid feature; (c) the shuffled-CV-minus-forward-backtest gap, computed per feature by ablation.
+
+Then the open question: **measure each detector's true-positive and false-positive rate** across a set of features you know to be clean and a set you have deliberately broken. Signal (a) will flag legitimate static attributes like `signup_country`; signal (c) is `p` retrains. Propose an operating point that a team would actually leave switched on, and defend the trade-off. A careful negative result — "none of these is cheap enough to run per-feature; here is what I would run instead" — is a full-credit answer.
+
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Build a feature with a subtle point-in-time bug, detect it via a backtest, then fix it.
+</Card>
+
+<Steps>
+  <Step title="Build both versions">
+  The same aggregate two ways: `transform("mean")` over the whole history, and `shift(1).expanding().mean()`. Keep everything else identical.
+  </Step>
+  <Step title="Measure four numbers, not two">
+  Shuffled CV with the leaky feature; shuffled CV with the correct one; **production reality** (train on leaky, serve with correct); and the honest model. The third is the one that matters and the one most people omit.
+  </Step>
+  <Step title="Quantify both costs">
+  The gap between the reported number and production is the broken promise. The gap between the honest model and production is the real performance you threw away. Report both.
+  </Step>
+  <Step title="Write the SQL">
+  The correct point-in-time join, with `ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING`, and a unit test with an event at exactly the decision timestamp.
+  </Step>
+</Steps>
+
+Time box: **3 hours**. Acceptance: four measured numbers; a stated shuffled-versus-forward gap; and a SQL window function with a strict inequality and a test for the boundary case.
+
+## The whiteboard
+
+T2 build-up, four frames: (1) the transaction timeline with the prediction moment marked; (2) the two aggregation braces, one crossed out in red; (3) the four-number ledger with both gaps arrowed; (4) the clock face showing hour 23 next to hour 0, with the two MAE numbers.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p3-w20-m2-blank.svg) · [Editable source](/assets/diagrams/p3-w20-m2.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+  **Resume line:** "Demonstrated that a point-in-time bug in one aggregate feature inflated reported AUC by 3.5 points and simultaneously cost 2.3 points of deliverable performance; built the backtest that detects it."
+  **Interview move:** when asked about feature engineering for time-series, write the SQL window function with `ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING` and say why the `1 PRECEDING` is there. It is one line and it demonstrates you have shipped one of these.
+  **Portfolio:** the four-number ledger. Showing that a leak costs real performance as well as inflating the report is a more sophisticated point than "leaks inflate numbers".
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+  1. **Grep your feature SQL for aggregates with no timestamp bound.** `PARTITION BY customer_id` with no `ORDER BY ... ROWS BETWEEN` is the pattern. Each one is a point-in-time violation.
+  2. **Write down a freshness SLA** for the three features your main model relies on most, and check whether anything monitors it. The war story above was a cron change nobody connected to the model.
+  3. **Build the serving replay test.** A thousand historical rows through the serving path, diffed against the training pipeline, run nightly. It is the single highest-value test in a production ML system and it takes about a day.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Shuffled CV beats a forward backtest | an aggregate includes future rows | bound the window at the row's timestamp; `shift(1)` before rolling |
+| Production below both CV numbers | trained on a feature serving cannot reproduce | serving replay diff; train on what serving produces |
+| Live metric drifts with no deploy | feature staleness changed upstream | freshness SLA per feature, monitored |
+| Linear model cannot use `hour` | the 23-to-0 wraparound | sin **and** cos, or one-hot |
+| Cyclical encoding added to a tree model, no effect | trees reconstruct wraparound from thresholds | do not bother; spend the effort on ratios instead |
+| Ratio features full of `inf` | zero denominators | `np.where(denom != 0, ...)` to `NaN`; add a `has_history` flag |
+| p99 latency blowout on a text model | dense vectorisation in the request path | measured 3.284 ms vs 0.223 ms; keep sparse, or precompute |
+| 2,000 auto-generated features, great CV | selection on generated noise | select inside CV; hand-write the survivors |
+
+## Assessment
+
+**Concept questions (8).**
+1. Why do you need both `sin` and `cos` for a cyclical feature?
+2. Why does cyclical encoding help Ridge by 3.8x and a boosted tree by nothing?
+3. Write the SQL window clause for an aggregate over all prior rows, excluding the current one.
+4. A leaky feature reported 0.8421 and delivered 0.8076; the honest model would have delivered 0.8303. Name both costs.
+5. Give three ways a training and a serving feature pipeline can disagree.
+6. Why hand a tree a ratio feature it could in principle learn?
+7. TF-IDF beat dense LSA on accuracy, latency and size here. Name two settings where that flips.
+8. What must a feature store guarantee for a point-in-time join to be possible?
+
+**Coding challenge.** Implement `point_in_time_aggregate(events, entities, entity_col, time_col, value_col, windows, aggs)` returning, for each `(entity, timestamp)` pair, the requested aggregates over events strictly before that timestamp within each window. Hidden tests: an event at exactly the boundary timestamp must be excluded; an entity with no prior events must produce `NaN` and not an error; and the result must match a reference SQL `ASOF` implementation row for row on 100,000 events.
+
+**Interview questions.**
+- *Junior:* "How would you turn a timestamp into features?"
+- *Mid:* "What is training/serving skew and how would you detect it?"
+- *Senior:* "Your offline AUC is 0.84 and production is 0.81 with no obvious bug. Walk me through your investigation in order."
+
+**Draw from memory.** The timeline with the two aggregation windows and the four-number ledger.
+
+## Sources & further reading
+
+**Primary docs**
+- [pandas 3.0 "Windowing operations"](https://pandas.pydata.org/docs/user_guide/window.html) — read this for `rolling`, `expanding` and the time-based `rolling("30D")` offset windows, which are what you want for irregular timestamps.
+- [scikit-learn 1.9 `TfidfVectorizer`](https://scikit-learn.org/stable/modules/generated/sklearn.feature_extraction.text.TfidfVectorizer.html) — read this for `sublinear_tf`, `min_df` and the exact IDF formula, which differs from the textbook one by a smoothing term.
+- [scikit-learn 1.9 `HashingVectorizer`](https://scikit-learn.org/stable/modules/generated/sklearn.feature_extraction.text.HashingVectorizer.html) — read this for the stateless-transformer argument and `alternate_sign`.
+- [DuckDB `ASOF JOIN`](https://duckdb.org/docs/sql/query_syntax/from.html#as-of-joins) — read this for the cleanest available syntax for a point-in-time join; it will change how you write feature SQL.
+
+**Papers**
+- [Kaufman, S. et al. (2011), "Leakage in Data Mining," *KDD*.](https://doi.org/10.1145/2020408.2020496) *Takeaway:* the window must end at the prediction moment, because legitimacy is defined by deployment.
+- [Sculley, D. et al. (2015), "Hidden Technical Debt in Machine Learning Systems," *NeurIPS 28*.](https://papers.nips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html) *Takeaway:* every feature is a data dependency with a maintenance cost no metric shows.
+- [Polyzotis, N. et al. (2018), "Data Lifecycle Challenges in Production Machine Learning," *SIGMOD Record* 47(2).](https://doi.org/10.1145/3299887.3299891) *Takeaway:* training/serving skew is a primary failure mode and the fix is one definition, two backends.
+- [Kanter, J. & Veeramachaneni, K. (2015), "Deep Feature Synthesis," *DSAA*. *Takeaway:* automated relational features require an explicit per-row cutoff time](https://doi.org/10.1109/DSAA.2015.7344858) — the automation relocates the point-in-time obligation rather than removing it.
+- Ramos, J. (2003), "Using TF-IDF to Determine Word Relevance in Document Queries." *Takeaway:* IDF is what makes rare discriminative terms count, and it is exactly what hashing discards.
+
+**Go deeper**
+- [Kuhn, M. & Johnson, K., *Feature Engineering and Selection* (2019), Chapter 7 on interactions. Read it for the systematic treatment of when an interaction is worth adding and how to test it without fishing](http://www.feat.engineering/) — the counterpart to this module's "hand the tree a ratio" advice.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-20/p3-w20-m2">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

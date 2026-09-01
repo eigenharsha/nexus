@@ -1,0 +1,111 @@
+---
+title: "Correctness, debugging & memory safety tooling"
+description: "Reference solution — Week 1"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W01-M5`
+
+The task: take the 300-line leaky, UB-ridden starter to zero sanitizer findings and zero leaks **without changing observable behaviour**. The golden-output diff must stay empty.
+
+The method — and the method is the deliverable — is one bug at a time, each with the tool that found it:
+
+```bash
+# 1. compile-time sweep first: free bugs, no runtime needed
+cc -std=c17 -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror -c src/*.c
+# 2. undefined behaviour
+cc -std=c17 -g -O1 -fsanitize=undefined src/*.c -o build/ubsan && ./build/ubsan < tests/input.txt
+# 3. memory
+cc -std=c17 -g -O1 -fsanitize=address,undefined src/*.c -o build/asan && ./build/asan < tests/input.txt
+# 4. leaks (platform-dependent)
+leaks -atExit -- ./build/asan < tests/input.txt        # macOS
+ASAN_OPTIONS=detect_leaks=1 ./build/asan < tests/input.txt   # Linux
+# 5. behaviour did not change
+./build/asan < tests/input.txt | diff - tests/golden.txt && echo BEHAVIOUR PRESERVED
+```
+
+The eleven defects and the tool that finds each:
+
+| # | Defect | Found by |
+|---|---|---|
+| 1 | `malloc(strlen(s))` — no room for `'\0'` | ASan `heap-buffer-overflow`, WRITE of 6 into a 5-byte region |
+| 2 | use of a pointer after `free` | ASan `heap-use-after-free` |
+| 3 | `free` called twice on one error path | ASan `attempting double-free` |
+| 4 | `for (i = 0; i <= n; i++)` over an array of `n` | ASan `heap-buffer-overflow`, READ 4 bytes after the region |
+| 5 | `int` used for a `size_t` length, negative on error | `-Wconversion` / `-Wsign-compare` at compile time |
+| 6 | signed overflow used as an overflow check | UBSan `signed integer overflow` |
+| 7 | shift by 32 on a 32-bit type | UBSan `shift exponent 32 is too large` |
+| 8 | `strcpy` into a fixed buffer from user input | ASan `stack-buffer-overflow` |
+| 9 | early `return` skipping a `free` | leak checker |
+| 10 | inner variable shadowing an outer one | `-Wshadow` at compile time |
+| 11 | `fclose` missing on the error path | leak checker (`leaks` reports the `FILE` buffer) |
+
+Note the ordering. Three of the eleven fall out of compile flags before you run anything, and they are the cheapest three. Always sweep the compiler first.
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: fixing the crash instead of the bug.**
+
+Defect 3 (double free) crashes inside `free`, deep in libmalloc, with a backtrace full of allocator frames. The tempting fix is to guard the second call — `if (p) free(p);` — which does nothing, because `p` is non-null; it is *stale*. The second tempting fix is to remove the second `free`, which sometimes introduces a leak on the other path.
+
+The correct fix comes from reading ASan's report, which prints **three** stacks: where the double free happened, where the first free happened, and where the block was allocated. The two free sites tell you immediately that two code paths both believed they owned the block. The fix is an ownership decision — one owner, documented in the header — not a null guard. Set `p = NULL` after freeing so a third path fails loudly rather than silently.
+
+The general rule this teaches: **a crash location and a bug location are different things**, and the whole value of ASan is that it reports the second.
+
+**Wrong turn 2: "fixing" behaviour while fixing bugs.**
+
+Defect 4, the `<= n` loop, reads one element past the end. The natural fix changes `<=` to `<`. But if the original program's output *depended* on that extra element — for instance, the buggy loop summed n+1 values and the golden file contains the buggy sum — then correcting the loop changes the output and the diff fails.
+
+This is deliberate, and it is the point of the exercise. Real refactoring under a behaviour-preservation constraint means you must separate "this is undefined behaviour" from "this is the specification". The correct resolution here is to make the read defined without changing the value: allocate n+1 elements with a defined sentinel, or restructure so the final iteration reads a real value. Then the golden diff stays empty *and* ASan is silent.
+
+If you cannot preserve behaviour, the right move is to say so explicitly in the README with the reasoning — not to quietly regenerate the golden file. Regenerating the golden file to match your new output is the single fastest way to fail this lab.
+
+## The measured numbers this solution produces
+
+| Measurement | Value |
+|---|---|
+| `-O2` baseline (merge sort n = 10⁶) | 65.2 ms |
+| `-O2 -fsanitize=address,undefined` | **179.0 ms — 2.75×** |
+| `-O0`, no sanitizers | 180.1 ms |
+| ASan shadow memory ratio | 1 byte per 8 bytes of application memory |
+| ASan memory overhead (documented) | ~3× |
+| Valgrind memcheck slowdown (documented) | 10–50×, and **unsupported on Apple Silicon** |
+| `is_admin` at `-O0` | null check present |
+| `is_admin` at `-O2` | **4 instructions, null check deleted** |
+
+The `is_admin` result in full, which is the artifact worth keeping:
+
+```asm
+_is_admin:
+	ldr	w8, [x0]
+	cmp	w8, #0
+	cset	w0, eq
+	ret
+```
+
+No `cbz`, no `cbnz`, no branch on `x0`. The dereference on the line above the check told the optimiser the pointer could not be null, so the check was dead code.
+
+## Grading notes
+
+**3/3 on correctness** means all eleven defects fixed, the golden diff empty, and the sanitized run silent. Partial fixes score partially: ASan halts on the first error, so a submission that fixed only defect 1 will *look* like progress and is not.
+
+**3/3 on explanation** means one paragraph per bug naming the tool that found it and why that tool rather than another. A submission that says "used the debugger" for a leak has not understood the routing table, which is the entire module.
+
+The three most common ways submissions lose points:
+
+1. **Regenerating the golden file.** Immediate 0 on Correctness. The constraint is behaviour preservation; changing the reference is changing the question.
+2. **Running ASan once, fixing one bug, and declaring victory.** ASan exits on the first error by default. Set `ASAN_OPTIONS=halt_on_error=0` for a survey pass, then fix in order and re-run each time.
+3. **Reporting "Valgrind clean" on an Apple Silicon Mac.** Valgrind does not run there. This claim tells the grader the submission was not actually executed, and it is checked.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

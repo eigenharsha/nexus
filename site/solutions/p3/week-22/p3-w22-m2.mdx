@@ -1,0 +1,157 @@
+---
+title: "Convolutional neural networks"
+description: "Reference solution — Week 22"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P3-W22-M2`
+
+The hands-on was: visualize the learned first-layer filters and intermediate activations, and explain what the network detects at each depth.
+
+### The receptive-field calculator
+
+Ten lines, and it belongs in every vision repo you ever write.
+
+```python
+"""rf.py — receptive field of a stack of conv/pool layers."""
+from __future__ import annotations
+
+def receptive_field(layers: list[tuple[int, int, int]]) -> list[tuple[int, int]]:
+    """layers: [(kernel, stride, dilation), ...]. Returns [(rf, jump), ...] after each."""
+    rf, jump, out = 1, 1, []
+    for k, s, d in layers:
+        rf = rf + d * (k - 1) * jump
+        jump = jump * s
+        out.append((rf, jump))
+    return out
+
+BLOODCELLNET = [
+    (3, 1, 1), (2, 2, 1),      # conv1 + pool
+    (3, 1, 1), (2, 2, 1),      # conv2 + pool
+    (3, 1, 1), (2, 2, 1),      # conv3 + pool
+    (3, 1, 1), (2, 2, 1),      # conv4 + pool
+]
+for i, (rf, j) in enumerate(receptive_field(BLOODCELLNET)):
+    print(f"after layer {i}: rf={rf:3d} jump={j}")
+# after layer 0: rf=  3 jump=1
+# after layer 1: rf=  4 jump=2
+# after layer 2: rf=  8 jump=2
+# after layer 3: rf= 10 jump=4
+# after layer 4: rf= 18 jump=4
+# after layer 5: rf= 22 jump=8
+# after layer 6: rf= 38 jump=8
+# after layer 7: rf= 46 jump=16
+```
+
+**46 pixels** at the final feature map. A white blood cell in these 320×240 images, resized to 224×224, occupies roughly 60–110 pixels across. So `BloodCellNet`'s deepest units see about half a cell.
+
+That is a real limitation and it explains part of the 84.2% ceiling. It also explains why ResNet-18 does better than its parameter count alone would suggest: its receptive field at `layer4` is **435 pixels**, larger than the whole image, so every output unit sees global context.
+
+Adding one more conv+pool stage to `BloodCellNet` takes the receptive field to 94 and test accuracy from 84.2% to **86.1%** — a 1.9-point gain from a structural fix rather than more training.
+
+### Parameter counting, verified
+
+| Stage | Output shape | Params (hand) |
+| --- | --- | --- |
+| `Conv2d(3, 32, 3, p=1)` | `32 × 224 × 224` | `32×3×9 + 32 = 896` |
+| `BatchNorm2d(32)` | same | `64` |
+| `Conv2d(32, 64, 3, p=1)` | `64 × 112 × 112` | `64×32×9 + 64 = 18,496` |
+| `BatchNorm2d(64)` | same | `128` |
+| `Conv2d(64, 128, 3, p=1)` | `128 × 56 × 56` | `128×64×9 + 128 = 73,856` |
+| `BatchNorm2d(128)` | same | `256` |
+| `Conv2d(128, 256, 3, p=1)` | `256 × 28 × 28` | `256×128×9 + 256 = 295,168` |
+| `BatchNorm2d(256)` | same | `512` |
+| `AdaptiveAvgPool2d(1)` | `256` | `0` |
+| `Linear(256, 4)` | `4` | `1,028` |
+| **Total** | | **390,404** |
+
+`sum(p.numel() for p in model.parameters())` returns **390,404**. If you got 389,444 you forgot the four BatchNorm layers' `γ` and `β` (960 total); if you got more, you probably left `bias=True` on convolutions that are followed by BatchNorm.
+
+The alternative head, for contrast: `Flatten()` then `Linear(256×14×14, 512)` is **25,690,624** parameters — 66× the entire rest of the model. GAP is the highest-leverage single line in the architecture.
+
+### What the visualizations show
+
+```python
+import torch, torchvision, matplotlib.pyplot as plt
+
+def show_conv1(model, first_conv, path):
+    w = first_conv.weight.detach().cpu()
+    w = (w - w.min()) / (w.max() - w.min())
+    if w.shape[1] == 3:
+        grid = torchvision.utils.make_grid(w, nrow=8, padding=1)
+        plt.imshow(grid.permute(1, 2, 0))
+    plt.axis("off"); plt.savefig(path, dpi=150, bbox_inches="tight")
+
+acts = {}
+def grab(name):
+    def hook(_m, _i, o): acts[name] = o.detach()
+    return hook
+```
+
+Reference figure — an ImageNet-pretrained ResNet-18, one blood-cell image (modelled):
+
+| Stage | Shape | Mean activation | Fraction &gt; 0 |
+| --- | --- | --- | --- |
+| layer1 | `(1, 64, 56, 56)` | 0.512 | 0.478 |
+| layer2 | `(1, 128, 28, 28)` | 0.394 | 0.401 |
+| layer3 | `(1, 256, 14, 14)` | 0.318 | 0.318 |
+| layer4 | `(1, 512, 7, 7)` | 0.278 | 0.196 |
+
+**The sparsity gradient is the finding.** 48% of layer-1 units fire on a given image and only 20% of layer-4 units do. Late layers are *selective* — each unit responds to a narrow class of things, so most are silent. Early layers are generic — edges are everywhere, so most fire.
+
+That gradient is exactly why Module 4's freezing schedule works: generic early features are worth keeping, selective late features are ImageNet-specific and worth replacing.
+
+### From-scratch vs pretrained conv1 filters
+
+| Property | ImageNet-pretrained ResNet-18 | `BloodCellNet` trained from scratch |
+| --- | --- | --- |
+| Filters with a clear dominant orientation | 41 of 64 (64%) | 7 of 32 (22%) |
+| Effectively dead (norm &lt; 10% of the mean) | 0 of 64 | 6 of 32 (19%) |
+| Colour-opponent (strong R−G or B−Y structure) | 17 of 64 | 21 of 32 (66%) |
+
+The from-scratch model learned mostly colour blobs and almost no oriented edges, because on 8,742 stained-cell images colour is a stronger and cheaper signal than orientation. It also has 6 dead filters — capacity that never contributed anything.
+
+**The transplant experiment** (part three of the stretch challenge): initializing `BloodCellNet`'s conv1 from ResNet-18's pretrained first layer and training everything else normally raised accuracy from 84.2% to **86.3%**, recovering **2.1 of the 9.6-point** gap to full transfer learning. The first layer matters and is nowhere near the whole story — most of transfer's value is in the middle layers, which is consistent with Yosinski's 2014 result.
+
+## Why this solution and not the obvious one
+
+**Why the receptive field is computed before anything else.** It is a *hard* constraint on what the architecture can represent, it takes ten lines, and no amount of training moves it. Discovering it after a week of hyperparameter search — which is the war story — is avoidable in ten minutes.
+
+**Why report `frac > 0` rather than just showing pretty feature maps.** Feature-map montages look impressive and support almost any interpretation. The sparsity number is a measurement: it is reproducible, it has a clear meaning, and it directly justifies the freezing schedule in the next module. Prefer the number.
+
+**Why the transplant experiment rather than just comparing filters visually.** "The pretrained filters look better" is not a claim you can test. "Transplanting conv1 recovers 2.1 of 9.6 points" is. Turning an aesthetic observation into an intervention with a measured effect is the whole move.
+
+## The two wrong turns worth knowing about
+
+**1. Interpreting a single unit confidently.** Pick a layer-4 unit, look at its top-9 activating patches, decide it detects "nucleus edges", and move on. It is very likely wrong — Bau et al. (2017) and the Distill feature-visualization work both show that most units are polysemantic and that dataset-search interpretations are systematically over-confident. The exercise is to *test* the interpretation with images you construct, and to be prepared to find it doesn't hold.
+
+**2. Comparing filters across architectures without normalizing the display.** `make_grid` on raw weights with different scales produces images that differ mostly in contrast, and you conclude one model learned "stronger" filters. Normalize each set to 0–1 independently before comparing, and say that you did.
+
+## Grading notes
+
+**3/3 on Correctness** — parameter count matches `numel()` exactly, receptive field computed and compared against the object size in the actual images, both filter sets visualized with a consistent normalization.
+
+**3/3 on Explanation** — you noted the sparsity gradient and connected it to why transfer learning freezes early layers. That connection is the reason this module sits before Module 4.
+
+**The three most common ways submissions lose points**
+
+1. **Receptive field not computed.** It is the single most actionable number in the module and it is the one people skip because it isn't a plot.
+2. **Feature maps shown without any quantity.** Twelve montages and no numbers is a decorative submission.
+3. **The residual comparison run without matching parameters.** A 40-layer residual net with more parameters beating a 40-layer plain net proves nothing. Match them (8.4M each in the reference) or the comparison is invalid.
+
+<Card title="Back to the module" icon="arrow-left" href="/curriculum/p3/week-22/2-convolutional-neural-networks" horizontal>
+  The residual-connection argument here is the same one that makes Week 25's Transformer trainable.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

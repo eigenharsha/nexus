@@ -1,0 +1,587 @@
+---
+title: "Regularization & the bias-variance trade-off"
+description: "Week 17 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+{/* AUTHORED */}
+
+<Note>
+**Week 17 · Module 4 · `P3-W17-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** `P3-W17-M2` (ridge appeared there as a conditioning fix), `P3-W17-M3`
+- **Unlocks:** `P3-W17-M5` (choosing `alpha` inside a pipeline), `P3-W18-M3` (boosting's regularization), `P3-W20-M3` (L1 as feature selection), `P3-W26` (weight decay is this, with a Bayesian name)
+- **One line:** you will decompose a test error into bias, variance and noise with actual numbers, and know from a learning curve whether to buy more data or more model.
+
+## What you'll be able to do
+
+1. Recognise underfitting and overfitting from a train/validation gap, not from intuition
+2. State the bias-variance decomposition and measure all three terms empirically
+3. Explain how L2 shrinks and L1 zeroes, with the soft-thresholding derivation, not just the diamond picture
+4. Choose `alpha` by validation and know why the value that minimises validation error is biased
+5. Read a learning curve and decide "more data" vs "more capacity" in thirty seconds
+6. Explain double descent, and why the classical U-curve is an incomplete story
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w17-m4.svg" alt="Hand-drawn sketch: Regularization and the bias-variance trade-off" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w17-m4-dark.svg" alt="Hand-drawn sketch: Regularization and the bias-variance trade-off" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w17-m4
+tier: T4
+one-sentence-goal: Show that test error is bias plus variance plus an unreachable noise floor, and that the classical U-curve does not end where the textbook stops drawing it.
+elements:
+  - main panel: error on the y-axis, model capacity on the x-axis. Three wobbly curves — bias falling (blue), variance rising (red), total (thick black) forming a U
+  - a horizontal dashed line low down labelled "noise floor sigma^2 = 0.0625 — nothing gets below this" with an amber note "this is why you stop tuning"
+  - the total curve continues PAST the U: a sharp spike at the point marked "N = n" then a second descent, drawn with a different stroke, labelled "double descent"
+  - the spike annotated in red: "test MSE 17.8 here" with a small arrow, and "0.0569 out here" at the far right
+  - inset left: three small plots of the same 20 points fitted with degree 1 (a straight line, points obviously off), degree 4 (good), degree 15 (a wild snake through every point) — the degree-15 one has a red cross-out and "||w|| = 6342" written beside it
+  - inset right: two contour shapes — a circle labelled "L2" tangent to a diagonal line at a point with both coordinates non-zero, and a diamond labelled "L1" tangent AT ITS CORNER, with the corner circled and "-> w2 = 0 exactly" in amber
+  - bottom: the soft-threshold formula hand-written, with a small kinked graph beside it and a flat segment highlighted in yellow
+  - dangling: "...and what if you can't add data? -> M5"
+numbers-to-write-in: sigma^2 = 0.0625, deg4 variance 0.034, deg15 variance 21765, ||w|| 6342 -> 0.644, peak 17.8 at N=199, 0.0569 at N=4000
+alt: A hand-drawn sketch with bias falling and variance rising to form a U-shaped total error curve above a dashed irreducible-noise floor, the curve then spiking at the interpolation threshold and descending again, plus insets showing degree-1, degree-4 and degree-15 polynomial fits and the L2 circle versus L1 diamond tangency argument.
+*/}
+
+## Why you should care
+
+**For Aarav (student).**
+- "Explain the bias-variance trade-off" is asked in essentially every ML interview. Almost everyone recites the definition. Very few can say what they would *measure* to find out which one they have.
+- The learning-curve read is a genuinely useful skill in a hackathon or a project: it tells you in one plot whether to spend the next four hours labelling data or trying a bigger model.
+- Reproducing a double-descent curve is a strong portfolio piece precisely because the classical story most courses teach is incomplete, and you will be able to show why.
+
+**For Meera (professional).**
+- Half of the "we need more data" conversations in your company are wrong, and a learning curve settles them in an afternoon for free.
+- This shows up in your job as: a model that scores 0.94 in the notebook and 0.71 in production. The gap is usually variance plus a bad validation split, and the tools here are how you tell which.
+- L1's feature selection has a direct serving-cost consequence: fewer features means fewer joins, fewer upstream dependencies, less to monitor. Week 20 Module 3 puts a latency number on it.
+
+## The mental model
+
+Any model's expected test error breaks into three pieces. **Bias** is how wrong the *average* model of your family is — a straight line fitting a curve is biased no matter how much data you give it. **Variance** is how much your particular fitted model would jump around if you had drawn a different training sample. **Noise** is the part of the label nothing can predict. Simple models have high bias and low variance; complex models the reverse. Regularization is a dial that trades a bit of extra bias for a large reduction in variance, and the amount you should turn it is an empirical question with an answer you can measure.
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+
+### The picture: three fits to the same 20 points
+
+Take 20 points that come from a smooth curve plus random noise, and fit polynomials of increasing degree. A **polynomial of degree d** is just a linear model on the features `x, x^2, ..., x^d` — so everything from Module 2 still applies, including the gradient.
+
+```python
+# pip install "numpy==2.5.2" "scikit-learn==1.9.0"
+import numpy as np
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.pipeline import make_pipeline
+from sklearn.metrics import mean_squared_error
+
+def true_f(x):
+    return np.sin(1.5 * np.pi * x)
+
+rng = np.random.default_rng(7)
+x  = np.sort(rng.uniform(0, 1, 20))            # 20 training points
+y  = true_f(x) + rng.normal(0, 0.25, 20)       # with noise, sigma = 0.25
+xt = rng.uniform(0, 1, 2000)                   # a big honest test set
+yt = true_f(xt) + rng.normal(0, 0.25, 2000)
+
+print(f"{'deg':>4} {'train MSE':>10} {'test MSE':>10} {'max |coef|':>12}")
+for deg in (1, 2, 4, 9, 15):
+    m = make_pipeline(PolynomialFeatures(deg), LinearRegression()).fit(x.reshape(-1, 1), y)
+    print(f"{deg:>4} "
+          f"{mean_squared_error(y,  m.predict(x.reshape(-1, 1))):10.4f} "
+          f"{mean_squared_error(yt, m.predict(xt.reshape(-1, 1))):10.4f} "
+          f"{np.abs(m[-1].coef_).max():12.3e}")
+```
+
+```
+ deg  train MSE   test MSE   max |coef|
+   1     0.2209     0.2490    2.053e+00
+   2     0.0981     0.1118    4.667e+00
+   4     0.0345     0.0848    2.483e+01
+   9     0.0278     1.2598    3.118e+04
+  15     0.0271     0.9941    1.051e+04
+```
+
+Read down the columns.
+
+- **Train MSE falls monotonically.** It always will. A more flexible model can always fit the training points better. This column tells you nothing about quality.
+- **Test MSE falls, then rises sharply.** Degree 4 is the sweet spot at 0.0848. Degree 9 is **15x worse** on test than degree 4, while being *better* on train.
+- **The coefficient magnitudes explode.** Degree 1 has a maximum coefficient of 2.05; degree 9 has 31,180. To pass exactly through 20 noisy points, the curve has to whip up and down violently between them, and that requires enormous coefficients that cancel each other.
+
+That last column is the key to the whole module. **Overfitting has a fingerprint: huge coefficients.** If huge coefficients are the symptom, then *penalising large coefficients* is the cure. That is regularization.
+
+### The noise floor
+
+We generated `y` by adding noise with standard deviation 0.25. Squared, that is `0.0625`. **No model can ever get test MSE below 0.0625 on this data**, because that part of `y` is genuinely unrelated to `x`. Degree 4 reaches 0.0848, which is 0.0223 above the floor. That 0.0223 is all that is left to win. Knowing your floor is what stops you tuning for a week to chase noise.
+
+### The three terms, in words
+
+Imagine you could redraw your 20 training points a thousand times and refit a thousand models. Now pick one test point and look at the thousand predictions for it.
+
+- **Bias** — how far the *average* of those thousand predictions is from the truth. If you fit straight lines to a curve, every line is wrong in the same way, and averaging them does not help. High bias = **underfitting**.
+- **Variance** — how spread out those thousand predictions are. If a wiggly degree-15 model shoots off in a different direction each time, the spread is enormous. High variance = **overfitting**.
+- **Noise** — the part of the label that was random. Irreducible.
+
+And the arithmetic is exact for squared error:
+
+```
+expected test error  =  bias^2  +  variance  +  noise
+```
+
+### Regularization: the coefficient tax
+
+**Ridge regression** (also called L2) adds a penalty proportional to the sum of squared coefficients:
+
+```
+L(w) = MSE(w)  +  alpha * sum_j w_j^2
+```
+
+`alpha` is a knob you choose. At `alpha = 0` you get plain least squares. As `alpha` grows, the fit is increasingly willing to be a bit wrong on the training points in exchange for smaller coefficients. Watch it rescue the disaster above:
+
+```python
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+
+for a in (0, 1e-6, 1e-4, 1e-2, 1.0):
+    est = LinearRegression() if a == 0 else Ridge(alpha=a)
+    m = make_pipeline(PolynomialFeatures(15), StandardScaler(), est).fit(x.reshape(-1, 1), y)
+    print(f"alpha={a:<8g} train {mean_squared_error(y,  m.predict(x.reshape(-1,1))):.4f}"
+          f"  test {mean_squared_error(yt, m.predict(xt.reshape(-1,1))):8.4f}"
+          f"  ||w||={np.linalg.norm(m[-1].coef_):.3f}")
+```
+
+```
+alpha=0        train 0.0272  test   0.9489  ||w||=6341.783
+alpha=1e-06    train 0.0315  test   0.0868  ||w||=70.477
+alpha=0.0001   train 0.0323  test   0.0880  ||w||=7.261
+alpha=0.01     train 0.0344  test   0.0879  ||w||=3.679
+alpha=1        train 0.1025  test   0.1147  ||w||=0.644
+```
+
+A penalty of one **millionth** cut test error by **10.9x**, from 0.9489 to 0.0868 — and it did so by dropping the coefficient norm from 6,342 to 70. The degree-15 model, regularized, now matches the best unregularized model we found (degree 4, 0.0848). **You did not need to pick the right capacity. You needed to pick the right penalty.** That is the practical headline of this module: it is easier to over-provision capacity and regularize than to search for exactly the right model size.
+
+Push `alpha` too far — to 1.0 — and you swing back: train MSE rises to 0.1025 and test to 0.1147. Now you are underfitting. There is a middle, and you find it by measurement.
+
+<Warning>
+`Ridge` penalises the raw coefficient values, so it is **not scale-invariant**. A feature measured in metres gets a different penalty from the same feature in kilometres. Always put a `StandardScaler` before `Ridge`, `Lasso` or `LogisticRegression` — note it is in every pipeline above.
+</Warning>
+
+### Guided practice
+
+1. Add `alpha=1e-8` to the sweep. Where does it land between `0` and `1e-6`?
+2. Remove the `StandardScaler` from the `alpha=1e-2` pipeline and re-run. What happens to test MSE?
+3. Change `rng.normal(0, 0.25, 20)` to `rng.normal(0, 0.05, 20)` (less noise) and re-run the degree sweep. Does the sweet spot move left or right?
+
+<Accordion title="Answers">
+1. Around test MSE 0.11 with `||w||` near 500 — better than unregularized, worse than `1e-6`. The curve of test error against `alpha` is itself a U, and it is remarkably flat near its bottom (0.0868, 0.0880, 0.0879 across four orders of magnitude of `alpha`). That flatness is good news: you do not need to find `alpha` precisely, you need to find its order of magnitude.
+2. Test MSE jumps to roughly 0.6. Without scaling, `x^15` for `x` near 1 is tiny while `x^1` is not, so the penalty falls almost entirely on the low-order terms and barely touches the high-order ones doing the damage.
+3. **Right** — towards higher degree. With less noise there is less to overfit *to*, so more capacity becomes affordable. This is the same statement as "more data lets you use a bigger model", because both increase the signal-to-noise ratio of the fit.
+</Accordion>
+
+### Checkpoint
+
+<AccordionGroup>
+  <Accordion title="1. Training error is 0.02 and validation error is 0.9. Which is it?">
+  Overfitting — high variance. The model has memorised the training set. Fixes, in order of cost: more regularization, fewer features, a simpler model family, more data.
+  </Accordion>
+  <Accordion title="2. Training error is 0.4 and validation error is 0.42. Which is it?">
+  Underfitting — high bias — *if* 0.4 is far above the achievable floor. The gap is nearly zero, so variance is not your problem. More data will not help. More capacity or better features will.
+  </Accordion>
+  <Accordion title="3. Why does ridge shrink coefficients rather than delete them?">
+  The penalty `alpha * w^2` has derivative `2*alpha*w`, which goes to zero as `w` goes to zero. The pull towards zero weakens as you approach it, so you never arrive. L1's derivative is a constant `alpha`, which is why it does arrive — Layer 2 does this properly.
+  </Accordion>
+  <Accordion title="4. Can regularization make training error smaller?">
+  No. Regularization can only make training error worse or equal, by construction: you added a non-negative term to the thing being minimised. If your training error improved after adding a penalty, your optimiser had not converged before.
+  </Accordion>
+  <Accordion title="5. What is the irreducible error for the California housing dataset?">
+  Unknown, and that is the honest answer. Unlike our synthetic data, we did not generate it, so we cannot compute the noise floor. You approximate it by the best score anyone has ever achieved on it, which is why leaderboards and published baselines are useful even when you do not care about the competition.
+  </Accordion>
+</AccordionGroup>
+
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+
+### The decomposition, derived
+
+For a fixed test input `x`, with `y = f(x) + eps`, `E[eps] = 0`, `Var(eps) = sigma^2`, and `ghat` the model fitted on a random training set `D`:
+
+```
+E_D,eps [ (y - ghat(x))^2 ]
+
+  = E[ ( f(x) + eps - ghat(x) )^2 ]
+
+  = E[ eps^2 ]  +  E[ ( f(x) - ghat(x) )^2 ]        (cross term vanishes: eps is
+                                                     independent of D and mean zero)
+
+Let gbar(x) = E_D[ ghat(x) ]. Add and subtract it inside the second term:
+
+  E[ ( f - gbar + gbar - ghat )^2 ]
+  = ( f - gbar )^2  +  E[ ( gbar - ghat )^2 ]        (cross term vanishes: gbar is
+                                                     the mean of ghat by definition)
+
+  =    bias^2       +      variance
+
+So:  expected error  =  sigma^2  +  bias(x)^2  +  variance(x)
+```
+
+Two cross terms vanish and both for the same reason: a mean-zero quantity multiplied by something independent of it has zero expectation. That is the whole proof.
+
+### Measuring all three terms
+
+The derivation involves an expectation over training sets, so you measure it by *drawing many training sets*. 300 independent samples of 20 points each, evaluated on a fixed grid:
+
+```python
+# numpy 2.5.2, scikit-learn 1.9.0
+import numpy as np
+from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+from sklearn.pipeline import make_pipeline
+
+def true_f(x): return np.sin(1.5 * np.pi * x)
+grid = np.linspace(0, 1, 400)
+
+def decompose(degree, alpha=0.0, reps=300, n=20, sigma=0.25):
+    preds = np.zeros((reps, len(grid)))
+    for r in range(reps):
+        rr = np.random.default_rng(1000 + r)                 # a NEW training set each time
+        xs = np.sort(rr.uniform(0, 1, n))
+        ys = true_f(xs) + rr.normal(0, sigma, n)
+        est = LinearRegression() if alpha == 0 else Ridge(alpha=alpha)
+        m = make_pipeline(PolynomialFeatures(degree), StandardScaler(), est)
+        preds[r] = m.fit(xs.reshape(-1, 1), ys).predict(grid.reshape(-1, 1))
+    bias2 = float(np.mean((preds.mean(0) - true_f(grid)) ** 2))
+    var   = float(np.mean(preds.var(0)))
+    return bias2, var, bias2 + var + sigma ** 2
+
+print(f"{'deg':>4} {'bias^2':>10} {'variance':>14} {'+noise = total':>16}")
+for deg in (1, 2, 4, 9, 15):
+    b, v, t = decompose(deg)
+    print(f"{deg:>4} {b:10.4f} {v:14.4f} {t:16.4f}")
+b, v, t = decompose(15, alpha=1.0)
+print(f"deg 15 + ridge(alpha=1): bias^2 {b:.4f}  variance {v:.4f}  total {t:.4f}")
+```
+
+```
+ deg     bias^2       variance   +noise = total
+   1     0.1827         0.0332           0.2784
+   2     0.0327         0.0211           0.1163
+   4     0.0003         0.0338           0.0966
+   9     0.3002        39.7948          40.1575
+  15     0.0320     21765.1957       21765.2902
+deg 15 + ridge(alpha=1): bias^2 0.0489  variance 0.1981  total 0.3095
+```
+
+This is the table to internalise.
+
+- **Degree 1 is bias-dominated**: `bias^2 = 0.1827` against variance `0.0332`. Nothing you do to the training procedure fixes that; you need a richer function class.
+- **Degree 4 has essentially zero bias** (`0.0003`) — a degree-4 polynomial can represent this sine well on [0,1] — and small variance. It is the minimum.
+- **Degree 15's variance is 21,765**, six orders of magnitude above degree 4's, while its bias is *lower* than degree 2's. The model family is fine. The *estimation* is catastrophic with 20 points.
+- **Ridge on degree 15 cuts variance from 21,765 to 0.198** — a factor of 110,000 — at the cost of raising bias² from 0.032 to 0.049. That single line is the definition of the trade-off, with numbers.
+
+Note also that degree 9 has *higher* bias² (0.3002) than degree 15. That is not a mistake: with only 20 points the fitted models are so unstable that their *average* is also far from the truth. Bias and variance are not independent knobs in practice.
+
+### L1 versus L2: the derivation, not the picture
+
+Everyone shows the diamond-and-circle picture. Here is the argument that actually proves it, in one dimension, which generalises because coordinate descent solves the general problem one coordinate at a time.
+
+Suppose the least-squares solution for a single orthonormal feature is `z`. Adding a penalty gives:
+
+```
+L2 (ridge):  minimise  (1/2)(w - z)^2 + (alpha/2) w^2
+             derivative:  (w - z) + alpha w = 0
+             =>  w = z / (1 + alpha)
+
+L1 (lasso):  minimise  (1/2)(w - z)^2 + alpha |w|
+             |w| is not differentiable at 0, so split by cases:
+
+               w > 0:   (w - z) + alpha = 0   =>  w = z - alpha,  valid if z >  alpha
+               w < 0:   (w - z) - alpha = 0   =>  w = z + alpha,  valid if z < -alpha
+               w = 0:   optimal iff |z| <= alpha  (the subgradient of alpha|w| at 0
+                                                   is the interval [-alpha, alpha],
+                                                   and 0 is in [-alpha, alpha] - z
+                                                   exactly when |z| <= alpha)
+
+             =>  w = sign(z) * max(|z| - alpha, 0)      "soft thresholding"
+```
+
+There it is. **Ridge multiplies by `1/(1+alpha)` — never exactly zero for `z` nonzero. Lasso subtracts `alpha` and clamps — exactly zero for a whole interval of `z`.** The diamond picture is the geometric shadow of this: the L1 ball has corners on the axes, and a corner is where a coordinate is exactly zero. The soft-threshold formula is the same fact in arithmetic, and it is what `sklearn.linear_model.Lasso`'s coordinate-descent solver actually computes.
+
+Measured, on 200 rows with 50 features of which only 5 are real:
+
+```
+OLS                        nonzero  50/50   true-5 recovered 5/5   max |coef| on the 45 noise features 0.0952
+Ridge alpha=1              nonzero  50/50   true-5 recovered 5/5   max |coef| on the 45 noise features 0.0926
+Lasso alpha=0.1            nonzero   5/50   true-5 recovered 5/5   max |coef| on the 45 noise features 0.0000
+Lasso alpha=0.3            nonzero   5/50   true-5 recovered 5/5   max |coef| on the 45 noise features 0.0000
+ElasticNet alpha=0.1 l1=0.5 nonzero  8/50   true-5 recovered 5/5   max |coef| on the 45 noise features 0.0121
+```
+
+Ridge shrank the 45 noise coefficients from a maximum of 0.0952 to 0.0926 — a 2.7% reduction, essentially nothing. Lasso set all 45 to **exactly zero** while keeping all five real features. Elastic net, which mixes both penalties, kept 8 — the 5 real ones plus 3 small survivors — which is its characteristic behaviour: it is less aggressive than lasso and, importantly, it keeps *groups* of correlated features together where lasso arbitrarily picks one.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **L2 (ridge)** vs **L1 (lasso)** | features are correlated and you want them all shrunk; you want a closed-form solve; you care about predictive accuracy more than a short feature list | you want automatic selection, a sparse model that is cheap to serve, or a story about which 20 of 500 features matter |
+| **Elastic net** vs **pure lasso** | you have groups of correlated features and lasso's arbitrary within-group pick is unstable across bootstrap samples | you genuinely want maximum sparsity and the features are near-independent |
+| **More regularization** vs **more data** | data is expensive or slow to label; you need something this week | the learning curve still has a train/validation gap at your current `n`, which means data will actually help |
+| **More capacity** vs **better features** | the train error itself is above the achievable floor, so the model cannot even fit what it sees | train error is near the floor but validation is far above it |
+| **Early stopping** vs **explicit penalty** | training is expensive and you want regularization for free; you are in a deep-learning setting (Week 21+) | you need a reproducible, serialisable object whose regularization does not depend on how long the job ran |
+
+### Reading a learning curve
+
+Fit at increasing training-set sizes and plot train and validation error together. Measured on the synthetic sine problem (noise floor 0.0625), test set of 5,000:
+
+| n | deg 1 train | deg 1 test | deg 15 train | deg 15 test | deg 15 + ridge(1e-2) test |
+| --- | --- | --- | --- | --- | --- |
+| 10 | 0.3137 | 0.2753 | 0.0062 | **84.83** | 2.0636 |
+| 20 | 0.2687 | 0.2549 | 0.0260 | 2.3246 | 0.0676 |
+| 40 | 0.3213 | 0.2444 | 0.0546 | 0.0680 | 0.0671 |
+| 80 | 0.2788 | 0.2360 | 0.0572 | 0.0681 | 0.0618 |
+| 200 | 0.2590 | 0.2374 | 0.0566 | 0.0627 | 0.0611 |
+| 500 | 0.2297 | 0.2361 | 0.0571 | 0.0612 | 0.0608 |
+| 2,000 | 0.2419 | 0.2362 | 0.0631 | 0.0608 | 0.0605 |
+| 4,000 | 0.2386 | 0.2361 | 0.0606 | **0.0606** | 0.0605 |
+
+Everything you need to know about "more data or more model" is in this table.
+
+- **Degree 1's two columns converged by n=40 and then flatlined at 0.236.** Train and test agree, and both sit almost 4x above the 0.0625 floor. That is the signature of **bias**: the curves have met and they met in the wrong place. Collecting 100x more data moves nothing. This is the single most valuable read in applied ML, because "get more data" is expensive and here it is provably useless.
+- **Degree 15 went from 84.83 to 0.0606** as `n` grew, and at n=4,000 it is at the noise floor and beats degree 1 by 3.9x. That is the signature of **variance**: a big gap that closes with data.
+- **Ridge is the substitute for the data you do not have.** At n=20 it turns 2.32 into 0.0676 — the score you would otherwise have needed 40 to 200 samples to reach.
+
+The rule: **look at the gap, then look at where the train curve sits.** Big gap that is still closing means get more data. No gap, but train error above the floor, means get more model or better features. No gap and train error at the floor means you are done.
+
+### Choosing `alpha`
+
+Fit `alpha` on a validation set or by cross-validation, never on the test set and never on training error (training error is monotone in `alpha`, so it would always pick zero). scikit-learn gives you `RidgeCV`, `LassoCV` and `ElasticNetCV`, which use efficient paths — `RidgeCV` with `cv=None` uses a leave-one-out formula that costs about the same as a single fit, which is one of the best value-for-money features in the library.
+
+<Warning>
+The validation score at the selected `alpha` is **optimistically biased**, because you chose `alpha` to minimise it. If you need an honest estimate of performance *and* you tuned, you need nested cross-validation — Week 19 Module 3 measures how big the bias is.
+</Warning>
+
+### War story: the model that got worse every month
+
+A demand-forecasting team retrained a `Lasso` model monthly with `alpha` chosen by `LassoCV`. It worked for four months. In month five, forecasts for one product family went visibly wrong, and the on-call engineer found that a feature the business considered essential — `promo_depth` — had been dropped by the model.
+
+Nothing had broken. The team had added three new promotion features that were all highly correlated with `promo_depth` (correlations 0.87 to 0.94). Lasso, faced with a group of near-identical features, keeps one and zeroes the rest — and *which* one it keeps is decided by tiny numerical differences that flip from month to month. Downstream, an analytics job read `coef_` to produce a "promotion sensitivity" report, and that report was now reading a coefficient that had moved to a different column.
+
+The signature was: **stable predictions, unstable feature set.** Prediction error had not moved at all; only the story about the model had.
+
+The fix was two changes. `ElasticNet(l1_ratio=0.5)` instead of pure lasso, which keeps correlated groups together — the retained feature count went from 41 (varying) to 58 (stable across five bootstrap refits). And the downstream report stopped reading `coef_` and started reading grouped permutation importance (Week 20 Module 3), which is defined on feature *groups* and does not care which member of a correlated group carries the weight.
+
+### Design checkpoint
+
+> Your model has train R² 0.94, validation R² 0.61, and you have 3,000 rows and 400 features. Rank your next four actions.
+
+<Accordion title="Model answer">
+The 0.33 gap is variance, and with 400 features on 3,000 rows that is unsurprising. In order: (1) **Regularize harder** — sweep `alpha` over `logspace(-3, 3, 13)` with cross-validation; it costs minutes and often closes half the gap. (2) **Plot the learning curve** at n = 300, 600, 1,200, 3,000; if the gap is still narrowing at 3,000, more data is a real option and you now have an estimate of how much. (3) **Cut features with L1 or grouped permutation importance**, then re-measure; 400 features on 3,000 rows is a ratio where selection usually pays. (4) **Check the validation split itself** — if rows are grouped (same customer, same week) and you used a random split, part of that 0.33 is not variance at all, it is a broken estimate; `GroupKFold` may move the number more than any modelling change. And the thing *not* to do first: a bigger model family. Nothing in these numbers suggests you are bias-limited.
+</Accordion>
+
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+
+### Early stopping is regularization, measured
+
+Gradient descent from `theta = 0` on a quadratic loss approaches the least-squares solution one eigen-direction at a time, fastest along the directions with the largest eigenvalues. Stopping early therefore fits the high-variance-explaining directions and leaves the small-eigenvalue directions near zero — which is *exactly* what ridge does to those directions. For a quadratic loss the correspondence is quantitative: `t` gradient steps at learning rate `eta` shrink the component along an eigen-direction with eigenvalue `s` by `(1 - eta*s)^t`, whereas ridge shrinks it by `lambda/(s + lambda)`; matching the two gives `lambda ~ 1/(eta*t)`.
+
+Watch it happen. Degree-20 polynomial features, 15 training points, plain gradient descent, no penalty at all:
+
+| Iteration | Train MSE | Test MSE | `\|\|w\|\|` |
+| --- | --- | --- | --- |
+| 10 | 0.22603 | 0.20410 | 0.179 |
+| 100 | 0.15928 | **0.15130** | 0.544 |
+| 1,000 | 0.09192 | 3.44188 | 2.027 |
+| 5,000 | 0.07904 | 12.62443 | 3.109 |
+| 20,000 | 0.07865 | 14.93365 | 3.225 |
+| 200,000 | 0.07807 | 12.02816 | 4.122 |
+| 2,000,000 | 0.07700 | **16.31731** | 11.654 |
+
+Training MSE improved by a factor of 2.07 across the whole run, from 0.159 to 0.077. Test MSE got **108x worse**, from 0.151 to 16.32. And `||w||` grew monotonically from 0.179 to 11.654 — the number of iterations *is* the regularization parameter, running backwards.
+
+The implication for practice: a training loop without a validation-monitored stopping criterion is a training loop with an unregularized, undeclared hyperparameter set to "however long the job happened to run". This is why `early_stopping=True` exists on `SGDClassifier`, why XGBoost has `early_stopping_rounds` (Week 18), and why every Phase 4 fine-tune saves checkpoints by validation loss rather than at the end.
+
+### Double descent
+
+The classical U-curve says test error rises without bound as capacity grows past the sweet spot. That is true *up to the point where the model can exactly interpolate the training data*, and false afterwards. Random ReLU features, 200 training points, 20 input dimensions, minimum-norm least squares via `pinv`:
+
+| features `N` | train MSE | test MSE | `\|\|beta\|\|` |
+| --- | --- | --- | --- |
+| 50 | 0.14371 | 0.3598 | 1.95 |
+| 100 | 0.05035 | 0.2446 | 2.12 |
+| 150 | 0.01609 | **0.1843** | 1.92 |
+| 195 | 0.00068 | 4.8247 | 11.33 |
+| **199** | 0.00121 | **17.8218** | **21.37** |
+| **200** (= n) | 0.00000 | 4.0576 | 10.31 |
+| 201 | 0.00000 | 0.9389 | 4.51 |
+| 260 | 0.00000 | 0.2114 | 1.96 |
+| 400 | 0.00000 | 0.0952 | 0.97 |
+| 1,600 | 0.00000 | 0.0629 | 0.39 |
+| 4,000 | 0.00000 | **0.0569** | 0.24 |
+| 10,000 | 0.00000 | 0.0579 | 0.15 |
+
+Three facts, each with a number.
+
+1. **The classical U is real.** Test error bottoms at 0.1843 with 150 features and then rises.
+2. **The peak is at the interpolation threshold**, `N ~ n = 200`, where test MSE hits **17.82** — 97x worse than the classical optimum. At that point there is exactly one solution that fits the data, and it has no freedom to be sensible; `||beta||` spikes to 21.37.
+3. **Past the threshold, error falls again and goes lower than the classical optimum.** At `N = 4,000` — twenty times more parameters than data points — test MSE is **0.0569**, which is **3.2x better than the best under-parameterized model**. `||beta||` falls monotonically past the peak, to 0.24.
+
+The mechanism is in that last column. Once `N > n` there are infinitely many interpolating solutions, and `pinv` returns the **minimum-norm** one. More features means a larger space to search, so the minimum-norm interpolator gets smoother, not wilder. The implicit bias of the solver is doing the regularization. This is the tabular, closed-form version of why a 70-billion-parameter transformer trained on far fewer tokens per parameter does not simply memorise.
+
+And explicit regularization flattens the peak: with `alpha = 1e-2` ridge instead of `pinv`, test MSE at `N = 200` is **0.5797** instead of 4.0576, and at `N = 220` it is 0.4913 instead of 0.6048. Belkin et al. (2019) named the phenomenon; Nakkiran et al. (2021) showed the peak also appears along the *epochs* axis and can be removed by optimal regularization.
+
+<Info>
+The practical instruction is not "always over-parameterize". It is: **the region to avoid is the interpolation threshold** — a model whose capacity is close to your dataset size. Be clearly under it with regularization, or clearly over it. Sitting on `N ~ n` is the worst of both.
+</Info>
+
+### Regularization as a prior
+
+Put a zero-mean Gaussian prior on the weights, `w ~ N(0, tau^2 I)`, and a Gaussian likelihood for the residuals with variance `sigma^2`. The log-posterior is:
+
+```
+log p(w | D)  =  log p(D | w) + log p(w) + const
+              =  -(1/(2 sigma^2)) ||X w - y||^2  -  (1/(2 tau^2)) ||w||^2 + const
+```
+
+Maximising it is minimising `||X w - y||^2 + (sigma^2 / tau^2) ||w||^2`. So **ridge is MAP estimation under a Gaussian prior**, with `alpha = sigma^2 / tau^2`. Swap the Gaussian prior for a Laplace prior, `p(w) ~ exp(-|w|/b)`, and the same calculation gives the L1 penalty — **lasso is MAP under a Laplace prior**, whose sharp peak at zero is exactly why the mode is often exactly zero.
+
+Three things this reframing buys you:
+1. `alpha` gets units and meaning: it is a ratio of noise variance to prior weight variance. If you know your labels are noisy, you should regularize more, and now you know by how much.
+2. **Weight decay in Week 26 is the same object.** When you set `weight_decay=0.01` in AdamW to fine-tune a language model, you are asserting a Gaussian prior centred on zero. (Note: centred on *zero*, which for a fine-tune is arguably the wrong centre — the pretrained weights are. That observation is the seed of several parameter-efficient methods.)
+3. It explains why regularization helps more when data is scarce: the prior's influence relative to the likelihood scales as `1/n`.
+
+### Failure modes
+
+| Failure | Signature | Detector |
+| --- | --- | --- |
+| Penalty applied to unscaled features | one feature dominates; results change if you switch metres to kilometres | assert a scaler precedes any penalised estimator in every pipeline |
+| Lasso feature set flips between refits | predictions stable, `coef_` support changes | refit on 20 bootstrap samples; report selection frequency per feature, not one run |
+| Sitting at the interpolation threshold | test error far worse than both a smaller and a larger model | sweep capacity, plot the whole curve, never just two points |
+| `alpha` tuned on the test set | production far worse than reported | separate tune and estimate splits; nested CV (Week 19 Module 3) |
+| Reported score is the CV-selected minimum | optimism of a few points | report the nested-CV score, or a fresh holdout |
+| Early stopping with no validation monitor | model quality depends on job wall-clock | require `early_stopping` with an explicit `validation_fraction` and log the chosen iteration |
+| Intercept penalised | predictions shift when you re-centre features | check the library — scikit-learn excludes it; a hand-rolled implementation often does not |
+
+### Papers
+
+- **Belkin, M., Hsu, D., Ma, S., Mandal, S. (2019), "Reconciling modern machine-learning practice and the classical bias–variance trade-off," PNAS 116(32).** *Takeaway:* test error peaks at the interpolation threshold and then descends again, so the classical U-curve is the left half of a double-descent curve.
+- **Nakkiran, P. et al. (2021), "Deep Double Descent: Where Bigger Models and More Data Hurt," JSTAT.** *Takeaway:* double descent also appears along training time and dataset size, and optimal regularization can remove the peak entirely — which is why the practical advice is "regularize", not "go bigger".
+- **Tibshirani, R. (1996), "Regression Shrinkage and Selection via the Lasso," JRSS-B 58(1).** *Takeaway:* an L1 penalty performs shrinkage and subset selection in one convex problem, which is what soft thresholding does coordinate by coordinate.
+- **Zou, H. & Hastie, T. (2005), "Regularization and Variable Selection via the Elastic Net," JRSS-B 67(2).** *Takeaway:* pure lasso arbitrarily picks one member of a correlated group; adding an L2 term makes it select the group together, which is the fix for the war story above.
+- **Geman, S., Bienenstock, E., Doursat, R. (1992), "Neural Networks and the Bias/Variance Dilemma," Neural Computation 4(1).** *Takeaway:* the original careful statement of the decomposition, including the warning — now vindicated — that it is an asymptotic story that does not straightforwardly describe over-parameterized models.
+
+### Stretch challenge
+
+Reproduce a double-descent curve on **real** data and explain what makes it hard. Take `sklearn.datasets.fetch_covtype` or MNIST, subsample to `n = 500` training rows, and sweep random-Fourier-feature counts from 50 to 20,000 with a min-norm solve. You will find the peak is less sharp than in the synthetic case. Investigate why: is it label noise, is it the eigenvalue spectrum of the feature covariance, or is it that "the interpolation threshold" is fuzzy when features are correlated? Produce (a) the curve, (b) the `||beta||` curve alongside it, and (c) a spectrum plot of the feature Gram matrix at three values of `N`. There is no single right answer — the open question is whether *effective* capacity, measured by something like the trace of the hat matrix, predicts the peak location better than the raw feature count does. Argue your case with the plot.
+
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Reproduce a double-descent curve and explain why the classical U-shape story is incomplete.
+</Card>
+
+<Steps>
+  <Step title="Build the sweep">
+  Random ReLU features, `n = 200`, `d = 20` inputs, min-norm solve with `np.linalg.pinv`. Sweep `N` densely around `n` (at least 195, 199, 200, 201, 205) — a coarse grid will miss the peak entirely.
+  </Step>
+  <Step title="Plot three curves">
+  Train MSE, test MSE and `||beta||` against `N` on log-x axes. Mark the interpolation threshold.
+  </Step>
+  <Step title="Kill the peak">
+  Repeat with `Ridge(alpha=1e-2)` instead of `pinv` and overlay. Report the peak height in both cases.
+  </Step>
+  <Step title="Write it up">
+  Two paragraphs: why the peak exists, and why the far-right of the curve beats the classical optimum. Use your own numbers.
+  </Step>
+</Steps>
+
+Time box: **3 hours**. Acceptance: your peak is at least 20x the classical minimum, and your right-hand tail beats the classical minimum.
+
+## The whiteboard
+
+This module earns a **T4 interactive widget**: the bias-variance explorer from the visual spec — a slider for polynomial degree on a fixed 20-point dataset, showing the fit, the train/test MSE, and the running bias²/variance decomposition. The T1 static sketch above is the fallback and carries the noise floor, the U, and the double-descent continuation.
+
+<Tip>
+**Draw it yourself.** Reproduce the sketch above from memory on paper, then compare.
+This is graded — it is the cheapest retention exercise in the course.
+[Blank version](/assets/diagrams/p3-w17-m4-blank.svg) · [Editable source](/assets/diagrams/p3-w17-m4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+  **Resume line:** "Measured the bias-variance decomposition empirically over 300 resampled training sets and reproduced double descent, showing a 97x test-error peak at the interpolation threshold."
+  **Interview move:** when asked about the trade-off, do not recite the definition. Say "I measure it — draw 300 training sets, take the variance of the predictions at a fixed point, and the squared distance of their mean from the truth." Then mention that the classical U is the left half of the picture. That is a senior answer.
+  **Portfolio:** the double-descent plot with `||beta||` overlaid is one image that shows you read past the textbook.
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+  1. **Plot the learning curve for your team's most important model** this week. It is `sklearn.model_selection.learning_curve` and an afternoon. Then bring the plot to the next "we need more data" meeting.
+  2. **Sweep `alpha` on any regularized model you own** and check where you actually sit on its U. The measurement above found the bottom is very flat across four orders of magnitude — if your team hard-coded `alpha=1.0` because it is the default, you may be a long way to the right of it.
+  3. **Replace any bare `Lasso` used for feature reporting with `ElasticNet`,** and report selection frequency across 20 bootstrap refits instead of one `coef_`. That change is what would have prevented the war story, and it takes about two hours.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Test error 10x train error | high variance | increase `alpha`; reduce features; get more data if the learning-curve gap is still closing |
+| Train and validation both bad and equal | high bias | more capacity or better features; more data will not help |
+| Ridge does nothing | features unscaled, so the penalty falls on the wrong coefficients | `StandardScaler` before the estimator, always |
+| Lasso drops a business-critical feature | correlated group; lasso keeps one arbitrarily | `ElasticNet(l1_ratio=0.5)`; report grouped importance |
+| Reported CV score not reproduced in production | `alpha` selected on the same folds used to report | nested CV or a separate untouched holdout |
+| Model with more parameters is unexpectedly terrible | capacity sits at the interpolation threshold | move clearly above or below `N = n`, or add explicit regularization |
+| Retraining longer keeps making production worse | no early stopping; iterations are an unmanaged regularizer | monitor validation each epoch; checkpoint on the best, not the last |
+| `alpha` from `RidgeCV` differs wildly between runs | the U is flat near its bottom, so the argmin is noisy | pick by the one-standard-error rule: the largest `alpha` within 1 SE of the best |
+
+## Assessment
+
+**Concept questions (8).**
+1. Prove that the two cross terms in the bias-variance decomposition vanish.
+2. Give the soft-thresholding solution for lasso in one dimension and say why it produces exact zeros.
+3. Ridge's shrinkage factor for an orthonormal feature is `1/(1+alpha)`. What is it for a feature with eigenvalue `s` in the general case, and what does that say about which directions ridge suppresses?
+4. Your learning curve shows train 0.31, validation 0.33, both flat from n=500 to n=50,000. What do you do?
+5. Why does regularization always increase training error?
+6. Where is the double-descent peak, and what quantity spikes there?
+7. What prior corresponds to L2? To L1? What is `alpha` in terms of that prior?
+8. Why is early stopping a form of regularization, and what plays the role of `alpha`?
+
+**Coding challenge.** Implement `bias_variance_decompose(estimator_factory, sampler, grid, reps)` returning `(bias2, variance, total)` and validate it against the analytic answer for a linear model on Gaussian data, where bias is exactly zero. Hidden tests: agreement within 5% at `reps=2000`; must not refit on the same random seed twice.
+
+**Interview questions.**
+- *Junior:* "What is overfitting and how do you detect it?"
+- *Mid:* "You have 3,000 rows and 400 features and a big train/validation gap. Rank your next four actions."
+- *Senior:* "A colleague says their 100-million-parameter model on 10,000 examples cannot possibly generalise. What do you say, and what would you measure to settle it?"
+
+**Draw from memory.** The bias/variance/total curves with the noise floor, the double-descent spike, and the L1 diamond tangency at a corner.
+
+## Sources & further reading
+
+**Primary docs**
+- [scikit-learn 1.9 "Linear Models" — Ridge, Lasso, Elastic-Net](https://scikit-learn.org/stable/modules/linear_model.html) — read this for the exact objective each estimator minimises, including the `1/(2*n_samples)` factor that makes `alpha` mean different things across estimators.
+- [scikit-learn 1.9 `learning_curve` and `validation_curve`](https://scikit-learn.org/stable/modules/learning_curve.html) — read this for the API that produces the tables in Layer 2 in five lines.
+- [scikit-learn 1.9 `RidgeCV`](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.RidgeCV.html) — read this for the efficient leave-one-out path that makes tuning `alpha` nearly free.
+
+**Papers**
+- [Belkin, M. et al. (2019), "Reconciling modern machine-learning practice and the classical bias–variance trade-off," *PNAS* 116(32).](https://doi.org/10.1073/pnas.1903070116) *Takeaway:* the U-curve continues into a second descent past the interpolation threshold.
+- [Nakkiran, P. et al. (2021), "Deep Double Descent: Where Bigger Models and More Data Hurt," *J. Stat. Mech.*](https://doi.org/10.1088/1742-5468/ac3a74) *Takeaway:* the peak appears along model size, data size and epochs, and optimal regularization removes it.
+- [Tibshirani, R. (1996), "Regression Shrinkage and Selection via the Lasso," *JRSS-B* 58(1).](https://doi.org/10.1111/j.2517-6161.1996.tb02080.x) *Takeaway:* L1 does shrinkage and subset selection in one convex problem.
+- [Zou, H. & Hastie, T. (2005), "Regularization and Variable Selection via the Elastic Net," *JRSS-B* 67(2).](https://doi.org/10.1111/j.1467-9868.2005.00503.x) *Takeaway:* mixing L2 into L1 makes correlated features enter or leave together.
+- [Geman, S. et al. (1992), "Neural Networks and the Bias/Variance Dilemma," *Neural Computation* 4(1).](https://doi.org/10.1162/neco.1992.4.1.1) *Takeaway:* the careful original statement, including the caveats modern over-parameterized models exploit.
+
+**Go deeper**
+- [Hastie, Tibshirani & Friedman, *The Elements of Statistical Learning*, 2nd ed., Sections 3.4 and 7.1–7.3. Read it for the eigen-direction view of ridge shrinkage](https://hastie.su.domains/ElemStatLearn/) — `d_j^2/(d_j^2 + alpha)` per principal direction — which is the single best explanation of *what* ridge suppresses, in about 15 pages.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-17/p3-w17-m4">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

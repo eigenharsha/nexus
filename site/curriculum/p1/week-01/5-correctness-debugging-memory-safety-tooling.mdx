@@ -1,0 +1,628 @@
+---
+title: "Correctness, debugging & memory safety tooling"
+description: "Week 1 · Module 5 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 1 · Module 5 · `P1-W01-M5`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Read a compiler error from the top down and fix the first one rather than the last.
+2. Drive `lldb`/`gdb` for breakpoints, watchpoints and backtraces without looking anything up.
+3. Read an AddressSanitizer report and name the bug, its size and its allocation site, in under a minute.
+4. Show, in assembly, a case where undefined behaviour caused the optimiser to delete a security check.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/P1-W01-M5.svg" alt="Hand-drawn sketch: Correctness, debugging & memory safety tooling" className="block dark:hidden" />
+  <img src="/assets/diagrams/P1-W01-M5-dark.svg" alt="Hand-drawn sketch: Correctness, debugging & memory safety tooling" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: P1-W01-M5
+tier: T2
+one-sentence-goal: Each class of bug has exactly one tool that finds it in seconds, and using the wrong tool is why debugging feels like guessing.
+elements:
+  - a hand-drawn decision tree, root box "my program is wrong"
+  - branch 1 "won't compile" -> "read the FIRST error, not the last" -> amber note "one missing semicolon prints 40 errors"
+  - branch 2 "crashes" -> "lldb: run, bt, frame select, p" -> small inset of a backtrace with frame #1 circled
+  - branch 3 "wrong answer, no crash" -> "assert + a failing test first" -> green tick
+  - branch 4 "works at -O0, breaks at -O2" -> big red box "UNDEFINED BEHAVIOUR" -> "-fsanitize=undefined"
+  - branch 5 "memory" -> "-fsanitize=address" -> inset of the real ASan shadow line "fa fa [05] fa" with "[05]" circled and labelled "5 valid bytes in this 8-byte granule"
+  - a red cross-out over a box labelled "add printf everywhere and stare" with the amber note "this is branch 3 only, and even there a test is faster"
+  - right margin: a small table drawn by hand "ASan cost: 65 ms -> 179 ms = 2.75x" and "same as -O0 (180 ms). so just turn it on."
+  - dangling arrow bottom-right: "…and what finds the bug you didn't think to test? -> fuzzing, Layer 3"
+numbers-to-write-in: ASan+UBSan 2.75x (65.2 ms -> 179.0 ms) · -O0 180.1 ms · shadow ratio 1:8 · UB deleted the null check: 9 instructions -> 4
+alt: A hand-drawn decision tree that routes each symptom — will not compile, crashes, wrong answer, works at O0 but not O2, memory corruption — to the single tool that diagnoses it, with a crossed-out box for scattering printf calls and a margin table showing AddressSanitizer's measured 2.75 times overhead.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term is defined where it first appears.
+
+### The one idea
+
+Debugging feels like guessing because most people use one tool — printing things — for every kind of bug. There are five kinds of bug and each has one tool that finds it almost instantly. Learning which tool goes with which symptom is a single afternoon, and it permanently changes how long bugs take you.
+
+### The analogy
+
+A car will not start. A mechanic does not begin by taking the engine apart. They ask one question — *does it crank?* — and that single answer routes them into one of three completely different investigations: no crank means electrical, cranks but does not fire means fuel or spark, fires and dies means something else again.
+
+Debugging is the same. The routing question is: **what kind of wrong is it?** Will not compile, crashes, produces a wrong answer, or behaves differently between builds. Answer that first and you have already eliminated 80% of the search space.
+
+### The vocabulary, defined
+
+- **Compile error** — the compiler could not turn your source into an object file. Nothing ran.
+- **Runtime error** — the program ran and then failed. A crash is one kind.
+- **Segmentation fault (`SIGSEGV`)** — the CPU refused a memory access, usually because the address was not mapped. Almost always a bad pointer. The shell reports exit status 139 (128 + 11).
+- **Debugger** — a program that runs your program and lets you pause it, inspect variables and step through lines. `lldb` on macOS, `gdb` on Linux.
+- **Breakpoint** — "pause when execution reaches this line."
+- **Watchpoint** — "pause when this variable's value changes." Far more useful than breakpoints, and almost nobody knows it exists.
+- **Backtrace** — the chain of function calls that led to where you are now. `bt` in both debuggers.
+- **Assertion** — a statement you declare must be true. `assert(x > 0)` aborts the program immediately if it is not. It is executable documentation.
+- **Sanitizer** — extra checking code the compiler inserts into your program. AddressSanitizer (ASan) checks every memory access; UndefinedBehaviorSanitizer (UBSan) checks for operations the language does not define.
+- **Undefined behaviour (UB)** — an operation the C standard gives no meaning to, such as signed overflow, reading uninitialised memory, or dereferencing `NULL`. The compiler may do *anything*, including assuming it never happens.
+- **Test** — code that runs your code and checks the answer, automatically, every time.
+
+### Rule one: read the first error
+
+```c
+#include <stdio.h>
+int main(void) {
+    int x = 5
+    printf("%d\n", x);
+    return 0;
+}
+```
+
+```bash
+cc -std=c17 -Wall first.c -o first
+```
+
+```
+first.c:3:14: error: expected ';' at end of declaration
+    int x = 5
+             ^
+             ;
+1 error generated.
+```
+
+One missing semicolon, one clear error, with a caret pointing at the exact column and a suggested fix. Now delete a closing brace instead and you will get a dozen errors, all of them downstream noise. **Always fix the first error and recompile.** The compiler recovers badly after the first mistake, and errors two through twelve are usually fiction.
+
+### The five symptoms and their tools
+
+| Symptom | Tool | First command |
+|---|---|---|
+| Will not compile | the compiler itself | read the **first** error; add `-Wall -Wextra` |
+| Crashes | debugger | `lldb ./prog` then `run`, then `bt` |
+| Wrong answer, no crash | a failing test, plus `assert` | write the test that fails first |
+| Works at `-O0`, breaks at `-O2` | UBSan | `cc -fsanitize=undefined -g` |
+| Memory weirdness, crashes far from the cause | ASan | `cc -fsanitize=address -g` |
+
+### Smallest working example: a guided bug hunt
+
+Five broken programs. Fix each with the tool named. Do not skip ahead.
+
+**Bug 1 — will not compile.**
+
+```c
+#include <stdio.h>
+int main(void) { printf("%d\n" 42); return 0; }
+```
+
+The error names the problem exactly. *(Missing comma. `cc` says `expected ')'`.)*
+
+**Bug 2 — crashes.**
+
+```c
+#include <stdio.h>
+int main(void) { int *p = NULL; printf("%d\n", *p); return 0; }
+```
+
+```bash
+cc -g -O0 bug2.c -o bug2 && lldb ./bug2
+(lldb) run
+Process stopped: EXC_BAD_ACCESS (code=1, address=0x0)
+(lldb) bt
+* frame #0: 0x... bug2`main at bug2.c:2:39
+(lldb) p p
+(int *) $0 = 0x0000000000000000
+```
+
+`address=0x0` plus `p` printing `0x0` is the whole diagnosis: a null dereference at line 2.
+
+**Bug 3 — wrong answer, no crash.**
+
+```c
+#include <stdio.h>
+int average(const int *a, int n) {
+    int sum = 0;
+    for (int i = 0; i <= n; i++) sum += a[i];   /* <= reads one past the end */
+    return sum / n;
+}
+int main(void) { int a[] = {2,4,6}; printf("%d\n", average(a, 3)); return 0; }
+```
+
+It prints something plausible and usually wrong. A test catches it immediately: `assert(average((int[]){2,4,6}, 3) == 4);`. So does ASan, which is why Bug 3 and Bug 5 are the same bug wearing different clothes.
+
+**Bug 4 — works at `-O0`, breaks at `-O2`.** Covered in Layer 3. Build both ways and compare.
+
+**Bug 5 — memory.**
+
+```c
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+static char *make_label(const char *name) {
+    char *buf = malloc(strlen(name));   /* no room for the '\0' */
+    strcpy(buf, name);
+    return buf;
+}
+int main(void) {
+    char *l = make_label("nexus");
+    printf("%s\n", l);
+    free(l);
+    printf("%zu\n", strlen(l));         /* use after free */
+    return 0;
+}
+```
+
+```bash
+cc -std=c17 -g -O1 -fsanitize=address bug5.c -o bug5 && ./bug5
+```
+
+Real output, trimmed:
+
+```
+==18051==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x00010c2006f5
+WRITE of size 6 at 0x00010c2006f5 thread T0
+    #1 0x104fdbcf8 in main buggy.c:10
+0x00010c2006f5 is located 0 bytes after 5-byte region [0x00010c2006f0,0x00010c2006f5)
+allocated by thread T0 here:
+    #1 0x104fdbce4 in main buggy.c:10
+```
+
+Read it as five facts: it was a **WRITE**, of **6 bytes**, **0 bytes after** a **5-byte** region, allocated at **line 10**. `strlen("nexus")` is 5, `strcpy` writes 6. The bug is fully identified before you open the file. Note that ASan stopped at the *first* error — the use-after-free on the next line is still there, and you will see it after you fix this one.
+
+### Line-by-line walkthrough of the fix
+
+```c
+static char *make_label(const char *name) {
+    size_t n = strlen(name);
+    char *buf = malloc(n + 1);          /* +1 for the terminating '\0' */
+    if (!buf) return NULL;              /* malloc can fail */
+    memcpy(buf, name, n + 1);           /* copy the terminator too */
+    return buf;                          /* CALLER OWNS: caller must free() */
+}
+```
+
+- `size_t n = strlen(name);` — compute it once. Calling `strlen` twice is both slower and an invitation to make the two calls disagree.
+- `malloc(n + 1)` — the `+ 1` is the entire bug. Every C string needs one byte for the terminator that `strlen` does not count.
+- `if (!buf) return NULL;` — allocation failure is a real path. It is also the path nobody tests, which is why the lab injects it.
+- `memcpy(buf, name, n + 1)` — we already know the length, so `memcpy` is both faster and clearer than `strcpy`, which would re-scan for the terminator.
+- The comment naming the ownership convention is not decoration; it is the only thing preventing a leak in the caller.
+
+### Guided practice
+
+<Steps>
+<Step title="Turn the warnings on and leave them on">
+
+```bash
+cc -std=c17 -Wall -Wextra -Wpedantic -g -O0 -fsanitize=address,undefined prog.c -o prog
+```
+
+Add this line to a `Makefile` today. `-Wall -Wextra` alone catches unused variables, sign-comparison mistakes, missing returns and format-string mismatches — a large fraction of the bugs in this module never reach the debugger if you compile this way.
+</Step>
+<Step title="Use a watchpoint, once, deliberately">
+A variable is being corrupted and you do not know where. Breakpoints will not help; you would have to guess the line. Watchpoints will:
+
+```
+(lldb) breakpoint set --name main
+(lldb) run
+(lldb) watchpoint set variable total
+(lldb) continue
+Watchpoint 1 hit: old value: 0, new value: 42
+```
+
+The debugger stops at the exact instruction that wrote the value, and `bt` tells you who called it. In `gdb` the commands are `break main`, `run`, `watch total`, `continue`. Learn this one; it is the highest-value debugger feature and almost nobody uses it.
+</Step>
+<Step title="Write assertions as documentation">
+
+```c
+#include <assert.h>
+double average(const int *a, size_t n) {
+    assert(a != NULL);
+    assert(n > 0);                     /* division by zero otherwise */
+    long sum = 0;
+    for (size_t i = 0; i < n; i++) sum += a[i];
+    return (double)sum / (double)n;
+}
+```
+
+Two assertions state the preconditions in a form the machine checks. `-DNDEBUG` removes them in release builds, which is why an assertion must never have a side effect — `assert(do_the_thing())` is a bug that only appears in production.
+</Step>
+<Step title="Write the failing test before the fix">
+
+```c
+/* test_average.c */
+#include <assert.h>
+#include <math.h>
+int main(void) {
+    int a[] = {2, 4, 6};
+    assert(fabs(average(a, 3) - 4.0) < 1e-9);
+    int b[] = {1};
+    assert(fabs(average(b, 1) - 1.0) < 1e-9);
+    return 0;
+}
+```
+
+Run it, watch it fail, then fix the code, then watch it pass. A test written after the fix proves nothing, because you never saw it fail.
+</Step>
+</Steps>
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **Why fix the first compiler error and not the last?** — the compiler's recovery after the first error is guesswork, so subsequent errors are frequently phantom.
+2. **What does exit status 139 mean?** — 128 + 11, i.e. killed by signal 11, `SIGSEGV`. A bad memory access.
+3. **When is a watchpoint better than a breakpoint?** — when you know *what* is wrong (a value) but not *where* it is being written.
+4. **Why must an assertion have no side effects?** — `-DNDEBUG` compiles it out entirely, so the side effect vanishes in release builds.
+5. **ASan reported one error and exited. Are you done?** — no. ASan stops at the first error by default; fix it and rerun. There may be a queue.
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions. Apple clang 15.0.0, lldb 1500, macOS 15; on Linux, gcc 13 / gdb 14 / Valgrind 3.22.
+
+### The debugger workflow you should have in muscle memory
+
+```
+lldb ./prog                  gdb ./prog
+run [args]                   run [args]
+bt                           bt                 # backtrace
+frame select 2               frame 2            # move up the stack
+p expr                       p expr             # print an expression
+v                            info locals        # all locals in this frame
+b file.c:42                  b file.c:42        # breakpoint at a line
+b func -c 'n > 100'          b func if n > 100  # conditional breakpoint
+watchpoint set variable v    watch v            # break when v changes
+n / s / finish               n / s / finish     # step over / into / out
+process launch --environment ASAN_OPTIONS=...   # env for the child
+```
+
+Two things worth knowing beyond the basics.
+
+**Conditional breakpoints are how you debug loops.** `b process_record -c 'record->id == 84721'` stops on the one iteration that matters instead of the 84,720 that do not. Doing this manually with `continue` is how people conclude that debuggers are slow.
+
+**Core dumps let you debug production.** On Linux, `ulimit -c unlimited` plus a `kernel.core_pattern`, then `gdb ./prog core`. On macOS, `sudo touch /cores` and `ulimit -c unlimited`, then `lldb -c /cores/core.NNN ./prog`. The backtrace of the crash you could not reproduce is worth more than a week of log-reading. Ship binaries with `-g` even in release — debug info does not slow the program down; strip it into a separate `.dSYM`/`.debug` file and keep it in the artifact store.
+
+### The sanitizer matrix
+
+| Sanitizer | Flag | Catches | Cost | Platform notes |
+|---|---|---|---|---|
+| AddressSanitizer | `-fsanitize=address` | heap/stack/global overflow, use-after-free, use-after-return, double free | **2.75× measured** (below); ~3× memory | all platforms |
+| LeakSanitizer | part of ASan; `ASAN_OPTIONS=detect_leaks=1` | leaks at exit | small | **Linux only.** Not supported on macOS — use `leaks -atExit -- ./prog` |
+| UndefinedBehaviorSanitizer | `-fsanitize=undefined` | signed overflow, shifts past width, misaligned access, null deref, bad casts | ~1.2× | all; combine with ASan |
+| ThreadSanitizer | `-fsanitize=thread` | data races | 5–15×, ~5–10× memory | Week 4; cannot combine with ASan |
+| MemorySanitizer | `-fsanitize=memory` | reads of uninitialised memory | ~3× | **clang on Linux only**; needs all deps instrumented |
+| Valgrind memcheck | `valgrind ./prog` | leaks, uninitialised reads, invalid access | 10–50× *(cited: Valgrind 3.22 manual)* | **not available on Apple Silicon.** Linux x86-64 and arm64 only |
+
+The important operational fact: **Valgrind does not run on Apple Silicon.** If you are on an M-series Mac, your memory-safety story is ASan + UBSan + `leaks`, and you run Valgrind in a Linux container when you need memcheck's uninitialised-value tracking, which ASan does not do. The lab's `make verify` handles both paths.
+
+The important budget fact is in the next layer: ASan+UBSan at `-O2` costs about the same as an unoptimised build. If your CI already runs debug builds, switching to sanitized release builds is free.
+
+### Undefined behaviour is not "unspecified"
+
+There are three different things people conflate:
+
+- **Implementation-defined** — the standard says the implementation must pick a behaviour and document it. `sizeof(int)`, whether `char` is signed. Portable code should not assume, but nothing catastrophic happens.
+- **Unspecified** — the standard allows several behaviours and the implementation need not document its choice. Argument evaluation order in `f(g(), h())`.
+- **Undefined** — the standard imposes **no requirements at all**. The compiler may assume it does not happen and optimise on that assumption. This is the dangerous one.
+
+The list you must know by heart, because these are the ones that appear in real code: signed integer overflow; dereferencing a null or dangling pointer; reading an uninitialised variable; shifting by more than the width of the type; strict-aliasing violations (accessing an object through an incompatible type); modifying a variable twice between sequence points; out-of-bounds array access; and infinite loops with no side effects.
+
+That last one surprises people. `while (1) { }` with an empty body and no volatile access is UB in C11 and later, and clang will happily delete it or fall through to whatever follows.
+
+### `assert` versus error handling: the actual rule
+
+An assertion is for a condition that is **impossible unless the program is buggy**. An error check is for a condition that is **possible in correct operation**.
+
+```c
+/* assertion: our own invariant. If this fires, WE have a bug. */
+assert(node->refcount > 0);
+
+/* error handling: the outside world. Files go missing all the time. */
+FILE *f = fopen(path, "r");
+if (!f) return NX_ERR_IO;
+```
+
+Using `assert` for user input is a denial-of-service bug: a malformed request aborts the process. Using an `if` for an internal invariant hides a bug behind a plausible-looking error path. The test for which you have: *could a well-behaved caller cause this?*
+
+Do not compile assertions out in production by reflex. A crash with a clear message at the point of the invariant violation is nearly always better than continuing with corrupted state and failing 200 ms later inside a library. The industries that disable them (games, HFT) do so for measured reasons, on measured hot paths.
+
+### Reference implementation: a `Makefile` that makes all of this one command
+
+```makefile
+CC      := cc
+SRC     := $(wildcard src/*.c)
+BASE    := -std=c17 -Wall -Wextra -Wpedantic -Wshadow -Wconversion -MMD -MP -g3
+
+.PHONY: all debug release asan ubsan verify clean
+all: debug
+
+debug:   CFLAGS := $(BASE) -O0 -DDEBUG
+release: CFLAGS := $(BASE) -O2 -DNDEBUG
+asan:    CFLAGS := $(BASE) -O1 -fsanitize=address,undefined -fno-omit-frame-pointer
+asan:    LDFLAGS := -fsanitize=address,undefined
+
+debug release asan:
+	$(CC) $(CFLAGS) $(SRC) $(LDFLAGS) -o build/$@/app
+
+# verify runs the whole gate: warnings-as-errors, sanitized tests, and leaks.
+verify:
+	$(CC) $(BASE) -Werror -O2 -c $(SRC) -o /dev/null
+	$(MAKE) asan && ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 ./build/asan/app --test
+ifeq ($(shell uname),Darwin)
+	leaks -atExit -- ./build/release/app --test
+else
+	valgrind --leak-check=full --error-exitcode=1 ./build/release/app --test
+endif
+```
+
+`-Wconversion` is the one people leave off because it is noisy. Turn it on once, fix what it finds, and you will have removed most of the implicit-narrowing bugs from Module 1 permanently. `-Wshadow` catches the "inner variable shadows the outer one" bug that costs an hour every time it happens.
+
+### What breaks in the real world
+
+A team's C service passed its full test suite on every commit for eight months. Then a routine toolchain bump from gcc 9 to gcc 12 in the base image, with no application change, produced a security regression: a request that should have been rejected was accepted.
+
+The code had a check that dereferenced a pointer before testing it for null — the pattern in Layer 3 below. Under gcc 9 the check happened to survive; under gcc 12 the optimiser used the earlier dereference to conclude the pointer could not be null and deleted the test. Nothing in the test suite exercised the null case, because reaching it required a specific malformed request the fuzzer had never generated.
+
+Three lessons. First, **a passing test suite is evidence about the paths you tested, and UB makes untested paths change under you**. Second, the bug was findable in one command: `-fsanitize=undefined` on the existing tests would have flagged the null dereference the first time that code ran. Third, and most uncomfortable: a toolchain upgrade is a behaviour change for any program containing UB, which means "we didn't change anything" is not a defence. Pin your toolchain, and when you bump it, run the sanitized suite.
+
+<Accordion title="Design checkpoint — one question, with a model answer">
+
+**Question.** Your team's CI runs the C test suite in 90 seconds. Adding `-fsanitize=address,undefined` takes it to 4 minutes. Someone proposes running sanitizers nightly instead of per-commit to keep the feedback loop tight. What do you argue?
+
+**Model answer.** Split the suite rather than moving it, and be specific about what nightly costs you.
+
+The measured overhead is not really the issue: on our merge-sort benchmark, `-O2` with ASan+UBSan cost 179 ms versus 65 ms unsanitized — 2.75× — which is almost exactly what an unsanitized `-O0` build costs (180 ms). So if any part of CI is currently building at `-O0`, sanitizing it is free. Check that first; it often turns the 90-second-to-4-minute framing into a much smaller delta.
+
+The real argument against nightly-only is bisection cost. A per-commit sanitizer failure names the commit. A nightly failure names 30 commits, and someone spends a morning with `git bisect` (Week 2) instead of the author spending 30 seconds. Historically the ratio is not close.
+
+The proposal I would make: run the fast unit tests sanitized on every commit — they are usually the cheap half and they exercise the memory-handling code — and move the slow integration tests to a merge-queue or nightly sanitized run. That typically lands around 2 minutes per commit, which preserves the loop. Additionally, turn on `-Werror` with `-Wall -Wextra -Wconversion -Wshadow` in the per-commit build, which costs zero runtime and catches a real fraction of the same bug classes at compile time.
+
+If the team still insists on 90 seconds, the fallback is a merge queue: unsanitized on the PR, sanitized before landing on main. That keeps main clean, which is the property that actually matters, at the cost of a slower merge rather than a slower edit-test loop.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a measured number. Figures produced on an Apple M3 Pro
+(11 cores, 18 GB), macOS 15, Apple clang 15.0.0, arm64. If you cannot reproduce the number
+on your own machine, treat the claim as unproven and tell us.
+</Warning>
+
+### Watch undefined behaviour delete a security check
+
+This is the demonstration to have ready when someone says UB is a theoretical concern.
+
+```c
+struct session { int uid; };
+
+int is_admin(struct session *s) {
+    int u = s->uid;            /* (1) dereference happens HERE */
+    if (s == NULL) return 0;   /* (2) ...so the compiler knows s != NULL */
+    return u == 0;
+}
+```
+
+The check on line (2) is written after the dereference on line (1) — which is exactly how this appears in real code, where the dereference was added later during a refactor and nobody moved the check.
+
+Compile at `-O0` and both lines are present. Compile at `-O2` with Apple clang 15:
+
+```bash
+clang -S -O2 ub.c -o -
+```
+
+```asm
+_is_admin:
+	ldr	w8, [x0]          ; load s->uid
+	cmp	w8, #0            ; compare uid to 0
+	cset	w0, eq            ; return uid == 0
+	ret
+```
+
+**Four instructions. The null check is gone.** There is no `cbz x0` anywhere in the function. The compiler's reasoning is airtight and entirely legal: dereferencing a null pointer is undefined behaviour, so if the program is well-defined, `s` cannot be null at line (1); therefore `s == NULL` at line (2) is always false; therefore the branch is dead code; therefore delete it. Every step is a standard optimisation (dereferenceability inference feeding null-check elimination), and each one is correct in isolation.
+
+This exact pattern is CVE-2009-1897 in the Linux kernel's `tun` driver, where gcc removed a null check for the same reason and turned a benign bug into a local privilege escalation. The kernel now builds with `-fno-delete-null-pointer-checks` for this reason — a flag that exists solely to disable this optimisation, and whose existence tells you how seriously the kernel developers took it.
+
+**Detection:** `-fsanitize=undefined` flags the null dereference at runtime the first time the function is called with `NULL`. **Prevention:** check before you dereference, and enable `-Wnull-dereference` (gcc) or clang's static analyzer, both of which flag this pattern statically.
+
+### ASan's cost, and why it should be your default test build
+
+Measured, merge sort at n = 1,000,000, minimum of 3 runs, CPU time:
+
+| Build | Time | Ratio to `-O2` |
+|---|---|---|
+| `-O2` | 65.2 ms | 1.00× |
+| `-O2 -fsanitize=address,undefined -fno-omit-frame-pointer` | 179.0 ms | **2.75×** |
+| `-O0` (no sanitizers) | 180.1 ms | 2.76× |
+
+The published ASan figure is "about 2× slowdown and 3× memory", and 2.75× here for a memory-traffic-heavy workload sits right in that band. The row that should change your defaults is the third: **a sanitized optimised build and an unsanitized debug build cost the same.** Most test suites run debug builds. Switching them to `-O2 -fsanitize=address,undefined` costs nothing and finds a category of bug that no test assertion can.
+
+Memory overhead is the real constraint at scale. ASan's shadow map is 1/8 of the address space, redzones add 32–128 bytes per allocation, and the free quarantine holds recently-freed blocks so their addresses are not recycled. A service with a 4 GB heap needs roughly 12 GB under ASan, which is why sanitized builds usually run on a subset of production traffic rather than all of it. `ASAN_OPTIONS=quarantine_size_mb=64:malloc_context_size=5` trims both.
+
+### How ASan works, precisely
+
+Every 8 bytes of application memory maps to 1 byte of shadow memory at `(addr >> 3) + offset`. The shadow byte encodes how many of those 8 bytes are addressable:
+
+- `0` — all 8 addressable.
+- `1`–`7` — only the first k addressable (a partially-used granule).
+- negative — poisoned, with a code: `0xfa` heap left redzone, `0xfb` heap right redzone, `0xfd` freed heap, `0xf1` stack left redzone, `0xf5` use-after-return.
+
+That is why the report from Layer 1 printed:
+
+```
+=>0x00010c200680: fa fa fa fa fa fa fa fa fa fa fa fa fa fa[05]fa
+```
+
+`[05]` is the granule containing the fault: five of its eight bytes are valid — the 5-byte `malloc(strlen("nexus"))` — and it is surrounded by `fa` redzones. The 6th byte written by `strcpy` fell into the sixth position of that granule, which the shadow byte says is not addressable. One byte of shadow answered the question.
+
+The instrumentation is roughly: before each memory access, compute the shadow address, load the byte, and if it is non-zero do a slower check on the exact offset. That is 3–4 extra instructions on the fast path per access, which is where the ~2× comes from.
+
+This design has known blind spots you should be able to name in a review: it does **not** detect reads of uninitialised memory (that is MSan), it does **not** detect intra-object overflows by default (writing past `struct.a` into `struct.b` is contiguous valid memory — `-fsanitize-address-field-padding=1` helps at ABI-breaking cost), and its use-after-free detection is bounded by quarantine size, so an address recycled after the quarantine evicts it will not be caught.
+
+### Fuzzing: finding the bug you did not think to test
+
+Sanitizers detect bugs on the inputs you supply. Fuzzers generate the inputs. Coverage-guided fuzzing — libFuzzer, AFL++, and `cargo-fuzz` — mutates inputs and keeps the mutations that reach new code paths, which turns input generation into a hill-climbing search over the coverage graph.
+
+The whole harness is this:
+
+```c
+/* fuzz_parse.c — build: clang -g -O1 -fsanitize=fuzzer,address,undefined fuzz_parse.c parse.c */
+#include <stddef.h>
+#include <stdint.h>
+#include "parse.h"
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+    struct record r;
+    (void)nx_parse((const char *)data, size, &r);   /* must not crash, ever */
+    return 0;
+}
+```
+
+```bash
+mkdir corpus && ./fuzz_parse corpus/ -max_total_time=60
+```
+
+Sixty seconds of that on a hand-written parser typically finds something, because the fuzzer will try zero-length input, input with no terminator, input that is all delimiters, and lengths that are exactly your buffer size — the cases every human test suite omits. The property being tested is not "produces the right answer" but "does not invoke undefined behaviour on any input", which is exactly the property ASan and UBSan can check automatically. That combination — a generator with no oracle, plus a sanitizer that provides the oracle — is why fuzzing works at all.
+
+Two operational notes. The corpus is the valuable artifact: commit it, and seed it with real inputs so the fuzzer starts near interesting code rather than exploring from nothing. And fuzzing finds crashes, not wrong answers, unless you add a differential oracle (compare against a reference implementation) or property assertions inside the harness.
+
+### Production failure modes and how you detect them
+
+| Failure | Signature | Detection |
+|---|---|---|
+| UB-dependent behaviour changes on a compiler upgrade | "we changed nothing" and behaviour changed | pin the toolchain; run `-fsanitize=undefined` before and after every bump |
+| Null check optimised away | check present in source, absent in `-S -O2` output | read the assembly; `-fno-delete-null-pointer-checks` as a stopgap; fix the ordering |
+| ASan misses a use-after-free | quarantine evicted the address before reuse | raise `quarantine_size_mb`; note the limitation in your threat model |
+| Assertions disabled in production hide corruption | failure surfaces 200 ms later inside a library, with a useless backtrace | keep assertions on unless you measured a reason; log-and-abort with context |
+| Crash cannot be reproduced locally | environment-dependent, or a race | enable core dumps in production; `lldb -c core ./prog` |
+| Sanitized build passes, production crashes | production runs the unsanitized `-O2` binary and has UB | build and test the *release* configuration too, not just the debug one |
+| Fuzzer finds nothing in 10 minutes | harness rejects input too early, or corpus is empty | check coverage with `-print_final_stats=1`; seed the corpus with real inputs |
+
+### Frontier and research pointers
+
+- **Serebryany, K., Bruening, D., Potapenko, A. & Vyukov, D. (2012). "AddressSanitizer: A Fast Address Sanity Checker." *USENIX ATC*.** One-sentence takeaway: a 1:8 shadow map plus redzones and a quarantine detects most memory errors at about 2× slowdown, which is the design point that made sanitizers default-on in practice.
+- **Wang, X., Chen, H., Cheung, A., Jia, Z., Zeldovich, N. & Kaashoek, M. F. (2012). "Undefined Behavior: What Happened to My Code?" *APSYS*.** One-sentence takeaway: they built a checker (STACK) that finds code the optimiser will discard because of UB, and found such code in the Linux kernel, Postgres and Python — this is not a corner case.
+- **Serebryany, K. & Iskhodzhanov, T. (2009). "ThreadSanitizer: Data Race Detection in Practice." *WBIA*.** One-sentence takeaway: happens-before race detection with shadow words per memory location finds real races in code that has passed years of testing; used in Week 4.
+- **Böhme, M., Pham, V.-T. & Roychoudhury, A. (2016). "Coverage-based Greybox Fuzzing as Markov Chain." *CCS*.** One-sentence takeaway: modelling fuzzing as a Markov chain and spending energy on low-frequency paths finds significantly more bugs per CPU-hour than uniform mutation.
+- **Regehr, J., Chen, Y., Cuoq, P., Eide, E., Ellison, C. & Yang, X. (2012). "Test-Case Reduction for C Compiler Bugs." *PLDI*.** One-sentence takeaway: automatic test-case reduction (C-Reduce) turns a 10,000-line failing input into a 10-line one, which is what makes fuzzer output actionable rather than a pile of crashes.
+
+### Stretch challenge
+
+Build the UB-detection experiment properly.
+
+1. Take a real open-source C project of moderate size (`jq`, `sqlite`'s amalgamation, or `zlib` are good choices — all build in under a minute).
+2. Build its test suite three ways: `-O0`, `-O2`, and `-O2 -fsanitize=address,undefined`. Record wall time and any behaviour differences.
+3. Now diff the *assembly* of five functions between `-O0` and `-O2`, looking specifically for branches present in one and absent in the other. Most differences will be benign (constant folding, inlining). Find one that is not, or convince yourself there are none, and write up how you decided.
+4. Write a libFuzzer harness for one entry point and run it for 10 minutes with ASan+UBSan. Report coverage reached and any findings.
+
+The open question: sqlite is famously tested to a level almost no other software reaches — 100% branch coverage, billions of test cases. Given that, what would you *expect* fuzzing plus sanitizers to find, and does your answer change what you think test coverage measures? Argue it with what you actually observed, not with what you expected before you started.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Take the provided 300-line leaky, UB-ridden C program in the lab starter. Get it to zero sanitizer findings and zero leaks **without changing its observable behaviour** — the provided output-comparison test must still pass byte for byte.
+</Card>
+
+Acceptance: `cc -std=c17 -Wall -Wextra -Wconversion -Wshadow -Werror` compiles clean; `-fsanitize=address,undefined` runs the full test input with no findings; leaks are zero (`leaks -atExit` on macOS, `valgrind --leak-check=full --error-exitcode=1` on Linux); and the output diff against the golden file is empty. Write one paragraph per bug you fixed naming the tool that found it.
+
+## The whiteboard
+
+The T1 sketch is the symptom-to-tool decision tree. The T2 build-up frames walk one bug through the tree: symptom, tool chosen, command run, output read, fix applied.
+
+<Tip>
+**Draw it yourself.** From memory: the five symptom branches, the tool at the end of each,
+and the crossed-out "printf everywhere" box. Then compare.
+[Blank version](/assets/diagrams/P1-W01-M5-blank.svg) · [Editable source](/assets/diagrams/P1-W01-M5.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Portfolio line:** *"Took a 300-line C program with 11 injected defects to zero AddressSanitizer, UBSan and leak findings without changing observable behaviour, documenting for each bug the tool that found it and why that tool and not another."* The second half is what makes it a story rather than a chore.
+
+**The interview angle.** "How do you debug?" is a behavioural question with a technical answer, and the strong version is the routing table: *first I classify the symptom, because the tool follows from it — will-not-compile means read the first error; crash means lldb and a backtrace; wrong answer means write the failing test first; works-at-O0-breaks-at-O2 means undefined behaviour and I go straight to UBSan; and anything memory-shaped means ASan, which usually names the bug, its size and its allocation site in five lines.*
+
+Then have the killer follow-up ready. "Can you give an example where undefined behaviour actually mattered?" — and you show the four-instruction `is_admin` with the null check deleted. That is a staff-level answer delivered by a student, and it is the single highest-leverage thing in this module.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+Three places this shows up in a normal engineering week:
+
+1. **The flaky test nobody can reproduce.** Before adding a retry, run the suite once under ASan (or TSan if it is concurrent). Flakiness in a compiled language is very often a real memory or race bug whose symptom depends on allocation addresses or scheduling. A retry hides it until it reaches production.
+
+2. **The dependency upgrade PR.** A base-image bump that changes the compiler is a behaviour change for any code containing UB. Add one sanitized CI job that runs on toolchain-changing PRs. This is the cheapest insurance in the repo, and the story above is why.
+
+3. **The 3 a.m. crash you cannot reproduce.** Enable core dumps *now*, before you need them, and keep the unstripped binary and its debug symbols in your artifact store keyed by build ID. The difference between "we have a core file and a backtrace" and "we have a log line" is the difference between a 20-minute fix and a week of speculation. This applies far beyond C — the equivalent for Python is faulthandler plus `py-spy dump`, which Week 4 covers.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| 40 compiler errors from one typo | fixing the last error instead of the first | fix error #1, recompile, repeat |
+| Debugger shows `<optimized out>` for every variable | debugging a `-O2` build | rebuild with `-Og -g3`, or `-O0 -g3` |
+| ASan reports one error and exits, bug persists | ASan halts on first error by default | fix it and rerun; there is often a queue |
+| Leak checker reports nothing on macOS | LeakSanitizer is not supported on Darwin | use `leaks -atExit -- ./prog`, or run in a Linux container |
+| `valgrind: command not found` on an M-series Mac | Valgrind does not support Apple Silicon | ASan + UBSan locally; Valgrind in a Linux container when you need memcheck |
+| Assertion never fires in production | `-DNDEBUG` compiled it out | do not disable assertions by default; if you must, log-and-return instead |
+| `assert(do_something())` stops working in release | the assertion had a side effect, and it was compiled out | never put side effects in assertions; `-Wassert-side-effect` where available |
+| Sanitized build passes but production crashes | you sanitized the debug config and ship the release config | build and test the release configuration too |
+| "We changed nothing and it broke" after an image update | the compiler changed, and the code contains UB | pin the toolchain; run UBSan across the bump |
+
+## Sources & further reading
+
+**Primary docs**
+
+- **[Clang User's Manual, "Controlling Code Generation" — the `-fsanitize=` families (LLVM 17/18).](https://clang.llvm.org/docs/UsersManual.html)** Read this for the exact set of checks each sanitizer enables and which combinations are mutually exclusive (ASan and TSan cannot be combined).
+- **[AddressSanitizer wiki, "AddressSanitizerAlgorithm" and "Flags".](https://github.com/google/sanitizers/wiki/AddressSanitizerAlgorithm)** Read this for the shadow mapping, the poison byte values, and the `ASAN_OPTIONS` you will need — `detect_leaks`, `quarantine_size_mb`, `abort_on_error`.
+- **[LLDB "GDB to LLDB command map" (Apple, current).](https://lldb.llvm.org/use/map.html)** Read this for the one-page translation table; the two debuggers are equivalent in capability and different in spelling.
+- **ISO/IEC 9899:2018 (C17), §3.4.3 "undefined behavior" and Annex J.2 (a complete list of UB).** Read Annex J.2 once, in full. It is about eight pages and it is the definitive list of what you must not do.
+- **[Valgrind 3.22 manual, §4 "Memcheck".](https://valgrind.org/docs/manual/mc-manual.html)** Read this for what memcheck detects that ASan does not — chiefly uninitialised-value propagation — and for the platform support table that confirms no Apple Silicon.
+
+**Papers**
+
+- **[Serebryany, K. et al. (2012). "AddressSanitizer: A Fast Address Sanity Checker." *USENIX ATC*, 309–318.](https://www.usenix.org/conference/atc12/technical-sessions/presentation/serebryany)** One-sentence takeaway: shadow memory at 1:8 with redzones and a quarantine catches most spatial and temporal memory errors at ~2× cost, making always-on checking practical.
+- **[Wang, X. et al. (2012). "Undefined Behavior: What Happened to My Code?" *APSYS*.](https://doi.org/10.1145/2349896.2349905)** One-sentence takeaway: optimiser-discarded, UB-dependent code is present in widely used systems software including the Linux kernel and Postgres, so treating UB as theoretical is empirically wrong.
+- **[Lattner, C. (2011). "What Every C Programmer Should Know About Undefined Behavior" (3-part series, LLVM blog).](https://blog.llvm.org/2011/05/what-every-c-programmer-should-know.html)** One-sentence takeaway: UB is what lets C be fast, the optimiser exploits it aggressively and correctly, and the only defence is tooling because the source looks fine.
+- **[Böhme, M. et al. (2016). "Coverage-based Greybox Fuzzing as Markov Chain." *CCS*, 1032–1043.](https://doi.org/10.1145/2976749.2978428)** One-sentence takeaway: allocating fuzzing energy inversely to path frequency finds substantially more bugs per CPU-hour than uniform random mutation.
+
+**Go deeper**
+
+- **[Zeller, A. (2009). *Why Programs Fail: A Guide to Systematic Debugging*, 2nd ed., Chapters 4–6.](https://www.whyprogramsfail.com/)** The scientific-method framing — hypothesis, prediction, experiment, refine — is what turns debugging from staring into a procedure; the delta-debugging chapter is the theory behind every test-case reducer you will use.
+- **[Regehr, J., "A Guide to Undefined Behavior in C and C++" (blog, 3 parts).](https://blog.regehr.org/archives/213)** The clearest available explanation of why the compiler is allowed to do what it does, written by the person who built the tooling that finds it.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-01/p1-w01-m5">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

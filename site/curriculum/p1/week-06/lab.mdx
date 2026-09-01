@@ -1,0 +1,167 @@
+---
+title: "Lab — \"Resume Tailor\" full-stack service"
+description: "Week 6 lab · three tracks · self-graded"
+icon: "flask-conical"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**`LAB-P1-W06`** — one lab, three tracks. Beginners start at `basic` and climb.
+Working professionals start at `standard`. `hard` is where the interview stories come from.
+</Note>
+
+## The ticket
+
+> **NEX-204 · Backend · P1**
+>
+> **Reporter:** Dev (Product) · **Assignee:** you
+>
+> We are launching "Resume Tailor": a user pastes their resume and a job description, and we return
+> a tailored, formatted version highlighting the overlap and flagging the gaps.
+>
+> Version 1 is **rule-based** — no LLM. Keyword extraction, overlap scoring, and a markdown
+> template. We are validating demand, not model quality. (The LLM version is Week 26; design so
+> that swapping the generator is a one-file change.)
+>
+> Requirements from the launch review:
+> - Users sign up and log in. Their tailoring history is private to them.
+> - Free tier: 20 tailorings per day. Enforce it.
+> - Resume upload accepts `.txt` and `.md` up to 200 KB. Nothing else.
+> - Support asked for a reference number on every error so they can find it in the logs.
+> - The Week 5 front end must work against this with no proxy hacks.
+> - Legal wants the ability to delete a user's data on request.
+>
+> Public URL by Friday, with the OpenAPI docs reachable.
+
+**Time box.** `basic` 4 h · `standard` 12 h · `hard` 8 h more. If `standard` is past 18 hours you
+have started building a job queue; stop and re-read the acceptance criteria.
+
+<Tabs>
+  <Tab title="basic">
+    `POST` resume text plus a job description, get a formatted markdown response. Rule-based, no
+    auth, no database. Wire it to your Week 5 front end.
+
+    <Info>~60% of the code is written for you. TODOs are marked. Answers in the solution page.</Info>
+
+    **Acceptance criteria**
+
+    1. `POST /v1/tailor` accepts `{"resume": "...", "job_description": "..."}` and returns `{"markdown": "...", "matched_skills": [...], "missing_skills": [...]}`.
+    2. Both fields are required, each between 50 and 20,000 characters, enforced by Pydantic — a short resume returns `422` naming the field.
+    3. `GET /healthz` returns `{"status":"ok"}`.
+    4. `/docs` renders and the `POST` can be executed from it successfully.
+    5. CORS is configured so the Week 5 page can call it from a different origin — verified in a browser, not just with `curl`.
+    6. Five tests pass in under two seconds: happy path, too-short resume, missing field, health, and the OpenAPI document containing the route.
+
+    **Verify**
+
+    ```bash
+    cd labs/p1/week-06
+    make verify TRACK=basic
+    ```
+  </Tab>
+
+  <Tab title="standard">
+    A full FastAPI service: Pydantic request/response models, file upload with size and type limits,
+    auth, rate limiting, structured errors, 25+ tests, OpenAPI docs, async I/O and a load-test
+    report.
+
+    <Info>Spec and tests only. You write the implementation.</Info>
+
+    **Acceptance criteria**
+
+    1. **Auth.** `POST /v1/auth/register`, `POST /v1/auth/token`, `POST /v1/auth/refresh`. Passwords hashed with argon2id. Access tokens expire in 15 minutes; refresh tokens are stored server-side, hashed at rest, rotate on use, and a reused refresh token revokes the whole family.
+    2. **Tenant isolation.** `GET /v1/tailorings/{id}` returns `404` — not `403` — when the tailoring belongs to another user. There is a test for this on **every** route with a path parameter.
+    3. **Upload.** `POST /v1/tailor/upload` accepts `multipart/form-data` with a `.txt` or `.md` file at most 200 KB. Wrong type → `415`. Too large → `413` **without** reading the whole body into memory.
+    4. **Rate limiting.** 20 tailorings per user per rolling 24 hours; the 21st returns `429` with `Retry-After` and a body explaining the limit and the reset time. Login is separately limited to 10 attempts per account per minute.
+    5. **Error envelope.** Every error response — validation, auth, rate limit, not-found, server error — has the same shape with `type`, `title`, `status`, `detail`, `request_id`, and `errors[]` when field-level. `request_id` also appears as a response header and in the logs.
+    6. **Async throughout.** No blocking call inside any `async def`. Password hashing runs off the event loop. A CI lint rule forbids importing `requests`, `time.sleep` and any sync database driver under `app/api/`.
+    7. **Deletion.** `DELETE /v1/me` removes the user and all their tailorings in one transaction and returns `204`. A test proves nothing of theirs remains.
+    8. **Tests.** 25 or more, running in under 30 seconds, passing in randomised order. Must include: auth happy path and every failure, cross-tenant 404, upload limits, rate-limit boundary (the 20th succeeds, the 21st does not), refresh rotation and reuse detection, and the error envelope shape.
+    9. **Docs.** `/docs` shows every endpoint with example requests and documented error responses. `openapi.json` is committed and diffed in CI.
+    10. **Load-test report.** `LOADTEST.md` with RPS against p50/p95/p99 at concurrency 10, 25, 50, 100 and 200; the knee identified; the saturated resource named with evidence; one fix applied and re-measured.
+
+    **Verify**
+
+    ```bash
+    cd labs/p1/week-06
+    make verify TRACK=standard    # tests, lint, types, OpenAPI diff, cross-tenant sweep
+    make loadtest                 # writes reports/loadtest.json
+    ```
+  </Tab>
+
+  <Tab title="hard">
+    Add idempotency keys, background job processing with status polling, and a p95 under 200 ms
+    target at 50 concurrent users.
+
+    <Warning>
+      There is a constraint here the `standard` solution fails: tailoring a 20,000-character resume
+      takes long enough that doing it inside the request breaks the p95 target under concurrency.
+      Moving it out of the request path changes the API's shape, and that is the point.
+    </Warning>
+
+    **Acceptance criteria**
+
+    1. **Idempotency.** `POST /v1/tailor` honours an `Idempotency-Key` header: a replay with the same key and the same body returns the **stored** response with an `Idempotency-Replayed: true` header and creates nothing new. The same key with a different body returns `422`. A replay while the original is still running returns `409`. Keys expire after 24 hours. The key row and the effect must commit in the same transaction — there is a test that kills the process between them and asserts no orphan.
+    2. **Background processing.** `POST /v1/tailor` returns `202` with a `Location` pointing at `GET /v1/jobs/{job_id}`, which returns `pending`, `running`, `succeeded` (with the result) or `failed` (with the error envelope). A job that fails is retried at most twice with backoff; the third failure is terminal and visible.
+    3. **Performance target.** At 50 concurrent users mixing 70% status polls and 30% submissions, **p95 under 200 ms** and zero errors over a 60-second run. Report the numbers.
+    4. **Backpressure.** With the queue depth over a configured threshold, `POST /v1/tailor` returns `503` with `Retry-After` instead of accepting work it cannot do. Prove it by submitting faster than the workers drain.
+    5. **Graceful shutdown.** `SIGTERM` finishes in-flight requests, stops accepting new ones, and either completes or re-queues running jobs — no job is silently lost. A test sends `SIGTERM` mid-job and asserts the job still reaches a terminal state.
+    6. **Write-up.** `ARCHITECTURE.md` with a diagram, the request path, the job lifecycle including every failure edge, and a paragraph on what you would change to add the LLM in Week 26.
+
+    **Verify**
+
+    ```bash
+    cd labs/p1/week-06
+    make verify TRACK=hard
+    make loadtest MIX=hard        # asserts the p95 target
+    ```
+  </Tab>
+</Tabs>
+
+## Ship it
+
+<Card title="This is the part people skip" icon="rocket" horizontal>
+Deploy publicly on Fly.io or Render (both have free tiers that fit this). The `/docs` URL must be
+reachable, `/healthz` must answer, and the Week 5 front end must talk to it from its own origin
+without a proxy. Put both URLs at the top of the README.
+</Card>
+
+**Keep this repo.** In Week 26 you replace the rule-based generator with an LLM behind the same
+interface. In Week 32 you instrument this exact service with distributed tracing and cost
+attribution. It is the longest-lived artifact in the course.
+
+## Verify yourself
+
+```bash
+cd labs/p1/week-06
+make verify              # everything that applies to your files
+make verify TRACK=hard   # just the hard track
+make loadtest            # RPS vs p50/p95/p99 sweep, writes reports/loadtest.json
+make security            # the exploit suite from P1-W06-M4 - must fail against your patched app
+```
+
+`make security` runs the IDOR, mass-assignment and token-tampering exploits. A correct submission
+makes every exploit fail. If any succeeds, the verify step is red regardless of your test count.
+
+## Rubric
+
+| Dimension | 0 | 1 | 2 | 3 |
+| --- | --- | --- | --- | --- |
+| Correctness | fails tests | happy path only | all failure paths covered; cross-tenant isolation proven per route | survives adversarial input: replayed idempotency keys, oversized uploads, burst rate-limit boundary, `SIGTERM` mid-job |
+| Code quality | works | readable | routers, services and repositories separated; services import no FastAPI | a reviewer would approve unchanged; the unsafe version of each pattern is not expressible |
+| Performance | untested | measured | meets the target with numbers | finds the knee, names the saturated resource with evidence, fixes one thing and re-measures |
+| Explanation | none | a README | `ARCHITECTURE.md` plus `LOADTEST.md` with reasoning | trade-offs defended, including one approach that failed and why |
+
+## Common ways this lab goes wrong
+
+- **Blocking calls in `async def`.** Password hashing at 65 ms and file parsing are both CPU work. On the event loop they cap you near 15 rps regardless of the machine. The load test will show it as high latency with idle CPU.
+- **Reading the upload to check its size.** `413` must be decided from `Content-Length` and by streaming with a running byte count, not by `await file.read()` and then measuring. A 2 GB upload must never reach memory.
+- **Rate limiting in process memory.** It works in tests and evaporates on restart and on a second instance. Store counters where all instances can see them, and say in the README what happens when that store is down.
+- **Idempotency stored in a separate transaction.** The most common serious defect in this lab. If the key and the effect can commit separately, a crash between them produces either a double effect or a permanently stuck key.
+- **`403` instead of `404` for another tenant's object.** It leaks existence. The verifier tests for `404` specifically.
+- **A load test that measures the client.** If your numbers plateau at a suspiciously round value and your laptop's fans are loud, you are measuring the generator. Use `ab`, `k6` or `wrk`.
+
+<Card title="Reference solution" icon="lock" href="/solutions/p1/week-06/lab">
+  Hidden page. Open it after you have a failing attempt of your own.
+</Card>

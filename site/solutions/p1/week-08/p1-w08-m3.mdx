@@ -1,0 +1,130 @@
+---
+title: "Indexing & query performance"
+description: "Reference solution — Week 8"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W08-M3`
+
+The exercise: given ten queries, propose the minimum index set, justify each, and measure the
+insert-throughput penalty.
+
+### The measured index set
+
+| Index | Query it serves | Before | After | Size |
+| --- | --- | --- | --- | --- |
+| `orders(customer_id)` | point lookup by customer | **86.8 ms** | **0.033 ms** | 11 MB |
+| `orders(customer_id, placed_at DESC)` | order history page with `ORDER BY placed_at DESC LIMIT` | 116.6 ms | **0.512 ms** | 30 MB |
+| `orders(status) WHERE deleted_at IS NULL` | open-orders dashboard | 106.2 ms | **94.4 ms** (index-only) | 6,704 kB |
+| `customers(lower(email))` | case-insensitive login lookup | 193.9 ms | **1.878 ms** | 9 MB |
+| `orders(placed_at, id)` | keyset pagination | 693.9 ms at depth 500k | **2.1 ms** | 30 MB |
+
+Note the first two: `orders(customer_id)` is **subsumed** by `orders(customer_id, placed_at DESC)`,
+which serves the leftmost prefix. A minimal set drops the single-column index. It is listed here to
+show the measurement; the submitted set should have four indexes, not five, and should say so.
+
+### The write cost
+
+```
+50,000 inserts, no indexes (primary key only) :   788.9 ms   (63,379 rows/s)
+50,000 inserts, five indexes                  : 1,591.8 ms   (31,411 rows/s)
+```
+
+**2.02× slower.** And the space:
+
+```
+heap    : 8,248 kB
+indexes : 13 MB      <- the indexes are larger than the table
+```
+
+### The three plan-reading facts that do the work
+
+**1. `Rows Removed by Filter` is the missing-index signal.**
+
+```
+->  Parallel Seq Scan on orders  (actual time=19.669..44.047 rows=2 loops=3)
+      Filter: (customer_id = 123456)
+      Rows Removed by Filter: 333332
+      Buffers: shared hit=8772
+```
+
+Each of three workers examined 333,332 rows to return two.
+
+**2. `Index Cond` versus `Filter`.** `Index Cond` is evaluated inside the index so non-matching rows
+are never fetched; `Filter` means rows were fetched and discarded.
+
+**3. `actual time` is per loop.** With `loops=3`, total work is three times the reported figure.
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: an index per query.** Ten queries do not need ten indexes. A composite index serves
+every leftmost prefix, so `(customer_id, placed_at DESC)` serves three of the ten by itself. Each
+index avoided is write throughput and disk saved — measured, five cost 2.02× on inserts.
+
+**Wrong turn 2: forcing an index the planner declined.** On a predicate matching 98% of rows the
+planner chose a sequential scan at 116.1 ms; forcing an index-only scan produced **375.6 ms**. The
+planner was right, and `enable_seqscan=off` is a diagnostic tool for asking "what would the
+alternative have cost", not a fix.
+
+**Wrong turn 3: not checking whether an index is used.**
+
+```sql
+SELECT indexrelname, idx_scan, pg_size_pretty(pg_relation_size(indexrelid))
+FROM pg_stat_user_indexes WHERE schemaname='public' ORDER BY idx_scan;
+```
+
+`idx_scan = 0` after a full benchmark means the index is pure cost. Teams running this for the first
+time routinely find several, some years old.
+
+**Wrong turn 4: not noticing the redundancy.** `(a)` is subsumed by `(a, b)`. A 3/3 answer proposes
+the four-index set and explains that the fifth was dropped for that reason.
+
+**Wrong turn 5: comparing a cold run to a warm one.** Without `BUFFERS` you cannot tell. In my
+Week 7 measurements a hash join at 1,148 ms looked worse than a forced merge join at 742 ms — until
+the buffer counts showed the hash run had `read=1859` cold pages and the merge run did not. Compare
+warm to warm, and read the `Buffers` line.
+
+## Measured numbers this solution produces
+
+| Claim | Number |
+| --- | --- |
+| Point lookup, seq scan versus index | 86.8 ms → **0.033 ms** (**1,970×**) |
+| Index build and size | 629 ms, 11 MB on a 69 MB heap |
+| Composite serving `ORDER BY` with no `Sort` node | 0.512 ms |
+| Same index, second-column-only predicate | **116.6 ms** — no leftmost prefix, unused |
+| Index-only scan, `Heap Fetches: 0` | 0.439 ms for 505 rows |
+| Partial index versus full | 6,704 kB versus 6,840 kB; 106.2 ms → 94.4 ms |
+| Expression index on `lower(email)` | 193.9 ms → **1.878 ms** (103×) |
+| Seq scan beating a forced index at 98% selectivity | 116.1 ms versus **375.6 ms** (3.2×) |
+| Write penalty of five indexes | 788.9 ms → 1,591.8 ms (**2.02×**) |
+| Index bytes versus heap bytes | 13 MB versus 8,248 kB |
+
+## Grading notes
+
+**A 3/3 on correctness**: every proposed index justified by a named query, redundant indexes
+identified and dropped, and minimality proven by removing each one and re-measuring.
+
+**A 3/3 on performance**: before-and-after plans with `BUFFERS`, warm-cache timings, and the write
+penalty measured for the whole set rather than asserted.
+
+**A 3/3 on explanation**: identifies `Rows Removed by Filter` as the diagnostic, explains the
+leftmost-prefix result with the two contrasting timings, and includes at least one case where an
+index did **not** help and why.
+
+**The four most common ways submissions lose points**
+
+1. One index per query, with no attempt at consolidation.
+2. No write-cost measurement, so the trade-off is asserted rather than priced.
+3. An index that is never scanned, left in the set.
+4. `actual time` read without multiplying by `loops`, understating a parallel node's cost by 3×.

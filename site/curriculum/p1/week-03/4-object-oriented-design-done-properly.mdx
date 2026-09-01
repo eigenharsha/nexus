@@ -1,0 +1,895 @@
+---
+title: "Object-oriented design done properly"
+description: "Week 3 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 3 · Module 4 · `P1-W03-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## What you'll be able to do
+
+1. Say exactly when to use an instance method, a `@classmethod` and a `@staticmethod`, with a real reason for each.
+2. Replace an inheritance hierarchy with composition and explain what you gained.
+3. Define a `Protocol` and get static duck typing that `mypy` checks without any base class.
+4. Implement `@property` from scratch as a descriptor, and know its measured cost: **12.8 ns versus 4.6 ns for a plain attribute**.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/P1-W03-M4.svg" alt="Hand-drawn sketch: Object-oriented design done properly" className="block dark:hidden" />
+  <img src="/assets/diagrams/P1-W03-M4-dark.svg" alt="Hand-drawn sketch: Object-oriented design done properly" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: P1-W03-M4
+tier: T2
+one-sentence-goal: Attribute lookup walks the MRO and stops at the first data descriptor, which is the one rule that explains @property, @classmethod, __slots__ and every "why is my attribute not being set" bug.
+elements:
+  - centre: a hand-drawn flowchart of `obj.x`, top to bottom, each step a box:
+      "1. look in type(obj).__mro__ for 'x'"  ->  "found, and is a DATA descriptor (has __set__)?" -> yes -> green box "call its __get__"
+      -> no -> "2. look in obj.__dict__" -> found -> green box "return it"
+      -> no -> "3. back to the class attr, NON-data descriptor?" -> "call __get__" -> else "return the plain class attr" -> else "__getattr__ / AttributeError"
+  - the phrase "data descriptor WINS over the instance dict" circled in blue with an amber margin note: "this is why @property cannot be shadowed by self.x = ..., and why everyone gets a RecursionError once"
+  - left margin: a hand-drawn recursion spiral labelled "@property def x(self): return self.x" with a red cross and "-> RecursionError. use self._x."
+  - right side: the three method kinds drawn as three arrows into one class box — "instance method: gets self", "classmethod: gets cls (works on subclasses!)", "staticmethod: gets nothing (it is a function that lives here)" — with `from_csv` written beside classmethod as the motivating example
+  - lower-left: a diamond A/B/C/D drawn by hand with the C3 result written under it: "D -> B -> C -> A -> object", amber note "left to right, children before parents, and every parent AFTER all its children"
+  - lower-right: a hand-drawn bar chart of attribute read cost: plain 4.6 ns, __slots__ 4.4 ns, @property 12.8 ns, custom descriptor 49.6 ns, with "10.8x" written over the last bar
+  - dangling arrow: "…and what builds the class object itself? -> metaclasses, Layer 3"
+numbers-to-write-in: plain attr 4.6 ns · __slots__ 4.4 ns · @property 12.8 ns (2.8x) · custom descriptor 49.6 ns (10.8x) · MRO: D B C A object
+alt: A hand-drawn flowchart of Python attribute lookup showing data descriptors taking precedence over the instance dictionary, with a crossed-out recursive property implementation, the three method kinds and what each receives, a diamond inheritance graph with its C3 linearisation written out, and a bar chart of measured attribute-access costs.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term is defined where it first appears.
+
+### The one idea
+
+A class is a template that bundles **data** with the **operations** that make sense on that data, and enforces the rules that must always be true about it. The reason to write one is not "because Python has classes" — it is that some rule must hold no matter who touches the data, and a class is where you put that rule.
+
+A `BankAccount` whose balance can go negative because someone set `account.balance = -50` directly is not a class; it is a dict with extra typing.
+
+### The analogy
+
+A vending machine.
+
+From outside you see a small, deliberate **interface**: slots for coins, buttons, a dispenser. You cannot reach in and set the stock count to −5, or take a drink without paying, because the mechanism does not allow it. The internal state — how much money is in the box, how many cans are on each shelf — is reachable only through operations that keep the rules true.
+
+An object is the same bargain: a small public surface, internal state nobody can put into an invalid configuration, and rules enforced by the operations rather than by everyone remembering to be careful.
+
+### The vocabulary, defined
+
+- **Class** — a template describing what instances have and can do.
+- **Instance (object)** — one concrete thing built from the class. `acct = BankAccount(...)`.
+- **Attribute** — a piece of data on an instance or class. `acct.balance`.
+- **Method** — a function defined in a class, called on an instance.
+- **`self`** — the first parameter of an instance method; the instance the method was called on. Python passes it automatically.
+- **`__init__`** — the initialiser, run right after the instance is created. It sets up the starting state.
+- **Encapsulation** — keeping state private and exposing only operations that preserve the rules.
+- **`_name`** — a leading underscore means "internal, do not touch from outside". A convention; Python does not enforce it.
+- **`@property`** — makes a method callable like an attribute: `acct.balance` runs a method but reads like data.
+- **Inheritance** — a class reusing another class's behaviour. `class Savings(BankAccount)`.
+- **Composition** — a class *holding* another object rather than inheriting from it. Usually the better choice.
+- **Dunder method** — a method with double underscores like `__len__`, `__eq__`, `__repr__`. Python calls these for you when you use `len()`, `==`, `repr()`.
+- **`@classmethod`** — a method that receives the **class** instead of an instance. Used for alternative constructors.
+- **`@staticmethod`** — a method that receives neither. A plain function that lives in the class's namespace.
+
+### Smallest working example
+
+```python
+class BankAccount:
+    def __init__(self, owner: str, balance: int = 0) -> None:
+        if balance < 0:
+            raise ValueError("opening balance cannot be negative")
+        self.owner = owner
+        self._balance = balance          # underscore: internal
+
+    @property
+    def balance(self) -> int:
+        """Read-only from outside. There is no setter, so `acct.balance = -1` fails."""
+        return self._balance
+
+    def deposit(self, amount: int) -> None:
+        if amount <= 0:
+            raise ValueError("deposit must be positive")
+        self._balance += amount
+
+    def withdraw(self, amount: int) -> None:
+        if amount <= 0:
+            raise ValueError("withdrawal must be positive")
+        if amount > self._balance:
+            raise ValueError(f"insufficient funds: have {self._balance}, need {amount}")
+        self._balance -= amount
+
+    def __repr__(self) -> str:
+        return f"BankAccount(owner={self.owner!r}, balance={self._balance})"
+
+
+acct = BankAccount("Aarav", 100)
+acct.deposit(50)
+print(acct)                    # BankAccount(owner='Aarav', balance=150)
+print(acct.balance)            # 150  — reads like an attribute, runs a method
+
+acct.withdraw(500)             # ValueError: insufficient funds: have 150, need 500
+acct.balance = 1_000_000       # AttributeError: property 'balance' has no setter
+```
+
+**The last two lines are the whole point.** The balance cannot be made invalid, from anywhere, by anyone.
+
+### Line-by-line walkthrough
+
+- `def __init__(self, owner, balance=0)` — runs when you write `BankAccount("Aarav", 100)`. `self` is the new instance.
+- `if balance < 0: raise ValueError(...)` — validate **at construction**. An object should never exist in an invalid state, not even briefly.
+- `self._balance = balance` — the underscore says "internal". Python will not stop anyone, but every Python programmer reads it as "hands off", and tools like `ruff` will flag external access.
+- `@property def balance(self)` — now `acct.balance` calls this method. Because there is **no** `@balance.setter`, assignment raises `AttributeError`. Read-only by omission, which is the cleanest way to get it.
+- `def deposit(self, amount)` — every mutation goes through a method that checks the rule first.
+- `f"...have {self._balance}, need {amount}"` — an error message containing the actual numbers. An error saying only "insufficient funds" makes the reader go and look; this one does not.
+- `def __repr__(self)` — what `print(acct)` and the REPL show. `{self.owner!r}` uses `repr()` on the value, so strings get their quotes. A good `__repr__` should ideally look like the code that would recreate the object; it is the single highest-value dunder method and takes one line.
+
+### The three method kinds, with the motivating example
+
+```python
+import csv
+from io import StringIO
+
+
+class BankAccount:
+    INTEREST_RATE = 0.02                       # class attribute: shared by all instances
+
+    def __init__(self, owner: str, balance: int = 0) -> None:
+        self.owner = owner
+        self._balance = balance
+
+    # INSTANCE method: needs this particular account
+    def deposit(self, amount: int) -> None:
+        self._balance += amount
+
+    # CLASS method: an ALTERNATIVE CONSTRUCTOR. Gets `cls`, so subclasses build themselves.
+    @classmethod
+    def from_csv_row(cls, row: str) -> "BankAccount":
+        owner, balance = next(csv.reader(StringIO(row)))
+        return cls(owner, int(balance))        # `cls`, not `BankAccount`
+
+    # STATIC method: related to accounts, needs neither the instance nor the class
+    @staticmethod
+    def is_valid_account_number(number: str) -> bool:
+        return len(number) == 10 and number.isdigit()
+
+
+class SavingsAccount(BankAccount):
+    INTEREST_RATE = 0.045
+
+
+a = BankAccount.from_csv_row("Aarav,100")
+s = SavingsAccount.from_csv_row("Meera,5000")
+print(type(a).__name__, type(s).__name__)     # BankAccount SavingsAccount
+```
+
+**`cls` is why `from_csv_row` is a `@classmethod` and not a `@staticmethod`.** Calling it on `SavingsAccount` builds a `SavingsAccount`, because `cls` is whatever class it was called on. Hard-coding `BankAccount(...)` inside would return the wrong type for every subclass — a bug that appears the day someone adds a subclass, long after the code was written.
+
+The decision rule:
+
+- Needs the instance's data → **instance method**.
+- Builds an instance, or needs the class → **`@classmethod`**.
+- Needs neither → **`@staticmethod`**, or honestly, just a module-level function.
+
+### Guided practice
+
+<Steps>
+<Step title="Add a validated setter">
+
+```python
+    @property
+    def owner(self) -> str:
+        return self._owner
+
+    @owner.setter
+    def owner(self, value: str) -> None:
+        value = value.strip()
+        if not value:
+            raise ValueError("owner cannot be empty")
+        self._owner = value
+```
+
+Then change `__init__` to assign `self.owner = owner` — which now runs the setter, so validation happens at construction too, with no duplicated code. That is the main reason to use a setter rather than validating in `__init__`.
+
+**The trap:** writing `self.owner = owner` inside the *getter* or `self.owner = value` inside the setter causes infinite recursion, because assigning to `self.owner` calls the setter again. Always use a different underscore-prefixed name for the storage.
+</Step>
+<Step title="Make it work with Python's built-in functions">
+
+```python
+class Portfolio:
+    def __init__(self, accounts: list[BankAccount]) -> None:
+        self._accounts = list(accounts)
+
+    def __len__(self) -> int:                    # len(p)
+        return len(self._accounts)
+
+    def __iter__(self):                          # for a in p:  /  list(p)
+        return iter(self._accounts)
+
+    def __getitem__(self, i):                    # p[0]
+        return self._accounts[i]
+
+    def __contains__(self, acct) -> bool:        # acct in p
+        return acct in self._accounts
+
+    def __repr__(self) -> str:
+        return f"Portfolio({len(self._accounts)} accounts)"
+
+
+p = Portfolio([BankAccount("A", 1), BankAccount("B", 2)])
+print(len(p), list(p), p[0])
+```
+
+Defining these four dunders makes your class work with `len()`, `for`, indexing and `in` — the same syntax users already know. That is what "Pythonic" actually means: implementing the protocols the language already has rather than inventing `p.get_length()`.
+</Step>
+<Step title="Make it a context manager">
+
+```python
+class Transaction:
+    def __init__(self, account: BankAccount) -> None:
+        self.account = account
+        self._snapshot = 0
+
+    def __enter__(self) -> BankAccount:
+        self._snapshot = self.account._balance
+        return self.account
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is not None:
+            self.account._balance = self._snapshot     # roll back
+        # returning None (falsy) lets the exception propagate
+
+
+acct = BankAccount("Aarav", 100)
+try:
+    with Transaction(acct) as a:
+        a.deposit(50)
+        raise RuntimeError("something failed")
+except RuntimeError:
+    pass
+print(acct.balance)          # 100 — rolled back
+```
+</Step>
+<Step title="Prefer composition to inheritance">
+
+```python
+# INHERITANCE — a SavingsAccount IS-A BankAccount. Reasonable here.
+class SavingsAccount(BankAccount):
+    INTEREST_RATE = 0.045
+
+# COMPOSITION — an account HAS-A fee policy. Better than a subclass per policy.
+class FeePolicy:
+    def fee_for(self, amount: int) -> int:
+        return 0
+
+class FlatFeePolicy(FeePolicy):
+    def __init__(self, cents: int) -> None:
+        self.cents = cents
+    def fee_for(self, amount: int) -> int:
+        return self.cents
+
+class CheckingAccount(BankAccount):
+    def __init__(self, owner, balance=0, fees: FeePolicy | None = None) -> None:
+        super().__init__(owner, balance)
+        self.fees = fees or FeePolicy()          # HELD, not inherited
+
+    def withdraw(self, amount: int) -> None:
+        super().withdraw(amount + self.fees.fee_for(amount))
+```
+
+The test to apply: **"is-a" or "has-a"?** A savings account *is* a bank account. A fee policy is something an account *has*. Inheriting `FreeCheckingAccount`, `FlatFeeCheckingAccount` and `PercentFeeCheckingAccount` gives you a class explosion the first time a second dimension appears; composition gives you a swap.
+</Step>
+</Steps>
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **What is `self`?** — the instance the method was called on, passed automatically as the first argument.
+2. **Why is `from_csv_row` a `@classmethod` and not a `@staticmethod`?** — it needs `cls` so that calling it on a subclass constructs the subclass.
+3. **How do you make an attribute read-only?** — a `@property` getter with no setter. Assignment then raises `AttributeError`.
+4. **Why does `@property def x` returning `self.x` recurse forever?** — reading `self.x` calls the property again. Store the value in `self._x`.
+5. **"Is-a" or "has-a"?** — inherit for is-a, compose for has-a. A fee policy is something an account has.
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions. Measured with CPython 3.13.2, mypy 2.3.1, ruff 0.16.5 on an Apple M3 Pro, macOS 15.
+
+### Composition over inheritance: a refactor, not a slogan
+
+The problem inheritance creates is combinatorial. Start with a notifier:
+
+```python
+class Notifier:                       # base
+    def send(self, msg: str) -> None: ...
+
+class EmailNotifier(Notifier): ...
+class SmsNotifier(Notifier): ...
+
+# then someone needs retries
+class RetryingEmailNotifier(EmailNotifier): ...
+class RetryingSmsNotifier(SmsNotifier): ...
+
+# then rate limiting
+class RateLimitedRetryingEmailNotifier(RetryingEmailNotifier): ...
+# ... and now every combination is a class. 2 channels x 2 features = 4, and it doubles.
+```
+
+Composition makes the features independent:
+
+```python
+from typing import Protocol
+
+
+class Channel(Protocol):
+    def send(self, msg: str) -> None: ...
+
+
+class EmailChannel:
+    def send(self, msg: str) -> None: ...
+
+
+class Retrying:
+    def __init__(self, inner: Channel, attempts: int = 3) -> None:
+        self.inner, self.attempts = inner, attempts
+
+    def send(self, msg: str) -> None:
+        for i in range(self.attempts):
+            try:
+                return self.inner.send(msg)
+            except TimeoutError:
+                if i == self.attempts - 1:
+                    raise
+
+
+class RateLimited:
+    def __init__(self, inner: Channel, per_second: float) -> None:
+        self.inner, self.min_gap = inner, 1.0 / per_second
+        self._last = 0.0
+
+    def send(self, msg: str) -> None:
+        ...
+        self.inner.send(msg)
+
+
+notifier: Channel = RateLimited(Retrying(EmailChannel()), per_second=10)
+```
+
+Two channels and two features are now **four small classes instead of eight**, and adding a third feature adds one class rather than doubling. Each is independently testable with a fake `Channel`. This is the decorator pattern, and it is what "composition over inheritance" means concretely.
+
+**When inheritance is still right:** a genuine is-a relationship with shared *implementation* and a stable base — `class HTTPError(Exception)`, `class SavingsAccount(BankAccount)`. Framework base classes you must subclass (Django models, `unittest.TestCase`) are inheritance you do not get to choose.
+
+### `Protocol` — static duck typing
+
+```python
+from typing import Protocol, runtime_checkable
+
+
+class Storage(Protocol):
+    def get(self, key: str) -> bytes | None: ...
+    def put(self, key: str, value: bytes) -> None: ...
+
+
+class MemoryStorage:                       # NOTE: does not inherit from Storage
+    def __init__(self) -> None:
+        self._d: dict[str, bytes] = {}
+    def get(self, key: str) -> bytes | None:
+        return self._d.get(key)
+    def put(self, key: str, value: bytes) -> None:
+        self._d[key] = value
+
+
+def save_report(storage: Storage, data: bytes) -> None:
+    storage.put("report", data)
+
+
+save_report(MemoryStorage(), b"x")         # mypy: OK — structural match
+```
+
+`MemoryStorage` never mentions `Storage`. `mypy` checks structurally: does it have `get` and `put` with compatible signatures? That is duck typing with static verification, and it is the main reason to prefer `Protocol` over `ABC`.
+
+| | `Protocol` | `ABC` (`abc.ABC`) |
+|---|---|---|
+| Implementer must inherit | **no** | yes |
+| Checked by | `mypy`, statically | Python, at instantiation |
+| Works on third-party classes | **yes** | no, unless you `register()` |
+| Can provide shared implementation | only via a default method body | yes, fully |
+| `isinstance()` support | only with `@runtime_checkable`, and it checks method *names* only | full |
+
+**Choose `Protocol`** when you are defining what you *need* from a collaborator — a repository interface, a client, a storage backend. This is the common case, and it lets you accept objects written by people who never heard of your protocol.
+
+**Choose `ABC`** when there is real shared implementation and you want subclasses to inherit it, or when a missing method must fail loudly at instantiation rather than at type-check time.
+
+Note the limitation: `@runtime_checkable` makes `isinstance(x, Storage)` work, but it only checks that the *names* exist — not the signatures, not the types. It is a smoke test, not a guarantee.
+
+### SOLID, applied rather than recited
+
+**Single responsibility** — a class should have one reason to change. `Order` holding cart items, computing tax, formatting an invoice and talking to Stripe has four. The test is not "is it small" but "would two different stakeholders ask for changes to it".
+
+**Open/closed** — extensible without modification. The `Protocol` above is how: adding an `S3Storage` requires no edit to `save_report`. This is what the lab's `hard` track measures.
+
+**Liskov substitution** — a subclass must be usable wherever the base is. The classic violation:
+
+```python
+class Rectangle:
+    def __init__(self, w, h): self.w, self.h = w, h
+    def set_width(self, w): self.w = w
+
+class Square(Rectangle):          # a square IS-A rectangle, mathematically
+    def set_width(self, w): self.w = self.h = w    # ...but breaks callers
+
+def stretch(r: Rectangle):
+    r.set_width(10)
+    assert r.w == 10 and r.h == r.h                # holds for Rectangle, surprises with Square
+```
+
+The practical version of LSP: **a subclass may weaken preconditions and strengthen postconditions, never the reverse.** A subclass that raises where the base did not, or accepts less than the base did, is a violation and will break a caller that was written against the base.
+
+**Interface segregation** — many small protocols beat one large one. A function needing only `get` should take a `Reader` protocol, not a full `Storage`.
+
+**Dependency inversion** — depend on the protocol, not the concrete class. `def __init__(self, storage: Storage)` rather than constructing an `S3Storage` inside. This is what makes tests fast: pass `MemoryStorage()`.
+
+### The dunder methods worth implementing
+
+```python
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True, slots=True, order=True)
+class Money:
+    cents: int
+    currency: str = "USD"
+
+    def __post_init__(self) -> None:
+        if self.currency not in ("USD", "EUR", "GBP"):
+            raise ValueError(f"unsupported currency {self.currency!r}")
+
+    def __add__(self, other: "Money") -> "Money":
+        if not isinstance(other, Money):
+            return NotImplemented                # let Python try the reflected operation
+        if other.currency != self.currency:
+            raise ValueError(f"cannot add {self.currency} to {other.currency}")
+        return Money(self.cents + other.cents, self.currency)
+
+    def __str__(self) -> str:
+        return f"{self.cents / 100:.2f} {self.currency}"
+```
+
+`@dataclass` generated `__init__`, `__repr__`, `__eq__`, ordering comparisons (`order=True`), and — because of `frozen=True` — `__hash__`. That is six dunders for one decorator, and Module 1 measured that `slots=True` costs 139 bytes per instance instead of 171.
+
+**Returning `NotImplemented`** (the singleton, not the exception) from `__add__` is the correct way to say "I do not know how to add this". Python then tries `other.__radd__(self)` and only raises `TypeError` if that also declines. Returning `NotImplemented` where you meant `raise NotImplementedError` is a real bug that produces a confusing `TypeError` far from the cause.
+
+`__post_init__` is where a dataclass validates. It runs after the generated `__init__` assigns the fields. In a `frozen=True` dataclass you cannot assign in `__post_init__` without `object.__setattr__`, which is a deliberate speed bump.
+
+### Trade-offs table
+
+| Decision | Choose X when… | Choose Y when… |
+|---|---|---|
+| Inheritance vs composition | **Inheritance** for a genuine is-a with shared implementation and a stable base, or when a framework requires it | **Composition** for has-a, for combining independent features (2 channels × 2 features: 4 classes instead of 8), and whenever you would otherwise write a class per combination |
+| `Protocol` vs `ABC` | **`Protocol`** for "what I need from a collaborator": no inheritance required, works on third-party types, `mypy`-checked | **`ABC`** when there is real shared implementation to inherit, or you need a loud failure at instantiation time |
+| `@property` vs a plain attribute | **Plain attribute** by default — 4.6 ns, no ceremony. Add a property *later* without changing call sites, which is the whole reason Python does not need Java-style getters | **`@property`** for validation, computed values, or read-only fields. Costs 12.8 ns, a 2.8× overhead that matters only in a hot loop over millions of objects |
+| `@dataclass` vs hand-written | **`@dataclass(frozen=True, slots=True)`** for value objects — six dunders free, 139 B/instance | **Hand-written** when construction is genuinely complex, or the class is mostly behaviour with little state |
+
+### Reference implementation — `@property` from scratch
+
+This is the hands-on, and it is the exercise that makes descriptors click.
+
+```python
+"""A working reimplementation of the builtin `property`, as a data descriptor."""
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
+
+
+class my_property:
+    def __init__(
+        self,
+        fget: Callable[[Any], Any] | None = None,
+        fset: Callable[[Any, Any], None] | None = None,
+        fdel: Callable[[Any], None] | None = None,
+        doc: str | None = None,
+    ) -> None:
+        self.fget, self.fset, self.fdel = fget, fset, fdel
+        self.__doc__ = doc if doc is not None else getattr(fget, "__doc__", None)
+        self._name = ""
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        """Called by `type.__new__` with the attribute name. 3.6+; how modern descriptors
+        learn their own name without the caller repeating it."""
+        self._name = name
+
+    # --- the descriptor protocol -------------------------------------------
+    def __get__(self, obj: Any, objtype: type | None = None) -> Any:
+        if obj is None:
+            return self                       # accessed on the CLASS: return the descriptor
+        if self.fget is None:
+            raise AttributeError(f"property {self._name!r} has no getter")
+        return self.fget(obj)
+
+    def __set__(self, obj: Any, value: Any) -> None:
+        if self.fset is None:
+            raise AttributeError(f"property {self._name!r} has no setter")
+        self.fset(obj, value)
+
+    def __delete__(self, obj: Any) -> None:
+        if self.fdel is None:
+            raise AttributeError(f"property {self._name!r} has no deleter")
+        self.fdel(obj)
+
+    # --- the decorator-chaining API ----------------------------------------
+    def getter(self, fget: Callable[[Any], Any]) -> "my_property":
+        return type(self)(fget, self.fset, self.fdel, self.__doc__)
+
+    def setter(self, fset: Callable[[Any, Any], None]) -> "my_property":
+        return type(self)(self.fget, fset, self.fdel, self.__doc__)
+
+    def deleter(self, fdel: Callable[[Any], None]) -> "my_property":
+        return type(self)(self.fget, self.fset, fdel, self.__doc__)
+```
+
+Used exactly like the builtin:
+
+```python
+class Celsius:
+    def __init__(self, c: float) -> None:
+        self.celsius = c                    # goes through the setter -> validated
+
+    @my_property
+    def celsius(self) -> float:
+        return self._celsius
+
+    @celsius.setter
+    def celsius(self, value: float) -> None:
+        if value < -273.15:
+            raise ValueError("below absolute zero")
+        self._celsius = value
+
+    @my_property
+    def fahrenheit(self) -> float:
+        return self._celsius * 9 / 5 + 32
+
+
+t = Celsius(20)
+print(t.celsius, t.fahrenheit)      # 20 68.0
+t.celsius = -300                    # ValueError: below absolute zero
+t.fahrenheit = 100                  # AttributeError: property 'fahrenheit' has no setter
+```
+
+Three details that make it a real implementation rather than a sketch:
+
+- **`__get__` returning `self` when `obj is None`.** That is what makes `Celsius.celsius` (on the class) give you the property object rather than exploding — which is how `help()`, `inspect` and IDEs discover it.
+- **`getter`/`setter`/`deleter` return a *new* instance** rather than mutating. `@celsius.setter` rebinds the class attribute, and mutating in place would corrupt a property shared through inheritance.
+- **`__set_name__`** gives the descriptor its own attribute name automatically, so error messages can say which property failed without the author repeating the name as a string.
+
+### What breaks in the real world
+
+A team modelled document permissions with inheritance: `Document`, then `SharedDocument(Document)`, then `PublicDocument(SharedDocument)`, then `ArchivedDocument(Document)`. Then the product added "shared **and** archived", and someone wrote `class ArchivedSharedDocument(ArchivedDocument, SharedDocument)`.
+
+The MRO of that class is `ArchivedSharedDocument → ArchivedDocument → SharedDocument → Document → object`. `ArchivedDocument.can_edit` returned `False` unconditionally, so it shadowed `SharedDocument.can_edit` — which was correct for archived documents. But `ArchivedDocument.can_view` also returned `False`, and it shadowed `SharedDocument.can_view`, which meant **documents that had been shared with a user and then archived became invisible to that user** rather than read-only.
+
+It shipped. Support tickets said "my document disappeared". It took four days to find, because the bug was not in any method — every method was correct in isolation — it was in the *order* two correct methods were consulted.
+
+The refactor was to composition:
+
+```python
+@dataclass(frozen=True, slots=True)
+class Permissions:
+    can_view: bool
+    can_edit: bool
+
+@dataclass(slots=True)
+class Document:
+    content: str
+    sharing: SharingPolicy
+    lifecycle: LifecyclePolicy
+
+    def permissions_for(self, user: User) -> Permissions:
+        p = self.sharing.permissions_for(user)
+        return self.lifecycle.restrict(p)      # explicit, ordered, testable composition
+```
+
+Now the interaction between sharing and lifecycle is **one function you can read and test**, rather than an emergent property of a linearisation nobody drew. The general lesson: when behaviour depends on the *order* of base classes, the design has stopped being expressible in inheritance.
+
+<Accordion title="Design checkpoint — one question, with a model answer">
+
+**Question.** A colleague has `class UserService(DatabaseMixin, CacheMixin, LoggingMixin, MetricsMixin)`. Tests are slow because every test needs a real database. They propose adding a `TestDatabaseMixin` and swapping it in via a class attribute. What do you propose instead?
+
+**Model answer.** Constructor injection over protocols, and the argument is about where the dependency is *named*.
+
+**Why the mixin swap does not fix it.** The dependency is still baked into the class definition — you have moved from one hard-coded base to two, selected by a conditional at import time. Every test now has to care about class construction rather than object construction, and you cannot have two configurations in one test process. It is also a diamond waiting to happen: four mixins with any shared base means the MRO decides which `__init__` and which method wins, and the document-permissions failure above is exactly that bug.
+
+**The proposal:**
+
+```python
+class Database(Protocol):
+    def fetch_user(self, uid: str) -> dict | None: ...
+
+class UserService:
+    def __init__(self, db: Database, cache: Cache, metrics: Metrics) -> None:
+        self.db, self.cache, self.metrics = db, cache, metrics
+```
+
+Tests pass `InMemoryDatabase()`. Production passes `PostgresDatabase(pool)`. Nothing about the class changes between them, `mypy` checks structurally that both satisfy the protocol, and two different configurations can coexist in one process.
+
+**What it buys, concretely.** Test suite runtime drops to whatever the in-memory implementations cost — usually two orders of magnitude. Each collaborator becomes independently testable. The class's dependencies are visible in its signature rather than discoverable only by reading four mixin files. And the "which method wins" question disappears, because there is no MRO.
+
+**What it costs, honestly.** Someone must construct the object graph — four arguments instead of zero. For a handful of services, a `create_user_service()` factory function is enough and I would not reach for a DI framework. If the graph grows past a screen, that is the signal to consider one, not before.
+
+**The one case I would keep a mixin:** genuinely orthogonal, stateless behaviour with no `__init__` and no shared base — a `ReprMixin` that defines `__repr__` from `__slots__`, say. Mixins fail when they carry state or when more than one of them wants to be first in the MRO.
+
+**And on `LoggingMixin` specifically:** logging is not a dependency, it is a module-level `logger = logging.getLogger(__name__)`. Making it a base class is inheritance used for namespacing, which is the weakest reason to inherit from anything.
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a measured number. Figures from CPython 3.13.2 on an Apple
+M3 Pro (11 cores, 18 GB), macOS 15, `timeit` minimum over repeats. If you cannot reproduce a
+number on your own machine, treat the claim as unproven and tell us.
+</Warning>
+
+### Attribute lookup: the one algorithm that explains everything
+
+`obj.x` runs `type(obj).__getattribute__(obj, "x")`, which does this:
+
+1. Walk `type(obj).__mro__` looking for `"x"`. Call what it finds `attr`.
+2. If `attr` is a **data descriptor** — it defines `__set__` **or** `__delete__` — call `attr.__get__(obj, type(obj))` and **return**. The instance dictionary is never consulted.
+3. Otherwise, look in `obj.__dict__`. If `"x"` is there, return it.
+4. Otherwise, if `attr` is a **non-data descriptor** (only `__get__`), call `attr.__get__(obj, type(obj))`.
+5. Otherwise return `attr` itself if it was found in step 1.
+6. Otherwise call `type(obj).__getattr__(obj, "x")` if it exists, else raise `AttributeError`.
+
+**Step 2 taking priority over step 3 is the rule that explains everything else in this module.**
+
+- `@property` defines `__set__`, so it is a data descriptor, so `self.x = ...` cannot shadow it — assignment goes through the setter, and raises if there is none.
+- **Functions** define only `__get__`, so they are non-data descriptors. That is why `obj.method` returns a bound method (the function's `__get__` binds `obj`), **and** why `obj.method = something` in the instance dict successfully shadows the class's method. Monkey-patching an instance works; shadowing a property does not.
+- `@classmethod` and `@staticmethod` are non-data descriptors whose `__get__` returns, respectively, a method bound to the class and the plain underlying function.
+- `__slots__` creates one data descriptor per slot name on the class, each reading and writing a fixed offset in the instance. That is why slotted instances have no `__dict__` and why you cannot add attributes.
+
+Measured cost of each path:
+
+| Access | Cost | Ratio |
+|---|---|---|
+| plain instance attribute (`obj.__dict__` hit) | **4.6 ns** | 1.0× |
+| `__slots__` attribute (data descriptor, fixed offset) | **4.4 ns** | 0.96× |
+| `@property` (C-implemented data descriptor + a Python call) | **12.8 ns** | **2.8×** |
+| hand-written descriptor (Python `__get__` + `getattr`) | **49.6 ns** | **10.8×** |
+
+Two things to take from this. **`__slots__` is not faster** than a dict attribute (4.4 vs 4.6 ns) — CPython 3.11+ uses key-sharing dicts plus inline caches, so the dict path was already about as fast. The `__slots__` win is memory (Module 1: 139 B versus 171 B per instance), full stop.
+
+And **a hand-written descriptor is 10.8× a plain attribute**, because it costs a Python-level function call (measured at 11.1 ns in Module 3's benchmark) plus a `getattr` on the instance. The builtin `property` is 4× cheaper than the equivalent Python descriptor because its `__get__` is implemented in C. Your `my_property` from Layer 2 will measure around 50 ns; that is the price of the exercise and the reason the builtin exists.
+
+### C3 linearisation, computed by hand
+
+The MRO is not depth-first and it is not breadth-first. It is the **C3 linearisation**, and it is the unique ordering satisfying three constraints: a class precedes its parents; parents appear in the order they were listed; and the ordering is *monotonic* — a class's MRO is consistent with the MRO of every one of its parents.
+
+```python
+class A: pass
+class B(A): pass
+class C(A): pass
+class D(B, C): pass
+
+print([c.__name__ for c in D.__mro__])
+# ['D', 'B', 'C', 'A', 'object']
+```
+
+Compute it: `L[D] = D + merge(L[B], L[C], [B, C])`, where merge repeatedly takes the head of the first list that does not appear in the *tail* of any other list.
+
+```
+L[B] = [B, A, object]
+L[C] = [C, A, object]
+merge([B,A,object], [C,A,object], [B,C])
+  head B: in any tail? no          -> take B
+  merge([A,object], [C,A,object], [C])
+  head A: appears in the tail of [C,A,object]  -> SKIP
+  head C: in any tail? no          -> take C
+  merge([A,object], [A,object], [])
+  head A: not in a tail now        -> take A
+  then object
+L[D] = [D, B, C, A, object]
+```
+
+The skip is the whole point: **`A` cannot come before `C`, because `C` is a subclass of `A`.** Depth-first would have given `D, B, A, C, object`, placing `A` before its own subclass `C` — the "diamond problem" that C3 exists to prevent.
+
+Some hierarchies have **no** valid linearisation, and Python refuses them at class creation:
+
+```python
+class X: pass
+class Y: pass
+class P(X, Y): pass
+class Q(Y, X): pass
+class R(P, Q): pass
+# TypeError: Cannot create a consistent method resolution order (MRO) for bases X, Y
+```
+
+`P` requires X before Y; `Q` requires Y before X. No total order satisfies both, so the error arrives at class definition rather than at some surprising call site. That is a good failure.
+
+**`super()` follows the MRO, not the parent.** In `D`, `super().method()` calls `B.method`, and `B`'s own `super().method()` calls **`C.method`**, not `A.method` — even though `C` is not `B`'s parent. This is cooperative multiple inheritance, and it works only if every class in the chain calls `super()` and accepts compatible arguments. When it works it is elegant; when one class in the chain forgets `super()` the chain silently truncates, and that is the bug that makes people abandon mixins.
+
+### Metaclasses, and the thing you should use instead
+
+A metaclass is a class's class. `type` is the default, and `type(name, bases, namespace)` is what actually creates a class object. A custom metaclass overrides `__new__` or `__init__` to intervene at class creation:
+
+```python
+class RegistryMeta(type):
+    registry: dict[str, type] = {}
+
+    def __new__(mcls, name, bases, ns, **kw):
+        cls = super().__new__(mcls, name, bases, ns, **kw)
+        if bases:                                  # skip the base class itself
+            RegistryMeta.registry[ns.get("kind", name)] = cls
+        return cls
+
+
+class Plugin(metaclass=RegistryMeta): pass
+class JsonPlugin(Plugin): kind = "json"
+```
+
+Since **Python 3.6, `__init_subclass__` does the same job without a metaclass**, and it is what you should reach for:
+
+```python
+class Plugin:
+    registry: dict[str, type] = {}
+
+    def __init_subclass__(cls, /, kind: str | None = None, **kw) -> None:
+        super().__init_subclass__(**kw)
+        Plugin.registry[kind or cls.__name__] = cls
+
+
+class JsonPlugin(Plugin, kind="json"): pass
+print(Plugin.registry)      # {'json': <class 'JsonPlugin'>}
+```
+
+`__init_subclass__` is an ordinary classmethod, is inherited normally, composes with other base classes, and does not create the **metaclass conflict** that is the real cost of metaclasses: a class cannot have two unrelated metaclasses, so combining a class using your metaclass with one using `ABCMeta` or a library's metaclass fails at definition time with `metaclass conflict`.
+
+Together with `__set_name__` (3.6+), which lets a descriptor learn its own attribute name, these two hooks cover essentially every case metaclasses were used for. The remaining legitimate uses are narrow: `ABCMeta` itself, `enum.EnumMeta`, and libraries that must rewrite the class namespace during creation. **Pydantic v1 used a metaclass; Pydantic v2 moved the model construction to Rust behind a metaclass that mostly delegates** — the pattern being that heavy class-creation machinery belongs in a library, not in application code.
+
+### What `@dataclass` and `attrs` actually do
+
+`@dataclass` reads `__annotations__` on the class, builds source code for `__init__`, `__repr__`, `__eq__` and the ordering methods as **strings**, `exec`s them, and attaches them. You can see the generated source:
+
+```python
+import dataclasses, inspect
+print(inspect.getsource(dataclasses))      # the _create_fn / _field_init machinery
+```
+
+Two consequences worth knowing. It happens **once, at class creation**, so there is zero per-instance cost — Module 1 measured `@dataclass` instances at exactly the same 171 B as hand-written ones. And `slots=True` cannot modify the class in place (slots must exist when the class object is created), so it **creates and returns a new class**. That means a decorator applied above `@dataclass(slots=True)` sees a different class object than one applied below, and any reference captured during class body execution — a closure over the original class, for instance — points at the discarded one.
+
+`attrs` (the library `@dataclass` was derived from) does the same code generation with more features: validators, converters, `__attrs_post_init__`, and slots handled more carefully. **Pydantic v2** goes further: it generates a validation schema and executes it in Rust (`pydantic-core`), which is why it is roughly an order of magnitude faster than v1 for parsing — Week 6 measures it.
+
+### Production failure modes and how you detect them
+
+| Failure | Signature | Detection |
+|---|---|---|
+| `RecursionError` in a property | stack overflow on attribute read | the getter reads the property's own name; store in `self._x` |
+| Attribute silently not set | `obj.x = 1` appears to work, reads give the old value | a data descriptor (property, slot) intercepted the set; check `type(obj).__mro__` for `x` |
+| Wrong method wins in a mixin stack | behaviour depends on base-class order; each method is correct alone | print `cls.__mro__`; this is the document-permissions bug — refactor to composition |
+| `TypeError: Cannot create a consistent MRO` | at class definition, after adding a base | two bases impose contradictory orders; the hierarchy is unrepresentable, not fixable by reordering |
+| `super()` chain truncates | a mixin's method never runs | some class in the chain does not call `super()`; every cooperative class must |
+| `metaclass conflict` | combining two libraries' base classes | prefer `__init_subclass__` and `__set_name__`; metaclasses do not compose |
+| A subclass breaks a caller written for the base | works with the base, raises or returns differently with the subclass | Liskov violation: preconditions strengthened or postconditions weakened; test the subclass against the base's test suite |
+| Attribute access is 10× expected in a profile | a Python-level descriptor in a hot loop at 49.6 ns vs 4.6 ns | use a plain attribute, or cache the computed value with `functools.cached_property` |
+| `@dataclass(slots=True)` breaks a decorator above it | the decorator holds the pre-slots class | slots creates a *new* class; order decorators so `@dataclass` is innermost, or use `attrs` |
+
+### Frontier and research pointers
+
+- **Simionato, M. (2003). "The Python 2.3 Method Resolution Order."** One-sentence takeaway: C3 is the unique linearisation that keeps every parent's own MRO intact, which is why some hierarchies are simply invalid rather than merely surprising.
+- **Barrett, K., Cassels, B., Haahr, P. et al. (1996). "A Monotonic Superclass Linearization for Dylan." *OOPSLA*.** One-sentence takeaway: the original C3 paper, which defines monotonicity as the property that adding a subclass never reorders an existing class's MRO.
+- **Liskov, B. & Wing, J. (1994). "A Behavioral Notion of Subtyping." *ACM TOPLAS* 16(6).** One-sentence takeaway: subtyping is about *behaviour* under substitution, not about shared fields — formally, preconditions may only weaken and postconditions only strengthen.
+- **Gamma, E., Helm, R., Johnson, R. & Vlissides, J. (1994). *Design Patterns*, "Introduction" §1.6.** One-sentence takeaway: the original "favour object composition over class inheritance" argument, made on the grounds that inheritance breaks encapsulation between parent and child.
+- **PEP 544, "Protocols: Structural subtyping (static duck typing)" (2017).** One-sentence takeaway: structural typing lets a type checker verify duck typing without forcing implementers to inherit anything, which is what makes third-party types usable as your dependencies.
+- **PEP 487, "Simpler customisation of class creation" (2016).** One-sentence takeaway: `__init_subclass__` and `__set_name__` replace the overwhelming majority of metaclass uses without the composition problems metaclasses create.
+
+### Stretch challenge
+
+Build a descriptor library and measure what abstraction costs.
+
+1. Implement `my_property` (Layer 2) and verify it passes the same tests as the builtin: read, write, delete, no-setter `AttributeError`, class-level access returning the descriptor, `__doc__` preserved, and correct behaviour under inheritance and override.
+2. **Measure it** against the builtin `property` and a plain attribute. Our reference: plain 4.6 ns, builtin property 12.8 ns, Python descriptor 49.6 ns. Explain your gap — how much is the Python-level call (11.1 ns measured in Module 3) and how much is the `getattr`?
+3. Now build a **typed, validated descriptor**: `Positive(int)`, `NonEmpty(str)`, `OneOf("a", "b")`, each using `__set_name__` to learn its own attribute name and storing into `obj.__dict__[self._name]`. Make it work with `__slots__` too — which requires a different storage strategy, and finding it is the exercise.
+4. Compare your descriptor approach against `@dataclass` with `__post_init__` validation, and against Pydantic v2, on: lines of code, per-instance memory (Module 1's method), construction time, and validation error quality.
+5. Add `functools.cached_property` to the comparison for a computed field, and measure the first access versus subsequent ones.
+
+The open question with no single right answer: descriptors give you per-field validation reusable across classes, at 49.6 ns per read and a real cost in "what is actually happening here" for the next reader. `__post_init__` is one function, obvious, and does not compose across classes. Pydantic is fast and adds a dependency and a mental model. For a service your team maintains, where is the line — and does your answer change if the objects are constructed a thousand times per request rather than once at startup? Bring your measurements.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Implement `@property` from scratch as a descriptor class, and make it pass the same tests as the builtin.
+</Card>
+
+Acceptance: read, write and delete work; a missing setter raises `AttributeError` naming the property; class-level access returns the descriptor object rather than raising; `@x.setter` chaining works and returns a new instance rather than mutating; `__set_name__` supplies the name; and you report the measured per-read cost against the builtin `property` and a plain attribute.
+
+## The whiteboard
+
+The T1 sketch is the attribute-lookup flowchart with the data-descriptor branch highlighted. The T2 build-up frames walk one `obj.x` through the six steps, one at a time.
+
+<Tip>
+**Draw it yourself.** From memory: the lookup order with data descriptors before the instance
+dict, the three method kinds and what each receives, and the diamond with `D B C A object`
+written underneath. Then compare.
+[Blank version](/assets/diagrams/P1-W03-M4-blank.svg) · [Editable source](/assets/diagrams/P1-W03-M4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Portfolio line:** *"A from-scratch reimplementation of Python's `property` as a data descriptor, passing the builtin's test suite, with a measured cost comparison — 4.6 ns for a plain attribute, 12.8 ns for the C builtin, 49.6 ns for the Python version — and an explanation of where the gap comes from."* Reimplementing a language feature and then measuring the gap is a strong signal.
+
+**The interview angle.** "Explain `@classmethod` versus `@staticmethod`" is standard, and the definition alone is a weak answer. Use the motivating example: *`from_csv_row` must be a classmethod because it receives `cls`, so calling it on a subclass constructs the subclass. A staticmethod would have to hard-code the class name and would return the wrong type for every subclass — a bug that appears the day someone adds one.*
+
+The senior follow-up is "how does `@property` actually work?" and the answer is the descriptor protocol plus the precedence rule: *`property` defines `__set__`, which makes it a data descriptor, and data descriptors are consulted before the instance dict. That is why `self.x = ...` cannot shadow a property, and it is why a property whose getter reads `self.x` recurses forever.*
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+Three places this shows up in a normal engineering week:
+
+1. **Reviewing a new base class or mixin.** Ask whether the relationship is is-a or has-a, and whether any behaviour depends on base-class *order*. If it does, that is the document-permissions bug in waiting — the one where every method is correct in isolation and the linearisation is wrong.
+
+2. **Making a slow test suite fast.** The usual cause is dependencies constructed inside classes rather than injected. Define a `Protocol` for what the class needs, take it in `__init__`, and pass an in-memory implementation in tests. `mypy` verifies both satisfy the protocol structurally, with no base class and no changes to third-party types.
+
+3. **Any class you write with more than two constructors' worth of shape.** `@dataclass(frozen=True, slots=True)` gives you `__init__`, `__repr__`, `__eq__`, `__hash__` and ordering for one decorator, at 139 bytes per instance instead of 171. It is the correct default for value objects and it removes an entire category of hand-written bug.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `RecursionError` reading a property | the getter reads the property's own name | store in `self._x`; the property is a data descriptor and intercepts every access |
+| `obj.x = 1` seems to work but reads give the old value | a data descriptor (property or slot) intercepted the assignment | check `type(obj).__mro__` for `x`; add a setter, or use a different name |
+| A `@classmethod` returns the wrong type for subclasses | the body constructs the base class by name instead of using `cls` | `return cls(...)`, always |
+| `AttributeError` on a property that clearly exists | there is a getter but no setter, and something assigned to it | add `@x.setter`, or fix the caller — read-only was probably intended |
+| Class explosion: `RetryingRateLimitedEmailNotifier` | inheritance used to combine independent features | compose: wrap one object in another; 4 classes instead of 8 |
+| Wrong method wins with multiple bases | MRO order, not the method itself | print `cls.__mro__`; refactor the interaction into one explicit function |
+| `TypeError: Cannot create a consistent MRO` | two bases require contradictory orders | the hierarchy is unrepresentable; restructure, do not reorder |
+| A mixin's method silently never runs | a class in the chain does not call `super()` | every cooperative class must call `super()` with compatible arguments |
+| `metaclass conflict` when combining libraries | two unrelated metaclasses | use `__init_subclass__` and `__set_name__` instead |
+| `NotImplementedError` raised where `NotImplemented` was meant | returning the wrong thing from `__add__` and friends | `return NotImplemented` (the singleton) so Python can try the reflected operation |
+| Tests need a real database | dependencies constructed inside the class | inject over a `Protocol`; pass an in-memory implementation in tests |
+
+## Sources & further reading
+
+**Primary docs**
+
+- **[Python Data Model §3.3, "Customizing attribute access", and the "Descriptor HowTo Guide" (3.13).](https://docs.python.org/3/howto/descriptor.html)** The HowTo builds `property`, `classmethod` and `staticmethod` from scratch in pure Python; it is the single best document on this topic and it is 20 pages.
+- **[`typing.Protocol` documentation and PEP 544.](https://docs.python.org/3/library/typing.html#typing.Protocol)** Read this for `runtime_checkable`'s limitations — it checks method names only, not signatures.
+- **[`dataclasses` documentation, especially `slots`, `frozen`, `order` and `__post_init__` (3.13).](https://docs.python.org/3/library/dataclasses.html)** Read the note that `slots=True` returns a *new class*, which is the source of a real decorator-ordering bug.
+- **[PEP 487, "Simpler customisation of class creation."](https://peps.python.org/pep-0487/)** Read this for `__init_subclass__` and `__set_name__`, which replace most metaclass use.
+- **[`abc` module documentation.](https://docs.python.org/3/library/abc.html)** Read this for `register()`, which lets an ABC accept a class that does not inherit from it — the escape hatch when you must use an ABC with third-party types.
+
+**Papers**
+
+- **[Barrett, K., Cassels, B., Haahr, P., Moon, D. A., Playford, K. & Withington, P. T. (1996). "A Monotonic Superclass Linearization for Dylan." *OOPSLA*, 69–82.](https://doi.org/10.1145/236337.236343)** One-sentence takeaway: C3 is the linearisation that preserves both local precedence order and monotonicity, and it is why Python rejects some hierarchies outright rather than silently picking an order.
+- **[Liskov, B. H. & Wing, J. M. (1994). "A Behavioral Notion of Subtyping." *ACM TOPLAS* 16(6), 1811–1841.](https://doi.org/10.1145/197320.197383)** One-sentence takeaway: a subtype must be substitutable *behaviourally*, meaning preconditions may only weaken and postconditions only strengthen — the formal content of "is-a".
+- **Gamma, E., Helm, R., Johnson, R. & Vlissides, J. (1994). *Design Patterns: Elements of Reusable Object-Oriented Software*, §1.6.** One-sentence takeaway: inheritance exposes a parent's implementation to its children, so composition preserves encapsulation where inheritance breaks it.
+- **[Snyder, A. (1986). "Encapsulation and Inheritance in Object-Oriented Programming Languages." *OOPSLA*.](https://doi.org/10.1145/28697.28702)** One-sentence takeaway: inheritance creates a second, usually undocumented, interface between a class and its subclasses — which is why changing a base class breaks subclasses you did not know existed.
+
+**Go deeper**
+
+- **[Ramalho, L., *Fluent Python*, 2nd ed., Chapters 11–14 (protocols, interfaces, inheritance) and 23 (attribute descriptors).](https://www.fluentpython.com/)** Chapter 23 is the best long-form treatment of descriptors available, including the storage strategies for `__slots__` that the stretch challenge asks about.
+- **Raymond Hettinger, "Python's Class Development Toolkit" (PyCon 2013).** Ninety minutes that builds a class up from a naive version through properties, class methods, static methods and slots, explaining the reason for each step as it appears.
+- **[CPython source: `Objects/typeobject.c` (`_PyType_Lookup`, `type_mro`) and `Objects/descrobject.c`.](https://github.com/python/cpython/blob/main/Objects/typeobject.c)** `_PyType_Lookup` is the six-step algorithm from this layer, in C, and it is shorter than you expect.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p1/week-03/p1-w03-m4">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

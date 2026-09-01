@@ -1,0 +1,149 @@
+---
+title: "Security, auth & hardening"
+description: "Reference solution — Week 6"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W06-M4`
+
+Three exploits, three patches, three tests.
+
+### Exploit 1 — IDOR
+
+```bash
+# authenticate as user B, read user A's order
+TOKEN_B=$(curl -s -X POST $API/token -d "username=bob&password=..." | jq -r .access_token)
+curl -s $API/v1/orders/4101 -H "Authorization: Bearer $TOKEN_B"
+# 200 OK  {"id":4101,"user_id":7,"total_cents":184900,...}   <- not Bob's
+```
+
+**Patch.** Ownership in the `WHERE` clause, 404 rather than 403:
+
+```python
+@router.get("/orders/{order_id}", response_model=OrderOut)
+async def get_order(order_id: int, session: SessionDep, user: CurrentUser):
+    order = (await session.execute(
+        select(Order).where(Order.id == order_id, Order.user_id == user.id)
+    )).scalar_one_or_none()
+    if order is None:
+        raise HTTPException(404, "Order not found")
+    return order
+```
+
+**Test that scales with your route count**, not with your discipline:
+
+```python
+@pytest.mark.parametrize("route", routes_with_path_params(app))
+async def test_cross_tenant_returns_404(client, route, tenant_a_object, token_b):
+    url = route.path.replace("{order_id}", str(tenant_a_object.id))
+    r = await client.get(url, headers={"Authorization": f"Bearer {token_b}"})
+    assert r.status_code == 404, f"{url} leaked to another tenant with {r.status_code}"
+```
+
+### Exploit 2 — mass assignment
+
+```bash
+curl -s -X POST $API/v1/users -H "Content-Type: application/json" \
+  -d '{"email":"m@example.com","password":"...","is_admin":true}'
+# 201 Created  {"id":91,"email":"m@example.com","is_admin":true}
+```
+
+**Patch.** `extra="forbid"` plus a narrow create model, and never `Model(**payload)` into a wider
+model:
+
+```python
+class UserCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    email: EmailStr
+    name: str
+    password: SecretStr
+# is_admin is not a field -> {"is_admin": true} is now 422 extra_forbidden
+```
+
+### Exploit 3 — token tampering
+
+Against PyJWT 2.10.1 the classic attacks are already blocked, verified:
+
+```
+forged alg:none, algorithms=["HS256"]         -> InvalidAlgorithmError
+forged alg:none, algorithms=["none"]          -> InvalidKeyError
+HS256 signed with an RSA public key           -> InvalidKeyError at ENCODE time
+```
+
+The one that still works is the codebase's own mistake:
+
+```python
+>>> jwt.decode(forged, options={"verify_signature": False})
+{'sub': '42', 'role': 'admin'}
+```
+
+**Patch.** Delete every `verify_signature: False`, always pass an explicit `algorithms` list,
+validate `aud` and `iss`, and add a lint rule banning the option. A test asserts a token signed
+with the wrong key is rejected on every authenticated route.
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: returning 403 for another tenant's object.** It reads as more honest and it is an
+enumeration oracle: 403 means "exists but not yours", 404 means "nothing to see". An attacker maps
+your entire object space with a loop and a status-code check. Return 404 and log the attempt at
+warning level with the user id — that log line is your detection signal.
+
+**Wrong turn 2: patching the handler and stopping.** Handlers are written by people, and people
+forget. The durable fixes are structural: ownership enforced in a repository layer so an unfiltered
+query is not expressible; a parametrised cross-tenant test that covers every route automatically;
+non-sequential public IDs so guessing is impractical; and an alert on one account reading many
+distinct IDs.
+
+**Wrong turn 3: bcrypt with a high cost as "more secure".** Measured: cost 12 is 245.6 ms and cost
+14 is 1,237.7 ms per hash. At 20 logins per second, cost 12 needs 4.9 CPU cores and cost 14 needs
+24.7. Without a rate limit that is an amplification attack — one attacker at 100 requests per
+second costs you 25 cores. argon2id at 65.5 ms hash / 51.4 ms verify with a per-account rate limit
+is the better whole-system answer, and the reasoning, not the algorithm name, is what earns the
+mark.
+
+**Wrong turn 4: claiming a demonstrated timing attack on `==`.** I measured 32-character hex
+comparison at 24 ns when differing at the first character and 26 ns at the last — no measurable
+signal locally, because CPython compares length first and short strings in word-sized chunks. The
+correct write-up says the local measurement showed nothing, cites the remote-timing literature for
+why the risk is real anyway, and notes that `compare_digest` costs 30–60 ns extra, which is
+irrelevant beside a 51 ms verify. Use it because it is constant-time by construction, not because
+your microbenchmark proved a leak.
+
+## Measured numbers this solution produces
+
+| Claim | Number |
+| --- | --- |
+| argon2id (t=3, m=64 MiB, p=4) | 65.5 ms hash · 51.4 ms verify |
+| bcrypt cost 10 / 12 / 14 | 79.3 / 245.6 / 1,237.7 ms |
+| bcrypt cost 12 verify | 261.1 ms |
+| JWT HS256 sign / verify | 10.5 µs / 13.2 µs (95,613 / 75,550 per second) |
+| Capacity at 20 logins/s | argon2id ≈ 1.0 core; bcrypt-12 ≈ 4.9 cores |
+| argon2id memory | 64 MiB per concurrent hash |
+| bcrypt truncation | `checkpw(b"A"*72 + b"different", hash(b"A"*72))` returns `True` |
+| `==` vs `compare_digest` (32 chars) | 24–26 ns vs 58–89 ns; no local timing signal from `==` |
+
+## Grading notes
+
+**A 3/3 on correctness**: all three exploits demonstrated with real request/response captures, all
+three patched, and a test for each that fails against the unpatched app. The cross-tenant test must
+be parametrised over routes, not written once.
+
+**A 3/3 on explanation**: says why 404 rather than 403; derives the hashing capacity number; and
+states one control it deliberately did *not* implement, with the reason.
+
+**The three most common ways submissions lose points**
+
+1. A patch with no failing test. The lab explicitly requires proof the fix does something.
+2. A cross-tenant check on one endpoint. IDOR is a per-route bug; a per-route test is the only defence that scales.
+3. Repeating 2015 JWT advice about `alg:none` without checking whether the pinned library is vulnerable. It is not — verify before you claim.

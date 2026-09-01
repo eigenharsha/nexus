@@ -1,0 +1,119 @@
+---
+title: "REST design & API contracts"
+description: "Reference solution — Week 6"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W06-M1`
+
+The exercise is the bad-spec review. Here are the 14 defects, with the correction and the reason.
+
+| # | Defect in `bad-api.yaml` | Correction | Why |
+| --- | --- | --- | --- |
+| 1 | `POST /getOrders` | `GET /orders` | The method is the verb; a verb in the path creates many spellings of one operation and defeats caching |
+| 2 | `GET /order/{id}` (singular) | `/orders/{id}` | One pluralisation rule, applied everywhere, so nobody has to remember |
+| 3 | List returns a bare array | `{"data": [...], "page": {...}}` | You cannot add pagination metadata later without breaking every client |
+| 4 | `200` on create | `201` with a `Location` header | The client should learn the new URL without parsing your body |
+| 5 | `200` with `{"deleted": true}` | `204`, no body | Nothing meaningful to return; a body invites clients to depend on it |
+| 6 | `400` for validation failures | `422` | The JSON was well-formed; the *content* is impossible |
+| 7 | `?page=47&per_page=100` only | cursor pagination, `per_page` capped at 100 | Offset is slow and incorrect under concurrent writes; measured 693.9 ms vs 1.7 ms at depth 500,000 |
+| 8 | Errors are `{"error": "some text"}` | RFC 9457 envelope with `type`, `title`, `status`, `detail`, `errors[]` | Clients must branch on a stable identifier, not on English prose |
+| 9 | `PUT /orders/{id}` used for partial updates | `PATCH`, with `If-Match` for concurrency | `PUT` means replace; using it for partials silently blanks omitted fields |
+| 10 | No versioning at all | `/v1/` prefix | You will need to break something; decide where the seam is before you need it |
+| 11 | `POST /orders` has no idempotency mechanism | `Idempotency-Key` header, unique constraint, stored response | Networks retry; without it a timeout charges twice |
+| 12 | `status` documented as `string` | `enum` with the closed set, plus a documented "tolerate unknown values" rule | An open string tells a client nothing and hides the breaking change when you add a value |
+| 13 | Timestamps as `"01/09/2026"` | RFC 3339 UTC: `"2026-09-01T09:14:22Z"` | Ambiguous between locales; no timezone; unsortable as a string |
+| 14 | `amount` as a JSON number `49.99` | integer minor units, or a string decimal with an explicit `currency` | IEEE-754 cannot represent 49.99 exactly; JavaScript clients lose precision above 2^53 |
+
+Defects deliberately *not* present, which learners sometimes "fix": the API uses `snake_case` field
+names (a style choice, not a defect) and returns `404` rather than `403` for objects the caller
+does not own (correct — that is the anti-enumeration behaviour from `P1-W06-M4`). Inventing defects
+costs a point.
+
+### The corrected pagination section
+
+```yaml
+  /v1/orders:
+    get:
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: cursor
+          in: query
+          description: Opaque cursor from a previous response. Do not construct it.
+          schema: { type: string }
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, page]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Order" }
+                  page:
+                    type: object
+                    required: [has_more]
+                    properties:
+                      next_cursor: { type: string, nullable: true }
+                      has_more:    { type: boolean }
+```
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: "offset pagination is fine, we just need an index."** It is not, on either axis.
+Measured on 1,000,000 rows: `OFFSET 500000 LIMIT 20` took 581.7 ms without a usable index and
+**693.9 ms with one** — the index changed how rows were produced, not the fact that 500,020 were
+produced and 500,000 discarded. And the correctness problem is untouched by any index: an insert
+before the read position shifts every later page, so clients see duplicates and miss rows.
+
+**Wrong turn 2: making the cursor readable.** A cursor of `?after_id=900020` looks friendly and
+becomes a contract: change the sort order and every client's saved cursor silently returns the
+wrong page. Base64 an opaque struct, sign it if the sort key is sensitive, and document that
+clients must treat it as bytes.
+
+**Wrong turn 3: an error envelope without a stable `type`.** A `message` field alone forces clients
+to string-match, so your copy edit becomes their outage. `type` is a URI you never change; `title`
+and `detail` are prose you may rewrite freely.
+
+## Measured numbers this solution produces
+
+| Claim | Number |
+| --- | --- |
+| `OFFSET 500000 LIMIT 20`, 1M rows, no index | 581.7 ms, sort spilled 14 MB to disk |
+| Same with a matching index | 693.9 ms — index scan reading 500,020 rows |
+| `OFFSET 100000` | 211.0 ms, spilled 11 MB |
+| Keyset at depth 500,000 | **2.1 ms** |
+| Keyset at depth 900,000 | **1.7 ms** — flat |
+| Speedup at depth | **≈408×** |
+| Over-fetch, 100 orders full vs three fields | 26,454 B vs 5,257 B = **5.0×** |
+| Same after gzip | 2,107 B vs 539 B (12.6× compression on the full doc) |
+
+## Grading notes
+
+**A 3/3 on correctness** finds at least 11 of the 14 defects, invents none, and gives a
+one-sentence *reason* for each — not just the corrected value.
+
+**A 3/3 on explanation** includes at least one number, defends cursor pagination on **both**
+performance and correctness grounds, and states one place where the corrected design is worse
+(cursors cannot jump to page 47; sparse fieldsets fragment cache keys).
+
+**The three most common ways submissions lose points**
+
+1. Correcting style rather than semantics — renaming fields to camelCase and calling it a fix.
+2. Justifying cursor pagination only on speed. The correctness argument is the stronger one and it survives "but our tables are small".
+3. Adding an idempotency key but not saying it must be written in the same transaction as the effect.

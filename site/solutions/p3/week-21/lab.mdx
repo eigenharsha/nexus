@@ -1,0 +1,243 @@
+---
+title: "Lab — `nanograd`: autograd + neural net from scratch"
+description: "Reference solution — Week 21"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `LAB-P3-W21`
+
+Full source is in `labs/p3/week-21/solution/`. This page is the reasoning: the design decisions,
+the two wrong turns, and the numbers the reference produces.
+
+## The architecture that makes MNIST reachable
+
+The scalar `Value` engine from Module 2 is correct and 1,730× slower than NumPy — too slow for
+60,000 MNIST images. The reference solution keeps the same graph machinery and makes `data` a
+**NumPy array**, so one node covers a whole tensor. That is one change, and it is the change
+that turns a teaching toy into something that trains.
+
+```python
+"""tensor.py — array-valued reverse-mode autograd with broadcasting.
+Python 3.12, NumPy 2.1.1. No deep-learning framework."""
+from __future__ import annotations
+import numpy as np
+
+def unbroadcast(grad: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
+    """Sum `grad` down to `shape`, undoing NumPy broadcasting.
+
+    This is THE function that separates a tensor engine from a scalar one, and
+    the one place everybody gets it wrong. Two steps, in this order:
+      1. sum away leading axes the target does not have at all
+      2. sum (keepdims) any axis where the target has size 1 and grad does not
+    """
+    while grad.ndim > len(shape):
+        grad = grad.sum(axis=0)
+    for i, s in enumerate(shape):
+        if s == 1 and grad.shape[i] != 1:
+            grad = grad.sum(axis=i, keepdims=True)
+    return grad.reshape(shape)
+
+class Tensor:
+    __slots__ = ("data", "grad", "_backward", "_prev", "_op", "requires_grad")
+
+    def __init__(self, data, _children=(), _op="", requires_grad=True):
+        self.data = np.asarray(data, dtype=np.float64)
+        self.grad = np.zeros_like(self.data)
+        self._backward = lambda: None
+        self._prev = _children
+        self._op = _op
+        self.requires_grad = requires_grad
+
+    @property
+    def shape(self): return self.data.shape
+
+    def __add__(self, other):
+        other = other if isinstance(other, Tensor) else Tensor(other)
+        out = Tensor(self.data + other.data, (self, other), "+")
+        def _backward():
+            self.grad  += unbroadcast(out.grad, self.data.shape)
+            other.grad += unbroadcast(out.grad, other.data.shape)
+        out._backward = _backward
+        return out
+
+    def __mul__(self, other):
+        other = other if isinstance(other, Tensor) else Tensor(other)
+        out = Tensor(self.data * other.data, (self, other), "*")
+        def _backward():
+            self.grad  += unbroadcast(other.data * out.grad, self.data.shape)
+            other.grad += unbroadcast(self.data  * out.grad, other.data.shape)
+        out._backward = _backward
+        return out
+
+    def __matmul__(self, other):
+        out = Tensor(self.data @ other.data, (self, other), "@")
+        def _backward():
+            self.grad  += out.grad @ other.data.T
+            other.grad += self.data.T @ out.grad
+        out._backward = _backward
+        return out
+
+    def relu(self):
+        out = Tensor(np.maximum(0.0, self.data), (self,), "relu")
+        def _backward():
+            self.grad += (self.data > 0) * out.grad     # gate on the INPUT
+        out._backward = _backward
+        return out
+
+    def sum(self, axis=None, keepdims=False):
+        out = Tensor(self.data.sum(axis=axis, keepdims=keepdims), (self,), "sum")
+        def _backward():
+            g = out.grad
+            if axis is not None and not keepdims:
+                g = np.expand_dims(g, axis)
+            self.grad += np.broadcast_to(g, self.data.shape).copy()
+        out._backward = _backward
+        return out
+
+    def backward(self):
+        topo, visited, stack = [], set(), [(self, False)]
+        while stack:
+            node, expanded = stack.pop()
+            if expanded:
+                topo.append(node); continue
+            if id(node) in visited: continue
+            visited.add(id(node))
+            stack.append((node, True))
+            for c in node._prev:
+                if id(c) not in visited:
+                    stack.append((c, False))
+        self.grad = np.ones_like(self.data)
+        for node in reversed(topo):
+            node._backward()
+```
+
+### The fused softmax–cross-entropy
+
+Do not implement softmax and cross-entropy separately. Fused, the forward is numerically stable
+and the backward is three lines.
+
+```python
+def softmax_cross_entropy(logits: Tensor, y: np.ndarray) -> Tensor:
+    """logits: (B, K) Tensor. y: (B,) int labels. Returns mean loss as a Tensor."""
+    Z = logits.data
+    Zs = Z - Z.max(axis=1, keepdims=True)                  # stability shift
+    logp = Zs - np.log(np.exp(Zs).sum(axis=1, keepdims=True))
+    B = y.shape[0]
+    loss_val = -logp[np.arange(B), y].mean()
+    out = Tensor(loss_val, (logits,), "softmax_ce")
+    def _backward():
+        p = np.exp(logp)
+        p[np.arange(B), y] -= 1.0
+        logits.grad += (p / B) * out.grad                  # dZ = (softmax - onehot)/B
+    out._backward = _backward
+    return out
+```
+
+## The numbers the reference produces
+
+**Reference figures** — Machine A (M3 Pro, NumPy 2.1.1, single process), modelled rather than run; see [About the numbers](/start/about-the-numbers).
+
+| Metric | Value |
+| --- | --- |
+| `gradcheck` max relative error, all ops, float64 | **3.1e-11** |
+| Architecture | `784 → 128 → 10`, ReLU |
+| Optimizer | Adam, lr 1e-3, batch 128 |
+| Test accuracy, epoch 5 | 96.4% |
+| Test accuracy, epoch 20 | **97.8%** |
+| Epoch wall clock | 11.2 s |
+| PyTorch parity after 100 steps, same seed | max param diff **6.2e-13** |
+| Speed vs PyTorch CPU, same workload | 1.21× slower |
+
+The `hard` track's checkpointing figures — **reference figure**, Machine B (RTX 4090, modelled; see [About the numbers](/start/about-the-numbers)), 24-layer / width-2048 MLP, batch 512. Your own run on your own hardware is the number that counts:
+
+| Segments | Activation memory | Step time |
+| --- | --- | --- |
+| 1 (none) | 214 MB | 38.1 ms |
+| 6 (≈ √24) | 45 MB | 50.9 ms |
+| 24 (every layer) | 21 MB | 58.4 ms |
+
+**79% memory saved for 34% more compute** at `√L` segments — within 4 points of Chen et al.'s
+theoretical ~30%.
+
+## Why this solution and not the obvious one
+
+**Why `unbroadcast` in every binary op, not just where you think you need it.** Broadcasting is
+implicit in NumPy, so `W @ x + b` where `b` is `(n,)` and the product is `(B, n)` broadcasts
+silently. If `b.grad` gets the full `(B, n)` gradient without reduction, NumPy's `+=` will
+either raise or (worse, with `keepdims` shapes) silently broadcast again and give you a bias
+gradient that is `B` times too large. Symptom: biases move `B` times too fast, the loss
+oscillates, and the network trains anyway — badly. Write `unbroadcast` once and use it
+mechanically.
+
+**Why the ReLU gate is on `self.data`, not `out.data`.** They are numerically identical for
+ReLU, so the bug hides. They differ the moment you add LeakyReLU or GELU. Gate on the input and
+your engine stays correct when you extend it.
+
+**Why float64 throughout.** This engine's purpose is to be *verifiable*. In float32 a correct
+gradient gives 1e-3 relative error under central differences and you cannot distinguish it from
+a bug. The 2× memory cost is irrelevant at this scale, and the parity test against PyTorch runs
+in `torch.float64` for the same reason.
+
+**Why the topological sort keys on `id()` and pushes `(node, expanded)` pairs.** The two-phase
+stack entry is the standard iterative post-order DFS: push the node marked unexpanded, pop it,
+push it back marked expanded, then push its children. When it comes off the stack the second
+time, all its children are already in `topo`. It is six lines and it never overflows.
+
+## The two wrong turns worth knowing about
+
+**1. `grad = ...` instead of `grad += ...`.** The signature is a gradient check that fails by
+exactly 0.5 relative error when a value has two consumers, and passes on any network where every
+value is used once. Test with `y = x * x`: correct gives `2x`, the bug gives `x`. Write that
+test before you write anything else.
+
+**2. Building the network with a ReLU on the output layer.** A classifier whose logits are all
+`≥ 0` cannot express confident negative evidence. It trains and plateaus about 3 points low. In
+`MLP.__init__`, the last layer must be linear.
+
+A third, less common but nastier: **reusing a cached loss `Tensor` in `gradcheck`.** The graph
+is consumed by `backward()` and the perturbed evaluations need a fresh forward pass. Pass a
+closure, not a value. Symptom: every numerical gradient is identical, and the relative error is
+exactly 1.0 everywhere.
+
+## Grading notes
+
+**What a 3/3 looks like on each row**
+
+- **Correctness 3** — `gradcheck` under 1e-7 on every op; a diamond-graph test (a value with
+  multiple consumers); a 2,000-deep chain that does not overflow; broadcasting gradients checked
+  for shape *and* value; PyTorch parity within 1e-6.
+- **Code quality 3** — type hints, `unbroadcast` factored out rather than repeated, ops
+  registered uniformly, and a test file a reviewer would not ask you to change.
+- **Performance 3** — the slowdown measured against both NumPy and PyTorch, with an explanation
+  in terms of per-operation interpreter overhead; and, on `hard`, the checkpointing
+  memory/compute curve across at least three segment counts.
+- **Explanation 3** — a README containing the worked 2-2-1 example beside your engine's output,
+  the gradcheck table, the MNIST curve, and the "why is it slow" paragraph.
+
+**The three most common ways submissions lose points**
+
+1. **No test for the accumulation bug.** Two lines, and without it correctness caps at 2 no
+   matter how green the rest is.
+2. **Broadcasting gradients checked only for shape.** `unbroadcast` returning the right shape
+   with the wrong values is a real and common bug — it happens when you `reshape` instead of
+   `sum`. Assert values against PyTorch.
+3. **The write-up reports "all tests pass".** The lab's whole thesis is that a passing test
+   suite is not evidence a gradient is right — a numerical check is. Your README should show
+   numbers, not badges.
+
+<Card title="Back to the lab" icon="arrow-left" href="/curriculum/p3/week-21/lab" horizontal>
+  If you scored under 8/12, the highest-value fix is usually the gradcheck coverage, not the engine.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

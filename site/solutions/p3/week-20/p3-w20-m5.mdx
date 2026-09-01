@@ -1,0 +1,120 @@
+---
+title: "Production feature pipelines"
+description: "Reference solution — Week 20"
+hidden: true
+icon: "lock"
+---
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+<Info>
+**Provenance.** The reference figures below were produced by running the code on an Apple M3 Pro (11 cores, 18 GB, macOS arm64, no GPU), Python 3.12.9, with the versions pinned in the week index. Arithmetic shown term by term is *derived* and holds anywhere; results attributed to a paper are that paper's. See [About the numbers](/start/about-the-numbers).
+</Info>
+
+
+## Reference solution — `P3-W20-M5`
+
+The task: break a pickled pipeline by bumping a library version, then re-architect so it survives.
+
+## The break
+
+Fit under scikit-learn **1.9.0** / numpy 2.5.2, save with joblib, load under **1.5.2** / numpy 2.0.2, compare against the saved reference predictions.
+
+```
+loading with sklearn 1.5.2 numpy 2.0.2
+  logreg  FAILED: AttributeError: 'LogisticRegression' object has no attribute 'multi_class'
+  rf      LOADED. max |pred diff| = 0.000e+00   warnings: InconsistentVersionWarning
+  hgb     LOADED. max |pred diff| = 1.525e-01   warnings: InconsistentVersionWarning
+```
+
+**Three estimators, three outcomes**, and the classification is the deliverable:
+
+1. **Crash.** `LogisticRegression` — loud, at load time, before a single prediction is served. This is the *good* failure.
+2. **Identical.** `RandomForest` — bit-for-bit, `0.000e+00`. Fine, for these versions, for this estimator.
+3. **Loaded and silently wrong.** `HistGradientBoostingClassifier` — predictions differ by up to **0.152 in probability**. A score of 0.62 becomes 0.47. It crosses thresholds. It changes decisions. The only signal is a warning that most services suppress.
+
+**Case three is the whole module.** A crash pages somebody on Tuesday; a silent 0.15 shift is found in a quarterly review, if at all.
+
+The mechanism: pickle stores the class's module path and the instance's `__dict__` — **state, not behaviour**. When the attributes survive but the code that interprets them has changed, you get case three, and no type check can detect it. Only comparing outputs can.
+
+## Saving the predictions is the point
+
+The step most submissions omit, and without it the experiment cannot work:
+
+```python
+# in the NEW environment -- save BOTH
+joblib.dump(pipe, f"model_{name}.joblib")
+np.save(f"pred_{name}.npy", pipe.predict_proba(df)[:, 1])       # <-- the reference
+
+# in the OLD environment
+m = joblib.load(f"model_{name}.joblib")
+print(np.abs(m.predict_proba(df)[:, 1] - np.load(f"pred_{name}.npy")).max())
+```
+
+Without the saved predictions you observe "it loaded" and conclude everything is fine. Case three looks exactly like case two until you diff the outputs.
+
+## The re-architecture, measured
+
+| Format | Size | Dump | Load | Cross-version | Executes code on load |
+| --- | --- | --- | --- | --- | --- |
+| joblib | **0.38 MB** | 11 ms | **4 ms** | no guarantee | **yes** |
+| skops | 1.02 MB | 19 ms | 30 ms | better, not guaranteed | **no** — 1 type flagged for review |
+| ONNX | varies | slow | fast | **guaranteed by opset** | no |
+| plain code + JSON | tiny | — | — | **guaranteed** | no |
+
+skops loads through an allow-list you approve:
+
+```python
+untrusted = sio.get_untrusted_types(file="pipeline.skops")   # ['numpy.dtype']
+model = sio.load("pipeline.skops", trusted=untrusted)
+```
+
+Measured: predictions identical, 2.7x larger, 7.5x slower to load. **That is the price of not executing arbitrary code**, and it is the right trade whenever the artifact crosses a trust boundary.
+
+## The answer the challenge is really asking for
+
+Rank the options by **cost-effectiveness at preventing a silent difference**, and the surprising winner is detection rather than prevention.
+
+**A golden-prediction test is twenty lines and catches every cause** — library upgrades, refactors, preprocessing edits, numpy dtype defaults — because it asserts the property you actually want (the outputs did not change) rather than a proxy for it.
+
+```python
+def test_predictions_unchanged():
+    pipe = joblib.load("artifacts/pipeline.joblib")
+    actual = pipe.predict_proba(pd.read_parquet(GOLDEN_ROWS))[:, 1]
+    worst = float(np.abs(actual - np.load(GOLDEN_PRED)).max())
+    assert worst < 1e-6, f"predictions moved by {worst:.3e}; regenerate deliberately if intended"
+```
+
+Three design decisions in those four lines:
+
+- **Tolerance `1e-6`.** BLAS thread counts and numpy versions move things around `1e-12`; the measured HGB break was `1.5e-1`, five orders of magnitude above the tolerance. There is a wide safe band.
+- **Golden rows must cover edge cases** — a null in every nullable column, an unseen category, the extremes of every numeric range, one row per important slice. A thousand median rows tests almost nothing.
+- **Regeneration is manual and reviewed.** `make regenerate-golden`, committed with a note saying why. A test that auto-regenerates on failure is a no-op that looks like coverage.
+
+ONNX genuinely prevents the problem, and it costs a conversion project, custom converters for your own transformers, and numerical differences around `1e-5` that mean "identical" has to be redefined. **For a Python service, joblib with exact pins plus a golden test is the better trade; for non-Python or very high throughput, ONNX earns its cost.** Say which you chose and why.
+
+## Why this solution and not the obvious one
+
+**The obvious solution loads the model in the old environment, sees it load, and concludes pickles are fine.** Two of the three cases here load successfully and one of those is wrong. Without saved reference predictions the experiment cannot distinguish them.
+
+Two more wrong turns:
+
+1. **Suppressing warnings.** `InconsistentVersionWarning` was the only signal in case three, and the war story in the module body is a team whose logging had warnings at `ERROR` level. Promote it: `warnings.simplefilter("error", InconsistentVersionWarning)`.
+2. **Testing only one estimator.** The three-way split is the finding. A submission that tests `LogisticRegression` reports "pickles break loudly" — the opposite of the truth for the dangerous case.
+
+## Grading notes
+
+**3/3 looks like:** at least four estimators tested across a version gap of three or more minor releases, classified into crash / identical / silently different, with the maximum prediction difference for each; reference predictions saved alongside the model; a golden-prediction test at `1e-6` demonstrated failing on the broken case; and a written recommendation choosing between prevention and detection, with the model complexity at which the choice flips.
+
+**The three most common ways submissions lose points:**
+
+1. **No saved reference predictions.** The silent case is then indistinguishable from success and the whole exercise reports the wrong conclusion.
+2. **One estimator tested.** Misses the three-way structure, which is the result.
+3. **Recommending ONNX without costing it.** It is the right answer sometimes; a recommendation without the conversion cost, the custom-converter problem and the `1e-5` numerical difference is not a recommendation.

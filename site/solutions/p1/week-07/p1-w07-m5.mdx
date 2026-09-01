@@ -1,0 +1,184 @@
+---
+title: "Postgres in practice"
+description: "Reference solution — Week 7"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W07-M5`
+
+The exercise: bloat a table deliberately, detect it from the catalogs, and reclaim the space.
+
+### The reproduction
+
+```sql
+DROP TABLE IF EXISTS bloat_demo;
+CREATE TABLE bloat_demo AS
+  SELECT g AS id, repeat('x', 200) AS payload, 0 AS counter
+  FROM generate_series(1, 200000) g;
+ALTER TABLE bloat_demo ADD PRIMARY KEY (id);
+VACUUM ANALYZE bloat_demo;
+
+SELECT pg_size_pretty(pg_relation_size('bloat_demo')) AS size_before,
+       n_live_tup, n_dead_tup
+FROM pg_stat_user_tables WHERE relname = 'bloat_demo';
+```
+
+```
+ size_before | n_live_tup | n_dead_tup
+-------------+------------+------------
+ 48 MB       |     200000 |          0
+```
+
+Then five full-table updates, each 2.4–3.2 seconds:
+
+```sql
+UPDATE bloat_demo SET counter = counter + 1;   -- x5
+```
+
+```
+ size_after_updates
+--------------------
+ 284 MB
+
+ n_live_tup | n_dead_tup
+------------+------------
+     200000 |     999959
+```
+
+**5.9× larger, same 200,000 live rows.** Five updates × 200,000 rows = 1,000,000 dead versions, and
+the observed 999,959 is that minus the few autovacuum reached first.
+
+### Reclamation, with the honest result
+
+```sql
+VACUUM bloat_demo;
+SELECT pg_size_pretty(pg_relation_size('bloat_demo'));
+--  284 MB          <- unchanged
+
+VACUUM FULL bloat_demo;
+SELECT pg_size_pretty(pg_relation_size('bloat_demo'));
+--  47 MB
+```
+
+Plain `VACUUM` took 1,316 ms and **did not shrink the file**. It marked the space reusable, so
+future inserts refill it instead of extending — which is the right outcome for a table that will
+keep being written. `VACUUM FULL` took 1,191 ms and rewrote the table to 47 MB, while holding an
+`ACCESS EXCLUSIVE` lock that makes the table unreadable for the duration. On a 284 MB table that is
+about a second; on a 284 GB table it is not.
+
+### The detection query to keep
+
+```sql
+SELECT relname, n_live_tup, n_dead_tup,
+       round(100.0 * n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 1) AS dead_pct,
+       pg_size_pretty(pg_relation_size(relid)) AS size,
+       last_autovacuum, autovacuum_count
+FROM   pg_stat_user_tables
+WHERE  n_dead_tup > 10000
+ORDER  BY n_dead_tup DESC;
+```
+
+### The load-speed comparison
+
+```
+100,000 single-row INSERTs, each auto-committed : 83,773 ms   (1,194 rows/s)
+The same 100,000 INSERTs in ONE transaction     : 23,227 ms   (4,306 rows/s)
+COPY FROM a CSV                                 :    295 ms   (~339,000 rows/s)
+```
+
+**284× and 79×.** Two separable effects: one `fsync` instead of 100,000 gives 3.6×, and skipping
+per-statement parse, plan and round trip gives the remaining ~79×.
+
+### The role setup, verified
+
+```sql
+CREATE ROLE app_readwrite NOLOGIN;
+GRANT CONNECT ON DATABASE nexus TO app_readwrite;
+GRANT USAGE  ON SCHEMA public TO app_readwrite;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES    IN SCHEMA public TO app_readwrite;
+GRANT USAGE                          ON ALL SEQUENCES IN SCHEMA public TO app_readwrite;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_readwrite;
+CREATE ROLE nexus_app LOGIN PASSWORD 'from-your-secret-manager' IN ROLE app_readwrite;
+```
+
+```
+   grantee     | privilege_type
+---------------+----------------
+ app_readwrite | DELETE
+ app_readwrite | INSERT
+ app_readwrite | SELECT
+ app_readwrite | UPDATE
+```
+
+No `TRUNCATE`, no `REFERENCES`, no ownership, no `CREATE` — so an injection that reaches the
+database still cannot drop a table.
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: expecting `VACUUM` to shrink the file.** Measured, it stayed at 284 MB. Every cohort
+produces at least one submission reporting that "vacuum did not work". It worked exactly as
+designed: it made 236 MB reusable. Only a rewrite returns space to the operating system.
+
+**Wrong turn 2: reaching for `VACUUM FULL` in production.** It took 1,191 ms here and locks the
+table completely. `pg_repack` performs the same rewrite while holding an exclusive lock only for the
+final swap. The submission that names `pg_repack` and explains the trade-off scores above the one
+that runs `VACUUM FULL` on a demo table and declares victory.
+
+**Wrong turn 3: measuring bloat while autovacuum is running.** If autovacuum cleans up between your
+updates, you see far less than 5.9×. Either disable it on the table
+(`ALTER TABLE bloat_demo SET (autovacuum_enabled = false)`) for the experiment, or take all
+measurements inside one script with no pauses. A submission that reports 1.2× and does not notice
+why has not understood the mechanism.
+
+**Wrong turn 4: `pg_stat_statements` ordered by `mean_exec_time`.** That surfaces the slow report
+somebody runs once a day and hides the 3 ms query called two million times. Order by
+`total_exec_time`. The 3 ms query is what is actually consuming your database.
+
+**Wrong turn 5: forgetting `ALTER DEFAULT PRIVILEGES`.** The grants above apply only to tables that
+exist *right now*. Without the default-privileges statement, the next migration's table is
+unreadable by the app role, and the fix gets applied by hand and forgotten again next release.
+
+## Measured numbers this solution produces
+
+| Claim | Number |
+| --- | --- |
+| Initial table, 200,000 rows × 200-byte payload | 48 MB |
+| After five full-table updates | **284 MB**, 999,959 dead tuples (5.9×) |
+| Each update | 2,388–3,174 ms |
+| `VACUUM` | 1,316 ms, size unchanged at 284 MB |
+| `VACUUM FULL` | 1,191 ms, 47 MB, `ACCESS EXCLUSIVE` throughout |
+| 100k `INSERT`s, auto-commit | 83,773 ms |
+| 100k `INSERT`s, one transaction | 23,227 ms (3.6×) |
+| `COPY` | 295 ms (284× / 79×) |
+| Insert penalty from five indexes | 788.9 ms → 1,591.8 ms (2.02×) |
+| Index bytes vs heap bytes on that table | 13 MB vs 8,248 kB |
+
+## Grading notes
+
+**A 3/3 on correctness**: all four sizes recorded (initial, bloated, post-`VACUUM`, post-`VACUUM
+FULL`), the dead-tuple count from the catalogs, and an explicit note that plain `VACUUM` does not
+shrink the file.
+
+**A 3/3 on explanation**: explains bloat via `xmin`/`xmax` and MVCC rather than as "unused space",
+names `pg_repack` as the production answer with its trade-off, and identifies at least one thing
+that can prevent vacuum from removing dead tuples (a long transaction, or an inactive replication
+slot).
+
+**The four most common ways submissions lose points**
+
+1. Reporting that `VACUUM` "did not work" because the file did not shrink.
+2. Bloat measured with autovacuum active, producing a much smaller ratio and no explanation of why.
+3. `pg_stat_statements` sorted by mean time.
+4. A role setup without `ALTER DEFAULT PRIVILEGES`, which is correct today and broken after the next migration.

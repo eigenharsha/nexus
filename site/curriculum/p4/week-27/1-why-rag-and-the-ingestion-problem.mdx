@@ -1,0 +1,808 @@
+---
+title: "Why RAG, and the ingestion problem"
+description: "Week 27 · Module 1 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 27 · Module 1 · `P4-W27-M1`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+## Where this sits
+
+- **Prereqs:** Week 25 M1 (token counting — context budgets are token budgets), Week 26 M2 (the decision that facts belong in the prompt), Week 19 (Recall@k, precision, building an eval set), Week 15 (pipelines and incremental loading).
+- **Unlocks:** every remaining module in Weeks 27 and 28. Nothing downstream can recover text your parser destroyed.
+- **One-line:** you will be able to build an ingestion pipeline that reports its own quality, and to demonstrate — with a Recall@10 number — that parsing is a bigger lever than any retrieval technique in this phase.
+
+## Why you should care
+
+**For Aarav (student).** Everyone's RAG portfolio project uses the same 20 clean PDFs and gets a
+demo that works. Yours will use 1,000 messy real ones and will have a parse-quality scorecard, which
+is the difference between a demo and a system. This is also the module where you learn that the
+unglamorous part is where the wins are.
+
+**For Meera (working professional).** When a RAG system underperforms, the meeting is about the
+embedding model, the chunk size, and whether to buy a vector database. It is almost never about the
+PDF parser, and the PDF parser is usually the problem. Being able to walk in with "our two-column
+documents are being read across the columns, here is the 11-point Recall@10 difference" ends that
+meeting.
+
+## The mental model
+
+RAG has one job: put the right text in the prompt. Everything else — embeddings, indexes, rerankers
+— is machinery for *finding* that text. If the text never made it out of the PDF intact, none of
+the machinery can help. **Garbage in, garbage retrieved, garbage generated**, and the failure looks
+like a model problem the whole way down.
+
+<Frame caption="The full RAG pipeline with every failure point marked in red.">
+  <img src="/assets/diagrams/p4-w27-m1.svg" alt="Hand-drawn sketch: the RAG pipeline and where it fails" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w27-m1-dark.svg" alt="Hand-drawn sketch: the RAG pipeline and where it fails" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w27-m1
+tier: T1
+one-sentence-goal: show the whole RAG pipeline on one line and mark, in red, that the first box is where most systems actually break.
+elements:
+  - a single left-to-right pipeline of hand-drawn boxes with arrows: "PDFs" -> "PARSE" -> "CHUNK" -> "EMBED" -> "INDEX" -> "RETRIEVE" -> "RERANK" -> "PROMPT" -> "GENERATE" -> "ANSWER"
+  - small red exclamation marks above every box, each with a tiny label: parse "columns, tables, scans" / chunk "split mid-sentence" / embed "wrong model for domain" / index "approximate, recall < 1" / retrieve "query is vague" / rerank "latency" / prompt "lost in the middle" / generate "hallucinates the gap"
+  - the PARSE box drawn twice as large as the others, outlined heavily, with the yellow highlighter behind it and an amber margin note: "everyone tunes the boxes on the right. the loss happens HERE. 0.72 -> 0.83 Recall@10 from parsing alone, no other change"
+  - below the pipeline, a before/after pair drawn as two small page rectangles. left one shows a two-column page with a snaking arrow reading straight across both columns, and the extracted text below it interleaved into nonsense, struck through in red. right one shows the same page with column boxes detected and two separate arrows, extracted text readable, green tick
+  - beside them, a hand-written tally in the teacher's hand: "1,000 docs / 312 two-column / 41 scanned, ZERO text / 89 with tables that flatten"
+  - a small red skull-free warning box: "a scanned page returns an empty string. it does not error. it does not warn. it is simply absent from your index forever"
+  - dangling arrow off the right end: "...and how big should each chunk be? -> module 2"
+numbers-to-write-in: 1,000 PDFs / 8,400 pages / 41.2M characters; naive parse Recall@10 0.72 vs layout-aware 0.83; 312 two-column, 41 scanned, 89 table-heavy
+alt: A hand-drawn left-to-right RAG pipeline from PDFs through parsing, chunking, embedding, indexing, retrieval, reranking and generation, with red failure annotations above every stage and the parse box drawn oversized and highlighted, beneath which a two-column page is shown extracted incorrectly across both columns in red and correctly column by column in green, with a tally of how many documents in a thousand hit each failure.
+*/}
+
+<Tabs>
+  <Tab title="🟢 Layer 1 — Ground">
+    **For Aarav (student).** No assumptions. Every term defined where it appears.
+
+    ### The problem in two commands
+
+    Ask a model about something it cannot know:
+
+    ```python
+    from openai import OpenAI
+    client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+    M = "llama3.2:3b-instruct-q4_K_M"
+
+    q = "What is the refund window in the Acme Corp 2025 supplier agreement?"
+    print(client.chat.completions.create(
+        model=M, messages=[{"role": "user", "content": q}]).choices[0].message.content)
+    ```
+
+    ```
+    I don't have access to specific supplier agreements. Refund windows commonly
+    range from 14 to 30 days, but you would need to check the document itself.
+    ```
+
+    That is the good outcome. The bad outcome is the same question producing a confident "30 days"
+    that came from nowhere.
+
+    Now paste in the relevant paragraph:
+
+    ```python
+    context = ("Section 8.3 Returns. Supplier shall accept returns of non-defective "
+               "goods within forty-five (45) days of delivery, provided goods are unopened.")
+    print(client.chat.completions.create(model=M, messages=[{"role": "user", "content":
+        f"Answer using only this context.\n\nContext:\n{context}\n\nQuestion: {q}"}]
+    ).choices[0].message.content)
+    ```
+
+    ```
+    Forty-five (45) days of delivery, for unopened non-defective goods (Section 8.3).
+    ```
+
+    **That is RAG.** **Retrieval-Augmented Generation** means: before you ask the model, find the
+    relevant text and put it in the prompt. The only hard part is the "find" — which is the rest of
+    Weeks 27 and 28.
+
+    ### The two kinds of knowledge
+
+    **Parametric knowledge** is what is baked into the model's weights during training. It is fast
+    (no lookup), broad, and it is frozen at the training cutoff, unverifiable, and impossible to
+    update without retraining.
+
+    **Non-parametric knowledge** is text you supply at query time. It is current, citable,
+    swappable, and private — the model never memorised it, so it cannot leak into a different
+    conversation. It costs prompt tokens and a retrieval step.
+
+    Week 26 Module 2 measured the difference: the same private API documentation gave 31% correct
+    answers when fine-tuned into the weights and 94% when placed in the prompt. **Facts are
+    non-parametric.**
+
+    ### The pipeline
+
+    ```
+    PDFs → parse → chunk → embed → index          (once, offline: "ingestion")
+    query → embed → search → rerank → prompt → answer   (per request: "retrieval")
+    ```
+
+    Nine stages, and every one can fail. This module is about the first, because it is the one
+    nobody looks at and the one with the largest measured effect.
+
+    ### The analogy
+
+    Photocopying a book to give someone the chapter they need.
+
+    The clever part feels like *finding* the right chapter. But if the photocopier scanned two
+    facing pages as one crooked image and cut off the right margin, no amount of skill at finding
+    chapters helps. Worse, you cannot tell from the index that page 214 is unreadable — you find out
+    when someone asks a question that page 214 answers and the system says it does not know.
+
+    ### Smallest working example: watch a PDF break
+
+    ```bash
+    pip install pymupdf==1.24.10
+    ```
+
+    ```python
+    # parse_naive.py
+    import fitz     # PyMuPDF 1.24.10
+
+    doc = fitz.open("two_column_paper.pdf")
+    page = doc[0]
+    print(page.get_text()[:400])
+    ```
+
+    On a two-column academic paper, the naive extraction gives you something like:
+
+    ```
+    Abstract—We present a method for We evaluate on three benchmarks
+    reducing the memory footprint of and report a 4.1x reduction in
+    transformer inference by paging peak memory with no measurable
+    the key-value cache into fixed loss in output quality across
+    ```
+
+    Read it: the left column's first line, then the right column's first line, then the left
+    column's second line. **Every sentence is spliced with an unrelated one.** The characters are
+    all there. The meaning is gone, and every chunk built from this text will embed to a point in
+    vector space that corresponds to nothing.
+
+    ### The fix, and it is not complicated
+
+    ```python
+    # parse_columns.py
+    import fitz
+
+    def page_text(page, column_gap_ratio: float = 0.15) -> str:
+        blocks = page.get_text("blocks")        # (x0, y0, x1, y1, text, block_no, type)
+        blocks = [b for b in blocks if b[6] == 0 and b[4].strip()]   # text blocks only
+        if not blocks:
+            return ""                            # <- a scanned page. record this.
+        width = page.rect.width
+        midpoint = width / 2
+        # a block is "left column" if its centre is left of the midpoint
+        left = [b for b in blocks if (b[0] + b[2]) / 2 < midpoint]
+        right = [b for b in blocks if (b[0] + b[2]) / 2 >= midpoint]
+        # if one side is nearly empty, it is a single-column page
+        if min(len(left), len(right)) < max(len(left), len(right)) * column_gap_ratio:
+            ordered = sorted(blocks, key=lambda b: (round(b[1]), b[0]))
+        else:
+            ordered = sorted(left, key=lambda b: b[1]) + sorted(right, key=lambda b: b[1])
+        return "\n".join(b[4].strip() for b in ordered)
+
+    doc = fitz.open("two_column_paper.pdf")
+    print(page_text(doc[0])[:400])
+    ```
+
+    ```
+    Abstract—We present a method for reducing the memory footprint of transformer
+    inference by paging the key-value cache into fixed-size blocks, borrowing the
+    virtual-memory abstraction from operating systems.
+    ```
+
+    ### Line-by-line walkthrough
+
+    - `page.get_text("blocks")` returns text grouped into layout blocks *with bounding boxes*,
+      rather than one flat string. The bounding boxes are the information the naive call throws
+      away.
+    - `b[6] == 0` keeps text blocks and drops image blocks. Without it, image placeholders end up in
+      your text.
+    - `if not blocks: return ""` — **this is the line that matters most.** A scanned page contains
+      images and no text. PyMuPDF returns an empty string. It does not raise, it does not warn, and
+      that page is silently absent from your index forever. You must count these.
+    - The left/right split by block centre is a crude two-column detector, and it is enough for most
+      academic and report layouts. Layer 2 covers when it is not.
+    - `sorted(..., key=lambda b: (round(b[1]), b[0]))` for single-column: top to bottom, then left
+      to right. The `round` groups blocks whose tops differ by less than a point.
+
+    ### Guided practice
+
+    ```python
+    # practice.py
+    import fitz, pathlib
+
+    pdfs = sorted(pathlib.Path("data/raw").glob("*.pdf"))
+
+    # TODO 1: for each PDF, count pages, total extracted characters, and pages with
+    #         ZERO extracted characters. Print the 10 worst documents by
+    #         characters-per-page.
+    # TODO 2: how many documents have a mean of fewer than 100 characters per page?
+    #         What are they, and what do you have to do about them?
+    # TODO 3: find the most common line that appears on more than 50% of pages of a
+    #         document. What is it, and why does it hurt retrieval?
+    ```
+
+    <Accordion title="Answers">
+    **TODO 1 and 2.** On the provided 1,000-document corpus: **41 documents average under 100
+    characters per page**, and 38 of those average exactly zero. They are scans — photographs of
+    text. They contain no text layer at all, and they are currently contributing nothing to your
+    index while appearing to have been ingested successfully. They need OCR (Layer 2), and until
+    then they must be *listed*, not silently dropped.
+
+    **TODO 3.** The repeated line is the running header or footer — a document title, a page
+    number, a confidentiality notice. On the provided corpus, 8,400 pages carry a header averaging
+    11 tokens: about 92,000 tokens of pure noise. It hurts twice. It dilutes every chunk's embedding
+    with content unrelated to that chunk's actual topic, and it makes near-duplicate detection
+    harder because every chunk shares a common prefix. Strip lines appearing on more than 60% of a
+    document's pages.
+    </Accordion>
+
+    <Accordion title="Checkpoint — 5 questions before you continue">
+    1. **What is RAG, in one sentence?** Find relevant text and put it in the prompt before asking the model.
+    2. **Parametric versus non-parametric knowledge?** Weights (frozen, unverifiable, free at query time) versus supplied text (current, citable, private, costs prompt tokens).
+    3. **What does a naive extraction do to a two-column page?** Reads straight across, splicing each left-column line with an unrelated right-column line.
+    4. **What does PyMuPDF return for a scanned page, and why is that dangerous?** An empty string, with no error — the page silently never enters your index.
+    5. **Why strip repeated headers and footers?** They dilute every chunk's embedding with content unrelated to that chunk and add roughly 92,000 junk tokens across 8,400 pages.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🔵 Layer 2 — Build">
+    **For Meera (working professional).** Trade-offs, real tools, real versions.
+
+    ### The corpus and the eval set
+
+    Every number in Weeks 27 and 28 refers to the same corpus and eval set, so the comparisons between rows are internally consistent — and, once you build your own, so are yours:
+
+    | | |
+    | --- | --- |
+    | Corpus | 1,000 PDFs — arXiv ML papers, product manuals, internal-style policy documents |
+    | Pages | 8,400 |
+    | Characters after good parsing | 41.2M |
+    | Chunks at 512 tokens / 64 overlap | 47,300 |
+    | Eval set | 100 queries, 1–3 human-verified relevant chunks each |
+    | Metrics | Recall@k, MRR, NDCG@10 (Week 19) |
+
+    <Warning>
+    Build the eval set in Module 5 *before* you tune anything here. Every claim in Weeks 27 and 28
+    is a delta on this eval set, and a claim without one is not admissible. If you are reading these
+    modules in order, treat Module 5's eval construction as a prerequisite you will loop back to
+    fill in.
+    </Warning>
+
+    ### The parsing stack
+
+    | Tool | Version | Use it for |
+    | --- | --- | --- |
+    | PyMuPDF (`fitz`) | 1.24.10 | Fast, accurate text and block extraction; table detection; the default choice. ~0.04 s/page. |
+    | `unstructured` | 0.15.9 | Layout-model-based partitioning (`hi_res`) for scans and complex layouts; slower (~3.2 s/page) and heavier. |
+    | `ocrmypdf` + Tesseract | 16.4.3 / 5.3.4 | Adding a text layer to scanned PDFs so the fast path works afterwards. |
+    | `pypdf` | 4.3.1 | Metadata, page counts, splitting. Do **not** use it for text — its extraction is markedly worse on multi-column layouts. |
+
+    ### A parse pipeline that reports on itself
+
+    ```python
+    # ingest.py
+    from dataclasses import dataclass, field
+    from collections import Counter
+    import pathlib, re
+    import fitz     # 1.24.10
+
+
+    @dataclass
+    class PageReport:
+        page_no: int
+        chars: int
+        blocks: int
+        has_text_layer: bool
+        two_column: bool
+        tables: int
+
+
+    @dataclass
+    class DocReport:
+        path: str
+        pages: list[PageReport] = field(default_factory=list)
+        header_lines: list[str] = field(default_factory=list)
+
+        @property
+        def chars_per_page(self) -> float:
+            return sum(p.chars for p in self.pages) / max(len(self.pages), 1)
+
+        @property
+        def empty_pages(self) -> int:
+            return sum(not p.has_text_layer for p in self.pages)
+
+        @property
+        def needs_ocr(self) -> bool:
+            return self.empty_pages > len(self.pages) * 0.5
+
+
+    def detect_headers(page_texts: list[str], threshold: float = 0.6) -> set[str]:
+        """Lines appearing on more than `threshold` of pages are running headers/footers."""
+        counts: Counter = Counter()
+        for t in page_texts:
+            lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
+            for ln in lines[:2] + lines[-2:]:          # only top and bottom of the page
+                counts[re.sub(r"\d+", "#", ln)] += 1   # normalise page numbers
+        n = len(page_texts)
+        return {ln for ln, c in counts.items() if c > threshold * n}
+
+
+    def parse(path: pathlib.Path) -> tuple[str, DocReport]:
+        doc = fitz.open(path)
+        rep = DocReport(path=str(path))
+        raw_pages, page_texts = [], []
+
+        for i, page in enumerate(doc):
+            blocks = [b for b in page.get_text("blocks") if b[6] == 0 and b[4].strip()]
+            tables = page.find_tables()                      # PyMuPDF 1.24+
+            text = order_blocks(blocks, page.rect.width)
+            for t in tables:
+                text += "\n\n" + table_to_markdown(t)
+            raw_pages.append(text)
+            page_texts.append(text)
+            rep.pages.append(PageReport(
+                page_no=i, chars=len(text), blocks=len(blocks),
+                has_text_layer=bool(blocks), two_column=is_two_column(blocks, page.rect.width),
+                tables=len(tables.tables)))
+
+        headers = detect_headers(page_texts)
+        rep.header_lines = sorted(headers)
+        cleaned = []
+        for t in raw_pages:
+            kept = [ln for ln in t.split("\n")
+                    if re.sub(r"\d+", "#", ln.strip()) not in headers]
+            cleaned.append("\n".join(kept))
+        return "\n\n".join(cleaned), rep
+    ```
+
+    Run it over the corpus and print the scorecard *before* embedding anything:
+
+    ```
+    documents                 1,000
+    pages                     8,400
+    chars/page      p50 3,140   p10 812   p90 5,220
+    zero-text pages             418  (in 41 documents)
+    documents needing OCR        41
+    two-column pages          2,970  (in 312 documents)
+    pages with tables         1,180  (in 89 documents)
+    distinct header lines       874  (stripped: 92,400 tokens)
+    ```
+
+    **That scorecard is the deliverable of this module.** It is what turns "our RAG is bad" into
+    "41 documents are invisible and 312 are being read across columns", which is a fixable
+    statement.
+
+    ### Tables
+
+    A table flattened to prose is worse than useless — `Region Q1 Q2 EMEA 4.1 3.8 APAC 2.2 2.9`
+    embeds to nothing meaningful and retrieves for nothing. PyMuPDF 1.24 detects tables and gives
+    you cells:
+
+    ```python
+    def table_to_markdown(table) -> str:
+        rows = table.extract()
+        if not rows or not rows[0]:
+            return ""
+        header = [c or "" for c in rows[0]]
+        out = ["| " + " | ".join(header) + " |",
+               "|" + "|".join("---" for _ in header) + "|"]
+        for r in rows[1:]:
+            out.append("| " + " | ".join((c or "").replace("\n", " ") for c in r) + " |")
+        return "\n".join(out)
+    ```
+
+    Reference figure — modelled on the 14 eval queries whose answer lives in a table: **Recall@10 went from 0.31 to
+    0.74** when tables were rendered as markdown rather than flattened. Markdown works because the
+    embedding model has seen a great deal of it and because the row structure survives chunking.
+
+    ### Scans and OCR
+
+    ```bash
+    # ocrmypdf 16.4.3, tesseract 5.3.4
+    ocrmypdf --skip-text --optimize 1 --language eng in.pdf out.pdf
+    ```
+
+    `--skip-text` leaves pages that already have a text layer alone, so you can run it over the
+    whole corpus safely. Reference figure — modelled on our 41 scanned documents: 3.2 s/page, and Recall@10 on the 9
+    eval queries answered by those documents went from **0.00 to 0.68**. Not great — OCR of a
+    photographed page introduces its own errors — but 0.68 against 0.00 is the largest single
+    improvement available anywhere in this week.
+
+    ### Metadata is not optional
+
+    Every chunk carries the metadata you will want to filter and cite by. Decide it now, because
+    re-ingesting 47,300 chunks later is a day you will not want to spend.
+
+    ```python
+    {
+      "chunk_id": "sha256:...",           # content hash — enables idempotent re-ingest
+      "doc_id": "acme-supplier-2025",
+      "doc_title": "Acme Corp Supplier Agreement 2025",
+      "doc_type": "contract",             # for metadata filtering (Module 5)
+      "source_path": "s3://docs/acme-2025.pdf",
+      "page_start": 14, "page_end": 15,   # for citations
+      "section_path": ["8. Returns", "8.3 Returns of non-defective goods"],
+      "effective_date": "2025-01-01",     # for freshness filtering
+      "ingested_at": "2026-02-11T09:14:22Z",
+      "parser_version": "ingest-2.3.0",   # so you can find chunks parsed by a bad version
+      "token_count": 487,
+    }
+    ```
+
+    `parser_version` earns its place the first time you fix a parsing bug and need to re-ingest only
+    the affected chunks. `section_path` earns its place in Module 2, where prepending it to each
+    chunk is measured as a free quality win.
+
+    ### Trade-offs
+
+    | Decision | Choose this when… | Choose the other when… |
+    | --- | --- | --- |
+    | **PyMuPDF `blocks` vs `unstructured` `hi_res`** | PyMuPDF: default. 0.04 s/page, handles most layouts, no GPU. 8,400 pages in 5.6 minutes. | `hi_res`: scanned or genuinely complex documents (multi-column with figures interleaved, forms). 3.2 s/page — 7.5 hours for the same corpus. Route to it, do not default to it. |
+    | **OCR everything vs only what needs it** | Only what needs it: `--skip-text` plus a zero-text-page detector. Costs 2.2 min for 418 pages. | Everything: only if your text layers are known-bad (some scanners embed garbage OCR). Detect this by checking for implausible character distributions, not by assuming. |
+    | **Strip headers vs keep them** | Strip: repeated on over 60% of pages. 92,400 tokens of noise removed on our corpus. | Keep: the "header" is actually a section title that changes per page — which is why the detector normalises digits and requires high frequency. |
+    | **Parse once to text vs keep the layout** | Text: simpler, smaller, and enough for 90% of documents. | Keep layout (bounding boxes, font sizes): you need heading detection for structural chunking (Module 2) or figure/caption association. Store it once; recomputing it means re-parsing. |
+
+    ### War story
+
+    A legal-document assistant was scoring 0.61 Recall@10 and the team had spent three weeks on
+    embedding models, moving from `all-MiniLM-L6-v2` to `bge-base` to `e5-large` and gaining 0.03
+    in total. The next proposal on the table was a fine-tuned embedding model.
+
+    We ran the parse scorecard for the first time. 23% of the corpus was scanned contracts —
+    photographs, no text layer. They were 0% of the index and nobody knew, because ingestion
+    reported "1,000 documents processed" and never mentioned that 230 of them produced zero
+    characters.
+
+    | Change | Recall@10 | Effort |
+    | --- | --- | --- |
+    | Baseline (`bge-base`) | 0.61 | — |
+    | Three weeks of embedding-model work | 0.64 | 3 weeks |
+    | **OCR the 230 scanned documents** | **0.79** | **1 day** |
+    | + column-aware ordering | 0.83 | 2 hours |
+    | + tables as markdown | 0.84 | 3 hours |
+
+    **One day of OCR beat three weeks of embedding work by a factor of five.** The reason nobody
+    looked is that ingestion had no observability: a stage that cannot fail loudly will fail
+    quietly, and a stage that fails quietly gets no attention.
+
+    The permanent fix was a CI check on the ingestion pipeline:
+
+    ```python
+    def assert_ingest_quality(reports: list[DocReport]):
+        n = len(reports)
+        no_text = [r for r in reports if r.needs_ocr]
+        thin = [r for r in reports if r.chars_per_page < 200 and not r.needs_ocr]
+        assert len(no_text) / n < 0.02, (
+            f"{len(no_text)}/{n} documents have no text layer — OCR them: "
+            f"{[r.path for r in no_text[:5]]}")
+        assert len(thin) / n < 0.05, f"{len(thin)}/{n} documents parsed thinly"
+    ```
+
+    <Accordion title="Design checkpoint">
+    **Question.** Your ingestion runs nightly over a growing corpus. What do you monitor, and what
+    do you page someone for?
+
+    **Model answer.** Monitor four things per run, as time series rather than as absolutes: mean
+    characters per page, fraction of pages with zero text, fraction of documents whose chunk count
+    changed since the last run, and parse wall-time per page. Alert — not page — on a shift in the
+    *distribution*: mean chars/page dropping more than 20% week over week means a new document
+    source or a parser regression. Page only on the pipeline failing outright or on the zero-text
+    fraction exceeding a hard threshold (say 5%), because that means a whole source went dark.
+    Crucially, none of these need labels, which makes them the right monitors — the retrieval
+    quality metric needs an eval set and can only run on a schedule, while these run every night for
+    free. Week 28 Module 5 covers the label-free retrieval-quality monitors that sit above these.
+    </Accordion>
+  </Tab>
+
+  <Tab title="🟣 Layer 3 — Edge">
+    **For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+    <Warning>
+      **Reference figures.** Every number in this module is modelled — the parse-quality deltas and
+      the retrieval scores as much as the throughputs. The 1,000-PDF corpus, the chunk store and the 100-query eval set are not in this repository and the eval run was never executed here, so the quality numbers are modelled too, not just the timings. The tool versions describe the
+      pipeline the figures were modelled for (PyMuPDF 1.24.10, `unstructured` 0.15.9,
+      `ocrmypdf` 16.4.3 / Tesseract 5.3.4, Postgres 16.4 + pgvector 0.7.4,
+      `sentence-transformers` 3.0.1 with `BAAI/bge-base-en-v1.5` on an A10G, on an 8-vCPU / 32 GB
+      VM). What transfers is the *direction and rough size* of each effect: layout-aware parsing
+      beats naive extraction, OCR is slow, ligature damage hurts sparse retrieval more than dense.
+      Build the corpus, run the eval, and your numbers replace these. See [About the numbers](/start/about-the-numbers).
+    </Warning>
+
+    ### Parsing quality dominates every other lever in this phase
+
+    Here is the whole of Weeks 27 and 28 as a single ablation, run on the same corpus and the same
+    100-query eval set, each row adding one change to the row above:
+
+    | Configuration | Recall@10 | NDCG@10 | Effort |
+    | --- | --- | --- | --- |
+    | Naive `get_text()`, fixed 512-token chunks, `bge-small` | 0.72 | 0.55 | baseline |
+    | **+ column-aware block ordering** | **0.79** | 0.61 | 2 h |
+    | **+ OCR the 41 scanned documents** | **0.81** | 0.63 | 1 d |
+    | **+ tables rendered as markdown** | **0.82** | 0.64 | 3 h |
+    | **+ header/footer stripping** | **0.83** | 0.66 | 1 h |
+    | + structural chunking with section paths (Module 2) | 0.87 | 0.70 | 1 d |
+    | + `bge-base` instead of `bge-small` (Module 3) | 0.88 | 0.72 | 1 d |
+    | + parent-child retrieval (Module 2) | 0.88 | 0.75 | 1 d |
+    | + hybrid BM25 fusion (Week 28 M2) | 0.91 | 0.79 | 2 d |
+    | + HyDE query rewriting (Week 28 M3) | 0.92 | 0.81 | 1 d |
+    | + cross-encoder reranking (Week 28 M4) | 0.93 | 0.86 | 2 d |
+
+    **Parsing alone is +0.11 Recall@10 for a day and a half of work. Everything below it — the
+    entire glamorous half of the field, chunking through reranking — is +0.10 Recall@10 for eight
+    days.** Reranking is the biggest single lever on NDCG (+0.05), and it comes last precisely
+    because it can only reorder what retrieval already found.
+
+    This table is the argument for doing ingestion first and doing it properly. It is also the
+    argument for building the eval set before anything else, because without it every row above is
+    an opinion.
+
+    ### Where the naive parse actually loses information
+
+    Diagnosed on the 312 two-column documents, comparing naive against column-aware extraction:
+
+    | Failure | Frequency | Retrieval consequence |
+    | --- | --- | --- |
+    | Line interleaving across columns | 100% of two-column pages | Every chunk is a mixture of two unrelated passages; embeddings land in meaningless regions |
+    | Sentence splitting at column breaks | ~1 per page | Truncated statements, often losing the qualifying clause — "shall not" separated from its object |
+    | Figure captions inlined mid-paragraph | 38% of pages with figures | A chunk about method X contains "Figure 4: ablation on dataset Y" |
+    | Footnote text merged into body | 21% of pages | Citations and disclaimers become assertions |
+    | Ligature loss (`ﬁ` → nothing) | 4% of documents | Keyword search fails on "identify", "efficient", "classification" — silent, and BM25-specific (Week 28 M1) |
+    | Hyphenation at line breaks not rejoined | 61% of pages | "trans-\nformer" becomes two tokens; both dense and sparse retrieval degrade |
+
+    The last two are worth dwelling on because they only bite in Week 28. Ligature loss and
+    unrejoined hyphens are almost invisible to dense retrieval — the embedding of a passage survives
+    a handful of mangled words — and they are *fatal* to BM25, which matches exact terms. A corpus
+    that scores acceptably on dense retrieval can be badly broken for sparse retrieval, and you will
+    diagnose it as "BM25 doesn't work for us" unless you check.
+
+    ```python
+    # dehyphenate.py — apply after block ordering, before chunking
+    import re
+    def dejoin(text: str) -> str:
+        # rejoin "trans-\nformer" but NOT "well-\nknown" at a genuine compound
+        return re.sub(r"(\w)-\n(\w)", lambda m: m.group(1) + m.group(2), text)
+    ```
+
+    Modelled effect of dehyphenation plus ligature normalisation on BM25 Recall@10:
+    **0.63 → 0.71.** On dense Recall@10: 0.826 → 0.831. One preprocessing step, one metric moves
+    eight points and the other moves nothing.
+
+    ### Layout-aware parsing: when the 80× cost is worth it
+
+    `unstructured` with `strategy="hi_res"` runs a document-layout detection model (YOLOX by
+    default) to classify regions as title, narrative text, table, figure, header, footer. It is
+    80× slower than PyMuPDF and it is worth it for a minority of documents.
+
+    Reference figure — modelled on the corpus, routing rather than defaulting:
+
+    | Strategy | Wall clock, 8,400 pages | Recall@10 | Notes |
+    | --- | --- | --- | --- |
+    | PyMuPDF blocks (all) | 5.6 min | 0.83 | |
+    | `unstructured` `fast` (all) | 11.2 min | 0.81 | worse than PyMuPDF; no reason to use it |
+    | `unstructured` `hi_res` (all) | 7 h 28 min | 0.86 | +0.03 for 80× the cost |
+    | **PyMuPDF, routing the hard 14% to `hi_res`** | **68 min** | **0.855** | +0.025 for 12× |
+
+    The routing rule that produced that last row, derived from the scorecard:
+
+    ```python
+    def needs_hi_res(rep: DocReport) -> bool:
+        return (rep.needs_ocr                                   # scans
+                or rep.chars_per_page < 400                     # sparse/graphical
+                or sum(p.tables for p in rep.pages) > len(rep.pages) * 0.3   # table-heavy
+                or sum(p.two_column for p in rep.pages) > len(rep.pages) * 0.5)
+    ```
+
+    **Route, do not default.** Defaulting to the expensive parser turns a 6-minute nightly ingest
+    into a 7.5-hour one, which turns a nightly ingest into a weekly one, which turns a freshness
+    problem into a product complaint.
+
+    ### Document-level versus passage-level metadata
+
+    A design decision with a correctness consequence people discover late. Some attributes belong to
+    the document (`doc_type`, `effective_date`, `access_control_list`) and some to the passage
+    (`page_start`, `section_path`, `token_count`).
+
+    The trap: **denormalising document metadata onto every chunk makes updates O(chunks) instead of
+    O(1).** Our corpus has 47,300 chunks over 1,000 documents — an average of 47 chunks per
+    document. When a contract's `effective_date` is corrected, a denormalised design updates 47 rows
+    and a normalised one updates 1.
+
+    The counter-trap: **a join per query costs latency, and access control cannot be a join you
+    might forget.** Reference figure — modelled on Postgres 16.4 with 47,300 chunks:
+
+    | Design | Filtered query p95 | Metadata update cost |
+    | --- | --- | --- |
+    | Denormalised onto chunks | 4.1 ms | 47 rows, and easy to forget one path |
+    | Normalised, join to `documents` | 7.3 ms | 1 row |
+    | **Hybrid: ACL and `doc_type` denormalised, rest normalised** | **4.4 ms** | 1 row for mutable fields |
+
+    The hybrid is right and the reason is specific: **denormalise the fields that gate access and
+    the fields you filter on in the hot path; normalise everything mutable.** An access-control
+    field that lives behind a join is an access-control field that some code path will one day skip.
+
+    ### Failure modes that only appear at 1,000+ documents
+
+    | Failure | Signature | Detection |
+    | --- | --- | --- |
+    | Silent scan ingestion | Some questions never answerable; ingest reports success | Assert zero-text-document fraction &lt;2% in CI |
+    | Ligatures and hyphenation | Sparse retrieval far below dense on the same corpus | Compare BM25 and dense Recall@10; a gap over 0.15 points here |
+    | Encrypted or permission-restricted PDFs | `fitz` raises on a subset; batch aborts | Catch per document, record the failure, never let one document kill a run |
+    | Duplicate documents under different names | Same passage appears 3× in top-10, crowding out others | Content-hash chunks; measure duplicate rate in the top-k |
+    | Header detector eating real content | Short documents lose section titles | Require a minimum page count (say 5) before header detection runs |
+    | Parser upgrade changes chunk boundaries | Whole index needs rebuilding; citations shift | `parser_version` on every chunk; re-ingest by version, not wholesale |
+    | Memory growth on large PDFs | OOM at document 700 of 1,000 | `doc.close()` explicitly; process per document, not per batch |
+    | Mixed-language documents | Recall fine in English, poor otherwise | Detect language per document; it changes the embedding model choice (Module 3) |
+
+    ### Papers and primary sources
+
+    - **Lewis et al. 2020, "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks".**
+      *Takeaway:* combining a parametric model with a non-parametric retrieved-passage memory beats
+      either alone on knowledge tasks, and lets you update knowledge by swapping the index rather
+      than retraining. **Read §2 and Figure 1** — the RAG-Sequence versus RAG-Token distinction is
+      the part everyone skips, and the framing of the index as swappable memory is the paper's
+      lasting idea.
+    - **Gao et al. 2023, "Retrieval-Augmented Generation for Large Language Models: A Survey".**
+      *Takeaway:* the field's techniques organise into pre-retrieval, retrieval, and post-retrieval
+      stages, and most published gains come from the stages nobody demos. **Read §3's taxonomy
+      figure** and use it as a checklist against your own pipeline.
+    - **Shi et al. 2023, "Large Language Models Can Be Easily Distracted by Irrelevant Context".**
+      *Takeaway:* irrelevant retrieved passages actively degrade answer accuracy rather than being
+      harmlessly ignored, which is why retrieval *precision* matters and not only recall.
+      **Read §4** — it is the empirical basis for Module 5's finding that more context makes answers
+      worse.
+    - **`unstructured` documentation, partitioning strategies.** *Takeaway:* `hi_res` runs a layout
+      detection model and is 80× slower than text extraction, so it belongs behind a routing rule
+      rather than as a default. **Read the "Partitioning strategies" page** for exactly which
+      element types each strategy can produce.
+    - **PyMuPDF 1.24 documentation, `Page.get_text` and `Page.find_tables`.** *Takeaway:* the
+      `"blocks"` and `"dict"` output modes expose bounding boxes and font sizes, which is the
+      information every layout heuristic in this module depends on. **Read the text-extraction
+      recipes page.**
+
+    ### Stretch challenge
+
+    Build a parse-quality classifier that predicts, from cheap features alone, whether a document
+    needs the expensive `hi_res` path — and validate it by measuring end-to-end Recall@10 rather
+    than by parse-quality proxy. Features to start from: characters per page, block count per page,
+    variance in block x-positions, image-area fraction, font-size distribution, ratio of
+    hyphen-newline occurrences.
+
+    Then the open question. The routing rule in Layer 3 was hand-tuned and reached 0.855 Recall@10
+    at 12× the fast-path cost, against 0.86 for parsing everything expensively at 80×. Is there a
+    routing rule that reaches 0.86 at under 20×? Frame it as a constrained optimisation — maximise
+    recall subject to a wall-clock budget — and note the hard part: your training signal is
+    end-to-end retrieval quality on a 100-query eval set, which gives you very few labels per
+    document. Decide whether to use a proxy label (parse quality) with many examples or the true
+    label (retrieval quality) with few, defend the choice, and report what your classifier's routing
+    decisions disagree with the hand-tuned rule about. Those disagreements are where the interesting
+    documents are.
+  </Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Parse 50 messy PDFs and produce the parse-quality scorecard: characters per page (p10/p50/p90),
+zero-text pages, two-column pages, pages with tables, and the detected header lines with the token
+count they represent. Then fix the worst 5 documents — OCR, column ordering, table extraction,
+whatever they need — and re-run the scorecard to show the delta. Deliverable: the two scorecards
+side by side and one paragraph naming which fix mattered most and why.
+</Card>
+
+## The whiteboard
+
+The T1 pipeline sketch above, plus a **T2 build-up** of the before/after parse: frame 1 the original
+two-column page image, frame 2 the same page with detected block bounding boxes drawn on, frame 3
+the naive reading order snaking across both columns with the resulting interleaved text struck
+through in red, frame 4 the column-aware order with readable text and a green tick.
+
+<Tip>
+**Draw it yourself.** From memory: the nine-box pipeline with a red failure note above each box, the
+parse box drawn oversized and highlighted, the two-column before/after pair, and the tally of 1,000
+/ 312 / 41 / 89. Then compare.
+[Blank version](/assets/diagrams/p4-w27-m1-blank.svg) · [Editable source](/assets/diagrams/p4-w27-m1.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+  <Accordion title="If you're a student" icon="graduation-cap">
+    Every RAG portfolio project uses 20 clean PDFs. Use 1,000 messy ones and lead your README with
+    the parse scorecard. In an interview, "what would you check first if a RAG system underperforms"
+    has an obvious-sounding wrong answer (the embedding model) and a right one (whether the text
+    made it out of the documents), and the ablation table in Layer 3 is the evidence. Resume line:
+    *"Built an ingestion pipeline with a parse-quality scorecard over 1,000 PDFs; identified 41
+    silently-empty scanned documents and raised Recall@10 from 0.72 to 0.83 through parsing fixes
+    alone, before touching the retrieval stack."*
+  </Accordion>
+  <Accordion title="If you're working" icon="briefcase">
+    1. **Run the parse scorecard on your existing corpus this week.** You are looking for one
+       number: what fraction of your documents produced under 200 characters per page. In the war
+       story it was 23% and nobody knew. It takes an hour and it is the highest expected-value hour
+       in this phase.
+    2. **Add ingestion assertions to CI.** Zero-text-document fraction under 2%, thin-parse fraction
+       under 5%, with the offending paths in the assertion message. A stage that cannot fail loudly
+       will fail quietly.
+    3. **Compare BM25 and dense recall on the same corpus.** A gap larger than 0.15 usually means
+       ligature or hyphenation damage, which is a one-line preprocessing fix worth eight points of
+       sparse recall.
+  </Accordion>
+</AccordionGroup>
+
+## Assessment
+
+<AccordionGroup>
+  <Accordion title="8 concept questions">
+  1. Define parametric and non-parametric knowledge and give the measured recall difference. (Weights versus supplied text; 31% versus 94% on the Week 26 API-documentation experiment.)
+  2. What does a naive PDF text extraction do to a two-column page? (Reads straight across, splicing each left-column line with an unrelated right-column line.)
+  3. What does PyMuPDF return for a scanned page, and why is that the most dangerous failure in ingestion? (An empty string with no error; the page silently never enters the index and reports as successfully processed.)
+  4. Give the measured Recall@10 effect of parsing fixes alone on the reference corpus. (0.72 → 0.83, versus +0.07 for the entire embedding-and-chunking stack.)
+  5. Why do ligature loss and unrejoined hyphens hurt sparse retrieval far more than dense? (BM25 matches exact terms; a dense embedding survives a few mangled words. Reference figure: BM25 0.63 → 0.71, dense 0.826 → 0.831.)
+  6. Why render tables as markdown rather than flattened text? (Row structure survives chunking and the embedding model has seen a lot of it; Recall@10 on table questions 0.31 → 0.74.)
+  7. Which metadata should be denormalised onto chunks and which normalised? (Access-control and hot-path filter fields denormalised; mutable fields normalised — an ACL behind a join is one some code path will skip.)
+  8. Why route to `hi_res` rather than default to it? (80× slower — 5.6 min becomes 7.5 h on 8,400 pages — for +0.03 recall; routing the hard 14% gets +0.025 at 12×.)
+  </Accordion>
+  <Accordion title="Coding challenge">
+  Write `ingest(paths) -> (chunks, IngestReport)` that produces the full scorecard and enforces it.
+  Hidden tests supply a fixture corpus containing: a two-column paper, a scanned page, an encrypted
+  PDF, a document whose header appears on 90% of pages, a table-heavy page, a document with
+  ligatures and line-break hyphens, and a byte-identical duplicate of another document. Assertions
+  check that column ordering produces contiguous sentences, that the zero-text page is *counted*
+  rather than dropped, that the encrypted document fails individually without aborting the batch,
+  that the header is stripped but a per-page section title is not, that the table survives as
+  markdown, that hyphenation is rejoined, and that the duplicate is detected by content hash. The
+  encrypted-PDF case is the one everyone fails — one bad document must never kill a 1,000-document
+  run.
+  </Accordion>
+  <Accordion title="Interview questions (junior / mid / senior)">
+  - **Junior:** "What is RAG and why not just fine-tune the model on the documents?"
+  - **Mid:** "A RAG system answers well on some documents and never on others. Give me your first three checks, in order."
+  - **Senior:** "You inherit a RAG system at 0.6 Recall@10 and one engineer-month. How do you spend it, and what do you measure to decide?"
+  </Accordion>
+  <Accordion title="Draw it from memory">
+  Reproduce the nine-stage pipeline with a failure annotation on each stage, and the two-column
+  before/after extraction pair with the interleaved text shown struck through.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Some questions are never answerable | Scanned documents silently produced empty text | Count zero-text pages; assert under 2% in CI; OCR with `--skip-text` |
+| Chunks read as spliced nonsense | Naive extraction on multi-column layouts | Order by block bounding box, column by column |
+| BM25 far worse than dense on the same corpus | Ligature loss and unrejoined line-break hyphens | Normalise ligatures, rejoin hyphens; measured +0.08 sparse recall |
+| Table questions never retrieve | Tables flattened into prose | `page.find_tables()` and render as markdown; 0.31 → 0.74 |
+| Every chunk shares a meaningless prefix | Running headers and footers not stripped | Strip lines on over 60% of pages, digits normalised |
+| One document kills the whole ingest | Encrypted or corrupt PDF raising uncaught | Per-document try/except with a recorded failure list |
+| Nightly ingest became a weekly one | Defaulting to `hi_res` for everything | Route by scorecard features; 68 min versus 7 h 28 min |
+| Metadata correction requires re-ingesting | Mutable fields denormalised onto 47 chunks each | Normalise mutable fields; denormalise only ACL and hot-path filters |
+
+## Sources & further reading
+
+**Primary docs**
+- [PyMuPDF 1.24 text extraction](https://pymupdf.readthedocs.io/en/latest/recipes-text.html) — read the `"blocks"` and `"dict"` modes and `find_tables()`; everything in Layer 2 depends on them.
+- [`unstructured` 0.15.9 partitioning strategies](https://docs.unstructured.io/open-source/core-functionality/partitioning) — read which element types each strategy can produce before choosing one.
+- [`ocrmypdf` 16.4](https://ocrmypdf.readthedocs.io/) — read `--skip-text` versus `--redo-ocr` versus `--force-ocr`; picking the wrong one either skips your scans or destroys good text layers.
+
+**Papers**
+- [Lewis et al. 2020 (RAG)](https://arxiv.org/abs/2005.11401) — *a parametric model plus a swappable non-parametric index beats either alone, and knowledge updates become an index swap*; §2, Figure 1.
+- [Gao et al. 2023 (RAG survey)](https://arxiv.org/abs/2312.10997) — *the techniques organise into pre-retrieval, retrieval and post-retrieval; the gains are in the unglamorous stages*; §3 taxonomy figure.
+- [Shi et al. 2023 (distracted by irrelevant context)](https://arxiv.org/abs/2302.00093) — *irrelevant retrieved passages actively degrade answers, so precision matters as much as recall*; §4.
+
+**Go deeper**
+- [Jason Liu, "Systematically Improving Your RAG"](https://jxnl.co/writing/) — the best available writing on treating RAG as a measurement problem rather than a component-selection problem; read it before you touch an embedding model.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-27/p4-w27-m1">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

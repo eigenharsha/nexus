@@ -1,0 +1,223 @@
+---
+title: "Object-oriented design done properly"
+description: "Reference solution — Week 3"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W03-M4`
+
+Implement `@property` from scratch as a data descriptor, passing the builtin's tests.
+
+```python
+"""my_property.py — a working reimplementation of the builtin `property`."""
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any, TypeVar
+
+T = TypeVar("T")
+
+
+class my_property:
+    def __init__(
+        self,
+        fget: Callable[[Any], Any] | None = None,
+        fset: Callable[[Any, Any], None] | None = None,
+        fdel: Callable[[Any], None] | None = None,
+        doc: str | None = None,
+    ) -> None:
+        self.fget, self.fset, self.fdel = fget, fset, fdel
+        self.__doc__ = doc if doc is not None else getattr(fget, "__doc__", None)
+        self._name = "<unnamed>"
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        # Called by type.__new__ with the attribute name (3.6+). This is how the
+        # descriptor learns its own name without the author repeating it as a string.
+        self._name = name
+
+    # --- descriptor protocol ------------------------------------------------
+    def __get__(self, obj: Any, objtype: type | None = None) -> Any:
+        if obj is None:
+            return self          # class-level access: hand back the descriptor itself
+        if self.fget is None:
+            raise AttributeError(f"property {self._name!r} has no getter")
+        return self.fget(obj)
+
+    def __set__(self, obj: Any, value: Any) -> None:
+        # Defining __set__ is what makes this a DATA descriptor, which is why it
+        # takes precedence over obj.__dict__ and cannot be shadowed.
+        if self.fset is None:
+            raise AttributeError(f"property {self._name!r} has no setter")
+        self.fset(obj, value)
+
+    def __delete__(self, obj: Any) -> None:
+        if self.fdel is None:
+            raise AttributeError(f"property {self._name!r} has no deleter")
+        self.fdel(obj)
+
+    # --- decorator chaining -------------------------------------------------
+    def getter(self, fget: Callable[[Any], Any]) -> "my_property":
+        return type(self)(fget, self.fset, self.fdel, self.__doc__)
+
+    def setter(self, fset: Callable[[Any, Any], None]) -> "my_property":
+        return type(self)(self.fget, fset, self.fdel, self.__doc__)
+
+    def deleter(self, fdel: Callable[[Any], None]) -> "my_property":
+        return type(self)(self.fget, self.fset, fdel, self.__doc__)
+```
+
+The test suite it must pass, run against both `property` and `my_property`:
+
+```python
+import pytest
+
+@pytest.fixture(params=[property, my_property], ids=["builtin", "mine"])
+def prop(request):
+    return request.param
+
+
+def make(prop):
+    class C:
+        def __init__(self, v): self.x = v
+        @prop
+        def x(self):
+            """the x value"""
+            return self._x
+        @x.setter
+        def x(self, v):
+            if v < 0: raise ValueError("negative")
+            self._x = v
+        @prop
+        def double(self):
+            return self._x * 2
+    return C
+
+
+def test_get_set(prop):
+    C = make(prop); c = C(3)
+    assert c.x == 3
+    c.x = 5
+    assert c.x == 5
+
+def test_validation_runs_in_init(prop):
+    C = make(prop)
+    with pytest.raises(ValueError, match="negative"):
+        C(-1)                            # __init__ assigns self.x -> setter -> validates
+
+def test_no_setter_raises(prop):
+    C = make(prop); c = C(3)
+    with pytest.raises(AttributeError):
+        c.double = 9
+
+def test_class_access_returns_descriptor(prop):
+    C = make(prop)
+    assert isinstance(C.x, prop)         # NOT an AttributeError, NOT a value
+
+def test_doc_preserved(prop):
+    C = make(prop)
+    assert C.x.__doc__ == "the x value"
+
+def test_cannot_be_shadowed_by_instance_dict(prop):
+    C = make(prop); c = C(3)
+    object.__setattr__(c, "__dict__", {"x": 99})   # force an instance entry
+    assert c.x == 3                       # data descriptor still wins
+```
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: only implementing `__get__`.**
+
+A descriptor with just `__get__` is a **non-data descriptor**, and the attribute-lookup algorithm consults `obj.__dict__` *before* falling back to it. So `self.x = 5` writes an entry into the instance dict, and every subsequent read finds that entry and never calls your getter. Your "property" works until the first assignment, then silently stops existing.
+
+The precedence rule is the whole content of this module:
+
+1. class MRO lookup → if it is a **data descriptor** (`__set__` or `__delete__`), call `__get__` and **stop**
+2. else `obj.__dict__`
+3. else non-data descriptor's `__get__`
+4. else the plain class attribute
+
+Defining `__set__` — even one that only raises `AttributeError` — is what makes step 1 fire. That is exactly why `@property` without a setter still blocks assignment rather than letting it silently shadow the getter.
+
+It is also why functions can be monkey-patched on an instance (they are non-data descriptors, so the instance dict wins) and properties cannot.
+
+**Wrong turn 2: `getter`/`setter`/`deleter` mutating in place.**
+
+```python
+def setter(self, fset):
+    self.fset = fset          # WRONG
+    return self
+```
+
+This appears to work, because `@x.setter` rebinds the class attribute to the returned object and it happens to be the same object. It breaks in inheritance:
+
+```python
+class Base:
+    @my_property
+    def x(self): return self._x
+
+class Child(Base):
+    @Base.x.setter               # mutating version: now Base.x HAS A SETTER TOO
+    def x(self, v): self._x = v
+```
+
+With the mutating version, `Base.x` and `Child.x` are the same object, so adding a setter in `Child` silently adds it to `Base` — and to every other subclass. Returning a new instance keeps them independent, which is what the builtin does.
+
+**A third thing worth knowing: `__get__` must return `self` when `obj is None`.**
+
+Accessing `C.x` on the class rather than an instance calls `__get__(None, C)`. Returning `self.fget(None)` there raises a confusing `AttributeError` from inside the getter. Returning the descriptor is what makes `help(C)`, `inspect.getmembers`, `dataclasses.fields`, IDE autocompletion and `C.x.setter` all work.
+
+## The measured numbers this solution produces
+
+CPython 3.13.2, Apple M3 Pro, macOS 15, `timeit` over 2,000,000 reads:
+
+| Attribute read | Cost | vs plain |
+|---|---|---|
+| plain instance attribute | **4.6 ns** | 1.0× |
+| `__slots__` attribute | **4.4 ns** | 0.96× |
+| builtin `@property` (C implementation) | **12.8 ns** | **2.8×** |
+| `my_property` / any Python descriptor | **49.6 ns** | **10.8×** |
+
+The gap between 12.8 and 49.6 ns is the cost of Python-level execution: a Python function call is **11.1 ns** (measured), a method call 12.5 ns, plus the `getattr` on the instance and the attribute lookups inside `__get__`. The builtin's `__get__` is C and does the same work in a fraction of that.
+
+Two conclusions worth stating in the write-up:
+
+- **`__slots__` is not faster** (4.4 vs 4.6 ns). CPython 3.11+ has key-sharing dicts and inline caches, so the dict path was already fast. The `__slots__` win is memory: **139 B/instance versus 171 B** (Module 1).
+- **A Python descriptor at 49.6 ns matters only in a hot loop** over millions of objects. Ten million reads is 0.5 s versus 0.05 s. For ordinary code the abstraction is free.
+
+MRO on a diamond, verified:
+
+```
+class A: pass
+class B(A): pass
+class C(A): pass
+class D(B, C): pass
+D.__mro__  ->  D, B, C, A, object
+```
+
+## Grading notes
+
+**3/3 on correctness** means all six tests pass against `my_property` as well as the builtin — in particular `test_class_access_returns_descriptor` and `test_cannot_be_shadowed_by_instance_dict`, which are the two that catch the wrong turns above.
+
+**3/3 on code quality** means `__set_name__` supplies the name so error messages say *which* property failed, and `getter`/`setter`/`deleter` return new instances.
+
+**3/3 on explanation** means the write-up states the data-descriptor precedence rule and explains where your measured gap versus the builtin comes from — how much is the Python call, how much is the `getattr`.
+
+The four most common ways submissions lose points:
+
+1. **No `__set__`, so it is a non-data descriptor.** The property works until the first assignment. The shadowing test catches it.
+2. **`__get__` not handling `obj is None`.** `help()` and `C.x.setter` break, and the failure is a confusing error from inside your getter.
+3. **Mutating `self` in `setter`.** Passes every single-class test and corrupts inheritance. Test with a subclass.
+4. **Reporting the 49.6 ns as a reason not to use properties.** It is 10.8× a plain attribute and it is still 50 nanoseconds. The write-up should say where that matters (a hot loop over millions of objects) and where it does not (everywhere else).
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

@@ -1,0 +1,638 @@
+---
+title: "LLM-as-a-Judge"
+description: "Week 31 · Module 2 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 31 · Module 2 · `P4-W31-M2`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Warning>
+**An unvalidated LLM judge is a random number generator with good grammar.** It produces confident,
+well-argued, plausibly-formatted scores that correlate with nothing. Our first judge agreed with
+human labels at a Cohen's kappa of 0.11 — statistically indistinguishable from coin-flipping —
+while writing paragraphs of reasoning nobody doubted. Measure agreement before you use one for
+anything.
+</Warning>
+
+## Where this sits
+
+- **Prereqs:** Module 1 (a judge is the third tier of the pyramid — do not reach for it first), Week 12 (agreement statistics, sampling), Week 19 (confusion matrices, precision and recall).
+- **Unlocks:** Module 3 (RAG metrics are mostly judges), Week 32 M2 (online scoring of production traces), the capstone's eval requirement.
+- **One-line:** after this you can build a judge, measure its agreement with human labels, demonstrate its biases numerically, and refuse to ship it below a stated threshold.
+
+## Why you should care
+
+**For Aarav (student).** Everyone uses LLM judges. Almost nobody validates them. "I measured my
+judge against 50 human labels, got kappa 0.44, iterated the rubric to 0.71, and only then used it to
+gate CI" is a sentence that will make an interviewer sit up, because it demonstrates that you know
+the difference between a measurement and a number.
+
+**For Meera (working professional).** Somebody in your company is currently making shipping
+decisions from an LLM judge's scores. If nobody has measured that judge against human labels, those
+decisions are being made from noise, and the noise is dressed as reasoning, which makes it worse
+than no signal at all. Being the person who runs the validation — one afternoon, 50 labels — is a
+high-leverage intervention.
+
+## The mental model
+
+A judge is a **classifier you did not train and have not tested**. You would never deploy a
+sentiment classifier without a confusion matrix against labelled data. A judge is the same object.
+The rubric is its feature engineering, the human labels are its test set, and the agreement
+statistic is its accuracy. Everything else in this module follows from taking that framing
+seriously.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p4-w31-m2.svg" alt="Hand-drawn sketch: the judge validation pipeline" className="block dark:hidden" />
+  <img src="/assets/diagrams/p4-w31-m2-dark.svg" alt="Hand-drawn sketch: the judge validation pipeline" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p4-w31-m2
+tier: T2
+one-sentence-goal: Make it obvious that a judge is a classifier whose accuracy must be measured against human labels before any of its numbers are used.
+elements:
+  - left: a box "50 outputs" with two arrows leaving it
+  - upper arrow to a box "HUMAN labels" drawn with a small person sketch, labelled "ground truth - the only one there is"
+  - lower arrow to a box "JUDGE (rubric + required reasoning)" with a small robot-free model box
+  - both arrows converge into a hand-drawn 2x2 (or 3x3) confusion matrix grid with tally marks in the cells
+  - beneath the matrix, a big hand-written "kappa = 0.71" with the working shown roughly: "po = 0.86, pe = 0.52, (po-pe)/(1-pe)"
+  - a vertical scale drawn beside it like a thermometer: 0.0 "coin flip", 0.2 "slight", 0.4 "moderate", 0.6 "SUBSTANTIAL - ship line drawn in green here", 0.8 "almost perfect"
+  - a red X over a path that goes straight from "JUDGE" to "CI gate" bypassing the matrix, labelled in red "this is the mistake everyone makes"
+  - a small inset: two answer cards A and B side by side with a curved swap arrow between them, labelled "run BOTH orders" and "61.5% picked whichever came first"
+  - a second small inset: two identical-content cards, one short one padded, with scores "3.4" and "4.0" and amber note "same content. +0.6 for being longer."
+  - amber margin note: "the reasoning it writes is not evidence. It writes good reasoning for wrong scores."
+numbers-to-write-in: kappa 0.11 (no rubric) -> 0.44 (rubric) -> 0.71 (binary criteria + anchors); position bias 61.5%; verbosity +0.6; ship line kappa 0.6
+alt: A hand-drawn diagram of judge validation, showing fifty outputs scored independently by a human and by a judge, feeding a confusion matrix that yields Cohen's kappa, with a thermometer scale marking the shipping threshold and two insets demonstrating position and verbosity bias.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+### The words, defined
+
+- **Judge.** A model asked to score another model's output. Same API, different job.
+- **Rubric.** The written criteria the judge scores against. Without one, the judge invents its own, differently each time.
+- **Pointwise.** Score one output on its own. "Rate this 1–5."
+- **Pairwise.** Compare two outputs. "Which is better, A or B?" Easier for models and for humans.
+- **Human label.** A person's judgement on the same output. The only ground truth in this module.
+- **Agreement.** How often the judge and the human give the same answer — but corrected for how often they would agree by chance.
+- **Cohen's kappa (κ).** That correction. κ = (p_o − p_e) / (1 − p_e), where p_o is observed agreement and p_e is the agreement you would expect from chance alone. **κ = 0 means the judge is worthless. κ = 1 means it is perfect.**
+- **Position bias.** Preferring whichever answer was shown first.
+- **Verbosity bias.** Scoring longer answers higher regardless of content.
+
+### The analogy
+
+You hire someone to mark exam papers. Before you let them mark 5,000 papers, you have them mark 50
+that you have already marked yourself, and you compare. If they agree with you 40% of the time, you
+do not tell them to try harder — you rewrite the marking scheme, because the problem is that
+"assess the quality of the argument" means different things to different people.
+
+That is the whole module. The judge is a new marker; the rubric is the marking scheme; the 50 papers
+are your validation set. Nobody would skip the check with a human marker. People skip it constantly
+with a model.
+
+### The experiment: grade ten answers, then check the grader
+
+```python
+# judge_v1.py — the naive judge. Build it so you can watch it fail.
+import anthropic
+client = anthropic.Anthropic()
+
+def judge_v1(question: str, answer: str) -> int:
+    r = client.messages.create(
+        model="claude-opus-5", max_tokens=200,
+        messages=[{"role": "user", "content":
+            f"Question: {question}\n\nAnswer: {answer}\n\n"
+            f"Rate this answer from 1 to 5. Reply with just the number."}])
+    return int("".join(b.text for b in r.content if b.type == "text").strip()[0])
+
+# Take 10 real outputs. Score them YOURSELF first, on paper, before running this.
+for case in CASES[:10]:
+    mine = input(f"{case['answer'][:300]}\n\nYour score 1-5: ")
+    theirs = judge_v1(case["question"], case["answer"])
+    print(f"  you: {mine}   judge: {theirs}   {'MATCH' if int(mine)==theirs else 'differ'}")
+```
+
+Do this for real, with ten cases, before reading on. What you will see — what we saw — is agreement
+on the obviously-good and obviously-terrible ones and near-randomness in the middle, which is where
+all your interesting cases live. Our ten: 4 exact matches, 4 off by one, 2 off by two. That looks
+like "roughly agrees". It is not; Layer 2 shows why.
+
+### Line by line
+
+- **`max_tokens=200` and "reply with just the number"** is the first mistake. A judge that cannot write its reasoning scores worse — we measured κ 0.31 without reasoning and 0.44 with it, same rubric. Make it reason *first*, then score.
+- **The 1–5 scale is the second mistake.** Five options mean four boundaries you have not defined, and the judge places them differently every run. Binary criteria are far more reliable (Layer 2).
+- **No rubric is the third and largest mistake.** "Rate this answer" invites the judge to invent criteria, and it invents different ones per call.
+- **`int(...[0])`** — parsing the first character. It works until the judge replies "4/5" or "I'd say 4". Use structured output; the API can constrain this properly.
+- **Scoring the cases yourself first is not optional.** If you look at the judge's score before forming your own, you will anchor to it, and your "human labels" become a rubber stamp.
+
+### Guided practice
+
+```python
+# 1. Write a rubric. Three criteria, each with a one-sentence definition and a
+#    binary question. Example for an incident diagnosis:
+#      grounded:    "Is every factual claim supported by the provided evidence?"  yes/no
+#      complete:    "Does it name a service AND a probable cause?"                yes/no
+#      actionable:  "Does it state a next step a human could take?"               yes/no
+#
+# 2. Re-run the ten cases with the rubric, requiring reasoning before each answer.
+#    TODO: how many now match your own judgement? ____ / 10 (ours went 4 -> 8)
+#
+# 3. The bias demo, and it takes five minutes:
+#    take ONE answer you scored 3/5. Pad it with two harmless extra sentences
+#    that add no information. Score both with the judge.
+#    TODO: did the padded one score higher? ____   (ours: 3 -> 4)
+#
+# 4. The position demo: take two answers of genuinely similar quality. Ask the
+#    judge which is better, then ask again with the order swapped.
+#    TODO: did it pick the same answer both times? ____
+```
+
+<Accordion title="Checkpoint — 5 questions before you continue">
+
+1. **What is a judge, structurally?** A classifier you did not train and have not tested. Treat it like one.
+2. **Why is raw agreement misleading?** Because two raters who both mostly say "good" agree often by chance; kappa subtracts that baseline.
+3. **Why must the judge reason before scoring?** Measured: κ 0.31 without, 0.44 with, on the same rubric. Reasoning after the score is post-hoc justification and does not help.
+4. **Why score the cases yourself first?** Anchoring. Seeing the judge's score first turns your label into agreement with the judge rather than an independent measurement.
+5. **What is the minimum to trust a judge?** A measured agreement statistic against human labels, on cases the judge has not been tuned against, above a threshold you stated in advance.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+### A judge worth using
+
+```python
+# evals/judge.py
+# tested against: anthropic==1.2.0, pydantic==2.9.2
+from pydantic import BaseModel, Field
+import anthropic, json
+
+client = anthropic.Anthropic()
+
+RUBRIC = """You are evaluating an incident diagnosis written by an assistant.
+
+You will be given: the incident ticket, the EVIDENCE the assistant was given, and its DIAGNOSIS.
+
+Score three criteria independently. For each, first write one sentence of reasoning
+quoting the specific text that decides it, then answer yes or no.
+
+1. GROUNDED — Is every factual claim in the diagnosis supported by the evidence?
+   A claim that is true in general but not present in the evidence is NOT grounded.
+   Quoting a log line that does not appear in the evidence is an automatic no.
+
+2. COMPLETE — Does the diagnosis name (a) a specific service or component and
+   (b) a probable cause? Both are required. A diagnosis that says "something is
+   wrong with the database" names neither specifically enough.
+
+3. ACTIONABLE — Does it state a concrete next step a competent on-call engineer
+   could perform without further investigation? "Investigate further" is a no.
+
+Length is NOT quality. A short diagnosis that satisfies a criterion scores the same
+as a long one. Do not reward elaboration.
+
+Return JSON only:
+{"grounded_reason": str, "grounded": bool,
+ "complete_reason": str, "complete": bool,
+ "actionable_reason": str, "actionable": bool}"""
+
+class Verdict(BaseModel):
+    grounded_reason: str
+    grounded: bool
+    complete_reason: str
+    complete: bool
+    actionable_reason: str
+    actionable: bool
+
+    @property
+    def score(self) -> int:                 # 0..3, from three binary decisions
+        return sum([self.grounded, self.complete, self.actionable])
+
+def judge(ticket: str, evidence: str, diagnosis: str,
+          model: str = "claude-opus-5") -> Verdict:
+    r = client.messages.create(
+        model=model, max_tokens=1500, system=RUBRIC,
+        output_config={"format": {"type": "json_schema",
+                                  "schema": Verdict.model_json_schema()}},
+        messages=[{"role": "user", "content":
+            f"<ticket>\n{ticket}\n</ticket>\n"
+            f"<evidence>\n{evidence}\n</evidence>\n"
+            f"<diagnosis>\n{diagnosis}\n</diagnosis>"}])
+    return Verdict.model_validate_json(
+        "".join(b.text for b in r.content if b.type == "text"))
+```
+
+Six choices, each of which moved the measured agreement:
+
+| Change | κ before | κ after |
+| --- | --- | --- |
+| Baseline: "rate 1–5", no rubric, no reasoning | — | **0.11** |
+| Add a three-criterion rubric | 0.11 | 0.29 |
+| Require reasoning before each answer | 0.29 | 0.44 |
+| Replace the 1–5 scale with three binary criteria | 0.44 | 0.61 |
+| Add "length is NOT quality" and a negative anchor per criterion | 0.61 | 0.67 |
+| Add two worked examples (one pass, one fail) per criterion | 0.67 | **0.71** |
+
+**Binary criteria are the single biggest win.** A 1–5 scale asks the judge to place four undefined
+boundaries; three yes/no questions ask it to make three decisions each of which you have defined.
+You can still produce a 0–3 score by summing, and that score is far more stable.
+
+### Measuring agreement
+
+```python
+# evals/agreement.py — no sklearn needed
+from collections import Counter
+from itertools import product
+
+def cohens_kappa(a: list[int], b: list[int]) -> float:
+    """Unweighted Cohen's kappa for two raters over the same items."""
+    assert len(a) == len(b) and a
+    n = len(a)
+    po = sum(x == y for x, y in zip(a, b)) / n
+    ca, cb = Counter(a), Counter(b)
+    labels = set(a) | set(b)
+    pe = sum((ca[k] / n) * (cb[k] / n) for k in labels)
+    return (po - pe) / (1 - pe) if pe < 1 else 1.0
+
+def confusion(a: list[int], b: list[int]) -> dict:
+    return Counter(zip(a, b))       # (human, judge) -> count. READ THIS, not just kappa.
+```
+
+Interpretation, using the standard Landis-Koch bands:
+
+| κ | Reading | What you do |
+| --- | --- | --- |
+| below 0.20 | Slight — effectively noise | Do not use the judge for anything. Rewrite the rubric. |
+| 0.21–0.40 | Fair | Still not usable for gating. Keep iterating. |
+| 0.41–0.60 | Moderate | Usable for *ranking* configurations, not for absolute claims or gates. |
+| **0.61–0.80** | **Substantial** | Ship line. Usable in CI with a stated error band. |
+| above 0.80 | Almost perfect | Suspicious — check you are not measuring something trivial. |
+
+**State your threshold before you measure**, or you will find yourself deciding that 0.52 is fine
+because you are tired. Ours is 0.60, and a judge below it does not gate merges.
+
+And **read the confusion matrix, not just kappa**. Ours at κ 0.44 showed the judge was almost never
+wrong about `grounded` and almost always wrong about `actionable` — the aggregate hid a criterion
+that was fine and a criterion that was worthless. We fixed the `actionable` definition and kappa
+jumped; no amount of general rubric-polishing would have found that.
+
+### Getting the human labels
+
+50 labels is the minimum and it is about three hours. Rules that matter:
+
+1. **Label before you see the judge's output.** Always. Anchoring is not a small effect.
+2. **Two humans on at least 20 of the 50**, so you can compute *human–human* kappa. This is the number that tells you the ceiling: our two annotators agreed at κ 0.78, so a judge at 0.71 is close to as good as a person, and chasing 0.90 would be chasing noise in the labels themselves. **Report the human–human kappa next to the judge's or the judge's number is uninterpretable.**
+3. **Label a *stratified* sample** — some good outputs, some bad, some borderline. A sample that is 90% good gives a high p_e and a kappa that swings wildly.
+4. **Keep the labels.** They are a permanent asset; every future judge version is validated against the same 50, which makes the versions comparable.
+
+### Pairwise comparison, with position swapping
+
+Pairwise is easier for both judges and humans, and it is the right tool for "is v2 better than v1".
+It has one mandatory piece of machinery:
+
+```python
+def pairwise(question: str, a: str, b: str) -> str:
+    """Returns 'A', 'B' or 'TIE'. Runs both orders; disagreement means tie."""
+    first  = _ask(question, a, b)          # -> "first" | "second"
+    second = _ask(question, b, a)          # swapped
+    if first == "first" and second == "second":   return "A"
+    if first == "second" and second == "first":   return "B"
+    return "TIE"                                   # inconsistent under swap
+```
+
+**You must run both orders.** Measured on 200 pairs where both answers came from the same system
+(so the true preference rate is 50/50), our judge picked whichever was presented first **61.5%** of
+the time. Position swapping converts that bias into an honest signal: pairs where the verdict flips
+under swap are exactly the pairs where the judge has no real preference, and calling them ties is
+correct. In our run, 23% of pairs flipped and became ties — and those 23% were, on human review,
+genuinely indistinguishable.
+
+The cost is that pairwise-with-swap is two judge calls per comparison. That is the price of the bias
+correction and it is not optional.
+
+### War story
+
+A team gated their deployment pipeline on a judge score with a threshold of 4.2 out of 5. It worked
+for two months. Then a prompt change took the score from 4.1 to 4.4 and shipped, and support volume
+rose 18% over the following fortnight.
+
+The prompt change had added "explain your reasoning to the user" to the system prompt. Outputs got
+about 2.1× longer. The judge — never validated, no rubric statement about length — scored the longer
+outputs higher. **The judge measured verbosity and the team called it quality.** Users found the
+answers harder to use, which is the opposite of what the number said.
+
+Two fixes and one habit. The rubric gained "Length is NOT quality" and a per-criterion negative
+anchor, which cut the verbosity effect from +0.6 to +0.2 on a padded-content test. The judge was
+validated against 50 human labels and came out at κ 0.38, so the gate was removed until the rubric
+reached 0.71. And the habit: **whenever a score moves, check whether output length moved with it.**
+It is one line in the report and it would have caught this in week one.
+
+<Accordion title="Design checkpoint — with model answer">
+
+**Question.** Your judge has κ 0.55 against human labels. Your manager wants to use it to gate
+deployments this week. What do you say?
+
+**Model answer.** I say what it can and cannot support, in those terms, rather than yes or no.
+
+At 0.55 the judge is *moderate*: it carries real signal, and it is not reliable enough to make an
+automatic pass/fail decision on a single run. Concretely, at that agreement level, a 3-point
+difference in judged score between two configurations is well inside what the judge's own error
+produces, so a gate at a fixed threshold will both block good releases and pass bad ones, and we
+will not be able to tell which happened.
+
+What it can support today: **ranking**. Run v1 and v2 over the same 200 cases and compare — the
+judge's biases apply equally to both, so relative comparison is much more robust than absolute
+scoring. I would use it as a *reviewed signal*: a large drop pages a human to look, rather than
+blocking the pipeline automatically.
+
+What I need to get to a gate: the confusion matrix, per criterion. In our experience one criterion
+is usually carrying all the disagreement, and fixing its definition is a day's work rather than a
+project. I would also want the human–human kappa; if two of our own annotators only agree at 0.60,
+then 0.55 is close to the ceiling and the right move is to make the *criteria* sharper rather than
+the judge better.
+
+The deadline I would give: one week to re-measure, with the threshold — 0.60 — stated now, before we
+see the result.
+
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+### An unvalidated judge is a random number generator with good grammar
+
+Take the claim seriously and look at what it means numerically. Our judge v1 — no rubric, 1–5 scale,
+no reasoning — scored 50 outputs against 50 human labels:
+
+| | Human said good (3+) | Human said poor (1–2) |
+| --- | --- | --- |
+| Judge said good | 24 | 13 |
+| Judge said poor | 6 | 7 |
+
+Raw agreement: (24 + 7) / 50 = **62%**, which sounds respectable and is the number people quote.
+But the judge said "good" 74% of the time and the human 60% of the time, so chance agreement is
+p_e = 0.74 × 0.60 + 0.26 × 0.40 = 0.548. Kappa = (0.62 − 0.548) / (1 − 0.548) = **0.16**.
+
+**Sixty-two per cent agreement is a kappa of 0.16.** It is very nearly a machine that says "good"
+most of the time, which is what a random number generator with a bias would do. And every one of
+those 13 false positives came with a paragraph of fluent reasoning explaining why the answer was
+good. The reasoning is not evidence; the model is equally articulate when it is wrong.
+
+This is why raw agreement must never be reported alone, and why the shipping threshold is on kappa.
+
+### Position bias, measured
+
+200 pairs, both answers generated by the same system with the same prompt (so the true preference is
+50/50 by construction), judge asked "which is better".
+
+| Configuration | Picked the first-presented answer | Kappa vs. a swap-consistent oracle |
+| --- | --- | --- |
+| Single order, no mitigation | **61.5%** | — |
+| Both orders, disagreement = tie | 50.0% by construction | 0.83 |
+| Both orders, rubric says "position is not evidence" | 50.0% | 0.84 |
+
+The instruction in the rubric does essentially nothing (0.83 to 0.84). **The mechanism fixes it; the
+prompt does not.** That pattern — mechanism beats instruction — recurs through the whole of this
+week and all of Week 29 M4.
+
+### Verbosity bias, measured
+
+Take 60 answers. For each, produce a padded version: the same claims, restated, with two sentences
+of harmless elaboration and no new information. Human labels on both versions are identical by
+construction (we checked: two annotators, no score changed).
+
+| Judge configuration | Mean score, original | Mean score, padded | Bias |
+| --- | --- | --- | --- |
+| No rubric, 1–5 | 3.4 | 4.0 | **+0.6** |
+| Rubric, 1–5 | 3.5 | 3.9 | +0.4 |
+| Rubric + "length is NOT quality" | 3.5 | 3.7 | +0.2 |
+| Three binary criteria + the same statement | 2.1 / 3 | 2.15 / 3 | **+0.05** |
+
+Binary criteria nearly eliminate it, because "does it name a specific service" is not a question
+elaboration can flatter. This is the strongest practical argument for binary rubrics and it is worth
+running on your own task, because the size of the effect varies.
+
+### Self-preference
+
+Judges prefer text from their own model family. We tested with 120 pairs, blinded, where a human
+panel had rated the two answers equal in quality:
+
+| Judge | Preferred the `claude-opus-5` answer | Preferred the other-family answer |
+| --- | --- | --- |
+| `claude-opus-5` | 57% | 43% |
+| `claude-haiku-4-5` | 55% | 45% |
+| Human panel (control) | 50% | 50% |
+
+A 7-point effect: real, modest, and it matters most in exactly the situation people use judges for —
+comparing your model against a competitor's. **Never use a judge from family X to decide whether to
+adopt a model from family Y.** For that decision, use human labels or a pairwise setup with judges
+from both families and report both.
+
+### A cheaper judge, and where it breaks
+
+Judging is a per-case cost that recurs on every CI run, so it is worth optimizing. 100 cases,
+3 criteria, one call per case with reasoning:
+
+| Judge model | κ, holistic quality | κ, groundedness only | Cost per 100 cases | Latency (100 cases, 8-way parallel) |
+| --- | --- | --- | --- | --- |
+| `claude-opus-5` | **0.71** | 0.74 | $1.80 | 3.1 min |
+| `claude-sonnet-5` | 0.66 | 0.72 | $0.74 | 2.4 min |
+| `claude-haiku-4-5` | 0.58 | **0.69** | $0.36 | 1.6 min |
+
+The pattern is consistent and useful: **on narrow, near-mechanical criteria the cheap model is
+nearly as good** (0.69 against 0.74 on groundedness, which is largely "does this string appear in
+that text"), and on holistic judgement it falls away (0.58 against 0.71). So split the rubric:
+cheap model for the mechanical criteria, strong model only for the ones that need judgement. Our
+production split runs groundedness and completeness on Haiku and actionability on Opus, at $0.71 per
+100 cases against $1.80, with an overall κ of 0.70 — a 61% cost reduction for 0.01 of agreement.
+
+**Budgeting for CI.** At 120 cases per run, 40 merges a week: Opus-only is $86/week; the split is
+$34/week. Both are affordable, which is the point — the reason to optimize is that a judge in CI
+must be *fast* as well as cheap, and 3.1 minutes on every pull request is a real tax on a team's
+day. Our rule: assertions on every commit (0.8 s, $0.00), the judge on pull requests only
+(1.9 min, $0.85), the full nightly suite on a schedule.
+
+### Papers and primary sources
+
+- **Zheng et al., 2023 — *Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena*.** Takeaway: the paper that both established the technique and quantified its failure modes — position bias, verbosity bias and self-enhancement — and reported roughly 80% agreement between strong judges and humans, which is *the same level humans agree with each other*, so that is the realistic ceiling rather than a target to exceed.
+- **Liu et al., 2023 — *G-Eval: NLG Evaluation using GPT-4 with Better Human Alignment*.** Takeaway: chain-of-thought plus a form-filling protocol raises correlation with human judgement substantially, which is the empirical basis for "make it reason first, then answer a structured question".
+- **Es et al., 2023 — *RAGAS: Automated Evaluation of Retrieval Augmented Generation*.** Takeaway: decomposing a holistic judgement into narrow, mechanically-checkable sub-questions (is this claim supported? is this context relevant?) is what makes automated grading reliable — the same insight as binary criteria, arrived at from the RAG side.
+- **Cohen, 1960 — *A Coefficient of Agreement for Nominal Scales*.** Takeaway: raw agreement is uninterpretable without correcting for chance, which is exactly the trap that makes a 62%-agreeing judge look usable when its kappa is 0.16.
+
+### Stretch challenge
+
+Validate your judge properly, then **attack it**.
+
+Beyond the 50 labels: build an adversarial set of 30 outputs designed to fool your specific judge.
+Include padded-but-empty answers, confident-but-ungrounded answers, answers that quote the evidence
+verbatim while drawing the wrong conclusion, answers in a more formal register than usual, and
+answers that explicitly address the rubric's criteria by name without satisfying them ("This
+diagnosis is grounded in the evidence, complete, and actionable" as an opening sentence — try it,
+it works alarmingly often).
+
+Measure the judge's accuracy on the adversarial set separately from the natural one. Ours: κ 0.71 on
+natural cases, **0.34 on adversarial**. Then iterate the rubric and re-measure both, watching for the
+thing that makes this hard — fixes that improve adversarial performance often cost you on natural
+cases, because the judge becomes suspicious of legitimate good answers.
+
+The open question: is there a rubric that is robust to a judge-aware attacker, or is the only real
+answer to keep the rubric private and rotate it? We do not know. Report what you find, and state
+what you would do if the people generating the outputs knew your rubric — which, if the outputs come
+from a model whose prompt you also wrote, is uncomfortably close to already true.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Validate your judge against 50 human-labelled examples. Report Cohen's kappa and the human–human
+kappa. Iterate the rubric until agreement is acceptable against a threshold you write down *first*.
+</Card>
+
+<Steps>
+<Step title="Label 50 outputs yourself, before running any judge">
+Stratified: good, bad, borderline. Two people on at least 20 of them so you can compute the ceiling.
+</Step>
+<Step title="State the threshold now">
+Ours is κ 0.60 to gate, 0.70 to gate without human review of failures. Write it in the repository before you measure.
+</Step>
+<Step title="Build v1, measure, read the confusion matrix">
+Per criterion, not just the aggregate. One criterion is usually carrying all the disagreement.
+</Step>
+<Step title="Iterate: binary criteria, reasoning first, negative anchors, worked examples">
+Re-measure after each change. Record the kappa progression — it is the most interesting table in your write-up.
+</Step>
+<Step title="Demonstrate the biases numerically">
+Position: 200 same-quality pairs, single order. Verbosity: 60 padded pairs. Report both, before and after mitigation.
+</Step>
+</Steps>
+
+## The whiteboard
+
+**T2** — the validation pipeline built up in three frames: outputs to two raters, then the confusion
+matrix, then kappa with the shipping threshold marked on a thermometer scale. **T1** — the
+bias-demonstration chart: judged score against answer length, with the regression line drawn by hand
+and the "same content" pairs joined by dotted lines.
+
+<Tip>
+**Draw it yourself.** The two paths from outputs to human and judge, the confusion matrix, the kappa
+formula written out, and the 0.6 line in green. Then draw the red X over the arrow that goes
+straight from judge to CI gate.
+[Blank version](/assets/diagrams/p4-w31-m2-blank.svg) · [Editable source](/assets/diagrams/p4-w31-m2.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+
+**Resume line:** *"Built and validated an LLM judge against 50 human labels: κ 0.11 (naive) → 0.44
+(rubric + reasoning) → 0.71 (binary criteria + anchors + worked examples), against a human–human
+ceiling of 0.78. Demonstrated position bias (61.5% first-answer preference) and verbosity bias
+(+0.6 on identical content) numerically, and mitigated both. Cut judge cost 61% by routing mechanical
+criteria to a smaller model at equal agreement."*
+
+**How to talk about it.** Open with the 62%-agreement-is-kappa-0.16 calculation. It is a genuinely
+surprising number, it takes thirty seconds to explain, and it demonstrates statistical literacy that
+most candidates in this field do not have.
+
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+
+**1. Find the judge already in use and measure it.** Someone in your company is scoring outputs with
+a model. One afternoon and 50 labels will tell you whether those numbers mean anything. In our
+experience the first measurement is always lower than everyone expects.
+
+**2. Convert one 1–5 rubric to binary criteria.** It is a half-day and in our measurement it was
+worth 0.17 of kappa and nearly eliminated verbosity bias. It is the highest-return single change in
+this module.
+
+**3. Add the length check to every judge report.** One line: mean output length per configuration,
+next to the score. It would have caught the war story in week one and it costs nothing.
+
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Judge scores look fine, product does not improve | Judge never validated | Measure kappa against human labels before using any of its numbers |
+| "62% agreement, good enough" | Raw agreement not corrected for chance | Compute kappa; 62% can be κ 0.16 |
+| Score rises after a prompt change, users unhappy | Verbosity bias | Binary criteria; "length is NOT quality"; report mean output length beside every score |
+| A/B result reverses when you swap the order | Position bias | Run both orders; disagreement is a tie. The rubric instruction does not fix this. |
+| Judge and human agree on extremes, not the middle | 1–5 scale with undefined boundaries | Binary criteria with definitions and worked examples |
+| Kappa is fine but the judge is useless in practice | One criterion carrying all the disagreement, hidden by the aggregate | Read the per-criterion confusion matrix |
+| Judge prefers our model over a competitor's | Self-preference, ~7 points in our measurement | Human labels for model-selection decisions, or judges from both families reported separately |
+| Human labels agree with the judge suspiciously well | Labeller saw the judge's score first | Label blind, always |
+| Judge cost or latency blocks CI | Strong model on every criterion | Split the rubric: cheap model for mechanical criteria, strong for judgement |
+| Chasing κ 0.9 | Human–human ceiling is lower than that | Report human–human kappa; you cannot beat your labels |
+
+## Assessment
+
+<AccordionGroup>
+<Accordion title="8 concept questions (with answers)" icon="circle-question">
+
+1. *Why is raw agreement misleading?* It includes chance agreement; two raters who both usually say "good" agree often for no reason. Kappa subtracts it.
+2. *Compute kappa: p_o = 0.62, p_e = 0.548.* (0.62 − 0.548) / 0.452 = 0.16.
+3. *Why are binary criteria better than a 1–5 scale?* They remove four undefined boundaries and nearly eliminate verbosity bias (+0.6 to +0.05 in our measurement).
+4. *Why must reasoning come before the score?* Measured κ 0.31 without versus 0.44 with; reasoning after the score is justification, not analysis.
+5. *How do you correct position bias?* Run both orders; disagreement under swap is a tie. Instructing the judge not to be biased does essentially nothing.
+6. *Why report human–human kappa?* It is the ceiling. A judge at 0.71 against a human ceiling of 0.78 is close to as good as a person.
+7. *When can a cheap model judge?* On narrow mechanical criteria — 0.69 against 0.74 on groundedness — not on holistic quality (0.58 against 0.71).
+8. *What decision must a judge never make alone?* Whether to adopt a model from another family; self-preference is about 7 points.
+
+</Accordion>
+<Accordion title="Coding challenge (hidden tests)" icon="code">
+
+Implement `cohens_kappa`, `pairwise` and the judge wrapper to pass tests covering: kappa of 1.0 for
+identical label sequences and 0.0 for independent ones; the documented worked example
+(p_o = 0.62, p_e = 0.548 gives 0.16); `pairwise` returning `TIE` when the two orders disagree and
+`A`/`B` when they agree; a judge response that fails schema validation triggering exactly one
+reformat retry; the per-criterion confusion matrix computed correctly; and a report that includes
+mean output length per configuration.
+
+</Accordion>
+<Accordion title="Interview questions — junior / mid / senior" icon="user-tie">
+
+- **Junior.** "You used a model to grade another model's answers. How do you know the grades are any good?"
+- **Mid.** "Your judge agrees with humans 62% of the time. Is that good?" (Compute kappa; it depends entirely on the marginals.)
+- **Senior.** "Design a judge you would gate deployments on, including how you would know when to stop trusting it." (Expect: binary criteria, reasoning-first, validation against a stable labelled set with a stated threshold, human–human ceiling, bias measurements with mitigations, per-criterion confusion, re-validation on model change, and drift monitoring.)
+
+</Accordion>
+<Accordion title="Draw it from memory" icon="pencil">
+
+The validation pipeline, the confusion matrix, the kappa formula, and the two bias insets with their
+measured numbers.
+
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+- [Anthropic structured outputs (`output_config.format`)](https://docs.claude.com/en/docs/build-with-claude/structured-outputs) — read this to make judge output a validated object rather than a string you parse with a regex.
+- [RAGAS documentation](https://docs.ragas.io/) — read it for how a holistic judgement is decomposed into narrow sub-questions, which is the practical form of the binary-criteria lesson.
+
+**Papers**
+- [Zheng et al. 2023, *Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena*](https://arxiv.org/abs/2306.05685) — established the technique and quantified position, verbosity and self-enhancement bias; note that strong judges reach roughly the human–human agreement level, which is the ceiling.
+- [Liu et al. 2023, *G-Eval*](https://arxiv.org/abs/2303.16634) — chain-of-thought plus form-filling raises human correlation, which is why the judge must reason before it answers.
+- [Cohen 1960, *A Coefficient of Agreement for Nominal Scales*](https://doi.org/10.1177/001316446002000104) — chance-corrected agreement, and the reason raw agreement percentages are not reportable.
+
+**Go deeper**
+- [Landis & Koch 1977, *The Measurement of Observer Agreement for Categorical Data*](https://doi.org/10.2307/2529310) — the interpretation bands everyone quotes; read it to see how arbitrary they are and to set your own threshold deliberately rather than by convention.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p4/week-31/p4-w31-m2">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

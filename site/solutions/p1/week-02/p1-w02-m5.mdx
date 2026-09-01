@@ -1,0 +1,154 @@
+---
+title: "SSH, keys & remote work + Vim survival"
+description: "Reference solution — Week 2"
+hidden: true
+icon: "lock"
+---
+
+{/* AUTHORED */}
+
+<Warning>
+**Hidden page.** It is not in the navigation, but it is not private either — anyone with the
+URL can read it. Do not paste this link into the cohort chat.
+</Warning>
+
+<Note>Open this only after you have an attempt of your own that fails. Reading a solution
+before struggling with the problem feels like learning and isn't.</Note>
+
+## Reference solution — `P1-W02-M5`
+
+The task: query a Postgres on a private network from your laptop with zero publicly exposed ports.
+
+**The topology.**
+
+```
+laptop ──ssh:22──▶ bastion (only public listener)
+                      │  private network, no route from the internet
+                      ▼
+                   postgres:5432
+```
+
+**`~/.ssh/config`.**
+
+```sshconfig
+Host *
+    AddKeysToAgent yes
+    IdentitiesOnly yes
+    ServerAliveInterval 30
+    ServerAliveCountMax 3
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 10m
+
+Host bastion
+    HostName bastion.example.com
+    User meera
+    IdentityFile ~/.ssh/id_ed25519
+
+Host db-tunnel
+    HostName bastion.example.com
+    User meera
+    IdentityFile ~/.ssh/id_ed25519
+    LocalForward 15432 db.internal:5432
+    RequestTTY no
+    SessionType none
+```
+
+**Use it.**
+
+```bash
+ssh -f -N db-tunnel                              # background the tunnel
+psql -h 127.0.0.1 -p 15432 -U app appdb -c 'select now();'
+ssh -O exit db-tunnel                            # tear it down (needs ControlMaster)
+```
+
+**Prove the zero-exposure claim** — this is the graded part:
+
+```bash
+# from a host OUTSIDE the private network
+nmap -Pn -p 22,5432 bastion.example.com
+# 22/tcp   open
+# 5432/tcp closed
+
+nmap -Pn -p 5432 db.internal      # does not even resolve/route from outside
+# and on the db host itself:
+ss -ltnp | grep 5432              # LISTEN 127.0.0.1:5432 or 10.0.x.x:5432 only
+```
+
+For the containerised version the lab ships:
+
+```bash
+docker network create --internal nexus-private     # --internal: no external route
+docker run -d --name pg   --network nexus-private postgres:16
+docker run -d --name bast --network nexus-private -p 2222:22 nexus/bastion
+docker network connect bridge bast                  # bastion only, on both networks
+ssh -p 2222 -N -L 15432:pg:5432 dev@localhost
+```
+
+## Why this solution and not the obvious one
+
+**Wrong turn 1: `-L 15432:localhost:5432`.**
+
+This is the single most common mistake in port forwarding and the error message is unhelpful. The `host:port` in `-L local:host:port` is resolved **from the SSH server's perspective**, not yours. Writing `localhost` means "the bastion's own localhost", so the tunnel connects to a Postgres running *on the bastion*, which does not exist — you get "connection refused" through a working tunnel.
+
+The correct value is however the *bastion* reaches the database: `db.internal:5432`, or `10.0.4.17:5432`, or the container name `pg:5432`. It need not resolve on your laptop at all.
+
+Diagnose it in one command:
+
+```bash
+ssh bastion 'nc -z -v db.internal 5432'      # does the bastion itself reach it?
+```
+
+If that fails, the tunnel was never the problem.
+
+**Wrong turn 2: `ssh -A` to reach the inner host.**
+
+The obvious way to get to a machine behind a bastion is to SSH to the bastion and SSH again from there — and since your key is not on the bastion, to forward the agent with `-A`. It works, and it hands the bastion the ability to authenticate as you.
+
+Concretely: any process running as root on the bastion can talk to the forwarded agent socket (`$SSH_AUTH_SOCK`) and ask it to sign anything, for as long as your session is open. It cannot steal the key, but it does not need to — it can use it. That is the standard lateral-movement step after a single host is compromised, and a bastion is exactly the host most likely to be targeted.
+
+`ProxyJump` gives the same ergonomics with none of that: your client opens a TCP forward *through* the bastion and then performs a fresh, end-to-end SSH handshake with the destination. The bastion sees encrypted bytes and never participates in the authentication.
+
+The lab asks you to demonstrate this difference, and the demonstration is the memorable part:
+
+```bash
+# on the intermediate host, as root, while a user is connected with -A:
+sudo SSH_AUTH_SOCK=$(ls /tmp/ssh-*/agent.* | head -1) ssh-add -l   # their keys, listed
+sudo SSH_AUTH_SOCK=... ssh user@another-host                        # and it works
+```
+
+With `ProxyJump`, there is no agent socket on the intermediate host at all.
+
+**A third thing worth knowing: `IdentitiesOnly yes` is not optional.**
+
+Without it, `ssh` offers every key in your agent, in order, before falling back to `IdentityFile`. A hardened server with `MaxAuthTries 3` disconnects you after three wrong keys — so with four keys loaded you get `Too many authentication failures` on a server where your key is correctly installed. The error names neither the cause nor the fix.
+
+## The measured numbers this solution produces
+
+| Measurement | Value |
+|---|---|
+| ed25519 keygen | **0.013 s** |
+| ed25519 private key file | **387 bytes** (mode 600) |
+| ed25519 public key file | **86 bytes** |
+| ed25519 fingerprint | `256 SHA256:cOCY4H2t5U9jmo0Gy3BVBz7GyvGWsYgWAas7PM1qkDI` |
+| RSA-4096 keygen | **0.380 s** — **29× slower** |
+| RSA-4096 private key file | **3,369 bytes** — **8.7× larger** |
+| RSA-4096 public key file | 730 bytes — 8.5× larger |
+| OpenSSH version tested | 10.0p2, LibreSSL 3.3.6 |
+| Publicly exposed ports in the final topology | **1** (bastion tcp/22, key-only) |
+
+## Grading notes
+
+**3/3 on correctness** means `psql` through the tunnel returns rows *and* you produced external scan output showing no reachable database port. Both halves are required — the claim without the proof is a 1.
+
+**3/3 on safety** means `ProxyJump` rather than `ForwardAgent`, `IdentitiesOnly yes`, a passphrase-protected key held in the agent, and — for the stretch — host certificates so no `known_hosts` TOFU prompt appears for a freshly created host.
+
+**3/3 on explanation** means you can state which single port is exposed in the whole path, what authenticates it, and what an attacker gets if they MITM your *first* connection versus a later one.
+
+The three most common ways submissions lose points:
+
+1. **"Zero ports exposed" asserted, not scanned.** Run the scan from outside the private network and paste the output. A scan from inside proves nothing.
+2. **The tunnel works but uses `ssh -A` somewhere in the path.** This is a security regression that happens to function, which is the worst combination, and criterion "safety" caps at 1.
+3. **A passphrase-less key used for a human login.** Automation keys may be passphrase-less *and* must then be restricted in `authorized_keys` with `command=`, `no-pty`, `no-port-forwarding`. A bare passphrase-less human key on a bastion is the war story from the module, in miniature.
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}

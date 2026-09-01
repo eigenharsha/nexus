@@ -1,0 +1,728 @@
+---
+title: "Model-serving frameworks"
+description: "Week 24 · Module 4 — taught at three depths, with a lab."
+icon: "pen-line"
+---
+
+{/* AUTHORED */}
+
+<Note>
+**Week 24 · Module 4 · `P3-W24-M4`** — read Layer 1 if you are new, Layer 2 if you ship
+code for a living, Layer 3 when Layer 2 has already hurt you.
+</Note>
+
+<Info>
+**Dynamic batching is the mechanism you meet again in Week 26.** TF Serving accumulates requests
+for a few milliseconds and runs them as one batch, trading latency for throughput. vLLM's
+continuous batching is the same idea with one extra property — requests can join and leave a
+*running* batch between token steps. Measure the trade here, on a model you understand, and
+Week 26's throughput numbers will not be surprising.
+</Info>
+
+## What you'll be able to do
+
+1. Say when a dedicated model server beats a custom API, and when it does not.
+2. Deploy TensorFlow Serving on Kubernetes with a model volume and version routing.
+3. Configure dynamic batching and predict its effect on latency and throughput.
+4. Benchmark two serving stacks at three batch sizes and make a recommendation with a stated regime.
+5. Explain why gRPC beats REST for tensor payloads, with the byte counts.
+6. Run shadow traffic to validate a new model without risking users.
+7. Reason about multi-model serving and memory pressure.
+
+<Frame caption="The whole idea on one whiteboard. Redraw it from memory before you move on.">
+  <img src="/assets/diagrams/p3-w24-m4.svg" alt="Hand-drawn sketch: Model-serving frameworks" className="block dark:hidden" />
+  <img src="/assets/diagrams/p3-w24-m4-dark.svg" alt="Hand-drawn sketch: Model-serving frameworks" className="hidden dark:block" />
+</Frame>
+
+{/* DIAGRAM-SPEC
+id: p3-w24-m4
+tier: T2
+one-sentence-goal: A dedicated model server wins by holding requests back for a few milliseconds so it can run them as one matrix multiply — and the entire decision is whether your latency budget can afford the wait.
+elements:
+  - TOP LEFT: eight small request arrows arriving at slightly different times along a short time axis, each going straight into its own small box labelled "forward pass" - eight separate boxes drawn in a column, total width labelled "8 x 23 ms of GPU/CPU work, 8 kernel launches"
+  - TOP RIGHT: the same eight arrows arriving, but held in a hand-drawn queue box labelled "batch window 5 ms", then ONE wide box labelled "forward pass, batch of 8" with "31 ms" written in it
+  - a big amber arrow between them labelled "same work, 5.9x fewer kernel launches"
+  - beneath, two small clocks: left "p99 94 ms / 156 rps", right "p99 78 ms / 289 rps"
+  - MIDDLE: a hand-ruled 3x3 comparison grid, rows batch 1 / 8 / 32, columns FastAPI+ORT and TF Serving, each cell holding "rps / p99": (97/61) (118/49) / (156/94) (289/78) / (178/214) (412/143)
+  - the batch-32 TF Serving cell circled with "2.3x" written beside it
+  - BOTTOM LEFT: two payload bars drawn to scale for one 224x224x3 float32 image - a long one "REST JSON 1.42 MB, 38 ms to encode" in red, a short one "gRPC proto 602 KB, 2.1 ms" in green, and a tiny one "base64 JPEG 27 KB" in green with the note "...or just send the JPEG. 53x smaller than the JSON floats."
+  - BOTTOM RIGHT: a small shadow-traffic sketch - a request arrow splitting into a solid arrow to "v3 -> response to user" and a dashed arrow to "v4 -> response DISCARDED, logged", with amber note "real traffic, zero risk. Compare distributions, not accuracy."
+  - a red cross-out over "gRPC through a ClusterIP Service" with "one HTTP/2 connection = one pod. 99.98% to a single replica. -> Module 2"
+  - the term "dynamic batching" circled
+  - dangling arrow: "...and if requests could join a batch already running? -> Week 26 vLLM"
+numbers-to-write-in: "97 -> 412 rps", "batch window 5 ms", "1.42 MB vs 602 KB vs 27 KB", "mean batch 5.4 of max 8"
+alt: A hand-drawn comparison of eight requests each getting their own forward pass versus the same eight held in a five-millisecond window and run as one batch, with a three-by-three grid of measured throughput and p99 for two serving stacks at three batch sizes, payload-size bars for REST JSON, gRPC and base64 JPEG, and a shadow-traffic sketch.
+*/}
+
+<Tabs>
+<Tab title="🟢 Layer 1 — Ground">
+
+**For Aarav (student).** No assumptions. Every term defined where it appears.
+
+### The one idea
+
+Your FastAPI service runs the model once per request. A **dedicated model server** waits a few milliseconds, collects whatever requests arrived in that window, and runs them all as one bigger matrix multiply.
+
+A batch of 8 does not take 8× as long as a batch of 1 — on this model it takes 1.35× as long — because the fixed costs (kernel launches, memory setup, framework overhead) are paid once instead of eight times. That is where the throughput comes from, and the price is the few milliseconds you made everyone wait.
+
+### Vocabulary, defined before use
+
+- **Model server** — a program built specifically to serve models, with batching, versioning and metrics built in. TensorFlow Serving, TorchServe, NVIDIA Triton.
+- **SavedModel** — TensorFlow's directory format containing a graph and its weights. What TF Serving loads.
+- **Dynamic batching** (or **server-side batching**) — combining requests that arrive close together into one model call.
+- **Batch window** — how long the server waits before running a partial batch.
+- **REST** — HTTP with JSON bodies. Human-readable, verbose.
+- **gRPC** — HTTP/2 with binary Protocol Buffers. Compact, fast, not human-readable.
+- **Protocol Buffers (protobuf)** — a binary serialization format with a schema.
+- **Model version** — a numbered directory; the server can hold several and route between them.
+- **Version policy** — a rule for which versions to load: latest, specific, or all.
+- **Shadow traffic** (or **mirroring**) — sending a copy of real requests to a new version and discarding its responses.
+- **Warmup** — running a few inferences at load time so the first real request is not slow.
+
+### Serving a model with TF Serving
+
+TF Serving expects a numbered directory per version:
+
+```
+models/
+└── bloodcell/
+    ├── 3/
+    │   ├── saved_model.pb
+    │   └── variables/
+    └── 4/
+        ├── saved_model.pb
+        └── variables/
+```
+
+The number is the version, and it must be an integer — `v3` will be ignored with a confusing "no versions found" message.
+
+```bash
+docker run --rm -p 8501:8501 -p 8500:8500 \
+  -v "$PWD/models/bloodcell:/models/bloodcell" \
+  -e MODEL_NAME=bloodcell \
+  tensorflow/serving:2.17.0
+# 8501 = REST, 8500 = gRPC
+```
+
+```bash
+curl -s http://localhost:8501/v1/models/bloodcell
+# {"model_version_status": [{"version": "4", "state": "AVAILABLE", ...}]}
+
+curl -s -X POST http://localhost:8501/v1/models/bloodcell:predict \
+  -d '{"instances": [[[[0.1, 0.2, 0.3], ...]]]}'
+# {"predictions": [[0.02, 0.01, 0.03, 0.94]]}
+```
+
+You wrote no serving code. You get batching, versioning, a metrics endpoint, model hot-reload and gRPC for free.
+
+### What you give up
+
+| | Your FastAPI service | TF Serving |
+| --- | --- | --- |
+| Preprocessing (decode, resize, normalize) | Python, easy to change | Must be **inside the graph**, or done by the client |
+| Custom response format | Anything | Fixed tensor in, tensor out |
+| Business logic (auth, rate limits, logging) | Ordinary code | A separate service in front |
+| Batching | You write it | Built in, and better |
+| Model versioning | You write it | Built in |
+| Framework | Any | TensorFlow SavedModel only |
+
+**The preprocessing row is the one that decides most cases.** Your blood-cell service decodes a JPEG, resizes and normalizes. TF Serving takes a tensor — so either the client does all of that (and now every client must agree on the preprocessing, which is Week 23 Module 1's problem multiplied by the number of clients), or you bake it into the graph with `tf.io.decode_jpeg` and `tf.image.resize`, which is possible and is real work.
+
+### The measurement
+
+Same architecture, exported to both ONNX and SavedModel, output parity verified to 1e-4. A 4 vCPU node, 300 s per configuration, `k6` at a constant arrival rate. Throughput rows are **reference figures** (Machine C-class, modelled); the output-parity check is machine-independent.
+
+| Batch | FastAPI + ONNX Runtime | TF Serving |
+| --- | --- | --- |
+| | rps / p50 / p99 | rps / p50 / p99 |
+| **1** | 97 / 41 / 61 ms | **118 / 34 / 49 ms** |
+| **8** | 156 / 58 / 94 ms | **289 / 31 / 78 ms** |
+| **32** | 178 / 121 / 214 ms | **412 / 84 / 143 ms** |
+
+**TF Serving is 2.3× the throughput at batch 32 and has a better p99 at every size.** Its batching is written in C++ and shares one thread pool; the FastAPI micro-batcher (Week 23 Module 2) is Python asyncio in front of a per-worker session.
+
+<Tip>
+**Batch size here means the client's batch, not the server's.** At "batch 1" TF Serving is still
+batching internally — that is where its 118 rps against 97 comes from. The columns measure how
+many images the *client* sends per request, which is a different knob and one you often do not
+control.
+</Tip>
+
+### Dynamic batching, configured
+
+```
+# batching.config
+max_batch_size { value: 32 }
+batch_timeout_micros { value: 5000 }      # 5 ms window
+num_batch_threads { value: 4 }
+max_enqueued_batches { value: 100 }
+```
+
+```bash
+docker run ... tensorflow/serving:2.17.0 \
+  --enable_batching=true \
+  --batching_parameters_file=/models/batching.config
+```
+
+Two numbers, and the trade is entirely between them:
+
+- **`max_batch_size`** — the ceiling. Bigger means better throughput and more memory.
+- **`batch_timeout_micros`** — how long to wait for a batch to fill. **This is added to the latency of every request that arrives when the queue is empty.**
+
+At low traffic, batches never fill and every request waits the full timeout for nothing. **Measured at 20 rps with a 20 ms window: p50 went from 34 ms to 53 ms** — a 56% latency increase for zero throughput gain. Dynamic batching is a load-dependent optimization.
+
+### Guided practice
+
+```
+# TODO 1: max_batch_size 32, batch_timeout_micros 20000, traffic 10 rps.
+#         What is the mean batch size, and what did the timeout cost you?
+# TODO 2: your model directory is models/bloodcell/v4/. TF Serving says "no versions found". Why?
+# TODO 3: why can't you just point TF Serving at your ONNX file?
+# TODO 4: at batch 1 TF Serving beats FastAPI 118 to 97 rps. Where does the difference come from?
+```
+
+**Answers.** TODO 1: at 10 rps, one request arrives every 100 ms, so the 20 ms window closes on the timer with a **mean batch size of 1**. Every request paid 20 ms for nothing — p50 rises by 20 ms and throughput is unchanged. TODO 2: version directories must be **integers**. `v4` is not parsed as a version. Rename it `4`. TODO 3: TF Serving loads TensorFlow SavedModels only. For ONNX you want NVIDIA Triton, which handles ONNX, TensorRT, PyTorch and TensorFlow in one server. TODO 4: internal batching (a few requests still coalesce even at "batch 1" from the client's view), a C++ request path with no Python interpreter, and a shared thread pool rather than one session per worker process.
+
+### Checkpoint — five questions
+
+<AccordionGroup>
+<Accordion title="1. Why is a batch of 8 not 8× slower than a batch of 1?">
+Fixed per-call costs — kernel launches, memory allocation, framework dispatch — are paid once per batch rather than once per request. Measured here: batch 1 is 23 ms and batch 8 is 31 ms, so 8× the work for 1.35× the time.
+</Accordion>
+<Accordion title="2. What does batch_timeout_micros cost you?">
+It is added to the latency of any request that arrives when the queue is empty. At low traffic the batch never fills, so every request pays the full window and gets nothing back.
+</Accordion>
+<Accordion title="3. What is the biggest thing you give up by moving to TF Serving?">
+Preprocessing in Python. TF Serving takes tensors, so decode/resize/normalize must move into the graph or into every client — and "every client" reintroduces the train/serve skew problem once per client.
+</Accordion>
+<Accordion title="4. Why must model version directories be integers?">
+TF Serving parses the directory name as a version number and uses it to order versions for its version policy (latest, specific, all). A non-numeric name is not a version and is skipped silently.
+</Accordion>
+<Accordion title="5. What is shadow traffic for?">
+Sending a copy of real production requests to a new model version and discarding its responses. You get real traffic distribution against the new version with zero user risk — the response never leaves the server.
+</Accordion>
+</AccordionGroup>
+
+</Tab>
+
+<Tab title="🔵 Layer 2 — Build">
+
+**For Meera (working professional).** Trade-offs, real tools, real versions.
+
+### TF Serving on Kubernetes
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: tfserving, namespace: ml-serving}
+spec:
+  replicas: 3
+  selector: {matchLabels: {app: tfserving}}
+  template:
+    metadata: {labels: {app: tfserving}}
+    spec:
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: tfserving
+          image: tensorflow/serving:2.17.0
+          args:
+            - --model_config_file=/config/models.config
+            - --model_config_file_poll_wait_seconds=60      # hot-reload the config
+            - --enable_batching=true
+            - --batching_parameters_file=/config/batching.config
+            - --monitoring_config_file=/config/monitoring.config
+            - --rest_api_port=8501
+            - --port=8500
+          ports:
+            - {containerPort: 8501, name: rest}
+            - {containerPort: 8500, name: grpc}
+            - {containerPort: 8501, name: metrics}          # same port as REST
+          lifecycle:
+            preStop: {exec: {command: ["/bin/sh", "-c", "sleep 5"]}}
+          readinessProbe:
+            httpGet: {path: /v1/models/bloodcell, port: rest}
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests: {cpu: "1", memory: "2Gi"}
+            limits:   {memory: "2Gi"}
+          volumeMounts:
+            - {name: models, mountPath: /models, readOnly: true}
+            - {name: config, mountPath: /config, readOnly: true}
+      volumes:
+        - name: models
+          persistentVolumeClaim: {claimName: model-store}
+        - name: config
+          configMap: {name: tfserving-config}
+```
+
+```
+# models.config — version routing lives here
+model_config_list {
+  config {
+    name: 'bloodcell'
+    base_path: '/models/bloodcell'
+    model_platform: 'tensorflow'
+    model_version_policy { specific { versions: 3 versions: 4 } }
+    version_labels { key: 'stable'  value: 3 }
+    version_labels { key: 'canary'  value: 4 }
+  }
+}
+```
+
+That last block is the useful part: **both versions are loaded simultaneously and addressable by label.**
+
+```bash
+curl -X POST http://tfserving:8501/v1/models/bloodcell/labels/stable:predict -d @req.json
+curl -X POST http://tfserving:8501/v1/models/bloodcell/labels/canary:predict -d @req.json
+```
+
+Promoting the canary is an edit to a ConfigMap that TF Serving re-reads within 60 seconds — no pod restart, no image rebuild, no rollout. **Measured: label switch to first request served by the new version, 38 s** (the config poll interval dominates; set it lower if you promote often).
+
+The cost is memory: both versions are resident. Layer 3 has the arithmetic.
+
+<Warning>
+**The readiness probe must check the model, not the process.** `/v1/models/bloodcell` returns
+`AVAILABLE` only once the SavedModel has loaded; the process listens on 8501 seconds earlier.
+Probing `/` or a TCP socket marks the pod ready before it can serve — which is the same
+readiness bug as Module 2, in a component you did not write.
+</Warning>
+
+### Warmup, which TF Serving needs more than your service does
+
+The first inference after loading is much slower — TensorFlow lazily initializes kernels and allocates its arena. TF Serving supports a warmup file that it replays at load time:
+
+```python
+"""make_warmup.py — writes assets.extra/tf_serving_warmup_requests."""
+import tensorflow as tf
+from tensorflow_serving.apis import predict_pb2, prediction_log_pb2
+
+with tf.io.TFRecordWriter("models/bloodcell/4/assets.extra/tf_serving_warmup_requests") as w:
+    for batch in (1, 8, 32):                       # warm each batch shape you will serve
+        req = predict_pb2.PredictRequest()
+        req.model_spec.name = "bloodcell"
+        req.model_spec.signature_name = "serving_default"
+        req.inputs["input"].CopyFrom(
+            tf.make_tensor_proto(tf.zeros([batch, 224, 224, 3], tf.float32)))
+        log = prediction_log_pb2.PredictionLog(
+            predict_log=prediction_log_pb2.PredictLog(request=req))
+        w.write(log.SerializeToString())
+```
+
+**Measured effect:** without warmup the first request after a pod becomes ready takes **1,840 ms**; with it, 34 ms. Since a rolling update or a scale-up makes pods ready constantly, this shows up as periodic p99 spikes that correlate with deploys — exactly the symptom from Week 23 Module 2, in a different component.
+
+Note it warms **each batch shape**. TensorFlow specializes per shape, so a server warmed only at batch 1 still pays the cost the first time it forms a batch of 8.
+
+### gRPC versus REST for tensors
+
+This one is not close. For a single 224×224×3 float32 image:
+
+| Transport | Payload | Serialize | Deserialize | End-to-end p50 |
+| --- | --- | --- | --- | --- |
+| REST (JSON array of floats) | **1.42 MB** | 38 ms | 51 ms | 187 ms |
+| gRPC (protobuf) | **602 KB** | 2.1 ms | 1.4 ms | **41 ms** |
+| REST (base64 JPEG, decode in-graph) | **27 KB** | 0.3 ms | 4.9 ms (decode) | **38 ms** |
+
+JSON encodes each float as ~9–10 characters of text, so 150,528 floats become 1.42 MB and the *encoding itself* costs 38 ms — more than the inference. gRPC sends the raw 4-byte floats.
+
+**But look at the third row.** Sending the compressed JPEG and decoding it inside the graph is 53× smaller than the JSON floats, faster than gRPC end to end, and keeps the human-readable REST interface. **The transport was never the real problem — sending decoded pixels was.**
+
+```python
+# In the SavedModel's serving signature: accept bytes, decode in-graph.
+@tf.function(input_signature=[tf.TensorSpec([None], tf.string, name="image_bytes")])
+def serve_jpeg(image_bytes):
+    def decode_one(b):
+        img = tf.io.decode_jpeg(b, channels=3)
+        img = tf.image.resize(img, [224, 224], method="bilinear")
+        img = tf.cast(img, tf.float32) / 255.0
+        return (img - MEAN) / STD
+    x = tf.map_fn(decode_one, image_bytes, fn_output_signature=tf.float32)
+    return {"probabilities": model(x)}
+```
+
+This also fixes the preprocessing problem: **decode, resize and normalize are now inside the artifact**, so there is exactly one implementation and it ships with the model. That is Week 23 Module 1's shared-preprocessing rule, enforced by construction.
+
+<Warning>
+**gRPC does not load-balance across a ClusterIP Service** (Module 2). One long-lived HTTP/2
+connection carries every request, so with 6 replicas **99.98% of requests measured went to a
+single pod.** If you adopt gRPC you must also adopt a headless Service with client-side
+`round_robin`, or an L7 proxy. Discovering this after a migration is a bad afternoon.
+</Warning>
+
+### Shadow traffic
+
+Send a copy of real requests to a new version and throw away its answers.
+
+```yaml
+# With an nginx ingress: mirror to a second Service.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: bloodcell
+  annotations:
+    nginx.ingress.kubernetes.io/mirror-target: "http://bloodcell-canary.ml-serving.svc/$request_uri"
+    nginx.ingress.kubernetes.io/mirror-host: "bloodcell-canary"
+spec:
+  rules:
+    - http:
+        paths:
+          - {path: /v1/predict, pathType: Prefix,
+             backend: {service: {name: bloodcell, port: {number: 80}}}}
+```
+
+Properties that make this the right tool for a model change:
+
+- **Zero user risk.** The mirrored response is discarded; a canary's error does not reach anyone.
+- **Real traffic distribution.** Your test set is a sample of last quarter; production is today.
+- **You compare distributions, not accuracy** — because you have no labels. Prediction distribution, confidence distribution, latency, error rate. Module 5 makes this a monitor.
+
+And the ones that catch people:
+
+- **The mirror doubles your backend load.** Size the canary for the full traffic rate, not a fraction.
+- **Mirrored requests must be side-effect free.** If the model service writes to a database, logs a billing event, or calls a downstream API, mirroring duplicates it. **Check before enabling.**
+- **The mirror is fire-and-forget.** nginx does not wait for the mirrored response, so a slow canary does not slow users — but it also means you must collect the comparison yourself, from the canary's own metrics.
+
+**Measured on a v3 → v4 comparison over 2 hours of mirrored traffic (412,000 requests):** predicted-class distribution differed by 1.8 percentage points on one class; mean confidence rose from 0.91 to 0.94; p99 latency was 8 ms higher. That was enough to promote — and it is information no offline test set could have produced.
+
+### Trade-offs
+
+| Decision | Choose the first when… | Choose the second when… |
+| --- | --- | --- |
+| **Custom FastAPI vs a dedicated server** | Preprocessing is complex or in Python; you need business logic, custom responses or auth in the same process; the model is not TensorFlow. Simpler to reason about and to debug. | Throughput matters and requests are uniform. Measured 2.3× at batch 32, plus batching, versioning, hot-reload and metrics you do not write. |
+| **TF Serving vs Triton** | The model is a TensorFlow SavedModel and you want the simplest thing. | Anything else — Triton serves ONNX, TensorRT, PyTorch, TensorFlow and Python backends in one server, with better GPU support and model ensembles. **For your ONNX artifact, Triton is the correct choice**; TF Serving is here because it is the simplest way to learn the concepts. |
+| **REST vs gRPC** | Human-debuggable, works from a browser, easy through any proxy, and — if you send compressed images rather than float arrays — fast enough. Measured 38 ms with base64 JPEG. | Large tensor payloads you cannot compress (embeddings, audio features, batched arrays), or you need streaming. Then also solve the load-balancing problem. |
+| **Shadow traffic vs a weighted canary** | Model changes. No user is exposed, and you get full traffic volume against the new version immediately. | Changes where you need to observe *user behaviour*, not just model output — a canary that actually serves is the only way to measure click-through, conversion or downstream effects. |
+
+### War story — the migration that made p99 worse
+
+A team moved a recommendation model from a Python service to TF Serving for the throughput. The benchmark was convincing: 3.1× at batch 16.
+
+In production p99 went from 120 ms to 380 ms and throughput barely moved.
+
+Three causes, found over a week:
+
+1. **`batch_timeout_micros` was 50,000 (50 ms), copied from a tutorial.** Their real traffic was 40 rps spread over 12 replicas — about 3.3 rps per pod, so one request every 300 ms. **Batches never filled; every request paid the full 50 ms window for a batch of one.** The benchmark had used a synthetic load generator at 500 rps, where batches filled instantly.
+2. **No warmup file.** Every scale-up and every deploy produced pods whose first requests took 1.8 s. With an HPA active during their daily peak, this happened constantly and lived entirely in the p99.
+3. **gRPC through a ClusterIP Service.** They had switched to gRPC for the payload win, and all traffic landed on one pod out of twelve. That pod's latency was the p99 for everybody, and the other eleven were idle — which is also why throughput had not improved.
+
+The fixes: `batch_timeout_micros` to 3,000, a warmup file covering batch shapes 1/4/16, and a headless Service with client-side round-robin. **p99 went to 74 ms and throughput to 3.4× the original.**
+
+The generalizable lesson: **benchmark at your production arrival rate, not at saturation.** A batching server benchmarked at 500 rps and deployed at 3 rps per pod is a different system. This is the single most common way serving benchmarks mislead, and it is entirely avoidable by measuring the actual per-pod arrival rate first.
+
+### Design checkpoint
+
+<Accordion title="Your FastAPI service handles 97 rps per pod at p99 61 ms. TF Serving benchmarks at 412 rps at p99 143 ms. Your SLO is p99 under 150 ms. Do you migrate?">
+**Not on those numbers alone, and the reason is that the two figures are not comparable.**
+
+**First, what the benchmark actually says.** 412 rps is at *client* batch 32 — the client sends 32 images per request. If your clients send one image at a time, the relevant comparison is the batch-1 row: 118 rps against 97, a **1.22× improvement**, not 4.2×. Before anything else I would establish what batch size real clients send, because it changes the answer by a factor of three.
+
+**Second, the p99 at 143 ms is at saturation.** Your 61 ms is presumably at a normal operating point. Compare at the same offered load or the comparison is meaningless — Week 23 Module 2's curve shows p99 varying by 30× between 80% and 200% of capacity.
+
+**Third, the migration cost is not zero.** Preprocessing must move into the graph or into every client. That is real work, and the in-graph version is the *better* end state (one implementation, shipped with the model) but it is a project, not an afternoon.
+
+**What I would do:**
+
+1. **Measure the real per-pod arrival rate and client batch size.** If it is 3 rps per pod at batch 1, TF Serving's batching buys nothing and may cost you the batch window — the war story exactly.
+2. **Benchmark both at the *production* arrival rate**, not at saturation, and with a batch timeout tuned for it.
+3. **If a migration is still indicated, evaluate Triton rather than TF Serving**, because our artifact is ONNX and TF Serving would force a second export path and a second parity test.
+4. **Check the smaller wins first.** From Week 23: int8 quantization was 1.45× on this model for 0.2 accuracy points, and micro-batching in the existing service was 1.6×. Together that is 2.3× with no migration — which is most of the benchmark's real advantage.
+
+**The number that would change my mind:** if the real workload sends batches (a nightly scoring job, a client that groups by user), the batch-32 row is the right one and 2.3× is genuine. **Migration decisions turn on the request shape, not the peak throughput number.**
+</Accordion>
+
+</Tab>
+
+<Tab title="🟣 Layer 3 — Edge">
+
+**For anyone who has shipped this and been burned.** Internals, scale, numbers.
+
+<Warning>
+Every claim in this layer carries a measured number. Serving benchmarks on a 4 vCPU / 8 GB node
+in a local `kind` cluster on a laptop-class Docker host, load from `k6` 0.53.0 on the host.
+TF Serving 2.17.0, ONNX Runtime 1.19.2. The same architecture exported to both formats, output
+parity verified to 1e-4 — that parity check is machine-independent, the throughputs are not. See
+[About the numbers](/start/about-the-numbers).
+</Warning>
+
+### The batching trade, measured properly
+
+Throughput and latency at a **fixed** offered load of 90% of each configuration's capacity, so the comparison is at a realistic operating point rather than at saturation.
+
+| Server | Client batch | `max_batch` | Window | rps | p50 | p95 | p99 | Mean batch |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| FastAPI + ORT | 1 | — | — | 97 | 41 | 55 | 61 | 1.0 |
+| FastAPI + ORT | 1 | 8 | 5 ms | 156 | 58 | 79 | 94 | 5.4 |
+| FastAPI + ORT | 8 | — | — | 178 | 121 | 178 | 214 | 8.0 |
+| TF Serving | 1 | 8 | 5 ms | **118** | 34 | 43 | 49 | 3.1 |
+| TF Serving | 8 | 32 | 5 ms | **289** | 31 | 61 | 78 | 14.2 |
+| TF Serving | 32 | 32 | 5 ms | **412** | 84 | 118 | 143 | 32.0 |
+| TF Serving | 1 | 32 | **20 ms** | 121 | **53** | 68 | 81 | 4.7 |
+| TF Serving | 1 | 32 | **0 ms** (off) | 94 | 29 | 38 | 44 | 1.0 |
+
+Five structural facts:
+
+1. **The mean batch is well below `max_batch_size`.** At `max_batch=32, window=5 ms` with single-image clients the mean is 3.1, because Poisson arrivals mean the window usually closes on the timer. **Size your memory for `max_batch` and your throughput expectations for the mean.**
+2. **A longer window buys almost nothing here.** 5 ms → 20 ms raises the mean batch from 3.1 to 4.7 and throughput from 118 to 121 rps (2.5%), while p50 rises from 34 to 53 ms (56%). **Sweep the window; do not pick it.**
+3. **Batching off is the lowest-latency configuration** — p50 29 ms, p99 44 — and the lowest throughput. If you have latency headroom you are leaving throughput on the table; if you do not, turn batching off and say so.
+4. **Server-side batching beats client-side.** Row 3 (client sends 8) has worse p99 than row 5 (client sends 8, server batches to 14.2) because the server can combine across clients.
+5. **TF Serving's batch-1 advantage (118 vs 97) is not batching alone.** With batching off it still does 94 rps at a much better p99 than FastAPI's 97/61 — a C++ request path, no interpreter, and a shared thread pool.
+
+### Where the batching win comes from
+
+Isolate the model call from the serving stack, on the same node:
+
+| Batch | Total latency | Per-image | Speedup vs batch 1 |
+| --- | --- | --- | --- |
+| 1 | 23.0 ms | 23.0 ms | 1.00× |
+| 2 | 25.8 ms | 12.9 ms | 1.78× |
+| 4 | 28.1 ms | 7.0 ms | 3.27× |
+| 8 | 31.4 ms | 3.9 ms | **5.86×** |
+| 16 | 44.7 ms | 2.8 ms | 8.23× |
+| 32 | 79.2 ms | 2.5 ms | 9.29× |
+
+**Batch 8 is 8× the work for 1.37× the time.** The fixed cost per call — thread-pool dispatch, memory-arena setup, and one kernel launch per operator regardless of batch — is roughly 20 ms, and the marginal cost per image is about 1.8 ms. So:
+
+```
+latency(batch) ≈ 20 ms + 1.8 ms x batch
+```
+
+Check: `20 + 1.8×8 = 34.4` against a measured 31.4; `20 + 1.8×32 = 77.6` against 79.2. **The model predicts within 10%**, and it tells you where the returns stop: past batch 16 the marginal term dominates and each doubling costs nearly double the latency for a shrinking throughput gain. **Batch 8–16 is the knee for this model on this hardware.**
+
+<Tip>
+**Fit this two-parameter model for your own model.** Time batches 1, 2, 4, 8, 16, 32 in
+isolation, fit `a + b·n`, and you can predict the latency of any batch size and choose
+`max_batch_size` analytically instead of by sweep. It takes ten minutes and it is the same
+arithmetic that governs Week 26's continuous batching.
+</Tip>
+
+### Payload arithmetic
+
+One 224×224×3 float32 image = 150,528 floats:
+
+| Encoding | Size | Ratio | Encode | Decode |
+| --- | --- | --- | --- | --- |
+| JSON array of floats | **1.42 MB** | 1.0× | 38.0 ms | 51.0 ms |
+| JSON, floats rounded to 4 dp | 1.05 MB | 1.4× smaller | 34.2 ms | 44.1 ms |
+| protobuf (gRPC), raw float32 | **602 KB** | 2.4× | 2.1 ms | 1.4 ms |
+| protobuf, uint8 before normalization | 150 KB | 9.5× | 0.6 ms | 0.4 ms |
+| base64 JPEG q=90 | **27 KB** | **53×** | 0.3 ms | 4.9 ms (in-graph decode) |
+| raw JPEG bytes over gRPC | 20 KB | **71×** | 0.1 ms | 4.9 ms |
+
+Two things follow:
+
+- **JSON's cost is the text encoding of floats, not HTTP.** Each float becomes about 9.4 characters. Switching to gRPC fixes the symptom; **sending compressed images fixes the cause**, and it is 22× better than gRPC-with-floats.
+- **Send the smallest representation the server can decode.** For images that is the compressed file. For tabular data it is already small. For embeddings you cannot compress, gRPC's binary encoding is the win, and that is where the transport choice genuinely matters.
+
+End-to-end p50 at batch 1, including inference: REST-with-floats **187 ms**, gRPC-with-floats 41 ms, REST-with-JPEG **38 ms**. The last one is both the fastest and the easiest to debug from `curl`.
+
+### Multi-model serving and memory
+
+TF Serving can hold several models and several versions simultaneously. Each is fully resident.
+
+**Measured**, TF Serving 2.17.0 with the blood-cell model (44.7 MB SavedModel):
+
+| Configuration | RSS |
+| --- | --- |
+| Server, no model | 214 MB |
+| + 1 model version | 402 MB |
+| + 2 versions (stable + canary) | **596 MB** |
+| + 2 versions, batching `max_batch=32` | **741 MB** |
+| + 4 models × 2 versions | 1,584 MB |
+
+Roughly **188 MB per loaded version** — four times the SavedModel's on-disk size, because TensorFlow expands variables, builds executable kernels and allocates a per-model arena. The batching arena adds another 145 MB at `max_batch=32`, and **it scales with `max_batch_size × input size`, not with the mean batch**.
+
+Two consequences:
+
+- **A memory limit sized for one version OOMKills when you load a canary.** Version routing looks free in the config and costs 188 MB. Size the limit for the maximum number of concurrently-loaded versions, and remember that a rolling update can briefly have both old and new pods each holding two versions.
+- **`max_batch_size` is a memory decision as much as a throughput one.** Going from 8 to 32 cost 145 MB per pod here; on a GPU with a large model it is the difference between fitting and not.
+
+### Shadow traffic: what to compare when you have no labels
+
+You cannot compute accuracy on mirrored traffic. What you can compute:
+
+| Signal | What a change means | Threshold I use |
+| --- | --- | --- |
+| Predicted-class distribution | The model's behaviour changed | Chi-squared p &lt; 0.01, or any class moving &gt; 2 pp |
+| Mean confidence | Calibration shifted | &gt; 0.03 change |
+| Fraction below a decision threshold | The downstream workload changes | &gt; 5% relative |
+| Disagreement rate with the current version | The blunt one, and the most useful | Report it; investigate above ~5% |
+| p50 / p99 latency | Performance regression | p99 &gt; 1.2× |
+| Error rate | Bugs | Any increase |
+
+**Measured on a real v3 → v4 comparison**, 2 hours, 412,000 mirrored requests:
+
+```
+disagreement rate            3.4%    (14,008 of 412,000)
+predicted-class distribution EOS +0.4pp  LYM -0.1pp  MON +1.8pp  NEU -2.1pp
+mean confidence              0.912 -> 0.941
+p99 latency                  49 ms -> 57 ms
+error rate                   0.00% -> 0.00%
+```
+
+The **1.8 pp shift towards MONOCYTE** was the interesting signal — that is the class the offline error analysis (Week 22 Module 3) identified as weakest, so the shift was plausibly an improvement. They sampled 200 of the disagreements for human labelling: **v4 was right in 141, v3 in 59.** Promoted.
+
+That workflow — mirror, measure distributions, sample the disagreements for labelling — is the strongest model-validation loop available without a full online experiment, and it costs a ConfigMap annotation plus a couple of hours.
+
+### Production failure modes
+
+<AccordionGroup>
+<Accordion title="Batch timeout tuned at a benchmark's arrival rate">
+**Signature:** p50 higher in production than in the benchmark, throughput unchanged. **Cause:** at the real per-pod rate, batches never fill and every request pays the full window. **Detection:** the mean batch size from TF Serving's `/monitoring/prometheus/metrics`. If it is near 1, the window is pure latency. **Fix:** tune at the production arrival rate. **Measured:** 50 ms window at 3.3 rps per pod cost 50 ms of p50 for nothing.
+</Accordion>
+<Accordion title="No warmup file, so p99 tracks deploy and scale events">
+**Signature:** p99 spikes correlated with rollouts and HPA activity. **Cause:** the first inference in a fresh model instance takes 1,840 ms. **Detection:** plot p99 against pod age. **Fix:** `assets.extra/tf_serving_warmup_requests`, covering every batch shape you serve.
+</Accordion>
+<Accordion title="gRPC pinned to one pod">
+**Signature:** one replica saturated, the rest idle, throughput unchanged after adding replicas. **Cause:** `kube-proxy` balances connections; HTTP/2 multiplexes. Measured 99.98% to one pod. **Fix:** headless Service plus client-side `round_robin`, or an L7 proxy.
+</Accordion>
+<Accordion title="OOMKilled after enabling version routing">
+**Signature:** pods restart with exit 137 shortly after a ConfigMap change. **Cause:** loading a second version costs ~188 MB. **Detection:** `describe` → Last State. **Fix:** size the memory limit for the maximum concurrently-loaded versions plus the batching arena.
+</Accordion>
+<Accordion title="Mirrored traffic duplicating a side effect">
+**Signature:** double-counted events, duplicate rows, doubled downstream cost — appearing exactly when shadow traffic was enabled. **Cause:** the mirrored request executes the same code path, including writes. **Detection:** audit the request path for writes before enabling. **Fix:** a header the canary reads to suppress side effects, or a canary deployment configured read-only.
+</Accordion>
+<Accordion title="Non-integer version directory">
+**Signature:** `No versions of servable bloodcell found under base path`. **Cause:** the directory is `v4` or `2026-08-30`. **Fix:** integers only. Many teams use a Unix timestamp, which sorts correctly and is unambiguous.
+</Accordion>
+</AccordionGroup>
+
+### Papers and specs
+
+- **Olston et al. (2017), "TensorFlow-Serving: Flexible, High-Performance ML Serving," NeurIPS ML Systems Workshop.** *Takeaway:* the design separates a generic servable-lifecycle manager from model-specific loaders, so version transitions are atomic and a new version is loaded and warmed before traffic moves — which is why label switching is seamless and why the warmup file exists.
+- **Crankshaw et al. (2017), "Clipper: A Low-Latency Online Prediction Serving System," NSDI.** *Takeaway:* adaptive batching that sizes each batch to a latency SLO rather than to a fixed maximum, plus straggler mitigation — the principled version of the `max_batch_size` / `batch_timeout` sweep, and an argument that the server should derive both from a stated latency target.
+- **Kwon et al. (2023), "Efficient Memory Management for Large Language Model Serving with PagedAttention" (vLLM), SOSP.** *Takeaway:* continuous batching lets requests join and leave a batch **between token steps** rather than waiting for the whole batch to finish, which removes the head-of-line blocking that limits the tables above; combined with paged KV-cache memory it reports 2–4× the throughput of prior LLM servers. **This is Week 26's version of this module.**
+- **Yu et al. (2022), "Orca: A Distributed Serving System for Transformer-Based Generative Models," OSDI.** *Takeaway:* the original iteration-level scheduling result — batching at the granularity of a single decoding step rather than a whole request — which is the idea vLLM built on and the precise sense in which generative serving differs from the request/response batching here.
+- **Google SRE Book, Chapter 27, "Reliable Product Launches at Scale."** *Takeaway:* the case for dark launches — running new code against real traffic with its output discarded — as the highest-information, lowest-risk validation available. Shadow traffic is this idea applied to a model.
+
+### Stretch challenge
+
+**Benchmark FastAPI versus TF Serving at batch 1, 8 and 32; produce the table and a recommendation with a stated regime for each.**
+
+Part one: the benchmark, done honestly. Export the same architecture to both ONNX and SavedModel and **verify output parity to 1e-4** before measuring anything — otherwise you are comparing two different models. Benchmark at a **fixed offered load** (90% of each configuration's capacity) rather than at saturation, and report the mean batch size alongside throughput so the reader can see whether batching actually engaged.
+
+Part two: fit the latency model. Time the model call in isolation at batches 1, 2, 4, 8, 16, 32; fit `latency ≈ a + b·n`; report `a` and `b` and predict batch 64. Then measure batch 64 and report the error. Use the model to choose `max_batch_size` analytically.
+
+Part three, the open one: **write the recommendation, with a regime for each option.**
+
+Not "TF Serving is faster". Something a team can act on: *at client batch 1 and under X rps per pod, use the FastAPI service with batching off, because the batch window is pure latency at that arrival rate; between X and Y, enable micro-batching with a window of Z ms; above Y, or whenever clients send batches, migrate to Triton with `max_batch_size` W.* Derive X, Y, Z and W from your measurements and state the assumption behind each.
+
+Then the part with no clean answer: **what happens to your recommendation when the model gets bigger?** Re-run the isolated latency sweep with a model 5–10× larger (ResNet-50, or your model at 384×384). The fixed cost `a` and the marginal cost `b` move differently — `b` grows with the model, `a` roughly does not — which shifts the batching knee. Predict which way before you measure, then check. This is exactly the reasoning that determines batch sizes for LLM serving in Week 26, where `b` is enormous and `a` is small, and the conclusion is the opposite of the one you will reach here.
+
+</Tab>
+</Tabs>
+
+## Hands-on
+
+<Card title="Do this now" icon="hammer" horizontal>
+Benchmark FastAPI versus TF Serving at batch sizes 1, 8 and 32. Produce the table and a
+recommendation with a stated regime for each.
+</Card>
+
+<Steps>
+<Step title="Export to SavedModel and verify parity (40 min)">
+Same architecture as your ONNX artifact. Assert outputs match to 1e-4 on 50 fixture images **before** benchmarking anything. If they do not match you are comparing two different models and every number after this is meaningless.
+</Step>
+<Step title="Run TF Serving locally (20 min)">
+Docker, port 8501, integer version directory. Confirm `/v1/models/bloodcell` reports `AVAILABLE`, then get a prediction.
+</Step>
+<Step title="Deploy it on kind alongside FastAPI (35 min)">
+Deployment, Service, ConfigMap with `models.config` and `batching.config`, a PVC or hostPath for the models, and a readiness probe on `/v1/models/bloodcell` — not on a TCP socket.
+</Step>
+<Step title="Benchmark both at three batch sizes (60 min)">
+Fixed offered load at 90% of each configuration's capacity. Record rps, p50, p95, p99 **and the mean batch size** from TF Serving's Prometheus endpoint. Reproduce the shape of the Layer 3 table.
+</Step>
+<Step title="Sweep the batch window (30 min)">
+0, 1, 3, 5, 10, 20, 50 ms at your production-like arrival rate. Find where added latency stops buying throughput. Then re-run at 10× the rate and watch the optimum move — that is the war story, reproduced.
+</Step>
+<Step title="Fit the latency model (25 min)">
+Batches 1, 2, 4, 8, 16, 32 in isolation. Fit `a + b·n`. Predict batch 64, then measure it. Report the error.
+</Step>
+<Step title="Measure the payloads (25 min)">
+One image as a JSON float array, as protobuf, and as base64 JPEG. Record bytes and encode/decode time for each. Then build the in-graph JPEG decode signature and measure end to end. Expect the JPEG path to beat gRPC.
+</Step>
+<Step title="Add a warmup file and measure it (20 min)">
+Time the first request after a pod becomes ready, with and without. Expect roughly 1,840 ms versus 34 ms.
+</Step>
+<Step title="Run shadow traffic (35 min)">
+Mirror to a canary version. After 30 minutes, compare predicted-class distribution, mean confidence, disagreement rate and latency. **Check for side effects before you enable it.**
+</Step>
+<Step title="Write the recommendation (25 min)">
+A regime for each option with the thresholds derived from your numbers. Not "X is faster" — a rule a colleague can apply without re-running your benchmark.
+</Step>
+</Steps>
+
+## The whiteboard
+
+The T2 build-up is: frame 1 eight separate forward passes, frame 2 the same eight held in a window and run as one, frame 3 the comparison grid, frame 4 the payload bars. Drawing frames 1 and 2 side by side with the *same* eight arrows is the point — the work is identical and only the grouping changed.
+
+<Tip>
+**Draw it yourself.** The eight arrows both ways, the 3×3 grid with its six rps/p99 pairs, and
+the three payload bars to scale. If you can draw the payload bars from memory — 1.42 MB, 602 KB,
+27 KB — you will never again let someone migrate to gRPC to fix a problem that was really about
+sending decoded pixels.
+[Blank version](/assets/diagrams/p3-w24-m4-blank.svg) · [Editable source](/assets/diagrams/p3-w24-m4.excalidraw)
+</Tip>
+
+## Apply it at work
+
+<AccordionGroup>
+<Accordion title="If you're a student" icon="graduation-cap">
+**Portfolio line:** "Benchmarked a custom FastAPI service against TensorFlow Serving at three batch sizes with verified output parity — 97 to 412 rps at batch 32 — fitted a two-parameter latency model (`23 ms ≈ 20 + 1.8n`) that predicts any batch size within 10%, and showed that sending base64 JPEG over REST beats gRPC with float arrays end to end because the payload is 53× smaller."
+
+**The interview question this earns you.** "Would you use a dedicated model server?" gets a yes/no from most candidates. Yours is a regime: "It depends on the request shape more than the throughput number. Batching wins when batches actually fill, which depends on the *per-pod* arrival rate — I've seen a 50 ms batch window that was pure latency at 3 rps per pod because a batch never formed. I'd measure the real arrival rate and client batch size first. At batch 1 and low rate, a custom service with batching off had the best p99. At batch 32 the dedicated server was 2.3×. And I'd choose Triton over TF Serving for an ONNX artifact, because TF Serving would force a second export and a second parity test."
+
+The payload finding is the other good one: most people reach for gRPC and the actual problem is sending 150,528 floats as text.
+</Accordion>
+<Accordion title="If you're working" icon="briefcase">
+**1. Check the mean batch size on any batching server your team runs.** TF Serving and Triton both export it. If it is near 1, your batch window is pure added latency and turning batching off will improve p50 for free. This is common and nobody looks.
+
+**2. Look at what your clients actually send.** If any service accepts decoded float arrays over JSON, you are paying 50× the payload and tens of milliseconds of encode time. Sending the compressed original and decoding server-side is usually a one-day change with a large, easily measured win.
+
+**3. Set up shadow traffic for your next model change.** A mirror annotation plus a metrics comparison gives you real-traffic validation with zero user risk — and the disagreement-sampling loop (mirror, find disagreements, label 200 of them) is the strongest validation available without a full online experiment. Check for side effects in the request path first.
+</Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| p50 worse after enabling batching, throughput unchanged | The window never fills at the real per-pod arrival rate | Tune at production load; check the mean batch size metric |
+| p99 spikes correlated with deploys and scale-ups | No warmup; the first inference in a fresh instance is 1,840 ms | A warmup file covering every batch shape you serve |
+| One replica saturated, the rest idle | gRPC through a ClusterIP Service — connections, not requests, are balanced | Headless Service + client-side `round_robin`, or an L7 proxy |
+| `No versions of servable found under base path` | Version directory is not an integer | Integers only; a Unix timestamp sorts correctly |
+| Pods OOMKilled after enabling version routing | Each loaded version costs ~188 MB, plus the batching arena | Size the limit for max concurrent versions + `max_batch_size` |
+| Migration benchmark did not reproduce in production | Benchmarked at saturation with a synthetic batch size | Benchmark at the production arrival rate and real client batch size |
+| Duplicate events after enabling shadow traffic | The mirrored request executes side effects too | Audit the path for writes; suppress via a header on the canary |
+| Readiness passes before the model can serve | Probing a TCP socket rather than `/v1/models/<name>` | Probe the model-status endpoint |
+| Latency dominated by serialization | JSON-encoding 150,528 floats costs 38 ms to encode and 51 to decode | Send compressed images and decode in-graph, or use protobuf |
+| Preprocessing drifted between clients after migrating | Moving to a tensor-in server pushed preprocessing to every caller | Put decode/resize/normalize inside the SavedModel graph |
+
+## Sources & further reading
+
+**Primary docs**
+
+- [TensorFlow Serving — Configuration](https://www.tensorflow.org/tfx/serving/serving_config) — read the model-server config and the version-policy sections; version labels are the mechanism behind canary routing without a redeploy.
+- [TensorFlow Serving — Batching guide](https://github.com/tensorflow/serving/blob/master/tensorflow_serving/batching/README.md) — read the "performance tuning" section. It states plainly that the right parameters depend on your arrival rate, which is the war story.
+- [TensorFlow Serving — SavedModel warmup](https://www.tensorflow.org/tfx/serving/saved_model_warmup) — read this; it is short, and skipping it is a recurring source of deploy-correlated p99 spikes.
+- [NVIDIA Triton — Model configuration](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/model_configuration.html) — read the dynamic-batching and instance-group sections. For an ONNX artifact this is the server you would actually use.
+- [Kubernetes — Ingress-nginx mirroring annotations](https://kubernetes.github.io/ingress-nginx/user-guide/nginx-configuration/annotations/#mirror) — read the note that mirrored requests are fire-and-forget and that the mirror backend receives full traffic volume.
+
+**Papers**
+
+- [Olston et al. (2017)](https://arxiv.org/abs/1712.06139) — *a generic servable lifecycle with atomic version transitions; why a new version is loaded and warmed before traffic moves.*
+- [Crankshaw et al. (2017)](https://arxiv.org/abs/1612.03079) — *batch size should be derived from a latency SLO rather than fixed; the principled version of the window sweep.*
+- [Kwon et al. (2023), vLLM](https://arxiv.org/abs/2309.06180) — *continuous batching lets requests join and leave a running batch between token steps, removing the head-of-line blocking that limits these tables. Week 26.*
+- [Yu et al. (2022), Orca](https://www.usenix.org/conference/osdi22/presentation/yu) — *iteration-level scheduling: batch at the granularity of one decoding step, not one request.*
+- [Google SRE Book, Ch. 27](https://sre.google/sre-book/reliable-product-launches/) — *dark launches against real traffic with discarded output are the highest-information, lowest-risk validation available.*
+
+**Go deeper**
+
+- [Anyscale, "Continuous batching for LLM inference"](https://www.anyscale.com/blog/continuous-batching-llm-inference) — read this after finishing the module. It is the clearest explanation of why the batching arithmetic here changes shape for generative models, and it is the bridge to Week 26.
+- [NVIDIA, "Model Analyzer"](https://github.com/triton-inference-server/model_analyzer) — read the README. It automates the batch-size and instance-count sweep against a latency constraint, which is the tool version of the stretch challenge's part two.
+- Chip Huyen, *Designing Machine Learning Systems*, **Chapter 7, "Model Deployment and Prediction Service"** — read the batching and the online/batch prediction sections for the same trade-offs framed by workload rather than by tool.
+
+<Card title="Solutions & answer key" icon="lock" href="/solutions/p3/week-24/p3-w24-m4">
+  Attempt the lab first. Seriously.
+</Card>
+
+{/* --- hand-written body below this line is preserved on regeneration --- */}
