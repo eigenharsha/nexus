@@ -37,6 +37,15 @@ PHASE_TITLES = {
     "P3": "Phase 3 · Machine Learning",
     "P4": "Phase 4 · Generative AI",
 }
+# Extra pages inserted at the front of a week, ahead of its modules.
+# Weeks 11-12 use NumPy on nearly every page but NumPy is not taught until
+# week 16 - a real ordering fault found in a beginner read-through. Rather than
+# reorder two phases, the week opens with a scoped primer.
+PRIMERS = {
+    11: ["curriculum/p2/week-11/0-numpy-in-20-minutes"],
+    16: ["curriculum/p2/week-16/0-scikit-learn-just-enough"],
+}
+
 # Weeks released to the cohort. Everything after this is a hidden group.
 RELEASED_THROUGH_WEEK = 32
 
@@ -388,7 +397,7 @@ def main() -> None:
     for w in all_weeks:
         ph, n = w["phase"], w["num"]
         base = f"curriculum/{ph.lower()}/week-{n:02d}"
-        pages = [f"{base}/index"]
+        pages = [f"{base}/index"] + PRIMERS.get(n, [])
         for i, m in enumerate(w["modules"], 1):
             rel = f"{base}/{i}-{slug(m['title'])}"
             pages.append(rel)

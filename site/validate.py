@@ -127,7 +127,10 @@ def main() -> int:
             if not (SITE / src.lstrip("/")).exists():
                 warns.append(f"{rel}: missing image {src}")
 
-        if rel.parts[0] == "curriculum" and rel.stem not in ("index", "lab"):
+        # Pages numbered 0- are primers: a scoped prerequisite bridge, not a
+        # three-layer module, so the layer/sources contract does not apply.
+        is_primer = rel.stem.startswith("0-")
+        if rel.parts[0] == "curriculum" and rel.stem not in ("index", "lab") and not is_primer:
             if "{/* AUTHORED */}" not in raw:
                 warns.append(f"{rel}: still a generated shell (no AUTHORED marker)")
             else:
