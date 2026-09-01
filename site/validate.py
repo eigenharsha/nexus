@@ -135,7 +135,10 @@ def main() -> int:
 
         # Pages numbered 0- are primers: a scoped prerequisite bridge, not a
         # three-layer module, so the layer/sources contract does not apply.
-        is_primer = rel.stem.startswith("0-")
+        # 0- pages are primers (a prerequisite bridge); 6-and-above are
+        # supplements added after the syllabus was written. Neither is a
+        # three-layer module, so the layer/sources contract does not apply.
+        is_primer = rel.stem.startswith("0-") or re.match(r"[6-9]-", rel.stem)
         if rel.parts[0] == "curriculum" and rel.stem not in ("index", "lab") and not is_primer:
             if "{/* AUTHORED */}" not in raw:
                 warns.append(f"{rel}: still a generated shell (no AUTHORED marker)")

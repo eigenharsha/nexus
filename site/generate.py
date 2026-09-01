@@ -46,6 +46,12 @@ PRIMERS = {
     16: ["curriculum/p2/week-16/0-scikit-learn-just-enough"],
 }
 
+# Extra module pages appended after a week's five modules. Week 25 gained one
+# in a Phase 4 coverage review: the 2025-26 reasoning-model shift (adaptive
+# thinking, effort, task budgets, context editing) was absent from a course that
+# teaches LLM engineering, and it changes cost, prompting and agent design.
+EXTRAS = {25: ["curriculum/p4/week-25/6-reasoning-effort-and-thinking-budgets"]}
+
 # Weeks released to the cohort. Everything after this is a hidden group.
 RELEASED_THROUGH_WEEK = 32
 
@@ -402,6 +408,7 @@ def main() -> None:
             rel = f"{base}/{i}-{slug(m['title'])}"
             pages.append(rel)
             write(SITE / f"{rel}.mdx", module_page(w, m, i))
+        pages += EXTRAS.get(n, [])
         if w["lab"]:
             pages.append(f"{base}/lab")
             write(SITE / f"{base}/lab.mdx", lab_page(w))

@@ -1,0 +1,255 @@
+---
+title: "Reasoning models, effort & thinking budgets"
+description: "Models that think before they answer — and the four dials that decide what that costs you."
+icon: "brain-circuit"
+---
+{/* AUTHORED */}
+
+<Note>
+**Added after a Phase 4 coverage review.** Modules 1–5 build a Transformer and teach generation as
+one token after another. That is still exactly what happens — but since 2025 the frontier models
+spend a variable amount of that generation on *reasoning before answering*, and the API exposes
+dials for it. Those dials change cost, latency, prompting and agent design, so they belong here,
+right after the inference-cost model in Module 5.
+</Note>
+
+## The one idea
+
+A reasoning model produces two kinds of output: **thinking tokens**, which work the problem, and
+**response tokens**, which answer it. You are billed for both. You usually cannot read the thinking.
+
+Everything else on this page is a consequence of that sentence.
+
+Module 5 gave you the cost model: prefill is compute-bound, decode is memory-bandwidth-bound, and
+you pay per token. Reasoning does not change that model — it changes the **token count**, and it
+changes it by an amount the model itself decides. A hard question might spend 4,000 tokens thinking
+and 200 answering. An easy one spends almost none.
+
+<Warning>
+**The stale pattern.** Older code sets a fixed thinking budget:
+
+```python
+thinking={"type": "enabled", "budget_tokens": 8000}     # deprecated
+```
+
+On current models (Opus 5, Sonnet 5, Fable 5, Opus 4.7/4.8) this is **rejected with a 400**. The
+fixed-budget idea has been replaced by adaptive thinking plus an effort setting. If you have read a
+tutorial written before 2026, this is the line that will be wrong.
+</Warning>
+
+## Dial 1 — adaptive thinking
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic()
+response = client.messages.create(
+    model="claude-opus-5",
+    max_tokens=16000,
+    thinking={"type": "adaptive"},
+    messages=[{"role": "user", "content": "..."}],
+)
+```
+
+`adaptive` means **the model decides how much to think, per request**. You are not budgeting; you
+are delegating the budget. That is the right default for anything non-trivial.
+
+On Opus 5 thinking is on by default, so omitting the parameter gives you adaptive anyway. On Opus
+4.8 and 4.7, omitting it means *no thinking at all* — a difference that has quietly cost people
+quality when they moved code between models.
+
+**Seeing the reasoning.** By default the thinking blocks come back empty:
+
+```python
+thinking={"type": "adaptive", "display": "summarized"}   # readable summary
+```
+
+The default is `"omitted"`. If you stream to a user, the default looks like a long pause before
+anything appears — set `summarized` explicitly when a human is watching. The raw chain of thought
+is never returned on any model; `display` changes visibility, not billing.
+
+## Dial 2 — effort
+
+```python
+response = client.messages.create(
+    model="claude-opus-5",
+    max_tokens=16000,
+    thinking={"type": "adaptive"},
+    output_config={"effort": "medium"},        # low | medium | high | xhigh | max
+    messages=[...],
+)
+```
+
+Effort is how hard it tries: thinking depth and overall token spend, within one model. Default is
+`high`. Note it lives **inside `output_config`**, not at the top level — a mistake that fails
+quietly by being ignored.
+
+| Effort | Use it for |
+| --- | --- |
+| `low` | Classification, extraction, routing, sub-agents — anything mechanical |
+| `medium` | The cost-saving step down, where quality visibly holds |
+| `high` | The default. Intelligence-sensitive work |
+| `xhigh` | Coding and long-horizon agentic work — the sweet spot for those, and Claude Code's default |
+| `max` | Correctness matters more than cost, and you have *measured* headroom at the level below |
+
+**The important non-obvious result:** lower effort on a newer model often beats higher effort on an
+older one. Before you build a cost cascade that routes easy requests to a cheaper model, measure the
+simpler thing first — the capable model at `low` or `medium`. One model means one cache namespace;
+a cascade forfeits cache reuse across its models, and caches are model-scoped.
+
+<Tip>
+**Judge cost per completed task, not per request.** Week 32 makes this the whole lesson. A cheaper
+request that needs two more turns to finish the job is not cheaper. Effort is the first
+quality-trading lever you reach for — but only *after* the free wins: caching, input hygiene, and
+not re-sending what you do not need.
+</Tip>
+
+## Dial 3 — task budgets, for agents
+
+Week 30 has you build budget guards by hand: count tokens in graph state, check at every node, fail
+loudly at the limit. That is still correct, and you should still do it — your guard is the hard
+ceiling.
+
+But there is a softer, complementary mechanism. A **task budget** tells the model its own ceiling so
+it *paces itself* and finishes gracefully, rather than being cut off mid-thought:
+
+```python
+with client.beta.messages.stream(
+    model="claude-opus-5",
+    max_tokens=128000,
+    output_config={
+        "effort": "high",
+        "task_budget": {"type": "tokens", "total": 64000},
+    },
+    betas=["task-budgets-2026-03-13"],
+    messages=[...],
+    tools=[...],
+) as stream:
+    response = stream.get_final_message()
+```
+
+The distinction is worth holding clearly:
+
+| | What it is | Model aware of it? |
+| --- | --- | --- |
+| `max_tokens` | Hard per-response ceiling | No — it just stops |
+| `task_budget` | Advisory ceiling for the whole agentic task | **Yes** — it paces against a countdown |
+| Your own guard (Week 30) | Enforced ceiling in your loop | It is your code; enforce it regardless |
+
+Minimum `total` is 20,000. Use streaming — a large `max_tokens` on a non-streaming request will hit
+HTTP timeouts. And the budget counts what the model generates plus the tool results it reads this
+turn, **not** the full history you resend.
+
+## Dial 4 — what to do when context fills up
+
+Week 29 Module 3 treats the context window as a budget and has you summarize by hand. Two
+server-side mechanisms now do related jobs, and they are **not** the same thing:
+
+| Mechanism | What it does | Beta flag |
+| --- | --- | --- |
+| **Compaction** | *Summarizes* earlier context when it nears a threshold (default 150K tokens) | `compact-2026-01-12` |
+| **Context editing** | *Clears* old tool results or thinking blocks outright | `context-management-2025-06-27` |
+
+```python
+# clearing - throws old tool results away
+client.beta.messages.create(
+    model="claude-opus-5", max_tokens=4096,
+    betas=["context-management-2025-06-27"],
+    context_management={"edits": [{"type": "clear_tool_uses_20250919"}]},
+    tools=[...], messages=[...],
+)
+```
+
+Summarize when the *content* still matters and only its length is the problem. Clear when the
+content is genuinely spent — a directory listing from forty tool calls ago is not worth summarizing.
+
+<Warning>
+**The compaction trap.** Append the whole `response.content` back to your messages each turn, not
+just the extracted text. The compaction blocks in the response are what the API uses to replace the
+compacted history next time. Pull out `.text` and append that, and you silently lose the compaction
+state — the conversation keeps growing and you never find out why.
+</Warning>
+
+## A fifth thing, which fixes a problem Week 29 measures
+
+Week 29 Module 2 measures tool-selection accuracy falling as the tool count rises. The platform now
+has a first-class answer: **tool search**. Mark most tools `defer_loading: true` so they are not in
+the context at all, and give the model a search tool to find them:
+
+```python
+tools=[
+    {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"},
+    {"name": "get_weather", "description": "...", "input_schema": {...},
+     "defer_loading": True},
+    # ...dozens more, all deferred
+]
+```
+
+The measurement in Week 29 stands and is worth doing — it teaches you *why* long tool lists degrade.
+This is the fix that follows from it.
+
+<Warning>
+**Never defer everything.** The search tool itself must not be deferred, and at least one ordinary
+tool must stay loaded, or the API returns `400 All tools have defer_loading set`.
+</Warning>
+
+## What this changes about prompting
+
+Prompts written for pre-reasoning models are often **too prescriptive** — they walk the model
+through steps it would now work out better on its own, and that reduces output quality rather than
+improving it.
+
+Three practical consequences:
+
+1. **State the task and the constraints; stop scripting the method.** "Think step by step" is
+   largely obsolete on a model that already does.
+2. **Give long-horizon agentic tasks the full spec up front**, at `high` or `xhigh` effort. Drip-fed
+   instructions waste the reasoning.
+3. **Assistant prefill is gone.** It returns a 400 on current models. Use structured outputs
+   (`output_config.format`) to control response shape — which is the Week 26 Module 4 technique,
+   and now the only way.
+
+## Check yourself
+
+<AccordionGroup>
+<Accordion title="1. Why is `budget_tokens` gone rather than just discouraged?">
+Because a fixed budget is the wrong shape for the problem. It forces you to guess a number before
+seeing the question, and the right number varies enormously between an easy request and a hard one.
+Adaptive thinking lets the model spend what the request needs; `effort` biases that spending up or
+down. On current models the old parameter returns a 400 rather than being silently ignored, which is
+the kinder failure.
+</Accordion>
+
+<Accordion title="2. You are running a high-volume classifier. Which dials, and why?">
+`effort: "low"`, adaptive thinking left on, and caching before either. Classification is mechanical
+and does not repay deep reasoning, so `low` is not a compromise here — it is the right setting.
+Reach for a cheaper model only after measuring `low` on the capable one, because switching models
+forfeits your cache namespace.
+</Accordion>
+
+<Accordion title="3. Your agent keeps getting cut off mid-task. max_tokens, task_budget, or your own guard?">
+All three do different jobs. Raise `max_tokens` if responses are truncating mid-sentence. Add a
+`task_budget` so the model paces itself across the whole task and lands gracefully. Keep your own
+guard regardless — it is the only one that is actually enforced in your loop, and Week 30's
+crash-and-resume work depends on it.
+</Accordion>
+
+<Accordion title="4. When would you clear context rather than compact it?">
+When the content is spent rather than merely long. Forty stale tool results — directory listings,
+intermediate lookups — are worth deleting outright; summarizing them wastes tokens preserving
+something nobody will read. Compact when the substance still matters and only the length is the
+problem.
+</Accordion>
+</AccordionGroup>
+
+## Sources & further reading
+
+**Primary docs**
+
+- [Anthropic — extended thinking](https://docs.claude.com/en/docs/build-with-claude/extended-thinking). Read this for the current `thinking` parameter shapes and the per-model differences in what omitting it means.
+- [Anthropic — context editing and compaction](https://docs.claude.com/en/docs/build-with-claude/context-editing). Read this for which strategy clears and which summarizes, and the beta flags each needs.
+- [Anthropic — tool use](https://docs.claude.com/en/docs/agents-and-tools/tool-use/overview). Read this for tool search and `defer_loading`, and the rule that at least one tool must stay loaded.
+
+**Go deeper**
+
+- [Anthropic — Building Effective Agents](https://www.anthropic.com/research/building-effective-agents). Read this for the workflow-versus-agent decision that Week 29 Module 1 argues arithmetically; reasoning models move the line but do not remove it.
