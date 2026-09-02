@@ -30,6 +30,40 @@ ROOT = Path(__file__).resolve().parent.parent
 SITE = ROOT / "site"
 OUT = ROOT / "publish" / "docs"
 
+ICONS = {
+    "play": ":material-play-circle:{ .lg .middle } ",
+    "users": ":material-account-group:{ .lg .middle } ",
+    "layers": ":material-layers-triple:{ .lg .middle } ",
+    "terminal": ":material-console:{ .lg .middle } ",
+    "compass": ":material-compass:{ .lg .middle } ",
+    "map": ":material-map:{ .lg .middle } ",
+    "brain": ":material-brain:{ .lg .middle } ",
+    "code": ":material-code-tags:{ .lg .middle } ",
+    "cpu": ":material-chip:{ .lg .middle } ",
+    "sparkles": ":material-auto-fix:{ .lg .middle } ",
+    "flask-conical": ":material-flask:{ .lg .middle } ",
+    "hammer": ":material-hammer-wrench:{ .lg .middle } ",
+    "seedling": ":material-sprout:{ .lg .middle } ",
+    "mountain": ":material-image-filter-hdr:{ .lg .middle } ",
+    "graduation-cap": ":material-school:{ .lg .middle } ",
+    "briefcase": ":material-briefcase:{ .lg .middle } ",
+    "lock": ":material-lock:{ .lg .middle } ",
+    "circle-check": ":material-check-circle:{ .lg .middle } ",
+    "trophy": ":material-trophy:{ .lg .middle } ",
+    "flag": ":material-flag:{ .lg .middle } ",
+    "book-a": ":material-book-alphabet:{ .lg .middle } ",
+    "wrench": ":material-wrench:{ .lg .middle } ",
+    "pen-line": ":material-pencil:{ .lg .middle } ",
+    "scroll": ":material-script-text:{ .lg .middle } ",
+    "ruler": ":material-ruler:{ .lg .middle } ",
+    "calendar": ":material-calendar:{ .lg .middle } ",
+    "file-text": ":material-file-document:{ .lg .middle } ",
+    "gauge": ":material-gauge:{ .lg .middle } ",
+    "sigma": ":material-sigma:{ .lg .middle } ",
+    "quote": ":material-format-quote-close:{ .lg .middle } ",
+    "book-open": ":material-book-open-variant:{ .lg .middle } ",
+}
+
 ADMONITION = {"Note": "note", "Tip": "tip", "Info": "info", "Check": "success",
               "Warning": "warning"}
 
@@ -99,7 +133,19 @@ def convert_block(body: str) -> str:
         body = new
 
     # Wrappers carry no output of their own
-    for w in ("Tabs", "Steps", "AccordionGroup", "CardGroup", "Columns"):
+    # A CardGroup is a real grid in Material; it needs the wrapper class and a
+    # blank line, not simple deletion.
+    body = re.sub(r"<(?:CardGroup|Columns)[^>]*>", '\n<div class="grid cards" markdown>\n', body)
+    body = re.sub(r"</(?:CardGroup|Columns)>", "\n</div>\n", body)
+
+    # Grid card items must start at column 0 inside the wrapper; JSX left them
+    # indented, which Markdown reads as a nested list and the grid never forms.
+    def degrid(m: re.Match) -> str:
+        return '<div class="grid cards" markdown>\n\n' + dedent(m.group(1)).strip() + "\n\n</div>"
+
+    body = re.sub(r'<div class="grid cards" markdown>\n(.*?)\n</div>',
+                  degrid, body, flags=re.S)
+    for w in ("Tabs", "Steps", "AccordionGroup"):
         body = re.sub(rf"</?{w}[^>]*>", "", body)
 
     body = re.sub(r"\{/\*.*?\*/\}", "", body, flags=re.S)      # MDX comments
@@ -136,9 +182,12 @@ def _replace(m: re.Match) -> str:
         return out(f"\n**{title}**\n\n{inner}\n")
     if tag == "Card":
         href = attr(full, "href")
+        icon = ICONS.get(attr(full, "icon"), "")
         label = title or "Open"
-        link = f"[{label}]({href})" if href else f"**{label}**"
-        return out(f"\n- {link} — {inner}\n" if inner else f"\n- {link}\n")
+        head = f"[{label}]({href})" if href else label
+        body = f"\n\n    {inner}" if inner else ""
+        return out(f"\n-   {icon}{'**' if not href else ''}{head}"
+                   f"{'**' if not href else ''}{body}\n")
     return inner
 
 
@@ -223,7 +272,12 @@ def convert_page(src: Path) -> tuple[str, str]:
 
 
 def collect(nav) -> list:
-    """Flatten docs.json navigation into a MkDocs nav tree."""
+    """Turn docs.json navigation into a MkDocs nav tree.
+
+    The tab level is kept: Material renders top-level nav entries as tabs, so
+    preserving "Start here / Phase 1 / ... / Reference" reproduces Mintlify's
+    top bar rather than promoting every week group into it.
+    """
     out = []
     if isinstance(nav, dict):
         if "pages" in nav:
