@@ -172,7 +172,10 @@ def _replace(m: re.Match) -> str:
     title = attr(full, "title")
 
     if tag in ADMONITION:
-        head = f'!!! {ADMONITION[tag]}' + (f' "{title}"' if title else "")
+        # Mintlify callouts show an icon and the content, with no "Note" /
+        # "Info" label. An empty title suppresses Material's heading row while
+        # keeping the icon and the colour.
+        head = f'!!! {ADMONITION[tag]}' + (f' "{title}"' if title else ' ""')
         return out(f"\n{head}\n\n{indent(inner)}\n")
     if tag == "Accordion":
         return out(f'\n??? note "{title or "Details"}"\n\n{indent(inner)}\n')
@@ -267,7 +270,13 @@ def convert_page(src: Path) -> tuple[str, str]:
     fm, _, body = raw[3:].partition("---") if raw.startswith("---") else ("", "", raw)
     title = (re.search(r'title:\s*"?(.*?)"?\s*$', fm, re.M) or [None, src.stem])[1]
     title = title.replace('\\"', '"')
-    md = f"# {title}\n\n{normalise_blocks(convert_block(body)).lstrip()}"
+    # Mintlify renders the frontmatter description as a subtitle under the h1.
+    # Without it the page jumps straight from title to body and reads denser
+    # than the original.
+    desc = (re.search(r'description:\s*"?(.*?)"?\s*$', fm, re.M) or [None, ""])[1]
+    desc = desc.replace('\\"', '"').strip()
+    sub = f'<p class="page-subtitle">{desc}</p>\n\n' if desc else ""
+    md = f"# {title}\n\n{sub}{normalise_blocks(convert_block(body)).lstrip()}"
     return title, md
 
 
@@ -310,6 +319,10 @@ def main() -> None:
         _, md = convert_page(src)
         dst.write_text(relativise(md, rel))
         n += 1
+
+    css = ROOT / "publish" / "overrides" / "stylesheets"
+    if css.exists():
+        shutil.copytree(css, OUT / "stylesheets", dirs_exist_ok=True)
 
     assets = SITE / "assets"
     if assets.exists():
