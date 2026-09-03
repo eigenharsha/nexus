@@ -212,6 +212,8 @@ def main() -> None:
         if desc:
             head += f'description: "{esc(desc)}"\n'
         head += "---\n\n"
+        # The subtitle is rendered by src/components/PageTitle.astro, which
+        # also adds the breadcrumb, so it must not be duplicated in the body.
         dst.write_text(head + body)
         n += 1
 

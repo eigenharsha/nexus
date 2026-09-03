@@ -2121,6 +2121,10 @@ export default defineConfig({
     title: 'Nexus',
     description: 'Systems, Machine Learning & Distributed AI — 0 to expert in 32 weeks.',
     customCss: ['./src/styles/nexus.css'],
+    components: {
+      Header: './src/components/Header.astro',
+      PageTitle: './src/components/PageTitle.astro',
+    },
     sidebar,
     pagination: true,
     lastUpdated: false,
