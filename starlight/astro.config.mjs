@@ -2124,6 +2124,7 @@ export default defineConfig({
     components: {
       Header: './src/components/Header.astro',
       PageTitle: './src/components/PageTitle.astro',
+      Sidebar: './src/components/Sidebar.astro',
     },
     sidebar,
     pagination: true,

@@ -114,16 +114,24 @@ def transform(body: str) -> str:
 
 
 def frames(body: str) -> str:
-    """A Frame holds a light and a dark <img> switched by Tailwind classes
-    Mintlify understands. Starlight has no equivalent, so keep the light one and
-    let the theme's own dark mode handle contrast."""
+    """A Frame holds a light and a dark <img>, switched by Tailwind classes
+    Mintlify understands and Starlight does not.
+
+    Dropping the dark one and keeping the light leaves a hand-drawn sketch on
+    #fffdf7 paper glowing white in the middle of a dark page - the single worst
+    thing on the page. Emit both and switch them with the theme instead."""
     def one(m: re.Match) -> str:
         inner = m.group(1)
         imgs = re.findall(r'<img[^>]*src="([^"]+)"[^>]*alt="([^"]*)"', inner)
         if not imgs:
             return inner
         light = next((u for u, _ in imgs if "-dark" not in u), imgs[0][0])
-        return f'\n![{imgs[0][1]}]({light})\n'
+        dark = next((u for u, _ in imgs if "-dark" in u), None)
+        alt = imgs[0][1].replace('"', "&quot;")
+        out = f'\n<img src="{light}" alt="{alt}" class="diagram diagram-light" />\n'
+        if dark:
+            out += f'<img src="{dark}" alt="{alt}" class="diagram diagram-dark" />\n'
+        return out
     return re.sub(r"<Frame[^>]*>(.*?)</Frame>", one, body, flags=re.S)
 
 
