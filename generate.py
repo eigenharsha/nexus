@@ -15,9 +15,9 @@ from __future__ import annotations
 import json, re, sys, unicodedata
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent
 TASKS = ROOT / "PLAN" / "tasks"
-SITE = ROOT / "site"
+SITE = ROOT
 
 BODY_MARKER = "{/* --- hand-written body below this line is preserved on regeneration --- */}"
 # A page containing this marker is owned by a human/agent author and is never regenerated.

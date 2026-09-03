@@ -169,7 +169,7 @@ unfinished — a dangling dashed arrow into the exercise.
 ## Running it
 
 ```bash
-python3 tools/sketch.py my-spec.json site/assets/diagrams/   # one spec -> 3 SVGs
+python3 tools/sketch.py my-spec.json assets/diagrams/   # one spec -> 3 SVGs
 python3 tools/sketch.py --selftest                           # renders + checks XML/size
 python3 tools/build_diagrams.py                              # the whole course
 ```

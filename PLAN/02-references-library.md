@@ -1,6 +1,6 @@
 # Nexus — Reference & Paper Library
 
-**Canonical location:** `site/reference/papers.mdx` — that file is the published library and the
+**Canonical location:** `reference/papers.mdx` — that file is the published library and the
 one to edit. This page holds the *rules* for what goes in it.
 
 ## What qualifies

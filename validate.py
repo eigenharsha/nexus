@@ -19,6 +19,11 @@ from collections import Counter
 from pathlib import Path
 
 SITE = Path(__file__).resolve().parent
+
+EXCLUDE = {"starlight", "_site", "publish", "node_modules", ".venv", ".tmp", ".git", "templates", "evidence", "tools", "PLAN"}
+
+def site_pages(root):
+    return [p for p in root.rglob("*.mdx") if not (set(p.relative_to(root).parts[:-1]) & EXCLUDE)]
 PAIRED = ["Note", "Warning", "Tip", "Info", "Check", "Card", "CardGroup", "Accordion",
           "AccordionGroup", "Steps", "Step", "Tabs", "Tab", "Frame", "CodeGroup",
           "Expandable", "Columns", "Update"]
@@ -62,11 +67,11 @@ def main() -> int:
         if not (SITE / f"{p}.mdx").exists() and not (SITE / f"{p}.md").exists():
             errors.append(f"docs.json references a missing page: {p}")
 
-    on_disk = {str(p.relative_to(SITE).with_suffix("")) for p in SITE.rglob("*.mdx")}
+    on_disk = {str(p.relative_to(SITE).with_suffix("")) for p in site_pages(SITE)}
     for p in sorted(on_disk - nav_set):
         warns.append(f"orphan page not in docs.json: {p}")
 
-    for path in sorted(SITE.rglob("*.mdx")):
+    for path in sorted(site_pages(SITE)):
         rel = path.relative_to(SITE)
         raw = path.read_text()
 
@@ -156,7 +161,7 @@ def main() -> int:
         print(f"WARN  {w}")
     for e in errors:
         print(f"ERROR {e}")
-    print(f"\n{len(list(SITE.rglob('*.mdx')))} pages · {len(errors)} errors · {len(warns)} warnings")
+    print(f"\n{len(list(site_pages(SITE)))} pages · {len(errors)} errors · {len(warns)} warnings")
     return 1 if errors else 0
 
 

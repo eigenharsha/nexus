@@ -27,7 +27,7 @@ import shutil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SITE = ROOT / "site"
+SITE = ROOT
 OUT = Path(__file__).resolve().parent / "src" / "content" / "docs"
 
 ASIDE = {"Note": "note", "Info": "note", "Tip": "tip",

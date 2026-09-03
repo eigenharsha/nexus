@@ -1,6 +1,6 @@
 # Publishing
 
-The course is authored as **Mintlify MDX** under `site/`. Mintlify is a hosted
+The course is authored as **Mintlify MDX** at the repo root. Mintlify is a hosted
 product — `mint` offers `dev`, `broken-links` and linting, but no `build` or
 static export — so publishing anywhere other than Mintlify's own hosting means
 rendering the same content with a different generator.
@@ -21,7 +21,7 @@ component the course actually uses has a real equivalent:
 
 ```bash
 # Mintlify hosting - nothing breaks, drip release works, 15 minutes
-cd site && mint dev          # preview; then connect the repo at mintlify.com
+mint dev          # preview; then connect the repo at mintlify.com
 
 # GitHub Pages - static, free, any host
 python3 publish/convert.py

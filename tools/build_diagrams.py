@@ -6,23 +6,23 @@ build_diagrams.py - walk the curriculum, render every DIAGRAM-SPEC block.
   python3 tools/build_diagrams.py --only p4-w30-m1
   python3 tools/build_diagrams.py --list     # parse only, no rendering
 
-The ~156 DIAGRAM-SPEC blocks in site/curriculum are written in prose by many
+The ~156 DIAGRAM-SPEC blocks in curriculum are written in prose by many
 different authors, so this parses defensively: a malformed block is recorded as
 an error and the run continues. It never raises on bad input.
 
-Two sources of specs are rendered into site/assets/diagrams/:
+Two sources of specs are rendered into assets/diagrams/:
 
-  1. `{/* DIAGRAM-SPEC ... */}` blocks in site/curriculum/**/*.mdx.
+  1. `{/* DIAGRAM-SPEC ... */}` blocks in curriculum/**/*.mdx.
      Their `elements:` list is English, not geometry, so it is *compiled* into a
      sketch spec by heuristics (quoted strings become boxes, `->` becomes a
      flow, "amber margin note" becomes a margin note, and so on). The result is
      a real, on-style whiteboard sketch, but a mechanical one - see
-     site/assets/diagrams/README.md for how to replace one by hand.
+     assets/diagrams/README.md for how to replace one by hand.
 
   2. Hand-authored JSON specs in tools/specs/*.json - the flagship sketches.
      These always win over an auto-compiled block with the same id.
 
-Writes site/assets/diagram-manifest.json.
+Writes assets/diagram-manifest.json.
 """
 from __future__ import annotations
 
@@ -39,14 +39,14 @@ import sketch          # noqa: E402
 import excalidraw      # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-CURRICULUM = ROOT / "site" / "curriculum"
+CURRICULUM = ROOT / "curriculum"
 SPEC_DIR = ROOT / "tools" / "specs"
-OUT_DIR = ROOT / "site" / "assets" / "diagrams"
+OUT_DIR = ROOT / "assets" / "diagrams"
 MANIFEST = ROOT / "site" / "assets" / "diagram-manifest.json"
 
 # ids whose SVGs are drawn by a human in Excalidraw and committed directly to
-# site/assets/diagrams/. The build never overwrites these - it only records them
-# in the manifest. See site/assets/diagrams/README.md.
+# assets/diagrams/. The build never overwrites these - it only records them
+# in the manifest. See assets/diagrams/README.md.
 HAND_DRAWN: set[str] = set()
 
 BLOCK_RE = re.compile(r"\{/\*\s*DIAGRAM-SPEC\b(.*?)\*/\}", re.S)

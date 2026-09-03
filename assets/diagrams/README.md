@@ -30,12 +30,12 @@ tier, source page and the three file paths. It is regenerated on every build.
 python3 tools/make_flagships.py       # rebuild the hand-authored flagship specs
 python3 tools/build_diagrams.py       # render everything into this directory
 python3 tools/build_diagrams.py --prune   # ...and delete anything stale
-python3 site/validate.py              # must still report 0 errors
+python3 validate.py              # must still report 0 errors
 ```
 
 `build_diagrams.py` takes two inputs:
 
-1. **`{/* DIAGRAM-SPEC ... */}` blocks** in `site/curriculum/**/*.mdx`. Their
+1. **`{/* DIAGRAM-SPEC ... */}` blocks** in `curriculum/**/*.mdx`. Their
    `elements:` list is English prose, not geometry, so the build *compiles* it
    into a sketch: quoted strings become boxes, `a -> b -> c` becomes a flow row,
    "amber margin note" becomes a margin note, "circled" becomes a circled term,
@@ -129,7 +129,7 @@ what is wrong.
    <desc>A four-by-four attention matrix for the sentence "the cat sat down"…</desc>
    ```
 
-7. Re-run `python3 site/validate.py` and confirm 0 errors.
+7. Re-run `python3 validate.py` and confirm 0 errors.
 
 ## Rules that are not negotiable
 

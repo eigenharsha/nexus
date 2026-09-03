@@ -11,20 +11,19 @@ defended.
 ├── PLAN/                       # the production plan — the source of truth
 │   ├── 00-content-spec.md        the lesson contract (3 layers, template, reject criteria)
 │   ├── 01-master-board.md        level 0–2 tasks: infrastructure, phases, weeks
-│   ├── 02-references-library.md  citation rules (library lives in site/reference/papers.mdx)
+│   ├── 02-references-library.md  citation rules (library lives in reference/papers.mdx)
 │   ├── 03-visual-spec.md         hand-drawn diagram house style, 42 hero animations, 15 widgets
 │   └── tasks/                    level 3–4 tasks: every module, its three layers, its lab
 │       ├── phase-1-tasks.md      weeks 1–8   · foundations
 │       ├── phase-2-tasks.md      weeks 9–16  · systems & data
 │       ├── phase-3-tasks.md      weeks 17–24 · machine learning
 │       └── phase-4-tasks.md      weeks 25–32 · generative AI
-├── site/                       # the Mintlify documentation site
-│   ├── docs.json                 navigation, generated — includes hidden tabs/groups
-│   ├── generate.py               rebuilds page shells + docs.json from PLAN/tasks/
-│   ├── curriculum/pN/week-NN/    5 module pages + index + lab per week
-│   ├── solutions/                hidden pages: worked solutions and answer keys
-│   ├── instructor/               hidden pages: session plans, rubrics, release schedule
-│   └── assets/diagrams/          hand-drawn SVGs (light, dark, blank) + editable sources
+├── docs.json                   # Mintlify navigation, generated — includes hidden tabs/groups
+├── generate.py                 # rebuilds page shells + docs.json from PLAN/tasks/
+├── curriculum/pN/week-NN/      # 5 module pages + index + lab per week
+├── solutions/                  # hidden pages: worked solutions and answer keys
+├── instructor/                 # hidden pages: session plans, rubrics, release schedule
+├── assets/diagrams/            # hand-drawn SVGs (light, dark, blank) + editable sources
 ├── labs/pN/week-NN/            # 32 labs · basic / standard / hard · make verify
 ├── templates/                  # lesson and lab templates
 ├── tools/                      # the hand-drawn sketch renderer and diagram build
@@ -46,7 +45,6 @@ get their money's worth.
 ## Running the site
 
 ```bash
-cd site
 npx mint dev          # local preview at http://localhost:3000
 python3 generate.py   # rebuild shells + docs.json from PLAN/tasks/
 ```

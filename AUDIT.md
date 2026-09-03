@@ -2,7 +2,7 @@
 
 Every numeric claim in the 160 modules was audited and labelled. This file records the outcome
 so the result is inspectable rather than merely asserted. Learner-facing statement:
-`site/start/about-the-numbers.mdx`. Authoring rule: `PLAN/00-content-spec.md` §5c.
+`start/about-the-numbers.mdx`. Authoring rule: `PLAN/00-content-spec.md` §5c.
 
 ## Result across all 32 weeks
 

@@ -26,7 +26,7 @@ Layers are cumulative depth on ONE topic. If Layer 3 introduces a new topic, it'
 
 ## Where you write
 
-Files already exist as shells at `site/curriculum/pN/week-NN/*.mdx`. **Edit them in place.**
+Files already exist as shells at `curriculum/pN/week-NN/*.mdx`. **Edit them in place.**
 Keep the frontmatter (title/description/icon). Replace the placeholder body with real content
 following the shell's existing structure (Tabs for the three layers, Hands-on, The whiteboard,
 Apply it at work, Common mistakes, Sources).
@@ -95,7 +95,7 @@ Concrete numbers and named tools beat adjectives every time.
 
 ## When you finish a week
 
-Run `cd site && python3 -c "import pathlib,sys;[print(p) for p in pathlib.Path('.').rglob('*.mdx') if '{' in p.read_text().split('---',2)[-1].replace('{/*','').replace('*/}','') and False]"` — or
+Run `python3 -c "import pathlib,sys;[print(p) for p in pathlib.Path('.').rglob('*.mdx') if '{' in p.read_text().split('---',2)[-1].replace('{/*','').replace('*/}','') and False]"` — or
 more simply, sanity-check that every file you touched has: the AUTHORED marker, balanced
 component tags, no raw `{` or `<` in prose outside code fences.
 

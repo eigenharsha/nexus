@@ -43,7 +43,7 @@ Fix what you find, in place. You are permitted and expected to edit Layer 1 sect
 - Add a one-line "you should now be able to…" where the exit condition is unclear.
 - Add a short "if this fails" note where a code block has an obvious failure mode.
 - Where a prerequisite genuinely belongs in an earlier week, do NOT reorder the course — add a
-  scoped inline primer, the way `site/curriculum/p2/week-11/0-numpy-in-20-minutes.mdx` does.
+  scoped inline primer, the way `curriculum/p2/week-11/0-numpy-in-20-minutes.mdx` does.
 
 **Do not:**
 - Do not dumb down Layer 2 or Layer 3. They are for a different reader and are deliberately dense.
@@ -51,13 +51,13 @@ Fix what you find, in place. You are permitted and expected to edit Layer 1 sect
 - Do not pad. If a page is already clear, leave it alone and say so.
 - Do not touch the numbers, or any provenance label (Measured / Derived / Cited finding /
   Reference figure). Those went through a separate audit.
-- Do not edit `site/solutions/`, `tools/`, or `PLAN/`.
+- Do not edit `solutions/`, `tools/`, or `PLAN/`.
 
 ## MDX safety
 
 `.mdx` files: a raw `{` or `<` in prose breaks the build, and `<https://…>` autolinks break it too.
 Escape as `&#123;` / `&lt;`, and write links as `[text](url)`. After each week, run
-`python3 site/validate.py` and confirm **0 errors** before moving on.
+`python3 validate.py` and confirm **0 errors** before moving on.
 
 ## Report
 

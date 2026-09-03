@@ -65,13 +65,13 @@ are the four failure modes in the current output.
 
 ## Reading the source
 
-Each diagram belongs to a module page under `site/curriculum/`. The manifest
-(`site/assets/diagram-manifest.json`) maps id → page. **Read that page** before drawing: the
+Each diagram belongs to a module page under `curriculum/`. The manifest
+(`assets/diagram-manifest.json`) maps id → page. **Read that page** before drawing: the
 existing `DIAGRAM-SPEC` block states the intent, and the module body has the real numbers.
 
 ## Do not
 
-- Do not edit anything under `site/curriculum/` or `site/solutions/` — content is finished.
+- Do not edit anything under `curriculum/` or `solutions/` — content is finished.
 - Do not touch `tools/sketch.py` or `tools/build_diagrams.py` unless you find a genuine renderer
   bug; if you do, report it rather than silently changing shared code.
 - Do not exceed 200 KB per rendered SVG.

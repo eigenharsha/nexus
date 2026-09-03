@@ -66,12 +66,12 @@ remove entries, and do not change any wording.
 
 These are `.mdx` files. A raw `{` or `<` in prose breaks the build. URLs are fine inside
 `(...)`, but if a URL contains a bare `<` or `{`, percent-encode it. After editing, run
-`python3 site/validate.py` and confirm 0 errors.
+`python3 validate.py` and confirm 0 errors.
 
 ## Do not
 
 - Do not edit anything outside the **Sources & further reading** section of your assigned pages.
-- Do not touch `site/solutions/`, `tools/`, or `PLAN/`.
+- Do not touch `solutions/`, `tools/`, or `PLAN/`.
 - Do not add links to entries that already have one.
 
 ## Report

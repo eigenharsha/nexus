@@ -27,7 +27,7 @@ import shutil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SITE = ROOT / "site"
+SITE = ROOT
 OUT = ROOT / "publish" / "docs"
 
 ICONS = {

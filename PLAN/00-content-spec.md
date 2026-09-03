@@ -172,7 +172,7 @@ prose that restates the tables rather than as a high total.
 ## 5c. Number provenance (added 2026-09-01, after a course-wide audit)
 
 Every numeric claim must be labelled as one of three classes. The learner-facing statement of
-this policy is `site/start/about-the-numbers.mdx`; this section is the authoring rule.
+this policy is `start/about-the-numbers.mdx`; this section is the authoring rule.
 
 | Class | Means | Test |
 |---|---|---|
