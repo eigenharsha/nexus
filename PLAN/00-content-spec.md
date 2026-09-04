@@ -341,6 +341,15 @@ page, never a second vocabulary to learn.
   the mapping is taught by colour before it is taught by words).
 - Every tough concept gets one. If a process has ≥3 steps, it moves.
 
+### The page-order law (added after positioning review)
+
+The reader reaches the story with almost zero scrolling. Above the Tabs, a page may carry only:
+the routing Note (2 lines), the generated ramp (one collapsed line), and one collapsed
+AccordionGroup holding "Where this page sits" and "Why this matters". Nothing else. The mental
+model and its diagram are a *summary*, not an opening — they live at the bottom, beside the
+"redraw it from memory" exercise, where they reward the reader instead of spoiling the story.
+Claims about live model behaviour must survive the reader testing them mid-read — they will.
+
 ### Pilot
 
 `curriculum/p4/week-25/1-text-tokens.mdx` is the reference implementation of this doctrine.
