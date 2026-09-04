@@ -32,6 +32,8 @@ walk(docs["navigation"])
 oidx = {s:i for i,s in enumerate(order)}
 
 def beginner_text(raw):
+    # ramp blocks are generated output, never source: exclude them from all scans
+    raw = re.sub(re.escape(BEGIN) + r".*?" + re.escape(END), " ", raw, flags=re.S)
     out, skip = [], False
     for line in raw.splitlines():
         if re.search(r'<Tab title="[^"]*Layer [23]', line): skip = True
