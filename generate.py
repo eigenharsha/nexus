@@ -142,8 +142,9 @@ icon: "pen-line"
 ---
 
 <Note>
-**Week {week['num']} · Module {idx} · `{mod['id']}`** — read Layer 1 if you are new, Layer 2 if you ship
-code for a living, Layer 3 when Layer 2 has already hurt you.
+**Week {week['num']} · Module {idx} · `{mod['id']}`** — start with 🟢 Ground if this page's words are not
+second nature yet — even after years of shipping code. Move to 🔵 Build once they are, and 🟣 Edge
+when Build has already hurt you. Nobody skips Ground the first time through.
 </Note>
 
 ## What you'll be able to do
