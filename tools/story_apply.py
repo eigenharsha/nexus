@@ -23,9 +23,14 @@ def apply(slug, d):
         print("  already storied, skipping:", slug.split("/")[-1]); return False
     if d.get("glimpse") and "</Note>\n" in t:
         t = t.replace("</Note>\n", "</Note>\n\n" + d["glimpse"] + "\n", 1)
-    if d.get("story") and GI in t:
-        i = t.index(GI) + len(GI); nl = t.index("\n", i) + 1
-        t = t[:nl] + "\n" + MARK + "\n" + d["story"] + t[nl:]
+    if d.get("story"):
+        if GI in t:                      # doctrine pages: after the layer intro line
+            i = t.index(GI) + len(GI); nl = t.index("\n", i) + 1
+        else:                            # older pages: straight after the Ground tab opens
+            m = re.search(r'<Tab title="[^"]*Layer 1[^"]*">\n', t)
+            nl = m.end() if m else None
+        if nl:
+            t = t[:nl] + "\n" + MARK + "\n" + d["story"] + t[nl:]
     if d.get("answer") and '<Accordion title="Checkpoint' in t:
         ck = t.index('<Accordion title="Checkpoint')
         t = t[:ck] + ('<Check>\n    **The answer to the opening question, plainly.** '
