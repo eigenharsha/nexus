@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Week-32 covers — the last week of Phase 4."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from covers_lib import build, preview
+W = "curriculum/p4/week-32/"
+COVERS = {
+W+"index.mdx": {
+  "id": "cover-w32",
+  "alt": "The week's journey: trace every request, see inside every prompt, cut the bill, hold the latency tail, and keep the system alive after you stop watching.",
+  "elements": [
+    {"type": "badge", "id": "b1", "n": 1, "x": 55, "y": 60},
+    {"type": "box", "id": "s1", "x": 80, "y": 40, "w": 120, "h": 60, "label": "traces", "size": 17, "color": "structure"},
+    {"type": "text", "id": "t1", "x": 140, "y": 126, "text": "see the shape of work", "size": 15, "color": "muted", "w": 150},
+    {"type": "badge", "id": "b2", "n": 2, "x": 250, "y": 60},
+    {"type": "box", "id": "s2", "x": 275, "y": 40, "w": 115, "h": 60, "label": "prompts", "size": 17, "color": "note"},
+    {"type": "text", "id": "t2", "x": 332, "y": 126, "text": "what it actually said", "size": 15, "color": "muted", "w": 150},
+    {"type": "badge", "id": "b3", "n": 3, "x": 440, "y": 60},
+    {"type": "box", "id": "s3", "x": 465, "y": 40, "w": 115, "h": 60, "label": "cost", "size": 17, "color": "correct"},
+    {"type": "text", "id": "t3", "x": 522, "y": 126, "text": "halve it, same model", "size": 15, "color": "muted", "w": 150},
+    {"type": "badge", "id": "b4", "n": 4, "x": 630, "y": 60},
+    {"type": "box", "id": "s4", "x": 655, "y": 40, "w": 115, "h": 60, "label": "p95", "size": 17, "color": "error"},
+    {"type": "text", "id": "t4", "x": 712, "y": 126, "text": "the tail, not the mean", "size": 15, "color": "muted", "w": 150},
+    {"type": "badge", "id": "b5", "n": 5, "x": 820, "y": 60},
+    {"type": "box", "id": "s5", "x": 845, "y": 40, "w": 115, "h": 60, "label": "keep it", "size": 17, "color": "structure"},
+    {"type": "text", "id": "t5", "x": 902, "y": 126, "text": "alive after you leave", "size": 15, "color": "muted", "w": 160},
+    {"type": "box", "id": "res", "x": 290, "y": 178, "w": 420, "h": 58, "label": "the end of the road you started in Week 1", "size": 17, "color": "correct", "fill": "hachure", "fill_gap": 15},
+    {"type": "circled", "id": "term", "x": 150, "y": 205, "text": "week 32", "ring": "note"},
+    {"type": "note", "id": "n", "x": 730, "y": 190, "w": 240, "text": "it works. Now it has to keep working."},
+    {"type": "text", "id": "dq", "x": 640, "y": 306, "text": "it starts with a ticket you cannot answer today…", "size": 19, "color": "note"},
+  ], "arrow": (150, 300, 370, 300)},
+
+W+"1-tracing-opentelemetry.mdx": {
+  "id": "cover-w32m1",
+  "alt": "Two log lines cannot explain a thirty second request; a trace of nested timed bars shows one tool call took twenty-eight of them.",
+  "elements": [
+    {"type": "badge", "id": "b1", "n": 1, "x": 48, "y": 62},
+    {"type": "box", "id": "l1", "x": 70, "y": 44, "w": 210, "h": 40, "label": "log: request received", "size": 13, "color": "muted"},
+    {"type": "box", "id": "l2", "x": 70, "y": 94, "w": 210, "h": 40, "label": "log: request finished", "size": 13, "color": "muted"},
+    {"type": "text", "id": "t1", "x": 175, "y": 168, "text": "30 seconds happened in between", "size": 15, "color": "error", "w": 999},
+    {"type": "text", "id": "t1b", "x": 175, "y": 190, "text": "and you cannot see any of it", "size": 15, "color": "error", "w": 999},
+    {"type": "badge", "id": "b2", "n": 2, "x": 360, "y": 62},
+    {"type": "bar", "id": "s0", "x": 430, "y": 46, "w": 260, "h": 16, "label": "request", "value": "30.0 s", "color": "correct"},
+    {"type": "bar", "id": "s1", "x": 445, "y": 76, "w": 20,  "h": 16, "label": "retrieve", "value": "0.4", "color": "structure"},
+    {"type": "bar", "id": "s2", "x": 445, "y": 106, "w": 14, "h": 16, "label": "re-rank", "value": "0.3", "color": "structure"},
+    {"type": "bar", "id": "s3", "x": 445, "y": 136, "w": 220, "h": 16, "label": "tool call", "value": "28.1 ←", "color": "error"},
+    {"type": "bar", "id": "s4", "x": 445, "y": 166, "w": 24, "h": 16, "label": "generate", "value": "1.2", "color": "structure"},
+    {"type": "text", "id": "t2", "x": 540, "y": 212, "text": "not deduced — seen", "size": 16, "color": "correct", "w": 999},
+    {"type": "badge", "id": "b3", "n": 3, "x": 700, "y": 210},
+    {"type": "text", "id": "t3", "x": 860, "y": 222, "text": "span: one timed step", "size": 16, "color": "muted", "w": 999},
+    {"type": "text", "id": "t3b", "x": 860, "y": 246, "text": "trace: all the spans of", "size": 16, "color": "muted", "w": 999},
+    {"type": "text", "id": "t3c", "x": 860, "y": 268, "text": "one request, linked", "size": 16, "color": "muted", "w": 999},
+    {"type": "circled", "id": "term", "x": 210, "y": 250, "text": "the trace", "ring": "note"},
+    {"type": "note", "id": "n", "x": 330, "y": 250, "w": 300, "text": "logs are diary entries. A trace is the shape of the work."},
+    {"type": "text", "id": "dq", "x": 640, "y": 306, "text": "but what was actually IN that prompt?", "size": 19, "color": "note"},
+  ], "arrow": (150, 300, 340, 300)},
+
+W+"2-langfuse-the-llm-observability-stack.mdx": {
+  "id": "cover-w32m2",
+  "alt": "A forwarded screenshot has no request id; generic tracing only says a call happened; model-aware observability stores the prompt, passages, tiles, cost and eval score.",
+  "elements": [
+    {"type": "badge", "id": "b1", "n": 1, "x": 48, "y": 62},
+    {"type": "box", "id": "shot", "x": 70, "y": 44, "w": 200, "h": 56, "label": "a screenshot. No id, no time.", "size": 13, "color": "error"},
+    {"type": "text", "id": "t1", "x": 170, "y": 130, "text": "generic tracing: “a call happened,", "size": 15, "color": "error", "w": 999},
+    {"type": "text", "id": "t1b", "x": 170, "y": 152, "text": "1.4 seconds”  — useless here", "size": 15, "color": "error", "w": 999},
+    {"type": "badge", "id": "b2", "n": 2, "x": 350, "y": 62},
+    {"type": "box", "id": "rec", "x": 375, "y": 44, "w": 240, "h": 130, "label": "prompt (with the passages) · output · tiles in/out · cost · latency · prompt version", "size": 12, "color": "correct"},
+    {"type": "text", "id": "t2", "x": 495, "y": 206, "text": "the whole generation, stored", "size": 15, "color": "correct", "w": 999},
+    {"type": "badge", "id": "b3", "n": 3, "x": 680, "y": 62},
+    {"type": "text", "id": "t3", "x": 845, "y": 76, "text": "Week 31's eval scores attach", "size": 16, "color": "note", "w": 999},
+    {"type": "text", "id": "t3b", "x": 845, "y": 100, "text": "to these same records", "size": 16, "color": "note", "w": 999},
+    {"type": "text", "id": "t3c", "x": 845, "y": 140, "text": "“why did it say that?” → a lookup", "size": 15, "color": "muted", "w": 999},
+    {"type": "text", "id": "t3d", "x": 845, "y": 164, "text": "“did the change help?” → a", "size": 15, "color": "muted", "w": 999},
+    {"type": "text", "id": "t3e", "x": 845, "y": 186, "text": "comparison on real traffic", "size": 15, "color": "muted", "w": 999},
+    {"type": "circled", "id": "term", "x": 210, "y": 250, "text": "observability", "ring": "note"},
+    {"type": "note", "id": "n", "x": 340, "y": 246, "w": 320, "text": "turns a screenshot into a link, and an argument into a lookup."},
+    {"type": "text", "id": "dq", "x": 640, "y": 306, "text": "one of those numbers is about to become Finance's problem.", "size": 18, "color": "note"},
+  ], "arrow": (150, 300, 340, 300)},
+
+W+"3-cost-engineering.mdx": {
+  "id": "cover-w32m3",
+  "alt": "Switching to a cheaper model is crossed out as the first instinct; the data shows repetition dominates; four levers halve the bill and the report is cost per answered question.",
+  "elements": [
+    {"type": "badge", "id": "b1", "n": 1, "x": 48, "y": 62},
+    {"type": "box", "id": "ch", "x": 70, "y": 44, "w": 200, "h": 50, "label": "“use a cheaper model”", "size": 15, "color": "error"},
+    {"type": "crossout", "id": "x", "x": 70, "y": 44, "w": 200, "h": 50, "style": "strike"},
+    {"type": "text", "id": "t1", "x": 172, "y": 124, "text": "worse quality, barely cheaper —", "size": 15, "color": "error", "w": 999},
+    {"type": "text", "id": "t1b", "x": 172, "y": 146, "text": "the money was never there", "size": 15, "color": "error", "w": 999},
+    {"type": "badge", "id": "b2", "n": 2, "x": 350, "y": 62},
+    {"type": "bar", "id": "c1", "x": 470, "y": 52, "w": 170, "h": 16, "label": "repeat context", "value": "48%", "color": "error"},
+    {"type": "bar", "id": "c2", "x": 470, "y": 84, "w": 110, "h": 16, "label": "already answered", "value": "31%", "color": "error"},
+    {"type": "bar", "id": "c3", "x": 470, "y": 116, "w": 50,  "h": 16, "label": "big model, easy work", "value": "14%", "color": "note"},
+    {"type": "bar", "id": "c4", "x": 470, "y": 148, "w": 26,  "h": 16, "label": "actual new work", "value": "7%", "color": "correct"},
+    {"type": "text", "id": "t2", "x": 500, "y": 196, "text": "most of the bill is repetition, not intelligence", "size": 15, "color": "muted", "w": 999},
+    {"type": "badge", "id": "b3", "n": 3, "x": 700, "y": 210},
+    {"type": "text", "id": "t3", "x": 858, "y": 222, "text": "cache · trim · route · batch", "size": 17, "color": "correct", "w": 999},
+    {"type": "text", "id": "t3b", "x": 858, "y": 254, "text": "report: cost per answered question", "size": 15, "color": "muted", "w": 999},
+    {"type": "circled", "id": "term", "x": 200, "y": 250, "text": "unit cost", "ring": "note"},
+    {"type": "note", "id": "n", "x": 320, "y": 246, "w": 300, "text": "four levers, applied in the order your data prefers."},
+    {"type": "text", "id": "dq", "x": 640, "y": 306, "text": "cheap is not the same as dependable. Then Tuesday happens.", "size": 18, "color": "note"},
+  ], "arrow": (150, 300, 340, 300)},
+
+W+"4-reliability-latency-production-operations.mdx": {
+  "id": "cover-w32m4",
+  "alt": "A healthy-looking 2.1 second average hides an eleven second p99; streaming splits latency into time to first token and total time; alerts belong on the tail.",
+  "elements": [
+    {"type": "badge", "id": "b1", "n": 1, "x": 48, "y": 62},
+    {"type": "box", "id": "avg", "x": 70, "y": 44, "w": 190, "h": 50, "label": "average: 2.1 s ✓", "size": 16, "color": "error"},
+    {"type": "crossout", "id": "x", "x": 70, "y": 44, "w": 190, "h": 50, "style": "strike"},
+    {"type": "text", "id": "t1", "x": 168, "y": 124, "text": "averages hide the users", "size": 15, "color": "error", "w": 999},
+    {"type": "text", "id": "t1b", "x": 168, "y": 146, "text": "you are actually failing", "size": 15, "color": "error", "w": 999},
+    {"type": "badge", "id": "b2", "n": 2, "x": 350, "y": 62},
+    {"type": "bar", "id": "p50", "x": 460, "y": 52, "w": 50,  "h": 16, "label": "p50", "value": "1.8 s", "color": "correct"},
+    {"type": "bar", "id": "p95", "x": 460, "y": 86, "w": 150, "h": 16, "label": "p95", "value": "7.4 s", "color": "note"},
+    {"type": "bar", "id": "p99", "x": 460, "y": 120, "w": 230, "h": 16, "label": "p99", "value": "11.2 s ←", "color": "error"},
+    {"type": "text", "id": "t2", "x": 520, "y": 168, "text": "the tail is where the tickets come from", "size": 15, "color": "muted", "w": 999},
+    {"type": "badge", "id": "b3", "n": 3, "x": 700, "y": 200},
+    {"type": "text", "id": "t3", "x": 858, "y": 212, "text": "streaming splits it in two:", "size": 16, "color": "structure", "w": 999},
+    {"type": "text", "id": "t3b", "x": 858, "y": 238, "text": "first token = how it feels", "size": 15, "color": "muted", "w": 999},
+    {"type": "text", "id": "t3c", "x": 858, "y": 260, "text": "total time = what it costs", "size": 15, "color": "muted", "w": 999},
+    {"type": "circled", "id": "term", "x": 200, "y": 250, "text": "p95", "ring": "note"},
+    {"type": "note", "id": "n", "x": 320, "y": 244, "w": 300, "text": "alert on the promise you actually made — never on the mean."},
+    {"type": "text", "id": "dq", "x": 640, "y": 306, "text": "now keep it alive after you stop watching.", "size": 19, "color": "note"},
+  ], "arrow": (150, 300, 340, 300)},
+
+W+"5-deploying-maintaining-an-ai-system.mdx": {
+  "id": "cover-w32m5",
+  "alt": "A deprecation email gives ninety days; prompts are versioned code shipped by canary or shadow traffic; the runbook is what lets someone else fix it at 3 a.m.",
+  "elements": [
+    {"type": "badge", "id": "b1", "n": 1, "x": 48, "y": 62},
+    {"type": "box", "id": "mail", "x": 70, "y": 44, "w": 220, "h": 60, "label": "“your model is deprecated — 90 days”", "size": 12, "color": "error"},
+    {"type": "text", "id": "t1", "x": 180, "y": 134, "text": "nothing broke · nobody erred —", "size": 15, "color": "muted", "w": 999},
+    {"type": "text", "id": "t1b", "x": 180, "y": 156, "text": "this is life on someone else's model", "size": 15, "color": "muted", "w": 999},
+    {"type": "badge", "id": "b2", "n": 2, "x": 380, "y": 62},
+    {"type": "box", "id": "pv", "x": 405, "y": 44, "w": 220, "h": 44, "label": "prompts are code: v7 → v8", "size": 13, "color": "correct"},
+    {"type": "box", "id": "can", "x": 405, "y": 100, "w": 220, "h": 44, "label": "canary 5% · shadow traffic", "size": 13, "color": "structure"},
+    {"type": "text", "id": "t2", "x": 515, "y": 178, "text": "you cannot diff a non-deterministic system —", "size": 15, "color": "muted", "w": 999},
+    {"type": "text", "id": "t2b", "x": 515, "y": 200, "text": "so ship to a slice and compare", "size": 15, "color": "muted", "w": 999},
+    {"type": "badge", "id": "b3", "n": 3, "x": 690, "y": 62},
+    {"type": "box", "id": "rb", "x": 715, "y": 44, "w": 240, "h": 60, "label": "the runbook: symptoms · dashboards · levers · rollback", "size": 11, "color": "note"},
+    {"type": "text", "id": "t3", "x": 835, "y": 132, "text": "written for the person who is", "size": 15, "color": "note", "w": 999},
+    {"type": "text", "id": "t3b", "x": 835, "y": 154, "text": "not you, at 3 a.m.", "size": 15, "color": "note", "w": 999},
+    {"type": "text", "id": "t3c", "x": 835, "y": 192, "text": "the difference between a system", "size": 15, "color": "muted", "w": 999},
+    {"type": "text", "id": "t3d", "x": 835, "y": 214, "text": "and a hostage situation", "size": 15, "color": "muted", "w": 999},
+    {"type": "circled", "id": "term", "x": 210, "y": 250, "text": "keeping it alive", "ring": "note"},
+    {"type": "note", "id": "n", "x": 340, "y": 250, "w": 300, "text": "anything unversioned is a future outage."},
+    {"type": "text", "id": "dq", "x": 620, "y": 306, "text": "and that is the end of the road you started in Week 1.", "size": 19, "color": "note"},
+  ], "arrow": (150, 300, 340, 300)},
+}
+if __name__ == "__main__":
+    build(COVERS)
+    if "--preview" in sys.argv: preview(COVERS, "w32")
