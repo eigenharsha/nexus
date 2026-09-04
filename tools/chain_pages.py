@@ -71,10 +71,20 @@ def headings(seg, limit=3):
     hs = [h for h in hs if not h.lower().startswith(("answers", "checkpoint"))]
     return hs[:limit]
 
-def phrase(hs):
+def anchor(h):
+    """Mintlify's heading id: lowercase, punctuation dropped, spaces to hyphens.
+    Linking to a heading inside an inactive tab switches to that tab."""
+    s = re.sub(r"[^a-z0-9 -]", "", h.lower())
+    return re.sub(r"\s+", "-", s.strip())
+
+def phrase(hs, link=True):
+    """Each named section becomes a link straight into its layer."""
     if not hs: return None
-    hs = [h[0].lower() + h[1:] if h[:2].isupper() is False else h for h in hs]
-    return " · ".join(hs)
+    out = []
+    for h in hs:
+        label = h[0].lower() + h[1:] if not h[:2].isupper() else h
+        out.append(f"[{label}](#{anchor(h)})" if link else label)
+    return " · ".join(out)
 
 def strip_block(t):
     return re.sub(re.escape(B) + r".*?" + re.escape(E), "", t, flags=re.S)
@@ -127,8 +137,12 @@ for p in PAGES:
     t = personas(restructure(t))
     spans = tab_spans(t)
     segs = {n: t[s:e] for n, s, e in spans}
-    build_p = phrase(headings(segs.get(2, ""))) or "the real tools, the trade-offs and a working reference implementation"
-    edge_p  = phrase(headings(segs.get(3, ""))) or "the internals, the numbers at scale and the production failure modes"
+    b_hs, e_hs = headings(segs.get(2, "")), headings(segs.get(3, ""))
+    build_p = phrase(b_hs) or "the real tools, the trade-offs and a working reference implementation"
+    edge_p  = phrase(e_hs) or "the internals, the numbers at scale and the production failure modes"
+    # the layer name itself links to that layer's first section
+    build_link = f"[🔵 **Build**](#{anchor(b_hs[0])})" if b_hs else "🔵 **Build**"
+    edge_link  = f"[🟣 **Edge**](#{anchor(e_hs[0])})" if e_hs else "🟣 **Edge**"
     has_assess = "## Assessment" in t
     ask = ("\n    - 🎯 **Prove it** — the concept, coding and interview questions this chapter"
            "\n      produces are waiting in [Assessment](#assessment) at the bottom of this page." if has_assess else "")
@@ -136,9 +150,9 @@ for p in PAGES:
     nxt_line = (f"carry on to [{page_title(nxt)}](/{nxt}), where the story continues at every depth."
                 if nxt else "carry the thread into the next module.")
 
-    ground = (f"\n{B}\n    <Info>\n    **You do not have to stop here.** This chapter goes two levels deeper — same page,"
-              f"\n    switch tabs at the top:\n\n    - 🔵 **Build** — {build_p}.\n    - 🟣 **Edge** — {edge_p}.{ask}\n    </Info>\n{E}\n")
-    build  = (f"\n{B}\n    <Info>\n    **One level further down.** 🟣 **Edge** holds {edge_p} — and the senior"
+    ground = (f"\n{B}\n    <Info>\n    **You do not have to stop here.** This chapter goes two levels deeper — every"
+              f"\n    link below jumps straight there:\n\n    - {build_link} — {build_p}.\n    - {edge_link} — {edge_p}.{ask}\n    </Info>\n{E}\n")
+    build  = (f"\n{B}\n    <Info>\n    **One level further down.** {edge_link} holds {edge_p} — and the senior"
               f"\n    interview question in [Assessment](#assessment) assumes you have read it.\n    </Info>\n{E}\n")
     edge   = (f"\n{B}\n    ### The floor of this topic\n\n    You have read as deep as this course goes here — the story, the"
               f"\n    machinery, and the scars. Two ways out: prove it against the senior questions in"
