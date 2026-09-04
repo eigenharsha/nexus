@@ -282,3 +282,48 @@ the mismatch rule naively here would reach precisely the wrong verdict.
 | Sun | Assessment + spaced-repetition deck | Assessment |
 
 Each week also produces: **1 flashcard deck (Anki-format)**, **1 "explain it in 5 minutes" recording prompt**, and **1 peer-review task**.
+
+---
+
+## 10. Storytelling doctrine (v2 addendum — applies to every GROUND layer)
+
+The Ground layer is not a simplified textbook. It is a **story the student walks through**,
+where every concept is *discovered* one step before it is needed. First-principles rule: the
+student should never meet a term before the page has created the need for it.
+
+### The five laws
+
+1. **Cold open with a story, not a definition.** Every Ground layer begins with a ≤150-word
+   scene — a person, a machine, a moment of surprise — that *is* the concept, before the
+   concept is named. The name arrives after the need. ("A friend who answers any question but
+   has never seen a letter in their life…" → *then* the word "tokenizer".)
+2. **The term ladder.** List (privately, in a comment) every technical term the page uses.
+   Order them so each is defined using only terms above it. If a term cannot be placed, it
+   does not belong in Ground — push it to Build. Acronyms are spelled out and motivated at
+   first use, every time (Byte-Pair Encoding before BPE, Large Language Model before LLM,
+   generative AI before GenAI).
+3. **One running example.** A single concrete artifact (one sentence, one file, one number)
+   is introduced in the cold open and reused through every section, the diagram, and the
+   animation. New examples are only added for contrast, never as replacements.
+4. **Motion for mechanism.** Anything that happens *over time* (an algorithm's steps, data
+   flowing through a system) gets an **animated SVG** (SMIL, looping, ≤12 s cycle,
+   `-anim.svg` suffix in assets/diagrams/, light+dark variants, house hand-drawn style).
+   Static diagrams remain for *structure*; animation is for *process*. Target: ≥1 animation
+   per module in Phase 4, best-effort backfill elsewhere.
+5. **End on a dangling question.** The last paragraph of Ground opens the exact question the
+   next module answers, phrased in the story's own vocabulary — the page hands the student
+   to the next page. ("The model has numbers now. But nothing says 8415 *means* cat. Where
+   does meaning come from? That is Module 2.")
+
+### Rejection additions (extend section on reject criteria)
+
+- Ground layer opens with a definition, a diagram, or "In this module…" → **reject**.
+- Any acronym used before its expansion on the same page's Ground layer → **reject**.
+- A process described in ≥3 sequential steps with no animation and no frame-by-frame
+  diagram → **flag** (animation debt, tracked per module).
+- Ground layer ends without a forward hook → **reject**.
+
+### Pilot
+
+`curriculum/p4/week-25/1-text-tokens.mdx` is the reference implementation of this doctrine.
+When redrafting a page, match its shape before inventing a new one.
