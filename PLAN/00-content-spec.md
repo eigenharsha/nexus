@@ -323,6 +323,24 @@ student should never meet a term before the page has created the need for it.
   diagram → **flag** (animation debt, tracked per module).
 - Ground layer ends without a forward hook → **reject**.
 
+### The vocabulary law (added after real-reader feedback)
+
+Ground layers are written in **basic English**. A reader whose English is functional but not
+literary must never stumble on the storytelling itself. Concretely: no idioms, no cultural
+references that do not travel ("pen-pal" failed a real reader; "a friend behind a locked
+door" did not), short sentences, everyday words. The story must be the easiest part of the
+page, never a second vocabulary to learn.
+
+### The animation laws (added after the CDN incident)
+
+- Animations are **inlined in the MDX**, never referenced as image assets — Mintlify's image
+  pipeline strips SMIL (16 animate tags in, 3 out). Keep a generator script per animation in
+  tools/ so it can be rebuilt (see tools/anim_w25_tokens.py).
+- Animations are **colourful, and the colour carries meaning**: each moving actor gets its own
+  colour, kept as it transforms (a text chunk and the number tile it becomes share a colour —
+  the mapping is taught by colour before it is taught by words).
+- Every tough concept gets one. If a process has ≥3 steps, it moves.
+
 ### Pilot
 
 `curriculum/p4/week-25/1-text-tokens.mdx` is the reference implementation of this doctrine.
