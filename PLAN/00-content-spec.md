@@ -369,6 +369,31 @@ as dry objectives ("understand tokenization"). Every promise must be provably ke
 page — the closing checkpoint is where the reader sees they can now do everything the box
 promised. The minutes are honest for the Ground walk.
 
+### The answer law (the question must close)
+
+The cold open poses a question; the chapter owes the reader its answer, *explicitly*. Before
+the Ground checkpoint stands a marked beat — a Check callout, "**The answer to the opening
+question, plainly.**" — that resolves the opening in two or three sentences using only ideas
+the chapter has now earned. A chapter whose opening question is answered only by implication
+is not done.
+
+### The chain law (no layer is a dead end)
+
+Every layer ends with somewhere to go:
+- **Ground** ends with three exits: the answer beat, the forward dangler (next module), and a
+  depth invitation naming what 🔵 Build and 🟣 Edge concretely hold for this reader — plus a
+  pointer to the interview/concept/coding questions in the page's Assessment.
+- **Build** opens with a two-to-four-sentence workplace scene (the Monday-morning incident this
+  layer lets you close) and ends with a hand-off naming what Edge holds.
+- **Edge** opens with a been-burned hook and ends with "The floor of this topic": Assessment,
+  then the next module. The reader is never left without a next step.
+
+### Build and Edge carry story too
+
+Not the beginner's fable — the professional's: incidents, meetings, bills, postmortems. Same
+first-principles discipline, adult stakes. The Assessment's junior/mid/senior interview
+questions are part of the chapter's promise and must be pointed to from inside the layers.
+
 ### Pilot
 
 `curriculum/p4/week-25/1-text-tokens.mdx` is the reference implementation of this doctrine.
