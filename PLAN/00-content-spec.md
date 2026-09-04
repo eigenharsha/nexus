@@ -354,11 +354,12 @@ Claims about live model behaviour must survive the reader testing them mid-read 
 
 ### The cover sketch (added with the glimpse)
 
-The very first thing on the page, above the routing note, is a small hand-drawn cover: a
-text-free, lightly animated sketch (~200px tall) that *teases the chapter's story* — the door
-with a note sliding under it, the map with a pin dropping in — and never shows the mechanism.
-No text means no font payload; keep it under a few KB, inline, light + dark. Generator lives
-in tools/ (see tools/heroes_w25.py).
+The very first thing on the page, above the routing note, is a hand-drawn cover rendered by
+the house sketch renderer (tools/sketch.py, via tools/covers_w25.py): a labelled miniature of
+the chapter's story in the whiteboard style — wobble, circled key term, amber teacher's note,
+red crossout where something fails. Covers are **always visually complete**: no element fades
+in from blank; the only motion is one amber dashed arrow that continuously redraws itself.
+Inline, light + dark, one line of MDX (multi-line JSX trips micromark — see tools/mdxcheck.mjs).
 
 ### The glimpse law (Gagné's second event)
 
