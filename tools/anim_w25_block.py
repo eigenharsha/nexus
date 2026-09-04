@@ -61,6 +61,8 @@ dark  = build("#e8e6e3","#5f5c57","#4dabf7","#da77f2","#ffb84d","#1a1a1a")
 def mdx_safe(s):
     s = re.sub(r"<!--.*?-->", "", s, flags=re.S)
     s = re.sub(r"<style>(.*?)</style>", lambda m: "<style>{`"+m.group(1)+"`}</style>", s, flags=re.S).strip()
+    # responsive: fixed width crops in narrow columns; viewBox keeps the ratio
+    s = re.sub(r'(<svg[^>]*?)\swidth="\d+"\sheight="\d+"', r'\1 width="100%"', s, count=1)
     # one line: multi-line JSX inside MDX trips micromark; single-line always compiles
     return re.sub(r"\s*\n\s*", " ", s)
 
