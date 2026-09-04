@@ -350,6 +350,14 @@ model and its diagram are a *summary*, not an opening — they live at the botto
 "redraw it from memory" exercise, where they reward the reader instead of spoiling the story.
 Claims about live model behaviour must survive the reader testing them mid-read — they will.
 
+### The glimpse law (Gagné's second event)
+
+Between the routing note and the ramp sits one small Card: **"In this chapter — about N
+minutes"**, with 3–5 promises written as *experiences* ("watch…", "catch…", "build…"), never
+as dry objectives ("understand tokenization"). Every promise must be provably kept by the
+page — the closing checkpoint is where the reader sees they can now do everything the box
+promised. The minutes are honest for the Ground walk.
+
 ### Pilot
 
 `curriculum/p4/week-25/1-text-tokens.mdx` is the reference implementation of this doctrine.
