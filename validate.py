@@ -37,6 +37,7 @@ def strip_code(text: str) -> str:
     text = re.sub(r"```.*?```", "", text, flags=re.S)
     text = re.sub(r"`[^`\n]*`", "", text)
     text = re.sub(r"\{/\*.*?\*/\}", "", text, flags=re.S)
+    text = re.sub(r"<svg\b.*?</svg>", "", text, flags=re.S)   # inline SVG islands are JSX, not prose
     text = re.sub(r"<[A-Za-z][^>]*>", "", text)   # component tags & their props
     text = re.sub(r"</[A-Za-z][^>]*>", "", text)
     return text
