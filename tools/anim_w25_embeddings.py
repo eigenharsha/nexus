@@ -66,7 +66,9 @@ dark  = build(ink="#e8e6e3", muted="#9a9791", amber="#ffb84d",
 
 def mdx_safe(s):
     s = re.sub(r"<!--.*?-->", "", s, flags=re.S)
-    return re.sub(r"<style>(.*?)</style>", lambda m: "<style>{`"+m.group(1)+"`}</style>", s, flags=re.S).strip()
+    s = re.sub(r"<style>(.*?)</style>", lambda m: "<style>{`"+m.group(1)+"`}</style>", s, flags=re.S).strip()
+    # one line: multi-line JSX inside MDX trips micromark; single-line always compiles
+    return re.sub(r"\s*\n\s*", " ", s)
 
 frame = f'''<Frame caption="The map of meanings, live: word pins drop onto the map — the animals land together, the banana and the laptop land far away — and distance on the map is meaning. It repeats — watch it twice.">
   <div className="block dark:hidden w-full">

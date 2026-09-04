@@ -56,7 +56,9 @@ dark  = build("#e8e6e3","#9a9791","#4dabf7","#ffa94d","#ffb84d","#1a1a1a")
 
 def mdx_safe(s):
     s = re.sub(r"<!--.*?-->", "", s, flags=re.S)
-    return re.sub(r"<style>(.*?)</style>", lambda m: "<style>{`"+m.group(1)+"`}</style>", s, flags=re.S).strip()
+    s = re.sub(r"<style>(.*?)</style>", lambda m: "<style>{`"+m.group(1)+"`}</style>", s, flags=re.S).strip()
+    # one line: multi-line JSX inside MDX trips micromark; single-line always compiles
+    return re.sub(r"\s*\n\s*", " ", s)
 
 frame = f'''<Frame caption="The dial, live: the same five tiles on the tray. Dial low — one bar towers and 'cold' wins every time. Dial high — the bars flatten and 'potato' gets its day. Bar height is probability. It repeats — watch both settings.">
   <div className="block dark:hidden w-full">

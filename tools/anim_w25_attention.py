@@ -60,7 +60,9 @@ dark  = build("#e8e6e3","#5f5c57","#12b886","#da77f2","#ffb84d","#1a1a1a")
 
 def mdx_safe(s):
     s = re.sub(r"<!--.*?-->", "", s, flags=re.S)
-    return re.sub(r"<style>(.*?)</style>", lambda m: "<style>{`"+m.group(1)+"`}</style>", s, flags=re.S).strip()
+    s = re.sub(r"<style>(.*?)</style>", lambda m: "<style>{`"+m.group(1)+"`}</style>", s, flags=re.S).strip()
+    # one line: multi-line JSX inside MDX trips micromark; single-line always compiles
+    return re.sub(r"\s*\n\s*", " ", s)
 
 frame = f'''<Frame caption="Attention, live: in one sentence the river pulls bank towards water; in the other, the loan pulls the same word towards money. Thick line = strong pull. It repeats — watch both scenes.">
   <div className="block dark:hidden w-full">

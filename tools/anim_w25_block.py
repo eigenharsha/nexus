@@ -60,7 +60,9 @@ dark  = build("#e8e6e3","#5f5c57","#4dabf7","#da77f2","#ffb84d","#1a1a1a")
 
 def mdx_safe(s):
     s = re.sub(r"<!--.*?-->", "", s, flags=re.S)
-    return re.sub(r"<style>(.*?)</style>", lambda m: "<style>{`"+m.group(1)+"`}</style>", s, flags=re.S).strip()
+    s = re.sub(r"<style>(.*?)</style>", lambda m: "<style>{`"+m.group(1)+"`}</style>", s, flags=re.S).strip()
+    # one line: multi-line JSX inside MDX trips micromark; single-line always compiles
+    return re.sub(r"\s*\n\s*", " ", s)
 
 frame = f'''<Frame caption="One floor, live: the words talk sideways (blue), then each thinks alone (violet), nothing on a whiteboard is ever erased — and the floor repeats thirty-two times. It loops — watch it twice.">
   <div className="block dark:hidden w-full">
