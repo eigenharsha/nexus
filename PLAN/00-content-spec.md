@@ -343,9 +343,11 @@ page, never a second vocabulary to learn.
 
 ### The page-order law (added after positioning review)
 
-The reader reaches the story with almost zero scrolling. Above the Tabs, a page may carry only:
-the routing Note (2 lines), the generated ramp (one collapsed line), and one collapsed
-AccordionGroup holding "Where this page sits" and "Why this matters". Nothing else. The mental
+The reader reaches the story with almost zero scrolling. Above the Tabs, a page carries only:
+the cover sketch, the routing Note (2 lines), the glimpse card, and the generated ramp (one
+collapsed line). Nothing else — no prerequisite blocks, no persona pitches ("Where this sits"
+/ "Why you should care" were cut after reader feedback; the ramp, glimpse and the bottom
+"Apply it at work" section carry that weight). The mental
 model and its diagram are a *summary*, not an opening — they live at the bottom, beside the
 "redraw it from memory" exercise, where they reward the reader instead of spoiling the story.
 Claims about live model behaviour must survive the reader testing them mid-read — they will.
