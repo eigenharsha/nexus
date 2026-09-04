@@ -350,6 +350,14 @@ model and its diagram are a *summary*, not an opening — they live at the botto
 "redraw it from memory" exercise, where they reward the reader instead of spoiling the story.
 Claims about live model behaviour must survive the reader testing them mid-read — they will.
 
+### The cover sketch (added with the glimpse)
+
+The very first thing on the page, above the routing note, is a small hand-drawn cover: a
+text-free, lightly animated sketch (~200px tall) that *teases the chapter's story* — the door
+with a note sliding under it, the map with a pin dropping in — and never shows the mechanism.
+No text means no font payload; keep it under a few KB, inline, light + dark. Generator lives
+in tools/ (see tools/heroes_w25.py).
+
 ### The glimpse law (Gagné's second event)
 
 Between the routing note and the ramp sits one small Card: **"In this chapter — about N
