@@ -72,7 +72,7 @@ portfolio repo will look at first.
 ## Ship it
 
 Deployed on a free tier (Fly.io or Render) with a README architecture diagram. **Keep this
-repo** — Week 26 and Week 32 both build on it.
+repo** — Week 26 and Week 34 both build on it.
 
 A lab never ends at "it printed the right thing".
 

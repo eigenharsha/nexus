@@ -172,10 +172,10 @@ assertions and the reference implementation are not written yet, and their READM
 | 26 | [`LAB-P4-W26` — QLoRA fine-tune for strict structured output](p4/week-26/) | python | 14-16 h | scaffold |
 | 27 | [`LAB-P4-W27` — 1,000-PDF retrieval system on pgvector/HNSW](p4/week-27/) | python | 14-16 h | scaffold |
 | 28 | [`LAB-P4-W28` — Production hybrid RAG](p4/week-28/) | python | 14-16 h | scaffold |
-| 29 | [`LAB-P4-W29` — Agent from scratch + custom MCP server](p4/week-29/) | python | 14-16 h | scaffold |
-| 30 | [`LAB-P4-W30` — Incident Auto-Remediation System](p4/week-30/) | python | 16-18 h | scaffold |
-| 31 | [`LAB-P4-W31` — Eval CI pipeline + guardrail layer](p4/week-31/) | python | 14-16 h | scaffold |
-| 32 | [`LAB-P4-W32` — Full observability & cost control](p4/week-32/) | python | 14-16 h | scaffold |
+| 29 | [`LAB-P4-W29` — Agent from scratch + custom MCP server](p4/week-30/) | python | 14-16 h | scaffold |
+| 30 | [`LAB-P4-W30` — Incident Auto-Remediation System](p4/week-32/) | python | 16-18 h | scaffold |
+| 31 | [`LAB-P4-W31` — Eval CI pipeline + guardrail layer](p4/week-33/) | python | 14-16 h | scaffold |
+| 32 | [`LAB-P4-W32` — Full observability & cost control](p4/week-34/) | python | 14-16 h | scaffold |
 
 ## Creating a new lab
 

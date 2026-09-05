@@ -70,7 +70,7 @@ portfolio repo will look at first.
 
 ## Ship it
 
-The harness is reused in the Midterm and again in Week 31 — package it properly, because you
+The harness is reused in the Midterm and again in Week 33 — package it properly, because you
 are going to import it three more times.
 
 A lab never ends at "it printed the right thing".

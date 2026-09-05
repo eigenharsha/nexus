@@ -1,6 +1,6 @@
 # Nexus — Systems, Machine Learning & Distributed AI
 
-A 32-week curriculum taking absolute beginners to production-ready systems and AI engineering
+A 34-week curriculum taking absolute beginners to production-ready systems and AI engineering
 mastery. Every topic is written at **three depths** and ends in something built, measured and
 defended.
 

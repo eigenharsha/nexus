@@ -1,6 +1,6 @@
 # LAB-P4-W32 — Full observability & cost control
 
-> Week 32 · Phase 4 · Generative AI · time box: **14-16 h**
+> Week 34 · Phase 4 · Generative AI · time box: **14-16 h**
 > Language: python · `make verify` grades you · no instructor required
 
 > **Status: scaffold.** The ticket, the three track specs with their acceptance criteria, the
@@ -39,7 +39,7 @@ keep passing.
 ## Getting started
 
 ```bash
-cd labs/p4/week-32
+cd labs/p4/week-34
 make help                    # what this lab can do
 cat standard/SPEC.md         # the acceptance criteria
 $EDITOR starter/             # your work goes here

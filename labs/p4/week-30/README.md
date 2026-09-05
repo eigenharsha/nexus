@@ -1,6 +1,6 @@
 # LAB-P4-W30 — Incident Auto-Remediation System
 
-> Week 30 · Phase 4 · Generative AI · time box: **16-18 h**
+> Week 32 · Phase 4 · Generative AI · time box: **16-18 h**
 > Language: python · `make verify` grades you · no instructor required
 
 > **Status: scaffold.** The ticket, the three track specs with their acceptance criteria, the
@@ -40,7 +40,7 @@ keep passing.
 ## Getting started
 
 ```bash
-cd labs/p4/week-30
+cd labs/p4/week-32
 make help                    # what this lab can do
 cat standard/SPEC.md         # the acceptance criteria
 $EDITOR starter/             # your work goes here
@@ -71,7 +71,7 @@ portfolio repo will look at first.
 ## Ship it
 
 Repo plus an architecture doc plus a recorded demo of a crash and resume. This is the
-capstone's backbone — build it so you can extend it in Week 32.
+capstone's backbone — build it so you can extend it in Week 34.
 
 A lab never ends at "it printed the right thing".
 

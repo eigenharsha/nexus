@@ -1,6 +1,6 @@
 # Nexus content-production brief — READ THIS FIRST
 
-You are writing production course content for **Nexus**, a 32-week curriculum taking absolute
+You are writing production course content for **Nexus**, a 34-week curriculum taking absolute
 beginners to expert level in systems, ML and distributed AI. Read these three files before
 writing anything:
 

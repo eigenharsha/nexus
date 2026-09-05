@@ -79,7 +79,7 @@
 - Micro-lessons: (a) text vs binary protocols; (b) message framing & schemas; (c) request/response vs streaming vs pub-sub; (d) versioning; (e) heartbeats & reconnection
 - **L1 Ground:** design a 5-command chat protocol on paper, then implement two commands.
 - **L2 Build:** a documented wire protocol with versioning, heartbeats, reconnect with backoff, and back-pressure; serialization choices (JSON vs MsgPack vs Protobuf) with size/speed numbers.
-- **L3 Edge:** protocol evolution without breaking old clients; WebSockets & SSE compared; how gRPC frames over HTTP/2 — and the direct relevance to MCP transports in Week 29.
+- **L3 Edge:** protocol evolution without breaking old clients; WebSockets & SSE compared; how gRPC frames over HTTP/2 — and the direct relevance to MCP transports in Week 30.
 - **Hands-on:** benchmark JSON vs MsgPack vs Protobuf on 100k messages: bytes on wire, encode/decode time.
 
 ### `P2-W10-M5` — Network security & operations basics
@@ -166,14 +166,14 @@
 - Micro-lessons: (a) population vs sample; (b) estimators, bias, variance; (c) confidence intervals; (d) hypothesis testing & p-values; (e) t-test, chi-square, Mann-Whitney; (f) bootstrap
 - **L1 Ground:** estimate a mean from a sample and see the interval shrink with n.
 - **L2 Build:** choosing the right test, one- vs two-tailed, effect size vs significance, bootstrap CIs for anything (including model metrics).
-- **L3 Edge:** what a p-value is *not*; multiple-comparison correction; p-hacking; power analysis; how this maps directly to comparing two model versions or two prompts (Week 31 evals).
+- **L3 Edge:** what a p-value is *not*; multiple-comparison correction; p-hacking; power analysis; how this maps directly to comparing two model versions or two prompts (Week 33 evals).
 - **Hands-on:** bootstrap a 95% CI around a model's F1 score; decide whether model B is genuinely better than model A.
 
 ### `P2-W12-M4` — Experimentation & A/B testing
 - Micro-lessons: (a) randomization; (b) metrics: primary, guardrail, proxy; (c) sample-size calculation; (d) running the test; (e) reading the result; (f) common pitfalls
 - **L1 Ground:** design an A/B test for a button color, end to end.
 - **L2 Build:** MDE and sample-size math, sequential-testing dangers, novelty effects, SRM checks, segmentation traps, decision rules written before launch.
-- **L3 Edge:** CUPED variance reduction, network effects/interference, switchback tests, online-vs-offline metric divergence — this is exactly the eval problem in Week 31.
+- **L3 Edge:** CUPED variance reduction, network effects/interference, switchback tests, online-vs-offline metric divergence — this is exactly the eval problem in Week 33.
 - **Hands-on:** given a results dataset with a subtle SRM problem, produce the correct (negative) conclusion and defend it.
 
 ### `P2-W12-M5` — Exploratory statistics & correlation
@@ -259,8 +259,8 @@
 ### `P2-W14-M3` — Graphs & traversal
 - Micro-lessons: (a) representations (adjacency list/matrix); (b) BFS & shortest path on unweighted graphs; (c) DFS, cycles, topological sort; (d) connected components; (e) union-find; (f) bipartite check
 - **L1 Ground:** model a friend network; run BFS by hand.
-- **L2 Build:** grid problems as graphs (islands, flood fill), topological sort for dependency resolution (this is literally your build system and Week 30's agent graph), union-find with path compression.
-- **L3 Edge:** graph representation memory/perf trade-offs at 10M edges; cycle detection in agent workflows and deadlock detection (Week 30); traversal order effects on cache.
+- **L2 Build:** grid problems as graphs (islands, flood fill), topological sort for dependency resolution (this is literally your build system and Week 32's agent graph), union-find with path compression.
+- **L3 Edge:** graph representation memory/perf trade-offs at 10M edges; cycle detection in agent workflows and deadlock detection (Week 32); traversal order effects on cache.
 - **Hands-on:** detect a cycle in a real dependency graph (e.g., a `package.json` tree) and print the cycle path.
 
 ### `P2-W14-M4` — Weighted shortest paths & greedy algorithms
@@ -361,7 +361,7 @@
 - Micro-lessons: (a) the EDA checklist; (b) univariate analysis; (c) bivariate & target relationships; (d) correlation & multicollinearity; (e) segmentation; (f) writing the findings
 - **L1 Ground:** run the full checklist on one dataset, guided.
 - **L2 Build:** a repeatable EDA function library; target leakage detection during EDA; class-imbalance discovery; distribution shift between train and holdout; documenting hypotheses.
-- **L3 Edge:** EDA as hypothesis generation, not decoration; automating profile reports and knowing their blind spots; detecting data drift with statistical tests (returns in Week 32 monitoring).
+- **L3 Edge:** EDA as hypothesis generation, not decoration; automating profile reports and knowing their blind spots; detecting data drift with statistical tests (returns in Week 34 monitoring).
 - **Hands-on:** produce a 2-page EDA memo for a stakeholder — findings, risks, and a recommended modelling approach.
 
 ### `P2-W16-M5` — Visualization that communicates

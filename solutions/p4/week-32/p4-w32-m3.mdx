@@ -1,5 +1,5 @@
 ---
-title: "Cost engineering"
+title: "Durable execution: checkpoint & resume"
 description: "Reference solution — Week 32"
 hidden: true
 icon: "lock"
@@ -16,62 +16,88 @@ URL can read it. Do not paste this link into the cohort chat.
 
 ## Reference solution — `P4-W32-M3`
 
-### Two rows make the submission
+### The one thing to get right
 
-Every cost report has a descending waterfall. A 3/3 report has two additional rows that most do not.
+```python
+NAMESPACE = uuid.UUID("6f1d6b6e-5f6a-4a0b-9a9b-0c2b7f1d0e11")   # fixed, in source
 
-**The row that costs more per run.** Verify-and-retry: +$0.008 per run, success 75.8% → 86.1%, cost
-per successful task $0.100 → $0.098. Anyone optimizing cost per call deletes this change. It is the
-best change in the table.
+def idempotency_key(thread_id: str, order_id: str, amount_pence: int) -> str:
+    return str(uuid.uuid5(NAMESPACE, f"{thread_id}|{order_id}|{amount_pence}"))
+```
 
-**The counter-example.** Route everything to the cheap model: $0.058 per run (a 69% saving on the
-invoice) and 54.0% success, giving **$0.107 per successful task** — worse than the $0.098 we shipped,
-and far worse in product terms. Put this row in front of anyone proposing a blanket downgrade.
+Everything else in this module is scaffolding around that function. A `uuid4()` in its place
+protects against in-process retries and nothing else: when the process dies and a new one replays
+the node, it generates a fresh random key and the provider's deduplication sees a new request. In
+our chaos harness both the "no key" and "random key" designs produced **6 double charges in 20
+kills**. Derived keys produced zero.
 
-### The full waterfall
+The namespace UUID is a constant in source, not generated at import. That is not pedantry — a
+namespace regenerated per process makes the derived key non-deterministic across processes, which
+reintroduces exactly the bug you were fixing.
 
-| Step | Cost/run | Success | Cost per successful task |
-| --- | --- | --- | --- |
-| Baseline | $0.190 | 75.0% | $0.253 |
-| Prompt caching | $0.143 | 75.0% | $0.191 |
-| Route triage + verify to haiku | $0.128 | 74.2% | $0.173 |
-| Evidence digests, not full text | $0.104 | 75.0% | $0.139 |
-| Semantic cache (31% hit, 1.2% false hits) | $0.076 | 75.8% | $0.100 |
-| **Verify-and-retry** | $0.084 | 86.1% | **$0.098** |
+### The chaos harness
 
-−61%, and every row was checked against the 120-case suite. Six of eleven configurations we measured
-turned out to be **dominated** — something else was both cheaper and better — which is the normal
-state of an unexamined system.
+```python
+# tests/chaos.py — sketch
+def one_trial(seed: int) -> dict:
+    proc = subprocess.Popen([sys.executable, "run_agent.py", "--thread", f"chaos-{seed}"])
+    time.sleep(random.Random(seed).uniform(0.5, 25.0))    # uniform over the run
+    proc.kill()                                            # SIGKILL, not SIGTERM
+    proc.wait()
+    resumed = subprocess.run([sys.executable, "run_agent.py", "--thread", f"chaos-{seed}"])
+    return {
+        "settled_charges": count_settled(f"chaos-{seed}"),      # must be exactly 1
+        "completed": resumed.returncode == 0,
+        "usd": total_cost(f"chaos-{seed}"),
+    }
+```
+
+Use `SIGKILL`, not `SIGTERM`. A `SIGTERM` handler that flushes state is a nice thing to have and it
+is not what you are testing; the pod eviction you are defending against does not always let you
+clean up.
+
+### Reference numbers
+
+| | Value |
+| --- | --- |
+| Checkpoint write p50, same AZ | 4.7 ms |
+| Per-run durability overhead | 42 ms, 0.12% of a 34 s run |
+| Replay cost overhead under chaos | 11.3% |
+| Double charges: no key / `uuid4` / derived / outbox | 6 / 6 / 0 / 0 in 20 kills |
+| Checkpoint storage, typed state | 41 KB per run, 63 GB per year at 4,200 runs/day |
+| After retention policy | 8.4 GB per year |
 
 ## Why this solution and not the obvious one
 
-**Obvious:** switch models first, because it is the biggest single number. It is the most visible
-lever and the one most likely to raise cost per successful task. Free wins first: caching (25% for
-five lines, zero quality risk), trimming (13%, and it slightly *improves* quality by removing
-distractors), then per-node routing measured against the suite.
+**Obvious:** wrap the node in a try/except and set a `charged=True` flag in the state. This does not
+work and it is worth understanding why: the flag is written when the node *completes*, and the crash
+happened *inside* the node, after the API call and before the return. The checkpoint never saw the
+flag. There is no way to atomically update remote state and local state without a key or a
+transaction — that is the whole reason the outbox exists.
 
-**Obvious:** route by model tier globally. Route per node. Haiku matched Opus on 118 of 120 triage
-cases and 71 of 120 diagnosis cases — the rule that emerged is *constrained-choice steps move,
-free-form judgement steps do not.*
+**Obvious:** use `SIGTERM` and flush on shutdown. It handles the polite case and none of the
+important ones. OOM kills, spot reclaims and node failures do not send `SIGTERM`.
 
-**Obvious:** treat a semantic cache as free money. It is a classifier with a false-hit rate — ours
-1.2% at a 0.93 threshold — and it needs a sweep, a stated budget and a TTL matched to how fast your
-domain goes stale. Incidents go stale in thirty minutes.
+**Obvious:** make the checkpointer write more often so less is replayed. The checkpoint boundary is
+the superstep and it is not tunable; and even if it were, finer checkpoints would not help, because
+the problem is not *how much* is replayed but that *anything effectful* is.
 
 ## The two wrong turns worth knowing about
 
-1. **A cost function reading only `input_tokens`.** Cache creation and cache read are separate usage fields at 1.25× and 0.1×. Our dashboard was 40% low for two weeks and, of course, in the flattering direction.
-2. **Optimizing the node we found annoying rather than the node with the money.** `diagnose` was 34% of spend and `triage` was 8%; the team's instinct was to fix triage because its prompt was ugly. Attribute first, with a p95 column — ours showed `diagnose` p95 at 3.3× its mean, which turned out to be a retry loop, i.e. a correctness bug wearing a cost costume.
+1. **`PostgresSaver.from_conn_string` per request.** Fine in the tutorial, a connection per run in a service. Combined with transactions held open across model calls, we exhausted the pool at 40 concurrent runs. `autocommit=True`, `prepare_threshold=0`, one pool at startup.
+2. **Effectful work before an `interrupt()` in the same node.** Resuming re-runs the node from its first line, so the pre-interrupt work happens twice. Build the proposal there (pure, cheap); do nothing that touches the world.
 
 ## Grading notes
 
-**3/3 on Cost:** per-step attribution with p95, at least 50% reduction in cost per successful task,
-an eval check on every row, the row that costs more per run, and the measured counter-example.
+**3/3 on Durability** requires the chaos harness output committed: 20 kills, `duplicate_effects: 0`,
+`lost_runs: 0`, and the replay cost overhead stated as a number.
 
-**Automatic cap:** a report whose headline is cost per call caps at 75, whatever else it contains.
+**Anything below 2 on Durability fails the lab**, because a system that repeats side effects is not
+a system.
 
-**Common losses:** cache tokens unpriced; a blanket model downgrade with no per-node measurement; a
-semantic cache with no false-hit rate; and — most common — a waterfall with no eval check on the
-intermediate rows, so "no quality regression" is asserted rather than measured.
+**Common losses:**
+- A random idempotency key. The most common single error in the week, and it looks correct.
+- No reconciliation queries. You must be able to detect the duplicates you did not prevent.
+- No retention policy, so the checkpoint table is presented as free. It is 63 GB/year at modest volume.
 
 {/* --- hand-written body below this line is preserved on regeneration --- */}

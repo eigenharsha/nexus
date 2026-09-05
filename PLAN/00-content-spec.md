@@ -267,7 +267,7 @@ the mismatch rule naively here would reach precisely the wrong verdict.
 - **PyTorch** 2.x · **transformers** / **peft** / **trl** pinned in each lab's `requirements.txt`
 - Diagrams: **Excalidraw hand-drawn house style** (`PLAN/03-visual-spec.md`) as the default; Mermaid only for large structural graphs. Light + dark SVG exports, `.excalidraw` source committed.
 - Every runnable artifact must work on **macOS (Apple Silicon)** and **Linux x86-64**; GPU labs must have a CPU/Colab fallback path.
-- Cost rule: the whole 32 weeks must be completable for **< $50** of cloud spend. Anything expensive gets a free-tier or local alternative documented.
+- Cost rule: the whole 34 weeks must be completable for **< $50** of cloud spend. Anything expensive gets a free-tier or local alternative documented.
 
 ---
 

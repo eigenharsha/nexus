@@ -233,11 +233,11 @@ Every module below carries a **`VIS:`** line (the diagrams/sketches/animations t
 
 ---
 
-## T-P4-W29 — Week 29: Agents I — Loops, Tools & MCP
+## T-P4-W29 — Week 30: Agents I — Loops, Tools & MCP
 
 **Week outcome:** learner builds an agent from scratch (no framework) and exposes real capabilities to it safely via a custom MCP server.
 
-### `P4-W29-M1` — What an agent actually is
+### `P4-W30-M1` — What an agent actually is
 - Micro-lessons: (a) LLM call vs chain vs agent; (b) the Observe-Think-Act loop; (c) ReAct; (d) termination conditions; (e) when *not* to use an agent; (f) the reliability math of multi-step systems
 - **L1 Ground:** build a 40-line agent loop with one tool — a calculator — and watch it reason.
 - **L2 Build:** a from-scratch ReAct loop with tool dispatch, scratchpad management, max-iterations, and structured stop conditions; a decision table for chain vs agent.
@@ -246,7 +246,7 @@ Every module below carries a **`VIS:`** line (the diagrams/sketches/animations t
 - **REF:** Yao et al. 2022 (ReAct); Anthropic "Building Effective Agents"; Schick et al. 2023 (Toolformer).
 - **Hands-on:** build the agent from scratch; then measure its success rate over 30 task instances and compute per-step reliability.
 
-### `P4-W29-M2` — Tools & function calling
+### `P4-W30-M2` — Tools & function calling
 - Micro-lessons: (a) tool schemas (Week 6 Pydantic returns); (b) the tool-calling protocol; (c) writing good tool descriptions; (d) argument validation & error feedback; (e) tool result formatting; (f) tool-selection failures
 - **L1 Ground:** give the model a weather tool; watch it decide to call it.
 - **L2 Build:** a tool registry with Pydantic schemas, validation errors fed back as recoverable messages, idempotent and side-effect-safe tool design, result truncation for context budget.
@@ -255,7 +255,7 @@ Every module below carries a **`VIS:`** line (the diagrams/sketches/animations t
 - **REF:** Anthropic tool-use docs; OpenAI function-calling docs; Patil et al. 2023 (Gorilla).
 - **Hands-on:** measure tool-selection accuracy with 3, 10, and 30 tools available; then improve the 30-tool case with better descriptions and grouping.
 
-### `P4-W29-M3` — Memory, context & state
+### `P4-W30-M3` — Memory, context & state
 - Micro-lessons: (a) the context window as a budget; (b) conversation memory strategies; (c) summarization & compaction; (d) retrieval as long-term memory (Week 27 returns); (e) scratchpads & working memory; (f) state serialization
 - **L1 Ground:** an agent that forgets — then add memory and see it improve.
 - **L2 Build:** a token budget manager, sliding window + summary hybrid, storing episodic memory in pgvector, structured state objects instead of raw transcript.
@@ -264,20 +264,20 @@ Every module below carries a **`VIS:`** line (the diagrams/sketches/animations t
 - **REF:** Packer et al. 2023 (MemGPT); Anthropic prompt-caching + context-management docs; needle-in-a-haystack evaluations.
 - **Hands-on:** run a 50-turn conversation under three memory strategies; report task success, tokens used and $ cost for each.
 
-### `P4-W29-M4` — Model Context Protocol (MCP)
+### `P4-W30-M4` — Model Context Protocol (MCP)
 - Micro-lessons: (a) the M×N integration problem MCP solves; (b) architecture: hosts, clients, servers; (c) primitives: tools, resources, prompts; (d) transports (stdio, HTTP/SSE); (e) writing a server; (f) security model
 - **L1 Ground:** connect an existing MCP server to a client and use its tools.
 - **L2 Build:** write a custom MCP server exposing a local database and a restricted filesystem; typed tool definitions; error handling; testing the server standalone.
-- **L3 Edge:** the security surface — a tool that can run shell commands is a remote-code-execution primitive; sandboxing, allow-lists, path traversal defence, read-only modes, and human-in-the-loop confirmation for destructive operations; prompt injection *through tool results* (setting up Week 31); transport choice and its trust implications (Week 10 returns).
+- **L3 Edge:** the security surface — a tool that can run shell commands is a remote-code-execution primitive; sandboxing, allow-lists, path traversal defence, read-only modes, and human-in-the-loop confirmation for destructive operations; prompt injection *through tool results* (setting up Week 33); transport choice and its trust implications (Week 10 returns).
 - **VIS:** hand-drawn M×N → M+N diagram; an MCP request/response sequence diagram; a trust-boundary diagram with the dangerous edges marked in red.
 - **REF:** MCP specification & official SDK docs; Anthropic MCP announcement + security guidance.
 - **Hands-on:** write an MCP server giving an agent *safe* terminal access — allow-listed commands, timeout, output cap, no network, audit log — then try to break your own sandbox and document the attempts.
 
-### `P4-W29-M5` — Pydantic AI & typed agents
+### `P4-W30-M5` — Pydantic AI & typed agents
 - Micro-lessons: (a) typed agent frameworks; (b) dependency injection for agents; (c) structured result types; (d) validation & retries; (e) streaming; (f) testing agents deterministically
 - **L1 Ground:** the same agent, rebuilt with Pydantic AI in a third of the lines.
 - **L2 Build:** typed dependencies, result models, validators that trigger a retry, streaming partial results, and unit tests with a mocked model (so the test suite is fast and free).
-- **L3 Edge:** framework vs from-scratch — the honest trade-off (control, debuggability, upgrade risk); making agent behaviour testable at all; deterministic replay of a recorded model trace as a regression test (the bridge to Week 31 evals).
+- **L3 Edge:** framework vs from-scratch — the honest trade-off (control, debuggability, upgrade risk); making agent behaviour testable at all; deterministic replay of a recorded model trace as a regression test (the bridge to Week 33 evals).
 - **VIS:** side-by-side sketch of the raw loop vs the framework-managed loop, with the framework's responsibilities shaded.
 - **REF:** Pydantic AI docs; LangChain vs Pydantic AI design discussions.
 - **Hands-on:** write a test suite for your agent that runs in under 10 seconds with zero API calls.
@@ -290,11 +290,11 @@ Every module below carries a **`VIS:`** line (the diagrams/sketches/animations t
 
 ---
 
-## T-P4-W30 — Week 30: Agents II — LangGraph, Multi-Agent & Durability
+## T-P4-W30 — Week 32: Agents II — LangGraph, Multi-Agent & Durability
 
 **Week outcome:** learner architects a stateful multi-agent system that survives crashes — the capstone's backbone.
 
-### `P4-W30-M1` — Graphs as the right abstraction
+### `P4-W32-M1` — Graphs as the right abstraction
 - Micro-lessons: (a) why linear chains break; (b) nodes, edges, conditional edges; (c) shared state schema; (d) cycles & loop control; (e) LangGraph basics; (f) visualizing the graph
 - **L1 Ground:** draw your agent's flow as a graph on paper first; then it becomes code almost verbatim.
 - **L2 Build:** a LangGraph app with typed state, conditional routing, and a cycle with a bounded iteration count; state reducers; graph visualization.
@@ -303,7 +303,7 @@ Every module below carries a **`VIS:`** line (the diagrams/sketches/animations t
 - **REF:** LangGraph documentation & conceptual guides; Anthropic "Building Effective Agents" (workflow patterns).
 - **Hands-on:** convert your Week-29 from-scratch agent into a graph; diff the debuggability of the two.
 
-### `P4-W30-M2` — Multi-agent patterns
+### `P4-W32-M2` — Multi-agent patterns
 - Micro-lessons: (a) when multiple agents beat one; (b) Orchestrator-Specialist; (c) Critic-Refiner; (d) Mixture of Agents / debate; (e) hand-off protocols; (f) shared vs isolated context
 - **L1 Ground:** a writer agent and a critic agent improving a draft over 3 rounds.
 - **L2 Build:** implement orchestrator-specialist routing with clear contracts between agents; a critic loop with an explicit rubric and a stopping rule; context isolation per specialist to control cost.
@@ -312,7 +312,7 @@ Every module below carries a **`VIS:`** line (the diagrams/sketches/animations t
 - **REF:** Wu et al. 2023 (AutoGen); Wang et al. 2024 (Mixture-of-Agents); Anthropic multi-agent research-system write-up.
 - **Hands-on:** the head-to-head benchmark — and be willing to conclude that single-agent wins.
 
-### `P4-W30-M3` — Durable execution: checkpoint & resume
+### `P4-W32-M3` — Durable execution: checkpoint & resume
 - Micro-lessons: (a) why agents must be durable; (b) checkpointers & thread IDs; (c) persistent backends (Postgres — Week 8 returns); (d) resuming after a crash; (e) time travel & state editing; (f) human-in-the-loop interrupts
 - **L1 Ground:** kill the process mid-run; restart; watch it continue from the last node.
 - **L2 Build:** a Postgres checkpointer, thread-scoped state, `interrupt()` for human approval before destructive actions, resume-from-edit for correcting an agent mid-flight.
@@ -321,7 +321,7 @@ Every module below carries a **`VIS:`** line (the diagrams/sketches/animations t
 - **REF:** LangGraph persistence docs; Temporal durable-execution concepts; the outbox pattern.
 - **Hands-on:** build an agent whose tool charges money; crash it mid-transaction 20 times and prove no double-charge.
 
-### `P4-W30-M4` — Resilience, budgets & failure handling
+### `P4-W32-M4` — Resilience, budgets & failure handling
 - Micro-lessons: (a) token & cost budgets per run; (b) timeouts and step limits; (c) deadlock and livelock in agent graphs; (d) retry vs escalate vs abort; (e) partial-failure recovery; (f) graceful degradation
 - **L1 Ground:** an agent stuck in a loop, burning tokens — add a budget guard and watch it stop.
 - **L2 Build:** a budget manager (tokens, $, wall-clock, steps) enforced at graph level; circuit breakers around flaky tools (Week 4 returns); escalation to a human with a structured summary.
@@ -330,8 +330,8 @@ Every module below carries a **`VIS:`** line (the diagrams/sketches/animations t
 - **REF:** LangGraph recursion/limits docs; SRE-style error-budget thinking applied to agents; published agent post-mortems.
 - **Hands-on:** inject 6 failure types (tool timeout, malformed output, infinite loop, budget exhaustion, dependency down, contradictory instructions) and show correct handling of each.
 
-### `P4-W30-M5` — Architecting a real agentic system
-- Micro-lessons: (a) decomposing a business process into agents/tools; (b) deciding autonomy level per step; (c) the human-approval boundary; (d) integrating RAG (Week 28) and MCP (Week 29); (e) deployment shape; (f) documenting the design
+### `P4-W32-M5` — Architecting a real agentic system
+- Micro-lessons: (a) decomposing a business process into agents/tools; (b) deciding autonomy level per step; (c) the human-approval boundary; (d) integrating RAG (Week 28) and MCP (Week 30); (e) deployment shape; (f) documenting the design
 - **L1 Ground:** map an incident-response runbook to a graph, on paper, before any code.
 - **L2 Build:** the full incident auto-remediation architecture — planner, analyst, executor, plus RAG over runbooks and an MCP server for safe system access; approval gates for anything destructive.
 - **L3 Edge:** blast-radius design (what's the worst thing this system can do, and what stops it?); staged autonomy rollout (suggest → approve → auto with rollback); auditability requirements; the organizational reality of shipping an autonomous system.
@@ -347,11 +347,11 @@ Every module below carries a **`VIS:`** line (the diagrams/sketches/animations t
 
 ---
 
-## T-P4-W31 — Week 31: Evals & Defensive AI
+## T-P4-W31 — Week 33: Evals & Defensive AI
 
 **Week outcome:** learner can prove an AI system works and defend it against attack — the two things that separate a demo from a product.
 
-### `P4-W31-M1` — Why evals, and how to build a dataset
+### `P4-W33-M1` — Why evals, and how to build a dataset
 - Micro-lessons: (a) vibes don't scale; (b) eval types (unit/reference/judge/human/production); (c) building a ground-truth set; (d) coverage & the error taxonomy; (e) eval maintenance; (f) eval-driven development
 - **L1 Ground:** change one prompt word; run 20 saved cases; see 3 regress. That's why evals exist.
 - **L2 Build:** a 100+ case eval set derived from real failures, an error taxonomy from manual review of 50 outputs, cheap deterministic assertions first (format, length, required entities, refusals), then the expensive ones.
@@ -360,7 +360,7 @@ Every module below carries a **`VIS:`** line (the diagrams/sketches/animations t
 - **REF:** Hamel Husain's evals writing; OpenAI Evals; Anthropic evaluation guidance.
 - **Hands-on:** manually review 50 outputs from your Week-30 system, build the error taxonomy, and convert the top 3 categories into automated checks.
 
-### `P4-W31-M2` — LLM-as-a-Judge
+### `P4-W33-M2` — LLM-as-a-Judge
 - Micro-lessons: (a) the pattern; (b) judge prompt design & rubrics; (c) pairwise vs pointwise; (d) known biases (position, verbosity, self-preference); (e) validating the judge against humans; (f) cost control
 - **L1 Ground:** have a model grade 10 answers against a rubric; then check its grades yourself.
 - **L2 Build:** a judge with an explicit rubric and required reasoning; pairwise comparison with position swapping; agreement measured against your own human labels (Cohen's kappa).
@@ -369,7 +369,7 @@ Every module below carries a **`VIS:`** line (the diagrams/sketches/animations t
 - **REF:** Zheng et al. 2023 (MT-Bench / LLM-as-a-Judge); RAGAS; G-Eval.
 - **Hands-on:** validate your judge against 50 human-labelled examples; report kappa; iterate the rubric until agreement is acceptable.
 
-### `P4-W31-M3` — RAG & agent-specific evaluation
+### `P4-W33-M3` — RAG & agent-specific evaluation
 - Micro-lessons: (a) decomposing RAG failure (retrieval vs generation); (b) faithfulness/groundedness; (c) answer relevancy; (d) context precision/recall; (e) agent trajectory evaluation; (f) tool-call correctness
 - **L1 Ground:** an answer that sounds right but isn't in the sources — detect it.
 - **L2 Build:** RAGAS-style metrics implemented and run against the Week-28 system; hallucination detection by claim-level source attribution; trajectory evaluation for agents (did it take a sensible path, not just reach an answer?).
@@ -378,7 +378,7 @@ Every module below carries a **`VIS:`** line (the diagrams/sketches/animations t
 - **REF:** Es et al. 2023 (RAGAS); TruLens; LangSmith evaluation docs.
 - **Hands-on:** plant 5 different failure causes in the Week-30 system and verify your eval suite attributes each to the right component.
 
-### `P4-W31-M4` — Prompt injection & defensive design
+### `P4-W33-M4` — Prompt injection & defensive design
 - Micro-lessons: (a) prompt injection vs jailbreaking; (b) direct vs indirect injection; (c) the RAG/tool injection surface; (d) data-vs-instruction separation; (e) least privilege for tools; (f) output handling & downstream sinks
 - **L1 Ground:** hide an instruction inside a document; watch the agent obey it. That's the whole attack.
 - **L2 Build:** defence in depth — input filtering, delimiting untrusted content, instruction hierarchy, tool allow-lists and scoping, human approval for destructive actions, output encoding before it reaches a shell/SQL/browser sink.
@@ -387,7 +387,7 @@ Every module below carries a **`VIS:`** line (the diagrams/sketches/animations t
 - **REF:** Greshake et al. 2023 (indirect prompt injection); OWASP Top 10 for LLM Applications; Simon Willison's prompt-injection series; Anthropic safety-practice docs.
 - **Hands-on:** red-team your own system: 15 documented attack attempts, which succeeded, and the mitigation shipped for each.
 
-### `P4-W31-M5` — Guardrails & moderation
+### `P4-W33-M5` — Guardrails & moderation
 - Micro-lessons: (a) input vs output guardrails; (b) Llama Guard & classifier-based moderation; (c) NeMo Guardrails / rule-based flows; (d) PII detection & redaction; (e) topical scoping & refusals; (f) measuring guardrail cost (latency, false positives)
 - **L1 Ground:** add an input classifier that blocks an obviously abusive request.
 - **L2 Build:** a Llama Guard input layer plus output checks (PII, groundedness, policy) on the Week-30 system; a guardrail eval set with both attacks and benign lookalikes; false-positive rate measured.
@@ -404,11 +404,11 @@ Every module below carries a **`VIS:`** line (the diagrams/sketches/animations t
 
 ---
 
-## T-P4-W32 — Week 32: LLMOps — Observability, Cost & Reliability
+## T-P4-W32 — Week 34: LLMOps — Observability, Cost & Reliability
 
 **Week outcome:** learner can see, price and operate an AI system in production.
 
-### `P4-W32-M1` — Tracing & OpenTelemetry
+### `P4-W34-M1` — Tracing & OpenTelemetry
 - Micro-lessons: (a) logs vs metrics vs traces; (b) spans, traces, context propagation; (c) OTel concepts & SDK; (d) instrumenting an LLM app; (e) semantic conventions for GenAI; (f) sampling
 - **L1 Ground:** wrap one LLM call in a span and view the trace.
 - **L2 Build:** instrument the whole Week-30 graph — one trace per run, a span per node/tool/LLM call, with inputs, outputs, token counts, model and latency as attributes; context propagation across async boundaries.
@@ -417,16 +417,16 @@ Every module below carries a **`VIS:`** line (the diagrams/sketches/animations t
 - **REF:** OpenTelemetry GenAI semantic conventions; OTel Python docs; Langfuse/LangSmith tracing docs.
 - **Hands-on:** produce a trace of one agent run and annotate every span with what it cost in time and money.
 
-### `P4-W32-M2` — Langfuse & the LLM observability stack
+### `P4-W34-M2` — Langfuse & the LLM observability stack
 - Micro-lessons: (a) what LLM observability adds beyond APM; (b) Langfuse setup (self-hosted); (c) sessions, users, traces; (d) prompt management & versioning; (e) datasets from production traces; (f) online evaluation
 - **L1 Ground:** send traces to Langfuse and browse a real conversation.
-- **L2 Build:** self-hosted Langfuse via Docker Compose, prompt versioning with rollback, converting production failures into eval cases automatically (closing the loop with Week 31), scoring traces online.
+- **L2 Build:** self-hosted Langfuse via Docker Compose, prompt versioning with rollback, converting production failures into eval cases automatically (closing the loop with Week 33), scoring traces online.
 - **L3 Edge:** the feedback flywheel — production traces → labelled dataset → eval suite → improved prompt → measured in production; build-vs-buy for observability; data-retention and privacy policy for stored traces.
 - **VIS:** hand-drawn flywheel diagram; a screenshot walkthrough of a real failure investigated from trace to fix.
 - **REF:** Langfuse docs; LangSmith docs; Arize Phoenix.
 - **Hands-on:** take one production failure from trace → eval case → fix → verified in the next eval run; document the full loop.
 
-### `P4-W32-M3` — Cost engineering
+### `P4-W34-M3` — Cost engineering
 - Micro-lessons: (a) the token cost model; (b) per-request, per-user, per-feature attribution; (c) prompt caching; (d) model routing (cheap → expensive); (e) context trimming & compression; (f) budget alerts
 - **L1 Ground:** price one agent run to the cent, by hand, from the token counts.
 - **L2 Build:** cost attribution per agent step from trace attributes; prompt caching with measured savings; a router that sends easy queries to a small model with quality measured on the Week-31 evals; caching layers (semantic cache from Week 28 returns).
@@ -435,7 +435,7 @@ Every module below carries a **`VIS:`** line (the diagrams/sketches/animations t
 - **REF:** provider pricing & prompt-caching docs; RouteLLM; FrugalGPT.
 - **Hands-on:** cut your system's cost per successful task by ≥50% with no measured quality regression on the Week-31 eval suite; show the before/after table.
 
-### `P4-W32-M4` — Reliability, latency & production operations
+### `P4-W34-M4` — Reliability, latency & production operations
 - Micro-lessons: (a) SLOs for AI systems; (b) latency budgets (TTFT vs total); (c) streaming for perceived performance; (d) fallbacks & multi-provider; (e) rate limits & queueing; (f) incident response for AI systems
 - **L1 Ground:** stream a response and feel the latency difference without changing total time.
 - **L2 Build:** an SLO with an error budget, TTFT vs total-latency instrumentation, provider fallback with a circuit breaker (Week 4 returns), queue + back-pressure under rate limits, a runbook for "the model is producing garbage".
@@ -444,7 +444,7 @@ Every module below carries a **`VIS:`** line (the diagrams/sketches/animations t
 - **REF:** Google SRE book (SLOs, error budgets); provider status/versioning docs; published LLM incident post-mortems.
 - **Hands-on:** run a game day on your Week-30 system: provider outage, rate limiting, a silently degraded model, and a prompt-injection attempt — diagnose all four from telemetry alone.
 
-### `P4-W32-M5` — Deploying & maintaining an AI system
+### `P4-W34-M5` — Deploying & maintaining an AI system
 - Micro-lessons: (a) deployment shape for agent systems; (b) prompt/model/config versioning together; (c) staged rollout & shadow mode; (d) continuous evaluation on a schedule; (e) drift & model-update detection; (f) the maintenance burden
 - **L1 Ground:** deploy the Week-30 system with Docker Compose; call it over HTTP.
 - **L2 Build:** deploy on the Week-24 Kubernetes stack, versioned prompts as config, canary rollout with automated eval gates, scheduled nightly evals against production traffic samples, alerting on quality metrics not just errors.
@@ -462,7 +462,7 @@ Every module below carries a **`VIS:`** line (the diagrams/sketches/animations t
 ---
 
 ## `T-P4-CAP` — Graduation Capstone: Distributed AI System
-*(3-week overlay, runs alongside Weeks 30–32; defended after Week 32)*
+*(3-week overlay, runs alongside Weeks 30–32; defended after Week 34)*
 
 **Brief:** design, build, operate and defend a stateful multi-agent system that solves a real problem — e.g. *Automated Code Reviewer* or *AI SRE Incident Responder*. It must be something you would let a colleague use.
 

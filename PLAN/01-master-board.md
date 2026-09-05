@@ -21,7 +21,7 @@ Level 3 (module) and Level 4 (lesson/lab) live in `PLAN/tasks/phase-N-tasks.md`.
 | T-007 | Assessment bank format + auto-grader harness | `assessments/`, `grade.py` | T-003 | 3 h | TODO |
 | T-008 | Anki deck pipeline (markdown → .apkg) | `decks/build.py` | T-003 | 2 h | TODO |
 | T-009 | Two persona journey maps (Aarav / Meera) week-by-week | `PLAN/personas.md` | T-000 | 2 h | TODO |
-| T-010 | Prerequisite/dependency graph across all 32 weeks | `PLAN/dep-graph.md` (Mermaid) | T-001 | 2 h | TODO |
+| T-010 | Prerequisite/dependency graph across all 34 weeks | `PLAN/dep-graph.md` (Mermaid) | T-001 | 2 h | TODO |
 | T-011 | Cost & hardware budget doc (incl. no-GPU fallback paths) | `PLAN/hardware-and-cost.md` | — | 2 h | TODO |
 | T-012 | Capstone + midterm project specs and rubrics | `PLAN/projects/` | T-001 | 4 h | TODO |
 | T-013 | Instructor guide: how to teach each layer, live-session plan | `PLAN/instructor-guide.md` | T-000 | 3 h | TODO |

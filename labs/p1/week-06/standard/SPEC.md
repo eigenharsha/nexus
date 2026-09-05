@@ -27,7 +27,7 @@ make verify TRACK=standard
 ## Design notes
 
 Keep this service. It is upgraded with a fine-tuned model in Week 26 and instrumented with
-OpenTelemetry in Week 32. The interfaces you choose now are the ones you will live with.
+OpenTelemetry in Week 34. The interfaces you choose now are the ones you will live with.
 
 ## What the tests will not tell you
 

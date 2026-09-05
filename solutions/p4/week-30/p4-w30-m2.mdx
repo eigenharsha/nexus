@@ -1,5 +1,5 @@
 ---
-title: "Multi-agent patterns"
+title: "Tools & function calling"
 description: "Reference solution — Week 30"
 hidden: true
 icon: "lock"
@@ -16,68 +16,80 @@ URL can read it. Do not paste this link into the cohort chat.
 
 ## Reference solution — `P4-W30-M2`
 
-### Running an honest head-to-head
+### Building the 120-prompt benchmark properly
 
-The experiment is the deliverable, and there are four ways to make it dishonest without meaning to.
+The experiment is worth more than the registry code, and it is where submissions go wrong.
 
-**1. Tuning one configuration more than the others.** You will spend three hours on the multi-agent
-prompt and twenty minutes on the baseline. Then the baseline loses and you conclude something false.
-Fix: fixed time budget per configuration, written down before you start. Ours was 90 minutes each.
+**Write prompts from user language, not tool names.** If your prompt is "search the orders" and your
+tool is `search_orders`, you are measuring string matching. Ours came from real support tickets:
+*"can you find the thing Asha ordered last month, she thinks it was a router"*. Twenty of the 120
+deliberately do not name any entity your tools handle, and the correct label is "none of these" —
+if your harness has no such label, you cannot measure the failure mode where the model invents a
+tool call for a task it should have declined.
 
-**2. Omitting the control.** Single agent asked to review its own work in one conversation. It is
-the strongest cheap configuration on many tasks — 80% of the critic's gain at 71% of its cost in our
-run — and leaving it out inflates the case for multi-agent.
+**Three runs, report the spread.** Single-run differences under about 3 points are noise on 120
+prompts. Ours varied ±1.7 points across three runs; a "4-point improvement" from one run each is not
+a result.
 
-**3. One scorer.** Two, with Cohen's kappa reported. Ours was 0.71, which is "substantial" and still
-means roughly one disagreement in seven. Week 31 M2 explains why a single unvalidated scorer is not
-evidence.
+```python
+# bench/selection.py — the core of it
+from collections import Counter
+def evaluate(prompts, tools) -> dict:
+    conf = Counter()
+    for p in prompts:
+        r = client.messages.create(model="claude-opus-5", max_tokens=1000,
+                                   tools=tools, messages=[{"role":"user","content":p.text}])
+        calls = [b for b in r.content if b.type == "tool_use"]
+        got = calls[0].name if calls else "NONE"
+        conf[(p.label, got)] += 1
+    correct = sum(v for (want, got), v in conf.items() if want == got)
+    return {"accuracy": correct / len(prompts), "confusion": conf}
+```
 
-**4. Cost per run instead of cost per successful task.** Multi-agent configurations fail differently
-— often more expensively — so per-run cost flatters them.
+The `confusion` counter is the deliverable. Accuracy tells you there is a problem; the confusion
+matrix tells you it is three pairs of tools, which turns a research project into an afternoon.
 
 ### Reference numbers
 
-| Configuration | Success | Cost per successful task | p50 |
+| Configuration | 3 tools | 10 tools | 30 tools |
 | --- | --- | --- | --- |
-| Single strong agent | 75.0% | $0.253 | 34 s |
-| Single agent + self-review, one conversation | 80.0% | $0.300 | 44 s |
-| Critic-Refiner, 2 rounds | 82.5% | $0.412 | 61 s |
-| Orchestrator + 3 specialists, isolated context | 77.5% | $0.400 | 71 s |
-| Mixture of 3 + aggregator | 77.5% | $1.110 | 71 s |
-
-Failure attribution over the orchestrator runs: **8 of 9 failures were coordination, not
-capability.** Individually the specialists were right 37 times in 40.
+| One-line descriptions | 98.3% | 90.0% | 76.7% |
+| Four-clause descriptions | 99.2% | 96.7% | 92.4% |
+| + namespacing (`orders.lookup`) | — | — | 86.5% from 81.7% baseline |
+| + enum-collapsed near-neighbours | — | — | 91.2% |
+| + deferred loading | — | — | 90.4%, cost/run $0.176 → $0.081 |
 
 ## Why this solution and not the obvious one
 
-**Obvious:** more agents, more capability. Week 29 M1's arithmetic disagrees before you run
-anything. Three specialists at 92.5% plus an orchestrator at 87.5% is 0.925³ × 0.875 = 69.3%
-expected against a single loop's 75%. We computed that before measuring and the measurement agreed.
+**Obvious:** raise the model's effort or switch to a bigger model. On our set this bought 1.9 points
+at 30 tools and roughly doubled cost. Rewriting six descriptions bought 8 points for free. Always
+exhaust the text before you spend on the model.
 
-**Obvious:** shared context so every agent "has the full picture". It triples token cost and turns
-one agent's wrong intermediate conclusion into everyone's premise. Isolated briefs took the
-orchestrator pattern from $0.71 to $0.31 with no quality change — but they move the failure mode to
-"answered the wrong question perfectly", which is why `must_return` and the `unanswered` check exist.
+**Obvious:** give the model all 30 tools and a better system prompt telling it to choose carefully.
+Measured: +0.8 points, inside noise. The system prompt cannot disambiguate two tools whose
+descriptions do not distinguish them — the information is not there to reason from.
 
-**Obvious:** three refinement rounds because two seems few. Measured per-round quality delta: +0.41,
-+0.07, −0.02. A critic asked to find problems in an acceptable draft finds some, and acting on them
-makes it worse.
+**Obvious:** collapse everything into one `query(action, params)` tool. This does fix selection —
+there is only one tool — but it moves the problem into an untyped `params` blob, so argument
+validity collapses instead. We measured 34% malformed-argument rate on a collapsed 30-operation
+tool versus 4% across 30 typed tools. Collapse *near-neighbours*, not everything.
 
 ## The two wrong turns worth knowing about
 
-1. **No `ACCEPT` token.** With no explicit accept, 0 of 40 runs stopped before the round cap. Critics are helpful by disposition; you must give them a way to say "done".
-2. **Prose feedback instead of structured fixes.** Prose reached acceptance in 2.6 rounds, structured `Fix` objects in 1.7 — a 35% cost reduction from changing the shape of one hand-off, because the writer knew which sentence to change rather than rewriting everything.
+1. **Measuring on the happy path only.** Our first benchmark had no "should not call any tool" cases. It reported 94% at 30 tools. Adding 20 such cases dropped it to 81.7% — the model was inventing tool calls for out-of-scope questions and we had built a harness that could not see it.
+2. **Tool order.** We shuffled the tool list between runs to "avoid position bias" and destroyed the prompt cache, which quadrupled the benchmark's cost and hid a real ordering effect. Sort deterministically; if you want to test position sensitivity, do it as a deliberate separate experiment.
 
 ## Grading notes
 
-**3/3 on Measurement:** four configurations including the control, two scorers with agreement
-reported, three repetitions, cost per successful task, and a failure taxonomy separating capability
-from coordination.
+**3/3 on Correctness:** the registry returns readable feedback for unknown tool, invalid arguments,
+tool exception and oversized output, and never raises out of `call()`.
 
-**3/3 on Explanation:** a stated conclusion with a recommendation, and the willingness to recommend
-the single agent. A submission that concludes multi-agent won without the control condition scores 1.
+**3/3 on Performance:** the before/after table has three tool-surface sizes, a spread across runs,
+schema-token counts, and dollars per run.
 
-**Common losses:** no control; one scorer; per-run cost only; and — most often — a mixture-of-agents
-implementation running one model three times, which does not reproduce the paper's mechanism at all.
+**Common losses:**
+- No confusion matrix. Accuracy alone is not a diagnosis, and the fix cannot be justified.
+- Prompts written from tool names. The result is inflated and the reviewer will spot it immediately.
+- Non-idempotent tools that auto-retry. This is an automatic point off on Security in the lab rubric, because it is the double-charge bug.
 
 {/* --- hand-written body below this line is preserved on regeneration --- */}

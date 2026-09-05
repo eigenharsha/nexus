@@ -30,7 +30,7 @@ The lab `Makefile`s find `.venv/` on their own by walking up to the directory co
 ## Options
 
 ```bash
-./bootstrap.sh                  # everything, all 32 weeks
+./bootstrap.sh                  # everything, all 34 weeks
 ./bootstrap.sh --through 8      # only what weeks 1-8 need  (a much smaller download)
 ./bootstrap.sh --check          # verify only; green/red per tool, installs nothing
 ./bootstrap.sh --check --through 8
@@ -100,7 +100,7 @@ that will cost you hours you should be spending on the actual material.
 
 ## Cost
 
-The whole 32 weeks is designed to cost **under $50** of cloud spend. Everything that can run
+The whole 34 weeks is designed to cost **under $50** of cloud spend. Everything that can run
 locally does. The GPU weeks (21, 22, 25, 26) have a documented CPU or free-Colab fallback path;
 they are slower, not impossible. Nothing in the course requires a paid model API — week 26
 serves a local model with Ollama and vLLM, and the agent weeks run against it.

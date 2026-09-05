@@ -265,7 +265,7 @@ Each module ID maps to `content/phase-1/week-NN/MX-slug.md` and a lab under `lab
 - Micro-lessons: (a) models & field types; (b) validators; (c) nested & generic models; (d) serialization aliases; (e) settings management; (f) error shaping
 - **L1 Ground:** reject bad input with a clear message, without a single `if`.
 - **L2 Build:** `field_validator`/`model_validator`, strict vs lax coercion, custom types, `BaseSettings` for 12-factor config, translating validation errors into a stable client-facing error format.
-- **L3 Edge:** `pydantic-core` in Rust and its measured speed vs v1; validation cost on hot paths; JSON Schema generation — the same mechanism you'll use in Week 26 for LLM structured output and in Week 29 for tool schemas.
+- **L3 Edge:** `pydantic-core` in Rust and its measured speed vs v1; validation cost on hot paths; JSON Schema generation — the same mechanism you'll use in Week 26 for LLM structured output and in Week 30 for tool schemas.
 - **Hands-on:** benchmark validation of 100k payloads; then generate the JSON Schema and hand it to an LLM as a tool definition (forward link to Phase 4).
 
 ### `P1-W06-M4` — Security, auth & hardening
@@ -286,7 +286,7 @@ Each module ID maps to `content/phase-1/week-NN/MX-slug.md` and a lab under `lab
 - `basic`: POST resume text + job description → returns a formatted markdown response (rule-based, no LLM yet); Week-5 frontend wired up.
 - `standard`: full FastAPI service — Pydantic request/response models, file upload with size/type limits, auth, rate limiting, structured errors, 25+ tests, OpenAPI docs, async I/O, load-test report.
 - `hard`: add idempotency keys, background job processing with status polling, and a p95 < 200 ms target under 50 concurrent users.
-- **Ship it:** deployed publicly (Fly.io/Render free tier) with a README architecture diagram. This service is upgraded with an LLM in Week 26 and instrumented in Week 32 — keep it.
+- **Ship it:** deployed publicly (Fly.io/Render free tier) with a README architecture diagram. This service is upgraded with an LLM in Week 26 and instrumented in Week 34 — keep it.
 
 ---
 

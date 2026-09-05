@@ -133,14 +133,14 @@
 - Micro-lessons: (a) baselines that matter; (b) statistical comparison of models; (c) error analysis by slice; (d) fairness slicing; (e) model cards; (f) when to ship
 - **L1 Ground:** always beat: majority class, simple heuristic, and last-value baselines before celebrating.
 - **L2 Build:** slice-based error analysis to find where the model fails, bootstrap CIs on the metric difference (using Week 12), a reproducible experiment log, model card authoring.
-- **L3 Edge:** the offline/online gap; proxy metrics diverging from the business metric; shadow deployment and A/B testing a model (Week 12 again); regression testing for models — the direct ancestor of LLM evals in Week 31.
+- **L3 Edge:** the offline/online gap; proxy metrics diverging from the business metric; shadow deployment and A/B testing a model (Week 12 again); regression testing for models — the direct ancestor of LLM evals in Week 33.
 - **Hands-on:** produce a slice report showing a model that is 92% overall but 61% on a segment that is 30% of revenue; write the ship/no-ship recommendation.
 
 ### `LAB-P3-W19` — **Evaluation harness**
 - `basic`: compute and plot the standard metric set for a provided model.
 - `standard`: a reusable library — CV strategy selector, leakage audit checks, metric suite with bootstrap CIs, slice analysis, calibration, threshold optimizer, and an auto-generated HTML evaluation report; validated on 3 datasets.
 - `hard`: nested CV + adversarial validation + automated leakage detection that catches all 5 planted leaks from M4; runtime budget enforced.
-- **Ship it:** the harness is reused in the Midterm and referenced again in Week 31.
+- **Ship it:** the harness is reused in the Midterm and referenced again in Week 33.
 
 ---
 
@@ -314,7 +314,7 @@
 - Micro-lessons: (a) GitHub Actions basics; (b) test + lint + type gates; (c) building & pushing images; (d) environments & secrets; (e) deploy on merge; (f) rollback
 - **L1 Ground:** a workflow that runs your tests on every push.
 - **L2 Build:** a full pipeline — lint, type-check, unit tests, build image, push to a registry, deploy; caching for speed; branch protection; secrets handled properly; a smoke test after deploy.
-- **L3 Edge:** pipeline runtime budget and parallelization; matrix builds; the *model* CI problem — how do you test a model? (data tests, performance thresholds, no-regression gates) — the direct precursor of Week 31's eval CI.
+- **L3 Edge:** pipeline runtime budget and parallelization; matrix builds; the *model* CI problem — how do you test a model? (data tests, performance thresholds, no-regression gates) — the direct precursor of Week 33's eval CI.
 - **Hands-on:** add a CI gate that fails the build if model accuracy on a fixed holdout drops more than 1% versus the committed baseline.
 
 ### `P3-W23-M5` — Serverless deployment
@@ -368,7 +368,7 @@
 - Micro-lessons: (a) metrics that matter; (b) Prometheus + Grafana basics; (c) logging & tracing; (d) alerting & SLOs; (e) drift & performance monitoring; (f) incident response & runbooks
 - **L1 Ground:** expose a `/metrics` endpoint and see request counts in Grafana.
 - **L2 Build:** the four golden signals for a model service, plus ML-specific monitors (input drift, prediction distribution shift, feature nulls); SLO definition and error budget; a runbook for "model returns garbage".
-- **L3 Edge:** detecting silent model degradation without labels (proxy signals, delayed-label pipelines); alert fatigue and alerting on symptoms not causes; a post-mortem template — all of which is reused verbatim for LLM systems in Week 32.
+- **L3 Edge:** detecting silent model degradation without labels (proxy signals, delayed-label pipelines); alert fatigue and alerting on symptoms not causes; a post-mortem template — all of which is reused verbatim for LLM systems in Week 34.
 - **Hands-on:** write the runbook and then run a game-day: a teammate breaks the service, you diagnose it using only dashboards and logs.
 
 ### `LAB-P3-W24` — **Kubernetes model-serving cluster**

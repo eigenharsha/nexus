@@ -12,7 +12,7 @@ suite. You write the implementation from an empty file.
 - A human-approval interrupt before **any** remediation action, with the proposed action and its
   blast radius shown to the approver.
 - RAG over a runbook corpus (reusing the Week-27/28 pipeline).
-- MCP-served sandboxed terminal access (reusing Week 29).
+- MCP-served sandboxed terminal access (reusing Week 30).
 - Budget guards on tokens, wall time and tool calls, each of which halts the run with a clear state.
 - Crash-resume proven by test: kill the process mid-run, restart, and the graph continues from
   the last checkpoint without repeating a side effect.
